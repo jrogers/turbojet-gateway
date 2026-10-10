@@ -497,7 +497,7 @@ impl Book {
         client_report.last_qty = report.last_qty;
         client_report.last_px = report.last_px;
         client_report.text = report.text;
-        if report.status == Status::Rejected {
+        if rejected {
             client_report.reject = report.ord_rej_reason.map(RejectReason::Venue);
         }
         out.push(Output::Report { client: order.client.clone(), report: client_report });
@@ -1889,5 +1889,30 @@ mod tests {
         let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false });
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(report.reject, Some(RejectReason::NoRoute));
+    }
+
+    /// `input`, a venue report, carrying the venue's OrdRejReason(103).
+    fn with_ord_rej_reason(mut input: Input, code: u32) -> Input {
+        let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+        report.ord_rej_reason = Some(code);
+        input
+    }
+
+    #[test]
+    fn exec_type_rejected_on_the_order_carries_the_venues_reason() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, with_ord_rej_reason(venue_report_as("1", ExecType::Rejected, Status::New, 0, 0), 3));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.reject, report.status), (Some(RejectReason::Venue(3)), Status::New));
+    }
+
+    #[test]
+    fn a_reason_on_a_report_that_rejects_nothing_is_not_passed() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, with_ord_rej_reason(venue_report("1", Status::New, 0, 0), 3));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.reject, None);
     }
 }
