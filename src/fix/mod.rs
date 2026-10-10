@@ -4,6 +4,7 @@
 use turbojet::Message;
 use turbojet::message::tags;
 
+pub mod fix42;
 pub mod fix44;
 
 /// PossDupFlag(43) or PossResend(97) is set: the message may have been seen before, so the
