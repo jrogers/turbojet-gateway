@@ -369,6 +369,11 @@ impl Book {
         }
     }
 
+    /// Routes orders from now on; orders already routed keep their venue.
+    pub fn set_router(&mut self, router: Router) {
+        self.router = router;
+    }
+
     pub fn order(&self, id: OrderId) -> Option<&Order> {
         self.orders.get(&id)
     }
@@ -2714,5 +2719,21 @@ mod tests {
         );
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((order.status, order.pending.is_none()), (Status::PendingCancel, true));
+    }
+
+    #[test]
+    fn replaced_routes_apply_to_new_orders_only() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        book.set_router(Router::new(vec![Rule {
+            client: None,
+            ex_destination: None,
+            symbol: None,
+            target: Target::Venue("NYSE".into()),
+        }]));
+        let out = new_order(&mut book, "C2");
+        assert!(matches!(out.as_slice(), [Output::NewOrder { venue, .. }] if venue == "NYSE"), "{out:?}");
+        let out = cancel(&mut book, "C3", "C1");
+        assert!(matches!(out.as_slice(), [Output::Cancel { venue, .. }] if venue == "NASDAQ"), "{out:?}");
     }
 }
