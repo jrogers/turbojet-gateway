@@ -60,7 +60,8 @@ impl Service {
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
         let loaded = config::load(path)?;
         let prefix = book::start_prefix(SystemTime::now());
-        let gateway = Arc::new(Gateway::new(loaded.router, loaded.version).with_id_prefix(prefix));
+        let gateway =
+            Arc::new(Gateway::new(loaded.router, loaded.version).with_id_prefix(prefix).with_limits(loaded.limits));
         let sessions = loaded.sessions;
         let listen = sessions.listen().expect("load checked the file has [acceptor]");
         // Bound before the venues start, so a port in use stops nothing half-started.
@@ -110,8 +111,8 @@ impl Service {
         self.initiators.handle(name)
     }
 
-    /// Rereads the sessions file and the routes, logging what changed. Either that doesn't load
-    /// is logged and stays as it was; the routes are checked against the venues the gateway took
+    /// Rereads the sessions file, and the routes and limits, logging what changed. Either file that
+    /// doesn't load is logged and stays as it was (routes and limits together); the routes are checked against the venues the gateway took
     /// after the sessions reload, so a venue added to both files at once can be routed to.
     pub fn reload(&self) {
         match self.sessions.reload_all(Some(&self.acceptor), &self.initiators) {
@@ -128,12 +129,16 @@ impl Service {
             Err(e) => warn!("keeping the sessions file in use: {e}"),
         }
         let venues = self.set_venues();
-        match config::reload_routes(&self.path, &venues) {
-            Ok(router) => {
-                info!(routes = router.rules().len(), "reloaded the routes");
-                self.gateway.set_router(router);
+        match config::reload(&self.path, &venues) {
+            Ok((router, limits)) => {
+                info!(
+                    routes = router.rules().len(),
+                    clients = limits.by_comp_id.len(),
+                    "reloaded the routes and limits"
+                );
+                self.gateway.set_config(router, limits);
             }
-            Err(e) => warn!("keeping the routes in use: {e}"),
+            Err(e) => warn!("keeping the routes and limits in use: {e}"),
         }
     }
 
@@ -281,6 +286,30 @@ mod tests {
         write(&dir, "jetbridge.toml", &routes_to("C"));
         service.reload();
         assert_eq!(service.gateway.router(), to_b);
+        service.shutdown().await;
+        serving.abort();
+    }
+
+    /// The limits load at start and change with the routes on a reload; a file whose routes are
+    /// refused changes neither, though its limits are fine.
+    #[tokio::test]
+    async fn a_reload_replaces_the_limits_with_the_routes_or_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        let limit = |qty: u32| format!("[risk.defaults]\nmax_order_qty = {qty}\n");
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(5)));
+        let path = dir.path().join("jetbridge.toml");
+        let (service, serving) = Service::start(&path).await.unwrap();
+        let max_order_qty = || service.gateway.limits().defaults.max_order_qty;
+        assert_eq!(max_order_qty(), Some(5.into()));
+
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(7)));
+        service.reload();
+        assert_eq!(max_order_qty(), Some(7.into()));
+        write(&dir, "jetbridge.toml", &format!("{}{}", routes_to("NOWHERE"), limit(9)));
+        service.reload();
+        assert_eq!(max_order_qty(), Some(7.into()));
+        assert_eq!(service.gateway.router(), Router::new(Vec::new()));
         service.shutdown().await;
         serving.abort();
     }

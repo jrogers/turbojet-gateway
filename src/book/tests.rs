@@ -1799,12 +1799,13 @@ fn a_failed_replace_leaves_a_pending_cancel_pending() {
 fn replaced_routes_apply_to_new_orders_only() {
     let mut book = book();
     new_order(&mut book, "C1");
-    book.set_router(Router::new(vec![Rule {
+    let router = Router::new(vec![Rule {
         client: None,
         ex_destination: None,
         symbol: None,
         target: Target::Venue("NYSE".into()),
-    }]));
+    }]);
+    book.set_config(router, crate::risk::Config::default());
     let out = new_order(&mut book, "C2");
     assert!(matches!(out.as_slice(), [Output::NewOrder { venue, .. }] if venue == "NYSE"), "{out:?}");
     let out = cancel(&mut book, "C3", "C1");

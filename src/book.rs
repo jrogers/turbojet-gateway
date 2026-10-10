@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use turbojet::SessionId;
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
+use crate::risk;
 use crate::router::{Router, Target};
 
 /// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
@@ -500,6 +501,7 @@ struct Sent {
 #[derive(Debug)]
 pub struct Book {
     router: Router,
+    limits: risk::Config,
     /// Empty unless set by [`set_prefix`](Self::set_prefix).
     prefix: CompactString,
     orders: HashMap<OrderId, Order>,
@@ -526,6 +528,7 @@ impl Book {
     pub fn new(router: Router) -> Self {
         Self {
             router,
+            limits: risk::Config::default(),
             prefix: CompactString::default(),
             orders: HashMap::new(),
             index: HashMap::new(),
@@ -551,13 +554,19 @@ impl Book {
         &self.prefix
     }
 
-    /// Routes orders from now on; orders already routed keep their venue.
-    pub fn set_router(&mut self, router: Router) {
+    /// Routes and checks orders by these from the next order on; orders already routed keep
+    /// their venue.
+    pub fn set_config(&mut self, router: Router, limits: risk::Config) {
         self.router = router;
+        self.limits = limits;
     }
 
     pub fn router(&self) -> &Router {
         &self.router
+    }
+
+    pub fn limits(&self) -> &risk::Config {
+        &self.limits
     }
 
     /// Orders not yet done, counted per venue.

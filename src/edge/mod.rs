@@ -23,6 +23,7 @@ use turbojet::{
 
 use crate::book::{Book, ClientId, GatewayCancel, Input, OrderId, Output, Scope, VenueId};
 use crate::fix::{self, Version};
+use crate::risk;
 use crate::router::Router;
 pub use outbox::Outbox;
 
@@ -105,6 +106,15 @@ impl Gateway {
     #[must_use]
     pub fn with_id_prefix(mut self, prefix: CompactString) -> Self {
         self.state.get_mut().expect("nothing has used the gateway yet").book.set_prefix(prefix);
+        self
+    }
+
+    /// Checks orders against `limits`.
+    #[must_use]
+    pub fn with_limits(mut self, limits: risk::Config) -> Self {
+        let book = &mut self.state.get_mut().expect("nothing has used the gateway yet").book;
+        let router = book.router().clone();
+        book.set_config(router, limits);
         self
     }
 
@@ -205,9 +215,15 @@ impl Gateway {
         self.lock().book.cancels_settled()
     }
 
-    /// Routes new orders by `router` from now on.
-    pub fn set_router(&self, router: Router) {
-        self.lock().book.set_router(router);
+    /// Routes and checks new orders by `router` and `limits` from now on, both changed under one
+    /// lock so no order sees one without the other.
+    pub fn set_config(&self, router: Router, limits: risk::Config) {
+        self.lock().book.set_config(router, limits);
+    }
+
+    /// The risk limits new orders are checked against.
+    pub fn limits(&self) -> risk::Config {
+        self.lock().book.limits().clone()
     }
 
     /// Whether the acceptor's session `id` may log on: a session seen before may; a new one if
