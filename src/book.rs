@@ -266,6 +266,10 @@ pub struct Book {
     /// Downstream ClOrdID -> what we sent under it.
     downstream: HashMap<CompactString, Sent>,
     next_id: u64,
+    /// [`MAX_CL_ORD_IDS_PER_CLIENT`] and [`MAX_AMEND_RESERVE`]; fields so tests can reach them
+    /// with real orders rather than a million.
+    max_cl_ord_ids: usize,
+    amend_reserve: usize,
 }
 
 impl Book {
@@ -277,6 +281,8 @@ impl Book {
             used: HashMap::new(),
             downstream: HashMap::new(),
             next_id: 1,
+            max_cl_ord_ids: MAX_CL_ORD_IDS_PER_CLIENT,
+            amend_reserve: MAX_AMEND_RESERVE,
         }
     }
 
@@ -298,6 +304,28 @@ impl Book {
             Input::VenueCancelReject { venue, downstream, status, text } => {
                 self.venue_cancel_reject(&venue, &downstream, status, text, out)
             }
+        }
+        #[cfg(debug_assertions)]
+        self.check();
+    }
+
+    /// The book's invariants, after every input. Walks the whole book, so debug builds only.
+    #[cfg(debug_assertions)]
+    fn check(&self) {
+        for (id, order) in &self.orders {
+            let sent = self.downstream.get(&order.downstream).expect("an order's downstream is recorded");
+            assert_eq!(sent.order, *id);
+            assert_ne!(sent.kind, Some(CancelKind::Cancel), "an order's downstream is never a cancel's");
+            if let Some(pending) = &order.pending {
+                assert!(!order.status.is_done(), "done order {id:?} has a replace pending");
+                let sent = self.downstream.get(&pending.downstream).expect("a pending replace is recorded");
+                assert_eq!(sent.order, *id);
+                assert_eq!(sent.kind, Some(CancelKind::Replace));
+            }
+        }
+        for (client, &used) in &self.used {
+            let indexed = self.index.keys().filter(|(owner, _)| owner == client).count();
+            assert_eq!(used, indexed, "{client}'s ClOrdID count");
         }
     }
 
@@ -323,7 +351,7 @@ impl Book {
             };
             return out.push(output);
         }
-        if self.used.get(&client).is_some_and(|&used| used >= MAX_CL_ORD_IDS_PER_CLIENT) {
+        if self.used.get(&client).is_some_and(|&used| used >= self.max_cl_ord_ids) {
             return out.push(reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
         }
         let venue = match self.router.route(&client, &request) {
@@ -470,7 +498,7 @@ impl Book {
                 if self
                     .used
                     .get(&amend.client)
-                    .is_some_and(|&used| used >= MAX_CL_ORD_IDS_PER_CLIENT + MAX_AMEND_RESERVE) =>
+                    .is_some_and(|&used| used >= self.max_cl_ord_ids + self.amend_reserve) =>
             {
                 Some((CancelRejectReason::Other, "too many requests today"))
             }
@@ -770,16 +798,18 @@ mod tests {
     #[test]
     fn a_client_just_under_its_cl_ord_id_bound_is_accepted() {
         let mut book = book();
-        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT - 1);
-        let out = new_order(&mut book, "C1");
+        book.max_cl_ord_ids = 2;
+        new_order(&mut book, "C1");
+        let out = new_order(&mut book, "C2");
         assert!(matches!(out.as_slice(), [Output::NewOrder { .. }]));
     }
 
     #[test]
     fn a_client_at_its_cl_ord_id_bound_is_rejected() {
         let mut book = book();
-        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT);
-        let out = new_order(&mut book, "C1");
+        book.max_cl_ord_ids = 1;
+        new_order(&mut book, "C1");
+        let out = new_order(&mut book, "C2");
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(report.reject, Some(RejectReason::TooManyOrders));
     }
@@ -1339,21 +1369,23 @@ mod tests {
     #[test]
     fn a_client_at_its_new_order_bound_can_still_cancel() {
         let mut book = book();
+        book.max_cl_ord_ids = 1;
         new_order(&mut book, "C1");
-        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT);
         assert!(matches!(cancel(&mut book, "C2", "C1").as_slice(), [Output::Cancel { .. }]));
     }
 
     #[test]
     fn a_client_past_its_reserve_cannot_cancel() {
         let mut book = book();
+        (book.max_cl_ord_ids, book.amend_reserve) = (1, 1);
         new_order(&mut book, "C1");
-        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT + MAX_AMEND_RESERVE);
-        let out = cancel(&mut book, "C2", "C1");
+        // The reserve's one ClOrdID.
+        assert!(matches!(cancel(&mut book, "C2", "C1").as_slice(), [Output::Cancel { .. }]));
+        let out = cancel(&mut book, "C3", "C1");
         let [Output::CancelReject { text, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(text, "too many requests today");
         assert_eq!(cancel_reject(&out).3, CancelRejectReason::Other);
-        let out = replace(&mut book, "C2", "C1", 80, 10);
+        let out = replace(&mut book, "C3", "C1", 80, 10);
         assert_eq!(
             cancel_reject(&out),
             (Some(OrderId(1)), CancelKind::Replace, Status::PendingNew, CancelRejectReason::Other)
