@@ -619,6 +619,17 @@ fn a_fill_after_a_gap_reaches_the_client_as_the_whole_rise() {
     );
 }
 
+/// An implied price that doesn't divide out is rounded: 40 at 10, then 70 at 11, is 30 at 12.33...
+#[test]
+fn an_implied_price_is_rounded_to_eight_places() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    let out = run(&mut book, priced(venue_report_as("1", ExecType::Status, Status::PartiallyFilled, 0, 70), "0", "11"));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(report.last_px, "12.33333333".parse().unwrap());
+}
+
 #[test]
 fn a_replace_ack_with_a_fill_reaches_the_client_as_a_trade() {
     let mut book = book();
@@ -1566,6 +1577,26 @@ fn a_pending_cancel_after_a_partial_fill_is_applied() {
     let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!((report.status, report.cl_ord_id.as_str()), (Status::PendingCancel, "C2"));
     assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingCancel);
+}
+
+/// A report raising CumQty is never stale: one whose status is behind the order's (PartiallyFilled
+/// while a cancel is pending) still fills, and the order keeps its status.
+#[test]
+fn a_missed_fill_behind_a_pending_cancel_fills_and_keeps_the_status() {
+    let mut book = limited(risk::Limits { credit: Some(2000.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    run(&mut book, fill_at("1", 40, 40, "10"));
+    cancel(&mut book, "C2", "C1");
+    run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 40));
+    let missed = venue_report_as("1", ExecType::Status, Status::PartiallyFilled, 0, 60);
+    let out = run(&mut book, priced(missed, "0", "10.5"));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.exec_type, report.status), (ExecType::Trade, Status::PendingCancel));
+    assert_eq!((report.last_qty, report.last_px), (20.into(), "11.5".parse().unwrap()));
+    assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingCancel);
+    // 400 open and 630 filled: 970 more fits a credit of 2000, and no more.
+    assert_eq!(risk_checked(&mut book, limit_order("C3", Side::Buy, 97, "10")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C4", Side::Buy, 1, "10")), Err(RiskReject::Credit));
 }
 
 #[test]

@@ -35,6 +35,12 @@ impl Book {
             }
             return tracing::debug!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "stale execution report dropped");
         }
+        // A fill whose status is behind (PartiallyFilled sent before a cancel the order now
+        // awaits, say) applies keeping the order's status, as a report without one would: it
+        // then accepts and settles nothing.
+        if behind(order, answered, &report) {
+            report.status = None;
+        }
         let pending_here = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
         // Any answer under the replace's ClOrdID but these means the venue took it.
         let accepted =
@@ -162,9 +168,18 @@ impl Order {
 /// comes under. Dropped:
 ///
 /// - anything for a done order (busts and corrections come later);
-/// - a CumQty below the order's, or a fill at the order's CumQty (a resent fill).
+/// - a CumQty below the order's, or a fill at the order's CumQty (a resent fill);
+/// - a report not raising CumQty whose status is [`behind`] the order's.
 ///
-/// Other fills always apply. Without a fill:
+/// A report raising CumQty always applies, its fill reported by LastQty(32) or not: its status
+/// is what may be behind.
+pub(super) fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool {
+    order.status.is_done()
+        || report.cum_qty < order.cum_qty
+        || (report.cum_qty == order.cum_qty && (report.last_qty > Decimal::ZERO || behind(order, answered, report)))
+}
+
+/// Whether the report's status is behind the order's, so would roll it back:
 ///
 /// - (a) `settled`: under a settled request, unless it's the order's current downstream, where
 ///   only the accepted replace's own PendingReplace is a resend (the order's later reports come
@@ -175,18 +190,8 @@ impl Order {
 ///   PendingReplace, unless it accepts the pending replace: the venue refuses a request with an
 ///   OrderCancelReject, which comes another way.
 ///
-/// A pending state may follow PartiallyFilled, so status alone doesn't order reports. Fills are
-/// known by LastQty, not status, since a fill on an order pending cancel says PendingCancel.
-pub(super) fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool {
-    if order.status.is_done()
-        || report.cum_qty < order.cum_qty
-        || (report.last_qty > Decimal::ZERO && report.cum_qty == order.cum_qty)
-    {
-        return true;
-    }
-    if report.last_qty > Decimal::ZERO {
-        return false;
-    }
+/// A pending state may follow PartiallyFilled, so status alone doesn't order reports.
+fn behind(order: &Order, answered: bool, report: &VenueReport) -> bool {
     let current = report.downstream == order.downstream;
     // A report keeping the order's status is never done, PendingNew or New.
     let status = report.status;
@@ -199,6 +204,10 @@ pub(super) fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool
         && !accepts_pending;
     settled || behind_new || behind_pending
 }
+
+/// Decimal places an implied LastPx is rounded to: a division can run to 28 digits, too many to
+/// put on the wire, and the price is only as exact as the venue's AvgPx rounding anyway.
+const IMPLIED_PX_DP: u32 = 8;
 
 /// The price of `rise`, what `report` takes the order's CumQty up by: its LastPx when that's
 /// the report's own fill, else what the change in AvgPx implies for the rise (a fill the gateway
@@ -213,6 +222,7 @@ fn fill_price(order: &Order, report: &VenueReport, rise: Decimal) -> Decimal {
     new.zip(old)
         .and_then(|(new, old)| new.checked_sub(old))
         .and_then(|missed| missed.checked_div(rise))
+        .map(|price| price.round_dp(IMPLIED_PX_DP))
         .filter(|&price| price > Decimal::ZERO)
         .unwrap_or(report.avg_px)
 }
