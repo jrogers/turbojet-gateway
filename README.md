@@ -167,8 +167,10 @@ an unsolicited Canceled report for each order as its venue confirms it, when it 
   doesn't load is logged as a warning and the one in use is kept: a bad sessions file keeps the
   sessions as they were, and a bad routes file keeps the routes. New routes apply to new orders;
   orders already working stay with their venue.
-- **Ctrl-C or SIGTERM** logs every client and venue out ("gateway shutting down") and exits once
-  they've closed; a second signal exits at once. On the way out it logs how many orders are still
+- **Ctrl-C or SIGTERM** logs every client out ("gateway shutting down"), which fires any
+  cancel-on-disconnect countdowns under way; waits up to 5 seconds for the venues to answer the
+  gateway's cancels; then logs every venue out and exits once they've closed. A second signal
+  exits at once. On the way out it logs how many orders are still
   open at each venue and how many reports weren't delivered to each client. Both are lost: the open
   orders stay working at their venues with nothing to report their fills to.
 

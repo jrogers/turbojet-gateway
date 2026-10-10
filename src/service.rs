@@ -5,7 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -20,6 +20,12 @@ use crate::fix::Version;
 
 /// The Text(58) of the Logouts sent at shutdown.
 const SHUTTING_DOWN: &str = "gateway shutting down";
+
+/// How long shutdown waits, with the clients gone, for the venues to answer the gateway's
+/// cancels (those cancel on disconnect sends as the clients log out, say). An order left working
+/// at a venue with no gateway to report its fills is worse than a slower stop; a venue that
+/// doesn't answer in this long isn't going to soon.
+const CANCELS_WAIT: Duration = Duration::from_secs(5);
 
 /// The gateway, serving.
 #[derive(Debug)]
@@ -131,12 +137,23 @@ impl Service {
         }
     }
 
-    /// Logs the venues' and clients' sessions out, returning once all have closed, then logs
-    /// what the stop loses.
+    /// Logs the clients' sessions out, waits for the venues to answer the gateway's cancels
+    /// (cancel on disconnect fires as the clients go), logs the venues' sessions out, returning
+    /// once all have closed, then logs what the stop loses.
     pub async fn shutdown(&self) {
-        // The sessions are going: no venue will take a retried cancel.
+        self.acceptor.shutdown(Some(SHUTTING_DOWN)).await;
+        // The retry tick keeps running meanwhile, so cancels a venue's session couldn't take go.
+        let settled = async {
+            // ponytail: polled; a notify from the book if shutdown latency ever matters.
+            while self.gateway.cancelling().iter().any(|(_, cancel)| !cancel.stuck) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(CANCELS_WAIT, settled).await.is_err() {
+            warn!(cancelling = ?self.gateway.cancelling(), "stopping without the venues' answer to these cancels");
+        }
         self.retrying.abort();
-        tokio::join!(self.initiators.shutdown(Some(SHUTTING_DOWN)), self.acceptor.shutdown(Some(SHUTTING_DOWN)));
+        self.initiators.shutdown(Some(SHUTTING_DOWN)).await;
         // Lost at exit until stage 4 persists the book and the undelivered reports: open orders
         // stay open at their venues with no client to report to.
         let unfinished = self.gateway.unfinished();

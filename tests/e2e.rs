@@ -800,6 +800,24 @@ async fn a_client_that_logs_out_under_disconnect_or_logout_has_its_orders_cancel
     assert_eq!(sent.orig_cl_ord_id.as_str(), &*setup.id("1"));
 }
 
+/// Shutdown stops the acceptor first, which fires the countdowns under way, so their cancels
+/// reach the venue before it's logged out; and it waits for the venue's answers.
+#[tokio::test]
+async fn shutdown_sends_pending_cancels_before_logging_the_venues_out() {
+    let mut setup = dropped_with_a_working_order("disconnect").await;
+    let shutdown = setup.service.shutdown();
+    let answering = async {
+        let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
+        setup.venue.send(canceled(&sent.cl_ord_id, &sent.orig_cl_ord_id));
+        setup.venue.events.logged_out().await;
+    };
+    timeout(WAIT, async { tokio::join!(shutdown, answering) }).await.expect("shutdown hung");
+    let unfinished = setup.service.gateway().unfinished();
+    assert!(unfinished.open_orders.is_empty() && unfinished.cancelling.is_empty(), "{unfinished:?}");
+    // The client is gone: its Canceled report is the one thing left.
+    assert_eq!(unfinished.undelivered.values().sum::<usize>(), 1);
+}
+
 #[tokio::test]
 async fn shutting_down_logs_the_client_and_the_venue_out() {
     let mut setup = Setup::new().await;
