@@ -145,7 +145,7 @@ impl Service {
         // The retry tick keeps running meanwhile, so cancels a venue's session couldn't take go.
         let settled = async {
             // ponytail: polled; a notify from the book if shutdown latency ever matters.
-            while self.gateway.cancelling().iter().any(|(_, cancel)| !cancel.stuck) {
+            while !self.gateway.cancels_settled() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };

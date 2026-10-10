@@ -200,6 +200,11 @@ impl Gateway {
         self.lock().book.cancelling()
     }
 
+    /// See [`Book::cancels_settled`].
+    pub fn cancels_settled(&self) -> bool {
+        self.lock().book.cancels_settled()
+    }
+
     /// Routes new orders by `router` from now on.
     pub fn set_router(&self, router: Router) {
         self.lock().book.set_router(router);

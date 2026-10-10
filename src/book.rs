@@ -1117,6 +1117,11 @@ impl Book {
         cancelling
     }
 
+    /// Whether every cancel the gateway sent itself is answered or given up (stuck).
+    pub fn cancels_settled(&self) -> bool {
+        !self.orders.values().any(|order| order.gateway_cancel.as_ref().is_some_and(|cancel| !cancel.stuck))
+    }
+
     /// The venue refused a cancel or replace we sent under `downstream`, with the order's status
     /// as the venue now gives it.
     fn venue_cancel_reject(

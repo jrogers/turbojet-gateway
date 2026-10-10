@@ -83,9 +83,10 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   error logged, and the client is logged out; later ones are dropped and counted until its queue
   empties.
 - Cancel on disconnect countdowns still pending when the gateway shuts down fire then, with the
-  clients logged out; the shutdown's own Logouts don't start any. Shutdown waits up to 5 s for
-  the venues to answer those cancels before logging them out, and the clients don't receive
-  those Canceled reports. A process that stops without shutting down loses its countdowns, as it
+  clients logged out; the shutdown's own Logouts don't start any. Before logging the venues
+  out, shutdown waits up to 5 s for them to answer all the gateway's cancels (the kill switch's
+  too), and the clients don't receive those Canceled reports. A venue that's down with cancels
+  waiting for it costs the full 5 s. A process that stops without shutting down loses its countdowns, as it
   loses the book until stage 4.
 - There are no risk checks: every order a route sends to a venue goes there.
 - A panic in the book stops the process rather than carry on with a book that may be half

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jetbridge::book::{ClientId, Scope};
 use jetbridge::service::Service;
@@ -42,8 +42,10 @@ const REFUSED_SYMBOL: &str = "MSFT";
 const REFUSED_TEXT: &str = "MSFT is not traded here";
 /// How long any one event may take.
 const WAIT: Duration = Duration::from_secs(2);
-/// The client's cancel-on-disconnect grace, where it has one.
+/// The client's cancel-on-disconnect grace, where a test waits it out.
 const GRACE: Duration = Duration::from_millis(200);
+/// A grace no test waits out: it must not end on a loaded host before the test is done.
+const LONG_GRACE: Duration = Duration::from_secs(2);
 
 /// Something a client or venue session saw.
 #[derive(Debug)]
@@ -200,7 +202,9 @@ fn routes(symbol: &str, text: &str) -> String {
 fn write_config(dir: &tempfile::TempDir, options: &Options, venue_port: u16) {
     let Options { client_version, venue_version, cancel_on_disconnect, .. } = options;
     let cancel = cancel_on_disconnect
-        .map(|trigger| format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", GRACE.as_millis()))
+        .map(|(trigger, grace)| {
+            format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", grace.as_millis())
+        })
         .unwrap_or_default();
     let sessions = format!(
         r#"
@@ -229,8 +233,8 @@ struct Options {
     relay: bool,
     /// The venue answers every order itself.
     answers: bool,
-    /// The client's `cancel_on_disconnect` setting, with a grace of [`GRACE`].
-    cancel_on_disconnect: Option<&'static str>,
+    /// The client's `cancel_on_disconnect` setting and its grace.
+    cancel_on_disconnect: Option<(&'static str, Duration)>,
 }
 
 impl Default for Options {
@@ -730,25 +734,26 @@ async fn a_comp_id_block_covers_a_session_that_logs_on_later() {
     assert_eq!(rejected.text.as_deref(), Some("blocked by an operator"));
 }
 
-/// A client with cancel on disconnect and a working order, its connection dropped without a
-/// Logout and the gateway having seen it go.
-async fn dropped_with_a_working_order(trigger: &'static str) -> Setup {
-    let mut setup = Setup::with(Options { cancel_on_disconnect: Some(trigger), ..Options::default() }).await;
+/// A client with cancel on disconnect after `grace` and a working order, its connection dropped
+/// without a Logout and the gateway having seen it go; and when it dropped.
+async fn dropped_with_a_working_order(grace: Duration) -> (Setup, Instant) {
+    let mut setup =
+        Setup::with(Options { cancel_on_disconnect: Some(("disconnect", grace)), ..Options::default() }).await;
     setup.working_order().await;
+    let dropped = Instant::now();
     setup.running.abort();
     assert!((&mut setup.running).await.unwrap_err().is_cancelled());
     setup.events.logged_out().await;
     let client = setup.service.client_session(&SessionId::new("FIX.4.4", GATEWAY, CLIENT));
     until(|| !client.is_connected()).await;
-    setup
+    (setup, dropped)
 }
 
 /// After the grace, the gateway cancels the order of a client that dropped; the client isn't
 /// blocked, and hears of the cancel once it logs back on.
 #[tokio::test]
 async fn a_client_that_drops_has_its_orders_cancelled_after_the_grace() {
-    let dropped = std::time::Instant::now();
-    let mut setup = dropped_with_a_working_order("disconnect").await;
+    let (mut setup, dropped) = dropped_with_a_working_order(GRACE).await;
     let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
     assert!(dropped.elapsed() >= GRACE, "cancelled within the grace");
     assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), (&*setup.id("1-1"), &*setup.id("1")));
@@ -768,10 +773,10 @@ async fn a_client_that_drops_has_its_orders_cancelled_after_the_grace() {
 /// A client back within the grace keeps its orders.
 #[tokio::test]
 async fn a_client_back_within_the_grace_keeps_its_orders() {
-    let mut setup = dropped_with_a_working_order("disconnect").await;
+    let (mut setup, _) = dropped_with_a_working_order(LONG_GRACE).await;
     tokio::spawn(setup.client.clone().run());
     setup.events.logged_on().await;
-    tokio::time::sleep(2 * GRACE).await;
+    tokio::time::sleep(LONG_GRACE + GRACE).await;
     assert!(setup.venue.events.0.try_recv().is_err(), "the venue got a cancel");
     assert_eq!(setup.service.gateway().unfinished().open_orders.len(), 1);
 }
@@ -779,7 +784,8 @@ async fn a_client_back_within_the_grace_keeps_its_orders() {
 /// Under `disconnect`, a Logout isn't a disconnect: the orders stay.
 #[tokio::test]
 async fn a_client_that_logs_out_keeps_its_orders() {
-    let mut setup = Setup::with(Options { cancel_on_disconnect: Some("disconnect"), ..Options::default() }).await;
+    let mut setup =
+        Setup::with(Options { cancel_on_disconnect: Some(("disconnect", GRACE)), ..Options::default() }).await;
     setup.working_order().await;
     setup.client.shutdown(None).await;
     setup.events.logged_out().await;
@@ -792,7 +798,8 @@ async fn a_client_that_logs_out_keeps_its_orders() {
 #[tokio::test]
 async fn a_client_that_logs_out_under_disconnect_or_logout_has_its_orders_cancelled() {
     let mut setup =
-        Setup::with(Options { cancel_on_disconnect: Some("disconnect_or_logout"), ..Options::default() }).await;
+        Setup::with(Options { cancel_on_disconnect: Some(("disconnect_or_logout", GRACE)), ..Options::default() })
+            .await;
     setup.working_order().await;
     setup.client.shutdown(None).await;
     setup.events.logged_out().await;
@@ -804,7 +811,7 @@ async fn a_client_that_logs_out_under_disconnect_or_logout_has_its_orders_cancel
 /// reach the venue before it's logged out; and it waits for the venue's answers.
 #[tokio::test]
 async fn shutdown_sends_pending_cancels_before_logging_the_venues_out() {
-    let mut setup = dropped_with_a_working_order("disconnect").await;
+    let (mut setup, _) = dropped_with_a_working_order(LONG_GRACE).await;
     let shutdown = setup.service.shutdown();
     let answering = async {
         let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
