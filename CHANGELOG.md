@@ -12,6 +12,8 @@ Notable changes to Jetbridge.
   OrderStatusRequest, for Market and Limit orders, and get ExecutionReports and
   OrderCancelRejects. Venues get orders, cancels and replaces under the gateway's own ClOrdIDs,
   and their reports reach the client under its ClOrdIDs with the gateway's OrderIDs and ExecIDs.
+  Each of the gateway's IDs starts with a prefix from its start time, so a restart doesn't reuse
+  them.
 - An order book in memory: each order's state, ClOrdID dedupe per client (a possible resend is
   answered with the order's state), one replace pending at a time, stale and resent venue reports
   dropped rather than rolling an order back, overfills refused, and the venue's reject reasons

@@ -8,10 +8,12 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 - The book (orders, the ClOrdIDs each client has used, what was sent to each venue) and the
   reports held for clients live in memory. A stop loses them; shutting down logs how many open
   orders and undelivered reports it leaves. Open orders stay working at their venues.
-- After a restart, numbering starts again at 1: OrderIDs and ExecIDs repeat on the same day, so
-  a client deduping on ExecID drops the repeats, and so do the ClOrdIDs sent to venues, which a
-  venue may refuse as duplicates. A late report from a venue on an order from before the restart
-  is taken as about the new order with the same number.
+- After a restart, numbering starts again at 1, but every ID the gateway issues (OrderIDs,
+  ExecIDs and the ClOrdIDs sent to venues) starts with a prefix from the start time: six base-36
+  digits of the seconds since 2026, such as `0EI800` in `0EI8001-1`. A late report from a venue
+  on an order from before the restart names an unknown order and is dropped with a warning. Two
+  starts within the same second share a prefix, and so repeat IDs. The prefix takes six of a
+  venue's ClOrdID length limit.
 - A client's request is committed by its session before the report answering it is stored by
   the client's session: a stop in between loses the report.
 - Nothing is cleared at the end of the day: orders, ClOrdIDs and requests sent stay in memory

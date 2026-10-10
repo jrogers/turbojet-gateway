@@ -23,7 +23,10 @@ reports back, keeping each order's state as it goes.
 - **ClOrdID dedupe** per client: a ClOrdID used before is rejected as a duplicate, unless the
   message is marked as a possible resend, when the client gets the order's state instead.
 - **Its own IDs.** Orders go to venues under the gateway's ClOrdIDs, never the client's, and
-  clients see the gateway's OrderIDs and ExecIDs. Every fill reaches the client as a fill (ExecType
+  clients see the gateway's OrderIDs and ExecIDs. Each starts with a prefix from the gateway's
+  start time, so a restart doesn't reuse them: order `0EI8001` goes to its venue as `0EI8001`,
+  then `0EI8001-1` for its first cancel or replace, and its reports carry ExecIDs `0EI8001.1`,
+  `0EI8001.2` and so on. Every fill reaches the client as a fill (ExecType
   Trade; Partial fill or Fill on FIX 4.2), whatever the venue called it.
 - **Reports held per client.** A report for a client that's disconnected, or reading slowly, waits
   in that client's queue and goes out, in order, once it can take it.
