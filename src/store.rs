@@ -17,6 +17,7 @@ use std::sync::LazyLock;
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyConnection, AnyPool, Executor, Row};
+use tracing::warn;
 use turbojet::fields::{CompactString, Decimal};
 
 use crate::book::{
@@ -34,8 +35,9 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens the database at `url` (`sqlite://path?mode=rwc` creates the file; `sqlite::memory:`
-    /// is for tests), creating its tables if it has none.
+    /// Opens the database at `url`, creating its tables if it has none. A missing file is an error
+    /// unless the URL asks for one (`sqlite://path?mode=rwc`), so a mistyped path at a restart
+    /// doesn't start an empty book; a new database is logged. `sqlite::memory:` is for tests.
     ///
     /// # Errors
     ///
@@ -60,8 +62,15 @@ impl Store {
             })
             .connect(url)
             .await
-            .map_err(database("connecting"))?;
-        create(&pool).await?;
+            .map_err(|e| {
+                let url = without_password(url);
+                io::Error::other(format!(
+                    "cannot open the database at {url}: {e} (a sqlite URL ending `?mode=rwc` creates a new database)"
+                ))
+            })?;
+        if create(&pool).await? {
+            warn!("created a new, empty database at {}", without_password(url));
+        }
         Ok(Self { pool })
     }
 
@@ -86,38 +95,48 @@ impl Store {
     ///
     /// The database refuses a query, or holds a value this build can't read.
     pub async fn load(&self) -> io::Result<Snapshot> {
-        // One transaction, so the orders and what names them are of the same commit.
+        // One transaction, so the orders and what names them are of the same commit: a SQLite
+        // transaction reads one snapshot; PostgreSQL's needs REPEATABLE READ for that (task D3).
         let mut transaction = self.pool.begin().await.map_err(database("starting a load"))?;
         let connection = &mut *transaction;
         let mut snapshot = Snapshot::default();
-        for row in fetch(connection, &format!("SELECT * FROM orders WHERE id IN ({HELD})")).await? {
+        // The held IDs found once, by index; dropped with the transaction should a read fail.
+        connection
+            .execute("CREATE TEMPORARY TABLE held (id BIGINT PRIMARY KEY)")
+            .await
+            .map_err(database("loading orders"))?;
+        connection
+            .execute(format!("INSERT INTO held (id) {HELD}").as_str())
+            .await
+            .map_err(database("loading orders"))?;
+        for row in fetch(connection, HELD_ORDERS, "orders").await? {
             let row = order_row(&Columns(&row))?;
             snapshot.orders.insert(row.order.id, row);
         }
-        for row in fetch(connection, &format!("SELECT * FROM sent WHERE order_id IN ({HELD})")).await? {
+        for row in fetch(connection, HELD_SENT, "sent").await? {
             let row = Columns(&row);
             snapshot.sent.insert(row.compact("downstream")?, sent(&row)?);
         }
-        for row in fetch(connection, &format!("SELECT * FROM cl_ord_ids WHERE order_id IN ({HELD})")).await? {
+        for row in fetch(connection, HELD_CL_ORD_IDS, "cl_ord_ids").await? {
             let row = Columns(&row);
             let day = row.text("day")?;
             let day = if day == NO_DAY { None } else { Some(Day(parse_time("day", &day)?)) };
             let key = (row.client()?, day, row.compact("cl_ord_id")?);
             snapshot.cl_ord_ids.insert(key, row.order_id("order_id")?);
         }
-        for row in fetch(connection, "SELECT * FROM days").await? {
+        for row in fetch(connection, "SELECT * FROM days", "days").await? {
             let row = Columns(&row);
             let today = Today { day: Day(row.time("day_end")?), began: row.optional_time("began")? };
             snapshot.days.insert(row.client()?, today);
         }
-        for row in fetch(connection, "SELECT * FROM blocks ORDER BY position").await? {
+        for row in fetch(connection, "SELECT * FROM blocks ORDER BY position", "blocks").await? {
             snapshot.blocked.push(scope(&Columns(&row))?);
         }
-        for row in fetch(connection, "SELECT * FROM risk_references").await? {
+        for row in fetch(connection, "SELECT * FROM risk_references", "risk_references").await? {
             let row = Columns(&row);
             snapshot.references.insert(row.compact("symbol")?, row.decimal("price")?);
         }
-        for row in fetch(connection, "SELECT * FROM risk_filled").await? {
+        for row in fetch(connection, "SELECT * FROM risk_filled", "risk_filled").await? {
             let row = Columns(&row);
             snapshot.filled.insert(row.client()?, row.decimal("notional")?);
         }
@@ -127,18 +146,29 @@ impl Store {
             .await
             .map_err(database("reading the last OrderId"))?;
         snapshot.next_order_id = unsigned::<u64>("id", max)? + 1;
+        connection.execute("DROP TABLE held").await.map_err(database("ending a load"))?;
         transaction.commit().await.map_err(database("ending a load"))?;
         Ok(snapshot)
     }
 }
 
 /// The IDs of the orders the book holds, as `held` in the book's `persist` decides: a live order;
-/// a done one written in its client's current day, or before the client's first day while that
-/// day is still the first (no `began`); and any order of a client with no day. That last is for
-/// rows with a day too, which `held` asserts can't be: restore finds them, not the load.
-const HELD: &str = "SELECT o.id FROM orders o
-    LEFT JOIN days d ON d.client = o.client AND d.client_comp_id = o.client_comp_id
-    WHERE o.live = 1 OR d.client IS NULL OR o.day = d.day_end OR (o.day IS NULL AND d.began IS NULL)";
+/// a done one written in its client's current day; and one written with no day (before its
+/// client's first), while its client has no day or is still in its first (no `began`). Each arm
+/// reads by an index, `orders_live` or `orders_day`, not the whole history. Not looked for: a
+/// row with a day whose client has none, which `held` asserts can't be. `CROSS JOIN`, an inner
+/// join to PostgreSQL, makes SQLite go from the few days to the many orders, whatever it guesses.
+const HELD: &str = "SELECT id FROM orders WHERE live = 1
+    UNION SELECT o.id FROM days d CROSS JOIN orders o
+        WHERE o.day = d.day_end AND o.client = d.client AND o.client_comp_id = d.client_comp_id
+    UNION SELECT o.id FROM orders o
+        LEFT JOIN days d ON d.client = o.client AND d.client_comp_id = o.client_comp_id
+        WHERE o.day IS NULL AND d.began IS NULL";
+
+/// The rows of the orders in the temporary table `held`, each found by index from its ID.
+const HELD_ORDERS: &str = "SELECT o.* FROM held h CROSS JOIN orders o WHERE o.id = h.id";
+const HELD_SENT: &str = "SELECT s.* FROM held h CROSS JOIN sent s WHERE s.order_id = h.id";
+const HELD_CL_ORD_IDS: &str = "SELECT c.* FROM held h CROSS JOIN cl_ord_ids c WHERE c.order_id = h.id";
 
 /// `cl_ord_ids.day` for a client with no day yet: part of the key, and SQL's UNIQUE would let
 /// NULLs repeat. Never an RFC 3339 time.
@@ -198,6 +228,9 @@ const TABLES: &[&str] = &[
         gateway_cancel_orig_downstream TEXT,
         gateway_cancel_refused_sends BIGINT
     )",
+    // For `HELD`: few orders are live, and each day's are found by day and client, NULL included.
+    "CREATE INDEX IF NOT EXISTS orders_live ON orders (live)",
+    "CREATE INDEX IF NOT EXISTS orders_day ON orders (day, client, client_comp_id)",
     "CREATE TABLE IF NOT EXISTS sent (
         downstream TEXT PRIMARY KEY,
         order_id BIGINT NOT NULL,
@@ -244,7 +277,8 @@ const TABLES: &[&str] = &[
 
 /// Creates the tables a new database lacks, after checking the version of one that has them: a
 /// database of another version is left as it is.
-async fn create(pool: &AnyPool) -> io::Result<()> {
+/// Whether the database is new: it had no schema version.
+async fn create(pool: &AnyPool) -> io::Result<bool> {
     let mut transaction = pool.begin().await.map_err(database("starting to create the tables"))?;
     let connection = &mut *transaction;
     let version_table = "CREATE TABLE IF NOT EXISTS schema_version (
@@ -252,11 +286,13 @@ async fn create(pool: &AnyPool) -> io::Result<()> {
         version BIGINT NOT NULL
     )";
     connection.execute(version_table).await.map_err(database("creating the schema_version table"))?;
-    sqlx::query("INSERT INTO schema_version (id, version) VALUES (1, $1) ON CONFLICT (id) DO NOTHING")
+    let created = sqlx::query("INSERT INTO schema_version (id, version) VALUES (1, $1) ON CONFLICT (id) DO NOTHING")
         .bind(SCHEMA_VERSION)
         .execute(&mut *connection)
         .await
-        .map_err(database("recording the schema version"))?;
+        .map_err(database("recording the schema version"))?
+        .rows_affected()
+        == 1;
     let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
         .fetch_one(&mut *connection)
         .await
@@ -267,9 +303,10 @@ async fn create(pool: &AnyPool) -> io::Result<()> {
         )));
     }
     for table in TABLES {
-        connection.execute(*table).await.map_err(database("creating the tables"))?;
+        connection.execute(*table).await.map_err(|e| io::Error::other(format!("creating `{table}`: {e}")))?;
     }
-    transaction.commit().await.map_err(database("creating the tables"))
+    transaction.commit().await.map_err(database("committing the new tables"))?;
+    Ok(created)
 }
 
 const ORDER_COLUMNS: &[&str] = &[
@@ -408,8 +445,8 @@ async fn run(connection: &mut AnyConnection, query: Query<'_>, doing: &'static s
     query.execute(connection).await.map(drop).map_err(database(doing))
 }
 
-async fn fetch(connection: &mut AnyConnection, sql: &str) -> io::Result<Vec<AnyRow>> {
-    sqlx::query(sql).fetch_all(connection).await.map_err(database("loading the book"))
+async fn fetch(connection: &mut AnyConnection, sql: &str, table: &str) -> io::Result<Vec<AnyRow>> {
+    sqlx::query(sql).fetch_all(connection).await.map_err(|e| io::Error::other(format!("loading {table}: {e}")))
 }
 
 fn bind_client<'q>(query: Query<'q>, client: &'q ClientId) -> Query<'q> {
@@ -540,7 +577,7 @@ struct Columns<'r>(&'r AnyRow);
 
 impl Columns<'_> {
     fn optional(&self, column: &str) -> io::Result<Option<String>> {
-        self.0.try_get(column).map_err(|e| unreadable(column, "", e))
+        self.0.try_get(column).map_err(|e| undecodable(column, e))
     }
 
     fn text(&self, column: &str) -> io::Result<String> {
@@ -582,7 +619,7 @@ impl Columns<'_> {
     }
 
     fn integer(&self, column: &str) -> io::Result<i64> {
-        self.0.try_get(column).map_err(|e| unreadable(column, "", e))
+        self.0.try_get(column).map_err(|e| undecodable(column, e))
     }
 
     fn flag(&self, column: &str) -> io::Result<bool> {
@@ -628,6 +665,19 @@ fn signed(value: u64) -> io::Result<i64> {
 
 fn unreadable(column: &str, value: &str, why: impl Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("the database's {column} {value:?}: {why}"))
+}
+
+fn undecodable(column: &str, why: sqlx::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("the database's {column}: {why}"))
+}
+
+/// `url` with any password replaced, for the logs.
+fn without_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let Some((user_info, host)) = authority.rsplit_once('@') else { return url.to_string() };
+    let Some((user, _)) = user_info.split_once(':') else { return url.to_string() };
+    format!("{scheme}://{user}:***@{host}{}", &rest[authority.len()..])
 }
 
 fn database(doing: &'static str) -> impl Fn(sqlx::Error) -> io::Error {

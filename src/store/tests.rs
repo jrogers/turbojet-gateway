@@ -30,7 +30,8 @@ fn decimal(text: &str) -> Decimal {
     text.parse().unwrap()
 }
 
-/// An order with every optional field set, or every one empty.
+/// An order with every optional field set, or every one empty. No two fields of a type share a
+/// value (decimals by value, as they compare), so a swapped column fails to read back.
 fn order(id: u64, client: &ClientId, full: bool) -> Order {
     let request = OrderRequest {
         cl_ord_id: format!("C{id}").into(),
@@ -39,7 +40,7 @@ fn order(id: u64, client: &ClientId, full: bool) -> Order {
         side: Side::Buy,
         ord_type: OrdType::Limit,
         qty: decimal("100.50"),
-        price: full.then(|| decimal("10.0100")),
+        price: full.then(|| decimal("10.0200")),
         ex_destination: full.then(|| "XNAS".into()),
         time_in_force: full.then_some(TimeInForce::Gtc),
     };
@@ -47,16 +48,16 @@ fn order(id: u64, client: &ClientId, full: bool) -> Order {
         downstream: format!("{id}-2").into(),
         cl_ord_id: format!("R{id}").into(),
         qty: decimal("200"),
-        price: Some(decimal("9.5")),
+        price: Some(decimal("9.25")),
         ord_type: OrdType::Limit,
         time_in_force: Some(TimeInForce::Ioc),
-        risk_price: decimal("9.5"),
+        risk_price: decimal("9.75"),
     };
     let gateway_cancel = GatewayCancel {
         tries: 2,
         unsent: true,
         stuck: false,
-        orig_downstream: format!("{id}-1").into(),
+        orig_downstream: format!("{id}-4").into(),
         refused_sends: 7,
     };
     Order {
@@ -403,4 +404,77 @@ fn block(scope: Scope) -> Input {
 /// `client`'s trading day ending `hour` o'clock on 2026-10-10.
 fn days_started(client: &ClientId, hour: u32) -> Input {
     Input::DaysStarted { days: vec![(client.clone(), Day(time(hour, 0)))] }
+}
+
+/// Loading reads orders by index, never the whole history: no step of its plan scans `orders`.
+#[tokio::test]
+async fn loading_never_scans_every_order() {
+    let store = memory().await;
+    let mut connection = store.pool.acquire().await.unwrap();
+    connection.execute("CREATE TEMPORARY TABLE held (id BIGINT PRIMARY KEY)").await.unwrap();
+    for query in [HELD, HELD_ORDERS, HELD_SENT, HELD_CL_ORD_IDS] {
+        let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {query}")).fetch_all(&mut *connection).await.unwrap();
+        let plan: Vec<String> = plan.iter().map(|row| row.try_get("detail").unwrap()).collect();
+        for step in &plan {
+            assert!(
+                !step.starts_with("SCAN o") && !step.starts_with("SCAN s") && !step.starts_with("SCAN c"),
+                "{query}: {plan:?}"
+            );
+        }
+    }
+}
+
+/// A ClOrdID row with no day is keyed by the sentinel, not NULL: writing it again replaces it.
+#[tokio::test]
+async fn a_cl_ord_id_with_no_day_is_one_row() {
+    let store = memory().await;
+    let funda = ClientId::from("FUNDA");
+    let row = |order| ClOrdIdRow { client: funda.clone(), day: None, cl_ord_id: "X".into(), order: OrderId(order) };
+    let orders = vec![
+        OrderRow { order: order(1, &funda, false), day: None },
+        OrderRow { order: order(2, &funda, false), day: None },
+    ];
+    let first = Changes { orders, cl_ord_ids: vec![row(1)], ..Changes::default() };
+    store.write(&[first, Changes { cl_ord_ids: vec![row(2)], ..Changes::default() }]).await.unwrap();
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT day, order_id FROM cl_ord_ids").fetch_all(&store.pool).await.unwrap();
+    assert_eq!(rows, [(NO_DAY.to_string(), 2)]);
+}
+
+/// A file store commits durably: WAL, and each commit synced (`synchronous` FULL is 2).
+#[tokio::test]
+async fn a_file_store_syncs_each_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display())).await.unwrap();
+    let journal: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(&store.pool).await.unwrap();
+    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous").fetch_one(&store.pool).await.unwrap();
+    assert_eq!((journal.as_str(), synchronous), ("wal", 2));
+}
+
+/// A missing file isn't created unless the URL asks: the error names the file and the fix.
+#[tokio::test]
+async fn a_missing_file_is_an_error_naming_it_and_mode_rwc() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.db");
+    let error = Store::open(&format!("sqlite://{}", path.display())).await.unwrap_err().to_string();
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("?mode=rwc"), "{error}");
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_urls_password_is_hidden() {
+    assert_eq!(without_password("postgres://jet:secret@db:5432/j?ssl=1"), "postgres://jet:***@db:5432/j?ssl=1");
+    assert_eq!(without_password("postgres://jet@db/j"), "postgres://jet@db/j");
+    assert_eq!(without_password("sqlite://a/b@c.db?mode=rwc"), "sqlite://a/b@c.db?mode=rwc");
+    assert_eq!(without_password("sqlite::memory:"), "sqlite::memory:");
+}
+
+/// Creating the tables says whether the database was new, which `open` logs.
+#[tokio::test]
+async fn creating_says_whether_the_database_was_new() {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+    assert!(create(&pool).await.unwrap());
+    assert!(!create(&pool).await.unwrap());
 }
