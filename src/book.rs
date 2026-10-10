@@ -151,7 +151,9 @@ pub struct Pending {
 pub struct VenueReport {
     /// The downstream ClOrdID it answers.
     pub downstream: CompactString,
-    /// Passed to the client as it is; fills are still known by `last_qty`, not `Trade`.
+    /// Passed to the client as it is, except that a report with a fill (`last_qty` > 0) goes to
+    /// the client as `Trade`, whatever the venue said: the book knows fills by `last_qty`, and
+    /// clients by ExecType.
     pub exec_type: ExecType,
     /// OrdStatus(39); `None` keeps the order's, for reports whose status the book doesn't model
     /// (DoneForDay, Stopped, Suspended, Calculated). Such a report never rejects anything or
@@ -591,12 +593,14 @@ impl Book {
         order.avg_px = report.avg_px;
         // `None` keeps the status, through `set_status` so a fill makes a New order PartiallyFilled.
         order.set_status(report.status.unwrap_or(order.status));
+        // Clients count fills by ExecType (FIX 4.2 has nothing else), so every fill is a Trade.
+        let exec_type = if report.last_qty > Decimal::ZERO { ExecType::Trade } else { report.exec_type };
         let mut client_report = if answers_request {
-            let mut client_report = order.report(&cl_ord_id, report.exec_type);
+            let mut client_report = order.report(&cl_ord_id, exec_type);
             client_report.orig_cl_ord_id = orig_cl_ord_id;
             client_report
         } else {
-            order.report(&order.request.cl_ord_id.clone(), report.exec_type)
+            order.report(&order.request.cl_ord_id.clone(), exec_type)
         };
         client_report.last_qty = report.last_qty;
         client_report.last_px = report.last_px;
@@ -1511,6 +1515,28 @@ mod tests {
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((&order.request, order.downstream.as_str()), (&replaced("C2", 80, 11), "1-1"));
         assert!(order.pending.is_none());
+    }
+
+    /// FIX 4.2 counts a report as a fill only by its ExecType, so any report with a fill is Trade.
+    #[test]
+    fn a_status_report_with_a_fill_reaches_the_client_as_a_trade() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, venue_report_as("1", ExecType::Status, Status::PartiallyFilled, 40, 40));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.exec_type, report.last_qty, report.cum_qty), (ExecType::Trade, 40.into(), 40.into()));
+    }
+
+    #[test]
+    fn a_replace_ack_with_a_fill_reaches_the_client_as_a_trade() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::PartiallyFilled, 30, 30));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.exec_type, report.last_qty, report.leaves_qty), (ExecType::Trade, 30.into(), 50.into()));
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((&order.request, order.pending.is_none()), (&replaced("C2", 80, 11), true));
     }
 
     #[test]
