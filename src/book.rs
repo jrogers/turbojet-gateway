@@ -344,10 +344,14 @@ impl Book {
     }
 
     fn venue_report(&mut self, venue: &VenueId, report: VenueReport, out: &mut Vec<Output>) {
-        let Some(Sent { order: id, cl_ord_id, orig_cl_ord_id, .. }) = self.downstream.get(&report.downstream).cloned()
-        else {
+        let Some(sent) = self.downstream.get(&report.downstream).cloned() else {
             return tracing::warn!(%venue, downstream = %report.downstream, "execution report for an unknown order");
         };
+        // Rejected under a cancel's or replace's ClOrdID is about that request, not the order.
+        if report.status == Status::Rejected && sent.kind.is_some() {
+            return self.refuse_request(venue, &report.downstream, sent, None, report.text, out);
+        }
+        let Sent { order: id, cl_ord_id, orig_cl_ord_id, .. } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
             return tracing::warn!(%venue, downstream = %report.downstream, "execution report for another venue's order");
@@ -478,9 +482,8 @@ impl Book {
         self.remember(&client, cl_ord_id, id);
     }
 
-    /// The venue refused a cancel or replace we sent under `downstream`: tell the client, under
-    /// the ClOrdIDs of its own request, with the order's status as the venue now gives it. Anything
-    /// that doesn't name such a request is dropped.
+    /// The venue refused a cancel or replace we sent under `downstream`, with the order's status
+    /// as the venue now gives it.
     fn venue_cancel_reject(
         &mut self,
         venue: &VenueId,
@@ -492,6 +495,22 @@ impl Book {
         let Some(sent) = self.downstream.get(downstream).cloned() else {
             return tracing::warn!(%venue, %downstream, "cancel reject for an unknown request");
         };
+        self.refuse_request(venue, downstream, sent, Some(status), text, out);
+    }
+
+    /// The venue refused the cancel or replace `sent` under `downstream`, by OrderCancelReject or
+    /// by a Rejected ExecutionReport: tell the client, under the ClOrdIDs of its own request.
+    /// `status` is the order's status as the venue gives it, if it does. Anything that doesn't
+    /// name such a request is dropped.
+    fn refuse_request(
+        &mut self,
+        venue: &VenueId,
+        downstream: &CompactString,
+        sent: Sent,
+        status: Option<Status>,
+        text: Option<CompactString>,
+        out: &mut Vec<Output>,
+    ) {
         let (Some(response_to), Some(orig_cl_ord_id)) = (sent.kind, sent.orig_cl_ord_id) else {
             return tracing::warn!(%venue, %downstream, "cancel reject naming an order, not a cancel or replace");
         };
@@ -504,7 +523,9 @@ impl Book {
             order.pending = None;
         }
         // Done is final, as in `stale`.
-        if !order.status.is_done() {
+        if let Some(status) = status
+            && !order.status.is_done()
+        {
             order.status = status;
         }
         let refusal = Refusal { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, response_to };
@@ -1155,5 +1176,47 @@ mod tests {
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
         assert_eq!((report.kind, report.reject, report.request.qty), (ReportKind::Status, None, 80.into()));
+    }
+
+    #[test]
+    fn a_rejected_report_for_a_replace_rejects_the_replace_not_the_order() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        replace(&mut book, "C2", "C1", 80, 11);
+        let out = run(&mut book, venue_report("1-1", Status::Rejected, 0, 0));
+        let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, text, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str()), ("C2", "C1"));
+        assert_eq!(text, "rejected by the venue");
+        assert_eq!(
+            cancel_reject(&out),
+            (Some(OrderId(1)), CancelKind::Replace, Status::New, CancelRejectReason::Other)
+        );
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, &order.request, order.downstream.as_str()), (Status::New, &request("C1"), "1"));
+        assert!(order.pending.is_none());
+        // The order is still live, so it can still be cancelled.
+        assert!(matches!(cancel(&mut book, "C3", "C1").as_slice(), [Output::Cancel { .. }]));
+    }
+
+    #[test]
+    fn a_rejected_report_for_a_cancel_rejects_the_cancel_not_the_order() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        cancel(&mut book, "C2", "C1");
+        let out = run(&mut book, venue_report("1-1", Status::Rejected, 0, 0));
+        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    #[test]
+    fn a_rejected_report_for_the_original_order_rejects_the_order() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, venue_report("1", Status::Rejected, 0, 0));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.status, Status::Rejected);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
     }
 }
