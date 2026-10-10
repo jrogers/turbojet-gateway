@@ -69,6 +69,11 @@ pub const MAX_CL_ORD_IDS_PER_CLIENT: usize = 1_000_000;
 /// `amendments` far below `u32::MAX`.
 pub const MAX_AMEND_RESERVE: usize = 10_000;
 
+/// Times the gateway sends its own cancel for one order before it gives up and lists the order as
+/// stuck in [`Book::cancelling`]. A venue that refuses a cancel three times will refuse a fourth;
+/// past that, someone has to look.
+pub const MAX_GATEWAY_CANCEL_TRIES: u32 = 3;
+
 /// The start of the seconds [`start_prefix`] counts: 2026-01-01T00:00:00Z, in Unix seconds.
 pub const ID_EPOCH: u64 = 1_767_225_600;
 
@@ -187,6 +192,42 @@ pub struct Order {
     /// The venue's OrderID(37): from the first report the book took that had one, then from the
     /// report accepting each replace. "NONE" and empty ones don't count.
     pub venue_order_id: Option<CompactString>,
+    /// The downstream ClOrdID of the latest cancel sent for the order, the client's or the
+    /// gateway's: while the venue hasn't answered it, a cancel is outstanding.
+    pub cancel: Option<CompactString>,
+    /// The gateway's own cancel (see [`Input::CancelAll`]) while the order is live. A done order
+    /// has none.
+    pub gateway_cancel: Option<GatewayCancel>,
+}
+
+/// The gateway cancelling an order itself, for the kill switch or cancel on disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayCancel {
+    /// Cancels sent so far, at most [`MAX_GATEWAY_CANCEL_TRIES`].
+    pub tries: u32,
+    /// Given up: the venue refused every try, or said it doesn't know the order or it's too late,
+    /// while the book still has it live.
+    pub stuck: bool,
+}
+
+/// Whose orders the gateway cancels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// One client session.
+    Session(ClientId),
+    /// Every session of a CompID.
+    CompId(CompactString),
+    All,
+}
+
+impl Scope {
+    fn covers(&self, client: &ClientId) -> bool {
+        match self {
+            Self::Session(session) => session == client,
+            Self::CompId(comp_id) => client.comp_id() == comp_id,
+            Self::All => true,
+        }
+    }
 }
 
 /// A replace awaiting the venue's answer.
@@ -289,15 +330,30 @@ pub enum Input {
     },
     /// The request sent under `downstream` never reached the venue's session, or the session
     /// dropped it unsent: it isn't connected, its queue is full, or the connection ended first. A
-    /// cancel or replace is refused with `text` and the order's status left as it is, even when
-    /// the order is done, since the venue never saw the request to answer it; an original order
-    /// still PendingNew is rejected. One for an answered request, or an original order the venue
+    /// client's cancel or replace is refused with `text` and the order's status left as it is,
+    /// even when the order is done, since the venue never saw the request to answer it; an
+    /// original order still PendingNew is rejected. The gateway's own cancel waits for `VenueUp`. One for an answered request, or an original order the venue
     /// acked or that is done, is dropped. It never produces venue-bound output, which the edge
     /// relies on.
     SendFailed {
         venue: VenueId,
         downstream: CompactString,
         text: CompactString,
+    },
+    /// The gateway cancels every live order in `scope` itself, except those with a cancel
+    /// outstanding. The client hears only the venue's Canceled, as an unsolicited report under
+    /// the order's current ClOrdID. A venue's refusal is logged and the cancel sent again, up to
+    /// [`MAX_GATEWAY_CANCEL_TRIES`] times; see [`Book::cancelling`].
+    CancelAll {
+        scope: Scope,
+    },
+    /// As `CancelAll`, for one order.
+    CancelOrder {
+        order: OrderId,
+    },
+    /// The venue's session logged on: the gateway's cancels that couldn't be sent to it go now.
+    VenueUp {
+        venue: VenueId,
     },
 }
 
@@ -338,7 +394,7 @@ pub enum CancelKind {
 pub enum CancelRejectReason {
     TooLate,
     UnknownOrder,
-    /// 3: a replace is already pending for the order.
+    /// 3: a replace is already pending for the order, or the gateway's own cancel.
     AlreadyPending,
     Duplicate,
     Other,
@@ -385,11 +441,21 @@ pub enum Output {
     },
 }
 
+/// Who asked for a request we sent a venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Client,
+    /// The gateway's own cancel: it spends none of the client's ClOrdIDs.
+    Gateway,
+}
+
 /// A request we sent a venue, by its downstream ClOrdID: what the venue's answers map back to.
 #[derive(Debug, Clone)]
 struct Sent {
     order: OrderId,
-    /// The client's ClOrdID for the request, and its OrigClOrdID for a cancel or replace.
+    origin: Origin,
+    /// The client's ClOrdID for the request, and its OrigClOrdID for a cancel or replace. Empty
+    /// and `None` for the gateway's own cancel, whose answers go under the order's current one.
     cl_ord_id: CompactString,
     orig_cl_ord_id: Option<CompactString>,
     /// `None` for the original order.
@@ -507,6 +573,9 @@ impl Book {
                 self.venue_cancel_reject(&venue, &downstream, refused, out)
             }
             Input::SendFailed { venue, downstream, text } => self.send_failed(&venue, &downstream, text, out),
+            Input::CancelAll { scope } => self.cancel_all(&scope, out),
+            Input::CancelOrder { order } => self.cancel_order(order, out),
+            Input::VenueUp { venue } => self.venue_up(&venue, out),
         }
         #[cfg(debug_assertions)]
         self.check();
@@ -526,6 +595,33 @@ impl Book {
                 let sent = self.downstream.get(&pending.downstream).expect("a pending replace is recorded");
                 assert_eq!(sent.order, *id);
                 assert_eq!(sent.kind, Some(CancelKind::Replace));
+            }
+        }
+        for sent in self.downstream.values() {
+            let order = &self.orders[&sent.order];
+            match sent.origin {
+                Origin::Client => {
+                    assert_eq!(self.index.get(&(order.client.clone(), sent.cl_ord_id.clone())), Some(&sent.order))
+                }
+                Origin::Gateway => {
+                    assert!(
+                        sent.cl_ord_id.is_empty() && sent.orig_cl_ord_id.is_none(),
+                        "a gateway cancel uses no client ClOrdID"
+                    );
+                    assert_eq!(sent.kind, Some(CancelKind::Cancel));
+                }
+            }
+        }
+        for (id, order) in &self.orders {
+            if let Some(cancel) = &order.cancel {
+                let sent = &self.downstream[cancel];
+                assert_eq!((sent.order, sent.kind), (*id, Some(CancelKind::Cancel)));
+            }
+            if let Some(gateway) = order.gateway_cancel {
+                assert!(!order.status.is_done(), "done order {id:?} has a gateway cancel");
+                assert!((1..=MAX_GATEWAY_CANCEL_TRIES).contains(&gateway.tries), "{id:?}'s gateway cancel tries");
+                let in_flight = self.outstanding_cancel(order).is_some_and(|sent| sent.origin == Origin::Gateway);
+                assert!(!(gateway.stuck && in_flight), "stuck order {id:?} has a gateway cancel in flight");
             }
         }
         for (client, &used) in &self.used {
@@ -568,8 +664,14 @@ impl Book {
         let name = format_compact!("{}{}", self.prefix, id.0);
         let downstream = name.clone();
         self.remember(&client, request.cl_ord_id.clone(), id);
-        let sent =
-            Sent { order: id, cl_ord_id: request.cl_ord_id.clone(), orig_cl_ord_id: None, kind: None, answered: false };
+        let sent = Sent {
+            order: id,
+            origin: Origin::Client,
+            cl_ord_id: request.cl_ord_id.clone(),
+            orig_cl_ord_id: None,
+            kind: None,
+            answered: false,
+        };
         let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
         out.push(Output::NewOrder { venue: venue.clone(), downstream: downstream.clone(), request: request.clone() });
@@ -587,6 +689,8 @@ impl Book {
             pending: None,
             exec_seq: 0,
             venue_order_id: None,
+            cancel: None,
+            gateway_cancel: None,
         };
         let previous = self.orders.insert(id, order);
         debug_assert!(previous.is_none(), "order {id:?} booked twice");
@@ -637,7 +741,7 @@ impl Book {
             let refused = Refused { status, text: report.text, venue_order_id: report.venue_order_id, reason: None };
             return self.refuse_request(venue, &report.downstream, sent, refused, out);
         }
-        let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind, answered } = sent;
+        let Sent { order: id, origin, cl_ord_id, orig_cl_ord_id, kind, answered } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");
@@ -653,10 +757,10 @@ impl Book {
         // Any answer under the replace's ClOrdID but these means the venue took it.
         let accepted =
             pending_here && !rejected && report.status.is_some_and(|status| status != Status::PendingReplace);
-        // A cancel's reports and a pending replace's (up to the one accepting it) answer that
-        // request; any other report is about the order, under the client's latest ClOrdID.
+        // A client's cancel's reports and a pending replace's (up to the one accepting it) answer
+        // that request; any other, the gateway's cancel's too, is about the order, unsolicited.
         let answers_request = match kind {
-            Some(CancelKind::Cancel) => true,
+            Some(CancelKind::Cancel) => origin == Origin::Client,
             Some(CancelKind::Replace) => pending_here,
             None => false,
         };
@@ -706,8 +810,15 @@ impl Book {
     }
 
     /// A cancel goes to the venue even while PendingNew, under the next numbered downstream ClOrdID.
+    /// One is refused while the gateway's own cancel is in flight: the order is going already, and
+    /// the client hears when it's gone. A stuck one, or one waiting for the venue to log on, lets
+    /// the client's through, which may fare better.
     fn cancel(&mut self, amend: Amend, named: (Side, CompactString), out: &mut Vec<Output>) {
-        let Some((id, amend)) = self.amendable(amend, named, |_| None, out) else { return };
+        let refuse = |book: &Self, order: &Order| {
+            let gateway = book.outstanding_cancel(order).is_some_and(|sent| sent.origin == Origin::Gateway);
+            gateway.then_some((CancelRejectReason::AlreadyPending, "the gateway is cancelling the order"))
+        };
+        let Some((id, amend)) = self.amendable(amend, named, refuse, out) else { return };
         let (downstream, order) = self.number(id, amend);
         out.push(Output::Cancel {
             venue: order.venue.clone(),
@@ -722,7 +833,7 @@ impl Book {
     /// the venue accepts it (see `venue_report`).
     fn replace(&mut self, amend: Amend, named: (Side, CompactString), terms: Terms, out: &mut Vec<Output>) {
         let Terms { qty, price, ord_type, time_in_force } = terms;
-        let refuse = |order: &Order| {
+        let refuse = |_: &Self, order: &Order| {
             if order.pending.is_some() {
                 Some((CancelRejectReason::AlreadyPending, "replace pending"))
             } else if qty < order.cum_qty {
@@ -760,7 +871,7 @@ impl Book {
         &mut self,
         amend: Amend,
         named: (Side, CompactString),
-        refuse: impl Fn(&Order) -> Option<(CancelRejectReason, &'static str)>,
+        refuse: impl Fn(&Self, &Order) -> Option<(CancelRejectReason, &'static str)>,
         out: &mut Vec<Output>,
     ) -> Option<(OrderId, Amend)> {
         let id = self.index.get(&(amend.client.clone(), amend.orig_cl_ord_id.clone())).copied();
@@ -792,7 +903,7 @@ impl Book {
             Some(order) if (order.request.side, &order.request.symbol) != (named.0, &named.1) => {
                 Some((CancelRejectReason::Other, "side or symbol does not match"))
             }
-            Some(order) => refuse(order),
+            Some(order) => refuse(self, order),
         };
         if let Some((reason, text)) = refusal {
             out.push(amend.refuse(order, reason, text.into()));
@@ -803,20 +914,127 @@ impl Book {
 
     /// Sends `amend` under the order's next numbered downstream ClOrdID, remembering what it was.
     fn number(&mut self, id: OrderId, amend: Amend) -> (CompactString, &mut Order) {
-        let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
-        order.amendments += 1;
-        let downstream = format_compact!("{}-{}", order.name, order.amendments);
         let sent = Sent {
             order: id,
+            origin: Origin::Client,
             cl_ord_id: amend.cl_ord_id.clone(),
             orig_cl_ord_id: Some(amend.orig_cl_ord_id),
             kind: Some(amend.kind),
             answered: false,
         };
-        let previous = self.downstream.insert(downstream.clone(), sent);
-        debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
+        let downstream = self.next_downstream(sent);
         self.remember(&amend.client, amend.cl_ord_id, id);
         (downstream, self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders"))
+    }
+
+    /// The order's next numbered downstream ClOrdID, recording `sent` under it.
+    fn next_downstream(&mut self, sent: Sent) -> CompactString {
+        let order = self.orders.get_mut(&sent.order).expect("requests are for booked orders");
+        order.amendments += 1;
+        let downstream = format_compact!("{}-{}", order.name, order.amendments);
+        if sent.kind == Some(CancelKind::Cancel) {
+            order.cancel = Some(downstream.clone());
+        }
+        let previous = self.downstream.insert(downstream.clone(), sent);
+        debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
+        downstream
+    }
+
+    /// The order's latest cancel, while the venue hasn't answered it.
+    fn outstanding_cancel(&self, order: &Order) -> Option<&Sent> {
+        let sent = &self.downstream[order.cancel.as_ref()?];
+        (!sent.answered).then_some(sent)
+    }
+
+    fn cancel_all(&mut self, scope: &Scope, out: &mut Vec<Output>) {
+        let mut ids: Vec<OrderId> = self
+            .orders
+            .values()
+            .filter(|order| scope.covers(&order.client) && !order.status.is_done())
+            .map(|order| order.id)
+            .collect();
+        // Map order is random; a fixed one keeps the venues' traffic and the tests repeatable.
+        ids.sort_unstable_by_key(|id| id.0);
+        for id in ids {
+            self.cancel_order(id, out);
+        }
+    }
+
+    /// Starts the gateway's own cancel for the order with no cancel outstanding, the tries
+    /// counted afresh: an operator asking again gets a stuck order another round.
+    fn cancel_order(&mut self, id: OrderId, out: &mut Vec<Output>) {
+        let Some(order) = self.orders.get_mut(&id) else {
+            return tracing::warn!(order = id.0, "gateway cancel for an unknown order");
+        };
+        if order.status.is_done() {
+            return tracing::debug!(order = %order.name, "gateway cancel for a done order");
+        }
+        if self.outstanding_cancel(&self.orders[&id]).is_some() {
+            return tracing::debug!(order = id.0, "gateway cancel skipped: a cancel is outstanding");
+        }
+        self.orders.get_mut(&id).expect("looked up above").gateway_cancel =
+            Some(GatewayCancel { tries: 0, stuck: false });
+        self.send_gateway_cancel(id, out);
+    }
+
+    /// Sends the gateway's cancel for the order one more time.
+    fn send_gateway_cancel(&mut self, id: OrderId, out: &mut Vec<Output>) {
+        let sent = Sent {
+            order: id,
+            origin: Origin::Gateway,
+            cl_ord_id: CompactString::default(),
+            orig_cl_ord_id: None,
+            kind: Some(CancelKind::Cancel),
+            answered: false,
+        };
+        let downstream = self.next_downstream(sent);
+        let order = self.orders.get_mut(&id).expect("requests are for booked orders");
+        let gateway = order.gateway_cancel.as_mut().expect("the caller started the gateway's cancel");
+        debug_assert!(gateway.tries < MAX_GATEWAY_CANCEL_TRIES && !gateway.stuck);
+        gateway.tries += 1;
+        tracing::info!(order = %order.name, %downstream, tries = gateway.tries, "gateway cancelling an order");
+        out.push(Output::Cancel {
+            venue: order.venue.clone(),
+            downstream,
+            orig_downstream: order.downstream.clone(),
+            request: order.request.clone(),
+            venue_order_id: order.venue_order_id.clone(),
+        });
+    }
+
+    /// Sends again, while tries remain, the gateway's cancels the venue's session couldn't take.
+    fn venue_up(&mut self, venue: &VenueId, out: &mut Vec<Output>) {
+        let mut ids: Vec<OrderId> = self
+            .orders
+            .values()
+            .filter(|order| order.venue == *venue && order.gateway_cancel.is_some_and(|gateway| !gateway.stuck))
+            .filter(|order| self.outstanding_cancel(order).is_none())
+            .map(|order| order.id)
+            .collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        for id in ids {
+            self.retry_gateway_cancel(id, out);
+        }
+    }
+
+    /// Sends the gateway's cancel again, or marks the order stuck once it has had its tries.
+    fn retry_gateway_cancel(&mut self, id: OrderId, out: &mut Vec<Output>) {
+        let order = self.orders.get_mut(&id).expect("requests are for booked orders");
+        let gateway = order.gateway_cancel.as_mut().expect("the caller checked for the gateway's cancel");
+        if gateway.tries >= MAX_GATEWAY_CANCEL_TRIES {
+            gateway.stuck = true;
+            return tracing::error!(order = %order.name, tries = gateway.tries, "gateway gave up cancelling an order");
+        }
+        self.send_gateway_cancel(id, out);
+    }
+
+    /// Orders the gateway is cancelling itself, by OrderId: what the shutdown log and the console
+    /// show. A stuck one needs someone to look.
+    pub fn cancelling(&self) -> Vec<(OrderId, GatewayCancel)> {
+        let mut cancelling: Vec<_> =
+            self.orders.values().filter_map(|order| Some((order.id, order.gateway_cancel?))).collect();
+        cancelling.sort_unstable_by_key(|(id, _)| id.0);
+        cancelling
     }
 
     /// The venue refused a cancel or replace we sent under `downstream`, with the order's status
@@ -845,6 +1063,15 @@ impl Book {
         debug_assert_eq!(order.venue, *venue, "the edge reports a failed send to the order's venue");
         if order.venue != *venue {
             return tracing::warn!(%venue, %downstream, "send failed for another venue's order");
+        }
+        // The gateway's own cancel waits for the venue to log on (`venue_up`): nothing to send now,
+        // which the edge relies on.
+        if sent.origin == Origin::Gateway {
+            if sent.answered {
+                return tracing::debug!(%venue, %downstream, "send failed for an answered request; dropped");
+            }
+            self.downstream.get_mut(downstream).expect("looked up above").answered = true;
+            return tracing::warn!(%venue, %downstream, %text, "gateway cancel not sent; again when the venue logs on");
         }
         // A cancel or replace the venue never saw is refused even on a done order: nobody else
         // will answer it. `refuse_request` drops one already answered.
@@ -876,7 +1103,7 @@ impl Book {
         out: &mut Vec<Output>,
     ) {
         let Refused { status, text, venue_order_id, reason } = refused;
-        let (Some(response_to), Some(orig_cl_ord_id)) = (sent.kind, sent.orig_cl_ord_id) else {
+        let Some(response_to) = sent.kind else {
             return tracing::warn!(%venue, %downstream, "request rejected naming an order, not a cancel or replace");
         };
         let order = self.orders.get_mut(&sent.order).expect("downstream ClOrdIDs point at booked orders");
@@ -903,11 +1130,41 @@ impl Book {
             }
             None => {}
         }
+        if sent.origin == Origin::Gateway {
+            return self.gateway_cancel_refused(sent.order, downstream, reason, text, out);
+        }
+        let orig_cl_ord_id = sent.orig_cl_ord_id.expect("a client's cancel or replace names an order");
         let client = order.client.clone();
         let amend = Amend { client, cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, kind: response_to, redelivered: false };
         let text = text.unwrap_or_else(|| "rejected by the venue".into());
         let reason = reason.map_or(CancelRejectReason::Other, CancelRejectReason::Venue);
         out.push(amend.refuse(Some(&*order), reason, text));
+    }
+
+    /// The venue refused the gateway's own cancel: the client never hears of it. Sent again,
+    /// unless the venue says it's too late or doesn't know the order, which another try won't
+    /// change; an order that's live here all the same is stuck.
+    fn gateway_cancel_refused(
+        &mut self,
+        id: OrderId,
+        downstream: &CompactString,
+        reason: Option<u32>,
+        text: Option<CompactString>,
+        out: &mut Vec<Output>,
+    ) {
+        let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
+        let text = text.unwrap_or_default();
+        // The refusal's status made the order done, which ends the gateway's cancel.
+        let Some(gateway) = order.gateway_cancel.as_mut() else {
+            return tracing::info!(order = %order.name, %downstream, ?reason, %text, "venue refused the gateway's cancel of a done order");
+        };
+        tracing::error!(order = %order.name, %downstream, ?reason, %text, tries = gateway.tries, "venue refused the gateway's cancel");
+        // CxlRejReason 0 is too late, 1 unknown order.
+        if matches!(reason, Some(0 | 1)) {
+            gateway.stuck = true;
+            return tracing::error!(order = %order.name, "gateway gave up cancelling an order the venue says is done or unknown");
+        }
+        self.retry_gateway_cancel(id, out);
     }
 
     /// A reject for an order we didn't book.
@@ -1001,7 +1258,8 @@ impl Order {
         report
     }
 
-    /// A done order has nothing pending: a replace it still awaited can't happen now. Set after
+    /// A done order has nothing pending: a replace it still awaited can't happen now, and the
+    /// gateway has nothing left to cancel. Set after
     /// `cum_qty`: a venue's New on an order with fills (a cancel reject's OrdStatus, say) is
     /// PartiallyFilled to the client.
     fn set_status(&mut self, status: Status) {
@@ -1011,6 +1269,7 @@ impl Order {
         };
         if self.status.is_done() {
             self.pending = None;
+            self.gateway_cancel = None;
         }
     }
 
