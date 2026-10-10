@@ -122,7 +122,7 @@ pub struct Order {
     /// A replace sent to the venue and not yet answered; `request` changes only when it's accepted.
     pub pending: Option<Pending>,
     /// Client reports built for the order so far, numbering the next ExecID.
-    pub exec_seq: u32,
+    pub exec_seq: u64,
 }
 
 /// A replace awaiting the venue's answer.
@@ -618,7 +618,7 @@ impl Book {
 
     /// A reject for an order we didn't book, under the book's next `R` ExecID.
     fn reject(&mut self, client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
-        // Saturating, as in `Order::report`; a u64 of rejects isn't reachable anyway.
+        // Saturating, as in `Order::report`; a u64 of rejects can't be reached.
         self.rejects = self.rejects.saturating_add(1);
         let report = ClientReport {
             exec_type: ExecType::Rejected,
@@ -650,9 +650,9 @@ impl Order {
     /// A report of where the order stands, answering the client's `cl_ord_id`, under the order's
     /// next ExecID.
     fn report(&mut self, cl_ord_id: &CompactString, exec_type: ExecType) -> ClientReport {
-        // Saturating: Status answers to redeliveries and pass-through venue reports aren't bounded
-        // by the ClOrdID limits, so a peer could in principle drive this to the top. Repeating the
-        // last ExecID there beats a peer being able to panic the book.
+        // Status answers to redeliveries and pass-through venue reports aren't bounded by the
+        // ClOrdID limits, so a peer drives this count; at u64 it can't reach the top. Saturating
+        // anyway, so no input can panic the book.
         self.exec_seq = self.exec_seq.saturating_add(1);
         ClientReport {
             exec_type,
@@ -1575,6 +1575,27 @@ mod tests {
         run(&mut book, venue_report("1", Status::New, 0, 0));
         new_order(&mut book, "C2");
         assert_eq!(exec_ids(&run(&mut book, venue_report("2", Status::New, 0, 0))), ["2.1"]);
+    }
+
+    #[test]
+    fn a_dropped_venue_report_uses_up_no_exec_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        assert_eq!(exec_ids(&run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40))), ["1.1"]);
+        // Stale: a resend of that fill. Overfill: past the quantity.
+        assert!(run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40)).is_empty());
+        assert!(run(&mut book, venue_report("1", Status::Filled, 110, 150)).is_empty());
+        assert_eq!(exec_ids(&run(&mut book, venue_report("1", Status::Filled, 60, 100))), ["1.2"]);
+    }
+
+    #[test]
+    fn a_status_answer_after_an_acked_replace_takes_the_next_exec_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        assert_eq!(exec_ids(&run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0))), ["1.1"]);
+        let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+        assert_eq!(exec_ids(&out), ["1.2"]);
     }
 
     #[test]
