@@ -42,7 +42,7 @@ async fn main() -> ExitCode {
         }
     };
     let service = Arc::new(service);
-    reload_on_hangup(service.clone());
+    let reloading = reload_on_hangup(service.clone());
     let code = tokio::select! {
         result = serving => {
             match result {
@@ -54,6 +54,8 @@ async fn main() -> ExitCode {
         }
         () = shutdown_signal() => ExitCode::SUCCESS,
     };
+    // A reload while shutting down would start initiators being stopped.
+    reloading.abort();
     info!("shutting down: logging sessions out (signal again to exit at once)");
     tokio::select! {
         () = service.shutdown() => info!("all sessions closed"),
@@ -75,10 +77,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<PathBuf>,
     config.map(Some).ok_or_else(|| "--config is required".to_string())
 }
 
-/// On Unix, reloads the configuration on each SIGHUP.
-fn reload_on_hangup(service: Arc<Service>) {
+/// On Unix, reloads the configuration on each SIGHUP, until the task is aborted.
+fn reload_on_hangup(service: Arc<Service>) -> tokio::task::JoinHandle<()> {
     #[cfg(unix)]
-    tokio::spawn(async move {
+    return tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
         let Ok(mut hangup) = signal(SignalKind::hangup()) else {
             warn!("cannot listen for SIGHUP; the configuration won't be reloaded");
@@ -89,7 +91,10 @@ fn reload_on_hangup(service: Arc<Service>) {
         }
     });
     #[cfg(not(unix))]
-    let _ = service;
+    {
+        let _ = service;
+        tokio::spawn(async {})
+    }
 }
 
 /// Completes on Ctrl-C (SIGINT) or, on Unix, SIGTERM, which service managers and `docker stop`
@@ -98,7 +103,11 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate()).expect("cannot listen for SIGTERM");
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            warn!("cannot listen for SIGTERM; only Ctrl-C shuts down");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}

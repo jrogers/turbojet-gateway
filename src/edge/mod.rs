@@ -9,7 +9,7 @@
 
 pub mod outbox;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tracing::error;
@@ -20,7 +20,7 @@ use turbojet::{
 };
 
 use crate::book::{Book, ClientId, Input, Output, VenueId};
-use crate::fix::{self, UnsupportedVersion, Version};
+use crate::fix::{self, Version};
 use crate::router::Router;
 pub use outbox::Outbox;
 
@@ -76,24 +76,40 @@ impl Gateway {
     /// Until a venue is set, its session's logons are refused (see [`VenueApp`]) and orders for
     /// it are rejected as unavailable.
     ///
-    /// # Errors
-    ///
-    /// A venue's session has a FIX version the gateway doesn't convert; nothing is changed.
-    pub fn set_venues(
-        &self,
-        venues: impl IntoIterator<Item = (VenueId, SessionHandle)>,
-    ) -> Result<(), UnsupportedVersion> {
+    /// A venue whose session has a FIX version the gateway doesn't convert is skipped, with an
+    /// error logged, so one misconfigured venue doesn't keep the others from changing. Returns
+    /// the skipped venues' names.
+    pub fn set_venues(&self, venues: impl IntoIterator<Item = (VenueId, SessionHandle)>) -> Vec<VenueId> {
         let mut by_name = HashMap::new();
         let mut names = HashMap::new();
+        let mut skipped = Vec::new();
         for (name, session) in venues {
-            let version = session.id().begin_string.parse()?;
+            let version = match session.id().begin_string.parse::<Version>() {
+                Ok(version) => version,
+                Err(e) => {
+                    error!(venue = %name, "skipping the venue: {e}");
+                    skipped.push(name);
+                    continue;
+                }
+            };
             names.insert(session.id().clone(), (name.clone(), version));
             by_name.insert(name, Venue { version, session });
         }
         let mut state = self.lock();
         state.venues = by_name;
         state.venue_names = names;
-        Ok(())
+        skipped
+    }
+
+    /// The router new orders are routed by.
+    pub fn router(&self) -> Router {
+        self.lock().book.router().clone()
+    }
+
+    /// What a stop would lose until the book is persisted: the open orders per venue, and the
+    /// reports not yet delivered per client.
+    pub fn unfinished(&self) -> (BTreeMap<VenueId, usize>, BTreeMap<ClientId, usize>) {
+        (self.lock().book.open_orders_by_venue(), self.outbox.held_by_client())
     }
 
     /// Routes new orders by `router` from now on.
@@ -290,17 +306,21 @@ mod tests {
         let gateway = gateway();
         let (app, venue) = (VenueApp(gateway.clone()), session("FIX.4.4", "VENUE"));
         assert!(logon(&app, &venue).is_err());
-        gateway.set_venues([(VENUE.into(), venue.clone())]).unwrap();
+        assert!(gateway.set_venues([(VENUE.into(), venue.clone())]).is_empty());
         assert_eq!(logon(&app, &venue), Ok(()));
-        gateway.set_venues([]).unwrap();
+        gateway.set_venues([]);
         assert!(logon(&app, &venue).is_err());
     }
 
     #[test]
-    fn a_venue_with_a_version_the_gateway_cant_convert_is_refused() {
+    fn a_venue_with_a_version_the_gateway_cant_convert_is_skipped_and_the_rest_set() {
         let gateway = gateway();
-        let refused = gateway.set_venues([(VENUE.into(), session("FIX.4.3", "VENUE"))]);
-        assert_eq!(refused, Err(UnsupportedVersion("FIX.4.3".into())));
+        let (good, bad) = (session("FIX.4.4", "VENUE"), session("FIX.4.3", "OTHER"));
+        let skipped = gateway.set_venues([(VENUE.into(), good.clone()), ("OTHER".into(), bad.clone())]);
+        assert_eq!(skipped, ["OTHER"]);
+        let app = VenueApp(gateway);
+        assert_eq!(logon(&app, &good), Ok(()));
+        assert!(logon(&app, &bad).is_err());
     }
 
     #[test]
@@ -422,7 +442,7 @@ mod tests {
         let (venue_app, mut venue_events) = peer();
         let venue_addr = serve("VENUE", venue_app).await;
         let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
-        gateway.set_venues([(VENUE.into(), venue.handle())]).unwrap();
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
         let (client, mut client_events) = client(&gateway).await;
@@ -445,7 +465,7 @@ mod tests {
     async fn an_order_for_a_venue_not_connected_is_rejected() {
         let gateway = gateway();
         let venue = initiator("127.0.0.1:1", "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
-        gateway.set_venues([(VENUE.into(), venue.handle())]).unwrap();
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         let (client, mut events) = client(&gateway).await;
 
         client.handle().send(order("C1")).unwrap();
@@ -466,7 +486,7 @@ mod tests {
         // The venue's side completes the logon, and then ours refuses it.
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOut));
-        gateway.set_venues([(VENUE.into(), venue.handle())]).unwrap();
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
         let (client, _client_events) = client(&gateway).await;
         client.handle().send(order("C1")).unwrap();
@@ -501,7 +521,7 @@ mod tests {
         let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
         let venue_addr = serve("VENUE", refuser).await;
         let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
-        gateway.set_venues([(VENUE.into(), venue.handle())]).unwrap();
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         timeout(Duration::from_secs(5), held.recv()).await.expect("logon not held");
         let (client, mut events) = client(&gateway).await;

@@ -23,6 +23,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use tracing::warn;
 use turbojet_config::SessionsFile;
 
 use crate::fix::Version;
@@ -64,23 +65,62 @@ pub struct Loaded {
 pub fn load(path: &Path) -> Result<Loaded, Error> {
     let file = read(path)?;
     let sessions_path = path.parent().unwrap_or(Path::new(".")).join(&file.sessions);
-    let sessions = SessionsFile::load(&sessions_path).map_err(|e| Error(e.to_string()))?;
+    let sessions = SessionsFile::load(&sessions_path).map_err(Error::new)?;
     let Some(base) = sessions.base() else {
         return Err(Error(format!("{}: no [acceptor]: the clients log on to it", sessions_path.display())));
     };
     let version = base.begin_string.parse().map_err(|e| Error(format!("{}: {e}", sessions_path.display())))?;
-    let router = file.router(&sessions).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    let router = file.router(path)?;
+    check_venues(path, &router, &sessions.initiator_names())?;
     Ok(Loaded { router, sessions, version })
 }
 
-/// Reads the routes in the configuration file at `path` again, checking them against `sessions`
-/// as it is now.
+/// Reads the routes in the configuration file at `path` again, checking that each venue they
+/// name is one of `venues`.
 ///
 /// # Errors
 ///
-/// As [`load`], for the routes.
-pub fn reload_routes(path: &Path, sessions: &SessionsFile) -> Result<Router, Error> {
-    read(path)?.router(sessions).map_err(|e| Error(format!("{}: {e}", path.display())))
+/// As [`load`], for the routes, or a route names a venue not in `venues`.
+pub fn reload_routes(path: &Path, venues: &[String]) -> Result<Router, Error> {
+    let router = read(path)?.router(path)?;
+    check_venues(path, &router, venues)?;
+    Ok(router)
+}
+
+/// Checks that each venue `router`, read from the file at `path`, routes to is one of `venues`:
+/// the initiators, or those the gateway took (see [`Gateway::set_venues`](crate::edge::Gateway::set_venues)).
+///
+/// # Errors
+///
+/// The first route to a venue not in `venues`.
+pub fn check_venues(path: &Path, router: &Router, venues: &[String]) -> Result<(), Error> {
+    for (index, rule) in router.rules().iter().enumerate() {
+        if let Target::Venue(venue) = &rule.target
+            && !venues.iter().any(|v| v == venue.as_str())
+        {
+            return Err(Error(format!(
+                "{}: route {}: venue {venue:?} has no [initiator.{venue}], or one whose BeginString \
+                 the gateway doesn't convert",
+                path.display(),
+                index + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What's likely a mistake in `router`, though it loads: routes after one that matches every
+/// order, which can never match, and no routes at all, which rejects every order.
+pub fn warnings(router: &Router) -> Vec<String> {
+    let rules = router.rules();
+    if rules.is_empty() {
+        return vec!["no routes: every order is rejected".to_string()];
+    }
+    let catch_all = rules.iter().position(|r| r.client.is_none() && r.ex_destination.is_none() && r.symbol.is_none());
+    let Some(catch_all) = catch_all else { return Vec::new() };
+    (catch_all + 1..rules.len())
+        .map(|index| format!("route {} can never match: route {} matches every order", index + 1, catch_all + 1))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,19 +147,17 @@ fn read(path: &Path) -> Result<File, Error> {
 }
 
 impl File {
-    /// The routes, each venue checked to be one of `sessions`' initiators.
-    fn router(&self, sessions: &SessionsFile) -> Result<Router, String> {
-        let venues = sessions.initiator_names();
+    /// The routes, read from `path`, with their [`warnings`] logged.
+    fn router(&self, path: &Path) -> Result<Router, Error> {
         let mut rules = Vec::with_capacity(self.route.len());
         for (index, route) in self.route.iter().enumerate() {
-            let number = index + 1;
             let target = match (&route.venue, &route.reject) {
-                (Some(venue), None) if venues.contains(venue) => Target::Venue(venue.as_str().into()),
-                (Some(venue), None) => {
-                    return Err(format!("route {number}: venue {venue:?} has no [initiator.{venue}]"));
-                }
+                (Some(venue), None) => Target::Venue(venue.as_str().into()),
                 (None, Some(text)) => Target::Reject(text.as_str().into()),
-                _ => return Err(format!("route {number}: needs one of venue and reject")),
+                _ => {
+                    let number = index + 1;
+                    return Err(Error(format!("{}: route {number}: needs one of venue and reject", path.display())));
+                }
             };
             rules.push(Rule {
                 client: route.client.as_deref().map(Into::into),
@@ -128,7 +166,11 @@ impl File {
                 target,
             });
         }
-        Ok(Router::new(rules))
+        let router = Router::new(rules);
+        for warning in warnings(&router) {
+            warn!(file = %path.display(), "{warning}");
+        }
+        Ok(router)
     }
 }
 
@@ -148,22 +190,20 @@ target_comp_id = "NASDAQ"
 connect = ["127.0.0.1:1"]
 "#;
 
-    /// A directory of its own for each test, holding `files`.
-    fn dir(test: &str, files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("jetbridge-config-{}-{test}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A temporary directory holding `files`.
+    fn dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
         for (name, text) in files {
-            let path = dir.join(name);
+            let path = dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
         dir
     }
 
-    fn load_error(test: &str, jetbridge: &str) -> String {
-        let dir = dir(test, &[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
-        load(&dir.join("jetbridge.toml")).unwrap_err().to_string()
+    fn load_error(jetbridge: &str) -> String {
+        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
+        load(&dir.path().join("jetbridge.toml")).unwrap_err().to_string()
     }
 
     fn venue_rule(client: Option<&str>, venue: &str) -> Rule {
@@ -182,8 +222,8 @@ venue = "NASDAQ"
 [[route]]
 reject = "no route"
 "#;
-        let dir = dir("good", &[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.join("jetbridge.toml")).unwrap();
+        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("jetbridge.toml")).unwrap();
         let expected = Router::new(vec![
             Rule {
                 client: Some("FUNDA".into()),
@@ -199,30 +239,29 @@ reject = "no route"
 
     #[test]
     fn an_unknown_key_is_an_error() {
-        let error =
-            load_error("unknown-key", "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\nsymbl = \"X\"");
+        let error = load_error("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\nsymbl = \"X\"");
         assert!(error.contains("unknown field `symbl`"), "{error}");
     }
 
     #[test]
     fn a_route_needs_one_of_venue_and_reject() {
         let both = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\nreject = \"no\"";
-        assert!(load_error("both", both).contains("route 1: needs one of venue and reject"));
+        assert!(load_error(both).contains("route 1: needs one of venue and reject"));
         let neither = "sessions = \"sessions.toml\"\n[[route]]\nreject = \"no\"\n[[route]]\nsymbol = \"X\"";
-        assert!(load_error("neither", neither).contains("route 2: needs one of venue and reject"));
+        assert!(load_error(neither).contains("route 2: needs one of venue and reject"));
     }
 
     #[test]
     fn a_route_to_a_venue_with_no_initiator_is_an_error() {
-        let error = load_error("no-venue", "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"LSE\"");
+        let error = load_error("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"LSE\"");
         assert!(error.contains("venue \"LSE\" has no [initiator.LSE]"), "{error}");
     }
 
     #[test]
     fn the_acceptor_must_speak_a_version_the_gateway_converts() {
         let sessions = SESSIONS.replace("FIX.4.4", "FIX.4.3");
-        let dir = dir("version", &[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);
-        let error = load(&dir.join("jetbridge.toml")).unwrap_err().to_string();
+        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);
+        let error = load(&dir.path().join("jetbridge.toml")).unwrap_err().to_string();
         assert!(error.contains("\"FIX.4.3\" is not supported"), "{error}");
     }
 
@@ -230,9 +269,8 @@ reject = "no route"
     fn the_sessions_file_needs_an_acceptor() {
         let sessions = "[initiator.NASDAQ]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
                         target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]";
-        let dir =
-            dir("no-acceptor", &[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", sessions)]);
-        let error = load(&dir.join("jetbridge.toml")).unwrap_err().to_string();
+        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", sessions)]);
+        let error = load(&dir.path().join("jetbridge.toml")).unwrap_err().to_string();
         assert!(error.contains("no [acceptor]"), "{error}");
     }
 
@@ -240,23 +278,33 @@ reject = "no route"
     #[test]
     fn the_sessions_path_is_relative_to_the_file() {
         let jetbridge = "sessions = \"fix/sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"";
-        let dir = dir("relative", &[("conf/jetbridge.toml", jetbridge), ("conf/fix/sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.join("conf/jetbridge.toml")).unwrap();
+        let dir = dir(&[("conf/jetbridge.toml", jetbridge), ("conf/fix/sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("conf/jetbridge.toml")).unwrap();
         assert_eq!(loaded.router, Router::new(vec![venue_rule(None, "NASDAQ")]));
     }
 
     #[test]
     fn reloading_replaces_the_routes() {
-        let path = dir("reload", &[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)])
-            .join("jetbridge.toml");
+        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let path = dir.path().join("jetbridge.toml");
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.router, Router::new(Vec::new()));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"")
             .unwrap();
-        let router = reload_routes(&path, &loaded.sessions).unwrap();
+        let venues = loaded.sessions.initiator_names();
+        let router = reload_routes(&path, &venues).unwrap();
         assert_eq!(router, Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ")]));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"LSE\"").unwrap();
-        assert!(reload_routes(&path, &loaded.sessions).is_err());
+        assert!(reload_routes(&path, &venues).is_err());
+    }
+
+    #[test]
+    fn routes_that_reject_every_order_or_never_match_warn() {
+        assert_eq!(warnings(&Router::new(Vec::new())), ["no routes: every order is rejected"]);
+        let catch_all = Rule { client: None, ex_destination: None, symbol: None, target: Target::Reject("no".into()) };
+        let router = Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ"), catch_all, venue_rule(Some("FUNDB"), "X")]);
+        assert_eq!(warnings(&router), ["route 3 can never match: route 2 matches every order"]);
+        assert!(warnings(&Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ")])).is_empty());
     }
 
     /// The example files the readme shows load.

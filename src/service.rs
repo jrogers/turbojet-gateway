@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use turbojet::Acceptor;
 use turbojet_config::{Initiators, SessionsFile};
 
@@ -52,7 +52,7 @@ impl Service {
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr };
-        service.set_venues()?;
+        config::check_venues(path, &service.gateway.router(), &service.set_venues())?;
         let serving = service.serve(listener)?;
         info!(addr = %local_addr, version = ?loaded.version, venues = ?service.initiators.names(), "gateway listening");
         Ok((service, serving))
@@ -64,8 +64,8 @@ impl Service {
     }
 
     /// Rereads the sessions file and the routes, logging what changed. Either that doesn't load
-    /// is logged and stays as it was; the routes are checked against the venues after the
-    /// sessions reload, so a venue added to both files at once can be routed to.
+    /// is logged and stays as it was; the routes are checked against the venues the gateway took
+    /// after the sessions reload, so a venue added to both files at once can be routed to.
     pub fn reload(&self) {
         match self.sessions.reload_all(Some(&self.acceptor), &self.initiators) {
             Ok(changes) => info!(
@@ -80,10 +80,8 @@ impl Service {
             ),
             Err(e) => warn!("keeping the sessions file in use: {e}"),
         }
-        if let Err(e) = self.set_venues() {
-            error!("keeping the venues in use: {e}");
-        }
-        match config::reload_routes(&self.path, &self.sessions) {
+        let venues = self.set_venues();
+        match config::reload_routes(&self.path, &venues) {
             Ok(router) => {
                 info!(routes = router.rules().len(), "reloaded the routes");
                 self.gateway.set_router(router);
@@ -92,16 +90,31 @@ impl Service {
         }
     }
 
-    /// Logs the venues' and clients' sessions out, returning once all have closed.
+    /// Logs the venues' and clients' sessions out, returning once all have closed, then logs
+    /// what the stop loses.
     pub async fn shutdown(&self) {
         tokio::join!(self.initiators.shutdown(Some(SHUTTING_DOWN)), self.acceptor.shutdown(Some(SHUTTING_DOWN)));
+        // Lost at exit until stage 4 persists the book and the undelivered reports: open orders
+        // stay open at their venues with no client to report to.
+        let (open_orders, undelivered) = self.gateway.unfinished();
+        if open_orders.is_empty() && undelivered.is_empty() {
+            info!("no open orders or undelivered reports");
+        } else {
+            warn!(
+                ?open_orders,
+                ?undelivered,
+                "stopping with open orders (per venue) and undelivered reports (per client)"
+            );
+        }
     }
 
-    /// Tells the gateway the venues running now: a reload may have started or stopped some.
-    fn set_venues(&self) -> Result<(), Error> {
+    /// Tells the gateway the venues running now (a reload may have started or stopped some), and
+    /// returns those it took.
+    fn set_venues(&self) -> Vec<String> {
         let names = self.initiators.names();
-        let venues = names.into_iter().filter_map(|name| Some((name.as_str().into(), self.initiators.handle(&name)?)));
-        self.gateway.set_venues(venues).map_err(Error::new)
+        let venues = names.iter().filter_map(|name| Some((name.as_str().into(), self.initiators.handle(name)?)));
+        let skipped = self.gateway.set_venues(venues);
+        names.into_iter().filter(|name| !skipped.iter().any(|s| s == name.as_str())).collect()
     }
 
     #[cfg(feature = "tls")]
@@ -125,38 +138,94 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::{Router, Rule, Target};
 
-    /// Starts from files on an ephemeral port, with the venue's initiator retrying a closed port,
-    /// and shuts down. Orders flowing end to end are `tests/e2e.rs`'s.
+    const ACCEPTOR: &str = "[acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n";
+
+    /// An initiator section for venue `name`, speaking `begin_string`, retrying a closed port.
+    fn venue(name: &str, begin_string: &str) -> String {
+        format!(
+            "[initiator.{name}]\nbegin_string = \"{begin_string}\"\ntarget_comp_id = \"{name}\"\n\
+             connect = [\"127.0.0.1:1\"]\n"
+        )
+    }
+
+    fn routes_to(venue: &str) -> String {
+        format!("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"{venue}\"\n")
+    }
+
+    fn write(dir: &tempfile::TempDir, name: &str, text: &str) {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+
+    /// Starts from the example files on an ephemeral port, with the venue's initiator retrying a
+    /// closed port, and shuts down. Orders flowing end to end are `tests/e2e.rs`'s.
     #[tokio::test]
     async fn starts_from_its_files_and_shuts_down() {
-        let dir = std::env::temp_dir().join(format!("jetbridge-service-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let sessions = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sessions.toml"))
             .unwrap()
             .replace("127.0.0.1:9876", "127.0.0.1:0")
             .replace("127.0.0.1:9877", "127.0.0.1:1");
-        std::fs::write(dir.join("sessions.toml"), sessions).unwrap();
-        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/jetbridge.toml"), dir.join("jetbridge.toml"))
-            .unwrap();
-        let (service, serving) = Service::start(&dir.join("jetbridge.toml")).await.unwrap();
+        write(&dir, "sessions.toml", &sessions);
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/jetbridge.toml"),
+            dir.path().join("jetbridge.toml"),
+        )
+        .unwrap();
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         assert_ne!(service.local_addr().port(), 0);
         assert!(tokio::net::TcpStream::connect(service.local_addr()).await.is_ok());
+        service.shutdown().await;
+        serving.abort();
+    }
+
+    /// A reload adds venue B, which the gateway converts, and C, a FIX 4.3 venue it doesn't:
+    /// B takes routes despite C; routes to C are refused and B's kept.
+    #[tokio::test]
+    async fn a_reload_takes_the_venues_it_can_and_refuses_routes_to_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let listen = "listen = \"127.0.0.1:0\"\n";
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}{listen}"));
+        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
+        let path = dir.path().join("jetbridge.toml");
+        let (service, serving) = Service::start(&path).await.unwrap();
+
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}{listen}{}{}", venue("B", "FIX.4.4"), venue("C", "FIX.4.3")));
+        write(&dir, "jetbridge.toml", &routes_to("B"));
         service.reload();
+        let to_b = Router::new(vec![Rule {
+            client: None,
+            ex_destination: None,
+            symbol: None,
+            target: Target::Venue("B".into()),
+        }]);
+        assert_eq!(service.gateway.router(), to_b);
+        assert_eq!(service.set_venues(), ["B"]);
+
+        write(&dir, "jetbridge.toml", &routes_to("C"));
+        service.reload();
+        assert_eq!(service.gateway.router(), to_b);
         service.shutdown().await;
         serving.abort();
     }
 
     #[tokio::test]
+    async fn a_route_to_a_venue_the_gateway_cant_convert_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n{}", venue("C", "FIX.4.3")));
+        write(&dir, "jetbridge.toml", &routes_to("C"));
+        let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
+        assert!(error.to_string().contains("route 1: venue \"C\""), "{error}");
+    }
+
+    #[tokio::test]
     async fn a_port_in_use_is_an_error() {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dir = std::env::temp_dir().join(format!("jetbridge-service-taken-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sessions = "[acceptor]\nbegin_string = \"FIX.4.2\"\nsender_comp_id = \"JETBRIDGE\"\n";
-        let sessions = format!("{sessions}listen = \"{}\"\n", taken.local_addr().unwrap());
-        std::fs::write(dir.join("sessions.toml"), sessions).unwrap();
-        std::fs::write(dir.join("jetbridge.toml"), "sessions = \"sessions.toml\"").unwrap();
-        let error = Service::start(&dir.join("jetbridge.toml")).await.unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"{}\"\n", taken.local_addr().unwrap()));
+        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
+        let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
         assert!(error.to_string().starts_with("cannot bind"), "{error}");
     }
 }

@@ -6,7 +6,7 @@
 //!
 //! ponytail: in memory until stage 4 persists undelivered reports with the book.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -154,6 +154,13 @@ impl Outbox {
         let drain = Drain { shared: shared.clone(), queue: receiver, flight: VecDeque::new(), retry: VecDeque::new() };
         lock(&self.tasks).spawn(drain.run());
         Client { queue, shared }
+    }
+
+    /// Reports held and not yet stored by the session, per client holding any.
+    pub fn held_by_client(&self) -> BTreeMap<ClientId, usize> {
+        let clients = lock(&self.clients);
+        let held = clients.iter().map(|(id, c)| (id.clone(), c.shared.pending.load(Ordering::Acquire)));
+        held.filter(|&(_, count)| count > 0).collect()
     }
 
     #[cfg(test)]
@@ -580,10 +587,12 @@ mod tests {
         assert!(outbox.deliver(&client(), report(0)));
         // Watched in flight until stored, so the next one queues behind it.
         assert_eq!(outbox.held(CLIENT), 1);
+        assert_eq!(outbox.held_by_client(), BTreeMap::from([(client(), 1)]));
         assert!(outbox.deliver(&client(), report(1)));
         assert!(outbox.push(&client(), report(2)));
         assert_eq!(reports(&mut events, 3).await, numbered_reports(3));
         until(|| outbox.held(CLIENT) == 0).await;
+        assert!(outbox.held_by_client().is_empty());
     }
 
     #[tokio::test]

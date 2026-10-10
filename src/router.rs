@@ -39,6 +39,7 @@ impl Router {
         Self { rules }
     }
 
+    /// The rules, in the order they're tried.
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }

@@ -1,7 +1,7 @@
 //! The order book: a sans-IO state machine. Each [`Input`] changes the book and pushes what to
 //! send onto `out`; the FIX side turns those into typed messages for each session's version.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
@@ -381,6 +381,19 @@ impl Book {
     /// Routes orders from now on; orders already routed keep their venue.
     pub fn set_router(&mut self, router: Router) {
         self.router = router;
+    }
+
+    pub fn router(&self) -> &Router {
+        &self.router
+    }
+
+    /// Orders not yet done, counted per venue.
+    pub fn open_orders_by_venue(&self) -> BTreeMap<VenueId, usize> {
+        let mut open = BTreeMap::new();
+        for order in self.orders.values().filter(|order| !order.status.is_done()) {
+            *open.entry(order.venue.clone()).or_default() += 1;
+        }
+        open
     }
 
     pub fn order(&self, id: OrderId) -> Option<&Order> {
@@ -1072,6 +1085,18 @@ mod tests {
         );
         assert_eq!(report.exec_type, ExecType::Rejected);
         assert!(book.order(OrderId(1)).is_none());
+    }
+
+    #[test]
+    fn open_orders_are_counted_per_venue_until_done() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        new_order(&mut book, "C2");
+        assert_eq!(book.open_orders_by_venue(), BTreeMap::from([("NASDAQ".into(), 2)]));
+        let failed = Input::SendFailed { venue: "NASDAQ".into(), downstream: "1".into(), text: "down".into() };
+        run(&mut book, failed);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
+        assert_eq!(book.open_orders_by_venue(), BTreeMap::from([("NASDAQ".into(), 1)]));
     }
 
     #[test]
