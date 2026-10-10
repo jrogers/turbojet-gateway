@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tracing::warn;
 use turbojet::fields::Decimal;
-use turbojet_config::{SessionsFile, Unknown};
+use turbojet_config::SessionsFile;
 
 use crate::fix::Version;
 use crate::risk::{self, Limits};
@@ -73,63 +73,6 @@ pub struct Loaded {
     pub sessions: SessionsFile,
     /// The clients' version: the acceptor's BeginString.
     pub version: Version,
-    /// The sessions file's path, which [`CancelOnDisconnect::read`] rereads on a reload.
-    pub sessions_path: PathBuf,
-    pub cancel_on_disconnect: CancelOnDisconnect,
-}
-
-/// Which clients have cancel on disconnect on, any trigger, by CompID, as the sessions file sets
-/// it: turbojet-config keeps a counterparty's resolved settings to itself, so this reads the two
-/// tables' `cancel_on_disconnect` and merges them as it does, a counterparty's over `[defaults]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CancelOnDisconnect {
-    /// `[defaults]`'s, which unlisted counterparties get under `unknown = "admit"`.
-    defaults: bool,
-    /// Each `[counterparty.COMPID]`'s, its own or the default.
-    listed: HashMap<String, bool>,
-}
-
-impl CancelOnDisconnect {
-    /// Reads the sessions file at `path`, which turbojet-config has loaded, so checked.
-    ///
-    /// # Errors
-    ///
-    /// The file can't be read, isn't TOML, or has a `cancel_on_disconnect` turbojet-config doesn't
-    /// take: changed since turbojet-config read it.
-    pub fn read(path: &Path) -> Result<Self, Error> {
-        /// The keys read here; the rest are turbojet-config's.
-        #[derive(Deserialize)]
-        struct File {
-            #[serde(default)]
-            defaults: Table,
-            #[serde(default)]
-            counterparty: HashMap<String, Table>,
-        }
-        #[derive(Default, Deserialize)]
-        struct Table {
-            cancel_on_disconnect: Option<Trigger>,
-        }
-        /// turbojet-config's values, so one it doesn't take is an error here too.
-        #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum Trigger {
-            Off,
-            Disconnect,
-            DisconnectOrLogout,
-        }
-        let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
-        let file: File = toml::from_str(&text).map_err(|e| Error(format!("{}: {e}", path.display())))?;
-        let on = |table: &Table, default: bool| table.cancel_on_disconnect.map_or(default, |t| t != Trigger::Off);
-        let defaults = on(&file.defaults, false);
-        let listed = file.counterparty.iter().map(|(comp_id, table)| (comp_id.clone(), on(table, defaults))).collect();
-        Ok(Self { defaults, listed })
-    }
-
-    /// Whether `comp_id`'s sessions have it, under `unknown`: an unlisted CompID, as the acceptor
-    /// resolves one, has the defaults' if admitted and none if refused.
-    pub fn is_on(&self, comp_id: &str, unknown: Unknown) -> bool {
-        self.listed.get(comp_id).copied().unwrap_or(unknown == Unknown::Admit && self.defaults)
-    }
 }
 
 /// Reads the configuration file at `path` and the sessions file it names.
@@ -149,8 +92,7 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
     let router = file.router(path)?;
     check_venues(path, &router, &sessions.initiator_names())?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    let cancel_on_disconnect = CancelOnDisconnect::read(&sessions_path)?;
-    Ok(Loaded { router, limits, sessions, version, sessions_path, cancel_on_disconnect })
+    Ok(Loaded { router, limits, sessions, version })
 }
 
 /// Reads the routes and limits in the configuration file at `path` again, checking that each
@@ -367,40 +309,6 @@ connect = ["127.0.0.1:1"]
             std::fs::write(path, text).unwrap();
         }
         dir
-    }
-
-    /// A counterparty's own setting over `[defaults]`'s; unlisted CompIDs get the defaults' only
-    /// if admitted.
-    #[test]
-    fn cancel_on_disconnect_merges_as_turbojet_config_does() {
-        let read = |sessions| {
-            let dir = dir(&[("sessions.toml", sessions)]);
-            CancelOnDisconnect::read(&dir.path().join("sessions.toml")).unwrap()
-        };
-        let sessions = read(
-            r#"
-[defaults]
-cancel_on_disconnect = "disconnect"
-[counterparty.OFF]
-cancel_on_disconnect = "off"
-[counterparty.LOGOUT]
-cancel_on_disconnect = "disconnect_or_logout"
-[counterparty.DEFAULT]
-store = "memory"
-"#,
-        );
-        let on = |comp_id| (sessions.is_on(comp_id, Unknown::Admit), sessions.is_on(comp_id, Unknown::Refuse));
-        let got = [on("OFF"), on("LOGOUT"), on("DEFAULT"), on("UNLISTED")];
-        assert_eq!(got, [(false, false), (true, true), (true, true), (true, false)]);
-        let without = read("[counterparty.A]\n");
-        assert!(!without.is_on("A", Unknown::Admit) && !without.is_on("B", Unknown::Admit));
-    }
-
-    #[test]
-    fn an_unknown_cancel_on_disconnect_is_an_error() {
-        let dir = dir(&[("sessions.toml", "[counterparty.A]\ncancel_on_disconnect = \"always\"\n")]);
-        let error = CancelOnDisconnect::read(&dir.path().join("sessions.toml")).unwrap_err().to_string();
-        assert!(error.contains("always"), "{error}");
     }
 
     fn load_error(jetbridge: &str) -> String {
