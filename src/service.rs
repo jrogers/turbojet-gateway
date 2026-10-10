@@ -16,6 +16,7 @@ use turbojet_config::{Initiators, SessionsFile};
 use crate::book;
 use crate::config::{self, Error};
 use crate::edge::{ClientApp, Gateway, VenueApp};
+use crate::fix::Version;
 
 /// The Text(58) of the Logouts sent at shutdown.
 const SHUTTING_DOWN: &str = "gateway shutting down";
@@ -40,8 +41,8 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// The configuration doesn't load, the acceptor's address can't be bound, or TLS or a venue
-    /// can't be set up.
+    /// The configuration doesn't load, the acceptor's address can't be bound, a venue speaks a FIX
+    /// version the gateway doesn't convert, or TLS or a venue can't be set up.
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
         let loaded = config::load(path)?;
         let prefix = book::start_prefix(SystemTime::now());
@@ -55,8 +56,15 @@ impl Service {
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr };
-        config::check_venues(path, &service.gateway.router(), &service.set_venues())?;
-        let serving = service.serve(listener)?;
+        service.set_venues();
+        // The initiators are running: stop them rather than leave them logging on.
+        let serving = match service.check_versions().and_then(|()| service.serve(listener)) {
+            Ok(serving) => serving,
+            Err(e) => {
+                service.initiators.shutdown(None).await;
+                return Err(e);
+            }
+        };
         info!(
             addr = %local_addr,
             version = ?loaded.version,
@@ -130,6 +138,19 @@ impl Service {
                 "stopping with open orders (per venue) and undelivered reports (per client)"
             );
         }
+    }
+
+    /// Checks that the gateway converts every venue's FIX version. Only at start: turbojet-config
+    /// doesn't say an initiator's BeginString until it's running, and a reload skips such a venue
+    /// with an error logged rather than stop the others (see [`Gateway::set_venues`]).
+    fn check_versions(&self) -> Result<(), Error> {
+        for name in self.initiators.names() {
+            let id = self.initiators.session_id(&name).expect("a running initiator");
+            if let Err(e) = id.begin_string.parse::<Version>() {
+                return Err(Error::new(format!("venue {name:?}: {e}")));
+            }
+        }
+        Ok(())
     }
 
     /// Tells the gateway the venues running now (a reload may have started or stopped some), and
@@ -234,13 +255,16 @@ mod tests {
         serving.abort();
     }
 
+    /// Even with no route to it: a venue the gateway can't speak to is a mistake to fix now, not
+    /// at the reload that first routes to it.
     #[tokio::test]
-    async fn a_route_to_a_venue_the_gateway_cant_convert_stops_startup() {
+    async fn a_venue_the_gateway_cant_convert_stops_startup() {
         let dir = tempfile::tempdir().unwrap();
-        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n{}", venue("C", "FIX.4.3")));
-        write(&dir, "jetbridge.toml", &routes_to("C"));
+        let venues = format!("{}{}", venue("B", "FIX.4.4"), venue("C", "FIX.4.3"));
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n{venues}"));
+        write(&dir, "jetbridge.toml", &routes_to("B"));
         let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
-        assert!(error.to_string().contains("route 1: venue \"C\""), "{error}");
+        assert!(error.to_string().contains("venue \"C\": BeginString \"FIX.4.3\" is not supported"), "{error}");
     }
 
     #[tokio::test]

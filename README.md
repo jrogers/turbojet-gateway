@@ -117,7 +117,8 @@ Jetbridge:
   as `[counterparty.COMPID]`, or any under `unknown = "admit"`. A client is known by its CompID.
 - Each `[initiator.NAME]` is a venue, and `NAME` is what routes call it. A venue speaks its own
   `begin_string` (the acceptor's by default), `FIX.4.2` or `FIX.4.4`, and logs on as the
-  acceptor's `sender_comp_id` unless it sets its own.
+  acceptor's `sender_comp_id` unless it sets its own. A venue with another version stops the
+  gateway at start; a reload that adds one skips it, with an error logged.
 - Sessions are kept in the `memory` store unless the file says otherwise, so sequence numbers
   start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them.
 
