@@ -195,6 +195,14 @@ pub enum Input {
         ord_type: Option<OrdType>,
         time_in_force: Option<TimeInForce>,
     },
+    /// OrderStatusRequest. `side` and `symbol` are only for the answer about an unknown order,
+    /// since FIX requires them on the request and on every ExecutionReport.
+    StatusRequest {
+        client: ClientId,
+        cl_ord_id: CompactString,
+        side: Side,
+        symbol: CompactString,
+    },
     VenueReport {
         venue: VenueId,
         report: VenueReport,
@@ -216,12 +224,13 @@ pub enum Input {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientReport {
     /// The venue's, except for the book's own rejects (`Rejected`) and answers to redeliveries
-    /// (`Status`).
+    /// and status requests (`Status`).
     pub exec_type: ExecType,
-    /// `None` for an order rejected before it was booked.
+    /// `None` for an order rejected before it was booked, or a status request for none.
     pub order_id: Option<OrderId>,
     pub cl_ord_id: CompactString,
     pub orig_cl_ord_id: Option<CompactString>,
+    /// For a status request about no order: the ClOrdID, side and symbol asked, Market, quantity 0.
     pub request: OrderRequest,
     pub status: Status,
     pub reject: Option<RejectReason>,
@@ -349,6 +358,9 @@ impl Book {
     pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
         match input {
             Input::NewOrder { client, request, redelivered } => self.new_order(client, request, redelivered, out),
+            Input::StatusRequest { client, cl_ord_id, side, symbol } => {
+                self.status_request(client, cl_ord_id, side, symbol, out)
+            }
             Input::VenueReport { venue, report } => self.venue_report(&venue, report, out),
             Input::Cancel { client, cl_ord_id, orig_cl_ord_id, side, symbol } => {
                 self.cancel(Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Cancel }, (side, symbol), out)
@@ -397,13 +409,7 @@ impl Book {
                 && order.request.symbol == request.symbol
                 && order.request.account == request.account;
             let output = if resent {
-                // Reports carry the order's latest ClOrdID; after a replace, OrigClOrdID names the
-                // one the client asked about.
-                let mut report = order.report(&order.request.cl_ord_id.clone(), ExecType::Status);
-                if report.cl_ord_id != request.cl_ord_id {
-                    report.orig_cl_ord_id = Some(request.cl_ord_id);
-                }
-                Output::Report { client, report }
+                Output::Report { client, report: order.status_report(request.cl_ord_id) }
             } else {
                 self.reject(client, request, RejectReason::Duplicate, "duplicate ClOrdID".into())
             };
@@ -447,6 +453,36 @@ impl Book {
         };
         let previous = self.orders.insert(id, order);
         debug_assert!(previous.is_none(), "order {id:?} booked twice");
+    }
+
+    /// The order's state, or for a ClOrdID the client never used, a Rejected report saying so:
+    /// OrdStatus 8 is FIX's answer for an unknown order.
+    fn status_request(
+        &mut self,
+        client: ClientId,
+        cl_ord_id: CompactString,
+        side: Side,
+        symbol: CompactString,
+        out: &mut Vec<Output>,
+    ) {
+        if let Some(id) = self.index.get(&(client.clone(), cl_ord_id.clone())) {
+            let order = self.orders.get_mut(id).expect("indexed ClOrdIDs point at booked orders");
+            return out.push(Output::Report { client, report: order.status_report(cl_ord_id) });
+        }
+        // The client named only the ClOrdID, side and symbol; the rest says nothing is there.
+        let request = OrderRequest {
+            cl_ord_id,
+            account: None,
+            symbol,
+            side,
+            ord_type: OrdType::Market,
+            qty: Decimal::ZERO,
+            price: None,
+            ex_destination: None,
+            time_in_force: None,
+        };
+        let report = self.unbooked_report(request, "unknown order".into());
+        out.push(Output::Report { client, report });
     }
 
     fn venue_report(&mut self, venue: &VenueId, report: VenueReport, out: &mut Vec<Output>) {
@@ -684,18 +720,25 @@ impl Book {
         out.push(amend.refuse(Some(&*order), reason, text));
     }
 
-    /// A reject for an order we didn't book, under the book's next `R` ExecID.
+    /// A reject for an order we didn't book.
     fn reject(&mut self, client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
+        let report =
+            ClientReport { exec_type: ExecType::Rejected, reject: Some(reason), ..self.unbooked_report(request, text) };
+        Output::Report { client, report }
+    }
+
+    /// A Rejected `Status` report about no order of ours, under the book's next `R` ExecID.
+    fn unbooked_report(&mut self, request: OrderRequest, text: CompactString) -> ClientReport {
         // Saturating, as in `Order::report`; a u64 of rejects can't be reached.
         self.rejects = self.rejects.saturating_add(1);
-        let report = ClientReport {
-            exec_type: ExecType::Rejected,
+        ClientReport {
+            exec_type: ExecType::Status,
             order_id: None,
             cl_ord_id: request.cl_ord_id.clone(),
             orig_cl_ord_id: None,
             request,
             status: Status::Rejected,
-            reject: Some(reason),
+            reject: None,
             last_qty: Decimal::ZERO,
             last_px: Decimal::ZERO,
             cum_qty: Decimal::ZERO,
@@ -703,8 +746,7 @@ impl Book {
             avg_px: Decimal::ZERO,
             exec_id: format_compact!("R{}", self.rejects),
             text: Some(text),
-        };
-        Output::Report { client, report }
+        }
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
@@ -738,6 +780,17 @@ impl Order {
             exec_id: format_compact!("{}.{}", self.id.0, self.exec_seq),
             text: None,
         }
+    }
+
+    /// Where the order stands, answering a client asking by `asked`: a status request or a
+    /// redelivered request. Reports carry the order's latest ClOrdID; after a replace, OrigClOrdID
+    /// names the one the client asked about.
+    fn status_report(&mut self, asked: CompactString) -> ClientReport {
+        let mut report = self.report(&self.request.cl_ord_id.clone(), ExecType::Status);
+        if report.cl_ord_id != asked {
+            report.orig_cl_ord_id = Some(asked);
+        }
+        report
     }
 
     /// A done order has nothing pending: a replace it still awaited can't happen now. Set after
@@ -2090,6 +2143,55 @@ mod tests {
         assert_eq!(request.time_in_force, Some(TimeInForce::Gtc));
         run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
         assert_eq!(book.order(OrderId(1)).unwrap().request.time_in_force, Some(TimeInForce::Gtc));
+    }
+
+    fn status_request(cl_ord_id: &str) -> Input {
+        Input::StatusRequest {
+            client: "FUNDA".into(),
+            cl_ord_id: cl_ord_id.into(),
+            side: Side::Buy,
+            symbol: "AAPL".into(),
+        }
+    }
+
+    #[test]
+    fn a_status_request_gets_the_orders_state() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        let out = run(&mut book, status_request("C1"));
+        let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(client, "FUNDA");
+        assert_eq!((report.exec_type, report.status, report.reject), (ExecType::Status, Status::PartiallyFilled, None));
+        assert_eq!((report.order_id, report.cum_qty, report.leaves_qty), (Some(OrderId(1)), 40.into(), 60.into()));
+        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id, report.exec_id.as_str()), ("C1", &None, "1.2"));
+    }
+
+    #[test]
+    fn a_status_request_after_a_replace_names_the_current_cl_ord_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+        let out = run(&mut book, status_request("C1"));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
+        assert_eq!((report.exec_type, report.request.qty), (ExecType::Status, 80.into()));
+    }
+
+    #[test]
+    fn a_status_request_for_an_unknown_order_is_answered_rejected() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        new_order(&mut book, "C1");
+        let out = run(&mut book, status_request("C9"));
+        let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(client, "FUNDA");
+        assert_eq!((report.exec_type, report.status, report.reject), (ExecType::Status, Status::Rejected, None));
+        assert_eq!((report.order_id, report.cl_ord_id.as_str()), (None, "C9"));
+        assert_eq!((report.text.as_deref(), report.exec_id.as_str()), (Some("unknown order"), "R2"));
+        assert_eq!((report.request.side, report.request.symbol.as_str()), (Side::Buy, "AAPL"));
+        assert_eq!((report.cum_qty, report.leaves_qty), (Decimal::ZERO, Decimal::ZERO));
     }
 
     #[test]
