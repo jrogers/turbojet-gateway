@@ -2219,3 +2219,47 @@ fn unblocking_lifts_exactly_its_scope() {
     assert!(book.blocked().is_empty());
     assert!(matches!(run(&mut book, order_from(&desk("DESK1"), "C1")).as_slice(), [Output::NewOrder { .. }]));
 }
+
+#[test]
+fn a_blocked_clients_redelivered_order_already_booked_gets_its_state() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    block(&mut book, Scope::All);
+    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.exec_type, report.reject, report.order_id.as_deref()), (ExecType::Status, None, Some("1")));
+}
+
+#[test]
+fn a_comp_id_block_refuses_a_replace_raising_the_quantity() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    block(&mut book, Scope::CompId("FUNDA".into()));
+    let raised = (Some("1"), CancelKind::Replace, Status::New, CancelRejectReason::Other);
+    assert_eq!(cancel_reject(&replace(&mut book, "C2", "C1", 101, 10)), raised);
+}
+
+#[test]
+fn only_a_gateway_cancel_left_unsent_says_a_send_is_waiting() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    new_order(&mut book, "C2");
+    run(&mut book, send_failed("1"));
+    assert!(!book.take_cancel_unsent(), "a client's order");
+    cancel_all(&mut book, Scope::All);
+    run(&mut book, send_failed("2-1"));
+    assert!(book.take_cancel_unsent());
+    assert!(!book.take_cancel_unsent(), "taken");
+}
+
+#[test]
+fn a_gateway_cancels_refused_sends_are_counted_for_the_logs() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    cancel_all(&mut book, Scope::All);
+    run(&mut book, send_failed("1-1"));
+    run(&mut book, venue_up("NASDAQ"));
+    run(&mut book, send_failed("1-2"));
+    assert_eq!(book.cancelling()[0].1.refused_sends, 2);
+}

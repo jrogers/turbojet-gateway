@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
 use turbojet::{
     Application, Clock, ConnectionInfo, Context, Dropped, Message, MessageReject, Receipt, SendError, SessionHandle,
@@ -55,8 +55,8 @@ pub struct Gateway {
     client_version: Version,
     /// For TransactTime(60) on what the gateway sends.
     clock: Clock,
-    /// A venue request was refused since the last retry tick, so a gateway cancel may be waiting:
-    /// the tick looks at the book only then.
+    /// A refused send left a gateway cancel waiting since the last retry tick (see
+    /// [`Book::take_cancel_unsent`]): the tick looks at the book only then.
     cancels_waiting: AtomicBool,
 }
 
@@ -176,9 +176,18 @@ impl Gateway {
     }
 
     /// Lifts the block of exactly `scope`: a block of a session's CompID, or of everyone, stays.
-    pub fn unblock(self: &Arc<Self>, scope: Scope) {
+    /// `false` if `scope` wasn't blocked, which changes nothing.
+    pub fn unblock(&self, scope: Scope) -> bool {
+        let mut state = self.lock();
+        if !state.book.blocked().contains(&scope) {
+            info!(?scope, blocked = ?state.book.blocked(), "nothing to unblock");
+            return false;
+        }
         warn!(?scope, "unblocking clients");
-        self.handle_all([Input::Unblock { scope }]);
+        let mut out = Vec::new();
+        state.book.handle(Input::Unblock { scope }, &mut out);
+        debug_assert!(out.is_empty(), "an unblock sends nothing");
+        true
     }
 
     /// The scopes blocked now.
@@ -248,9 +257,6 @@ impl Gateway {
         let mut outputs = Vec::new();
         while let Some(input) = inputs.pop_front() {
             let send_failed = matches!(input, Input::SendFailed { .. });
-            if send_failed {
-                self.cancels_waiting.store(true, Ordering::Release);
-            }
             state.book.handle(input, &mut outputs);
             for output in outputs.drain(..) {
                 if let Some(failed) = self.send(state, &output, now) {
@@ -258,6 +264,9 @@ impl Gateway {
                     inputs.push_back(failed);
                 }
             }
+        }
+        if state.book.take_cancel_unsent() {
+            self.cancels_waiting.store(true, Ordering::Release);
         }
     }
 
@@ -283,7 +292,8 @@ impl Gateway {
         }
         let venues: BTreeSet<VenueId> = {
             let state = self.lock();
-            // ponytail: walks every order after any refused send; a per-venue count if it shows.
+            // ponytail: walks every order after a gateway cancel's send is refused; a per-venue
+            // count if it shows.
             state
                 .book
                 .cancelling()
@@ -783,14 +793,35 @@ mod tests {
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         book_order(&gateway);
         gateway.cancel_all(Scope::All);
+        assert!(gateway.cancels_waiting.load(Ordering::Acquire));
+        // The venue isn't connected: the tick sends nothing, and leaves it to the logon.
         gateway.send_waiting_cancels();
         assert_eq!(unsent(&gateway), [true]);
+        assert!(!gateway.cancels_waiting.load(Ordering::Acquire));
 
         tokio::spawn(venue.clone().run());
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
         let sent: v44::OrderCancelRequest = next_message(&mut venue_events).await.parse().unwrap();
         assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), ("1-2", "1"));
         assert_eq!(unsent(&gateway), [false]);
+    }
+
+    /// A refused send of a client's order leaves no gateway cancel waiting for the tick.
+    #[tokio::test]
+    async fn only_a_gateway_cancel_left_unsent_wakes_the_retry_tick() {
+        let gateway = gateway();
+        book_order(&gateway);
+        gateway.handle(Input::SendFailed { venue: VENUE.into(), downstream: "1".into(), text: VENUE_BUSY.into() });
+        assert!(!gateway.cancels_waiting.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unblock_says_whether_the_scope_was_blocked() {
+        let gateway = gateway();
+        gateway.block(Scope::All);
+        assert!(!gateway.unblock(Scope::CompId("FUNDA".into())));
+        assert!(gateway.unblock(Scope::All));
+        assert!(gateway.blocked().is_empty());
     }
 
     /// The gateway's venue application, saying when its `on_logon` has run.

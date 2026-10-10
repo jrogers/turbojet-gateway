@@ -209,7 +209,8 @@ pub struct GatewayCancel {
     /// session couldn't take doesn't count.
     pub tries: u32,
     /// Waiting to be sent: the venue's session couldn't take the last one, or a cancel already
-    /// outstanding may do the job. It goes when that cancel is refused or the venue logs on.
+    /// outstanding may do the job. It goes when that cancel is refused, or when the venue's
+    /// session can take it (on logon or the retry tick).
     pub unsent: bool,
     /// Given up: the venue refused every try, or said it doesn't know the order or it's too late,
     /// while the book still has it live.
@@ -217,6 +218,9 @@ pub struct GatewayCancel {
     /// The order's downstream ClOrdID the latest cancel named: when a replace accepted since
     /// changes it, the venue's "unknown order" is worth another try.
     pub orig_downstream: CompactString,
+    /// Sends the venue's session refused, for the logs: the first is a warning, repeats (a
+    /// queue full tick after tick) are debug.
+    pub refused_sends: u32,
 }
 
 /// Whose orders the gateway cancels, or which clients it blocks.
@@ -514,6 +518,8 @@ pub struct Book {
     amend_reserve: usize,
     /// Operators' blocks, each scope once: a handful, so a list.
     blocked: Vec<Scope>,
+    /// A refused send left a gateway cancel waiting since [`take_cancel_unsent`](Self::take_cancel_unsent).
+    cancel_unsent: bool,
 }
 
 impl Book {
@@ -530,6 +536,7 @@ impl Book {
             max_cl_ord_ids: MAX_CL_ORD_IDS_PER_CLIENT,
             amend_reserve: MAX_AMEND_RESERVE,
             blocked: Vec::new(),
+            cancel_unsent: false,
         }
     }
 
@@ -839,7 +846,7 @@ impl Book {
 
     /// A cancel goes to the venue even while PendingNew, under the next numbered downstream ClOrdID.
     /// One is refused while the gateway's own cancel is in flight: the order is going already, and
-    /// the client hears when it's gone. A stuck one, or one waiting for the venue to log on, lets
+    /// the client hears when it's gone. A stuck one, or one waiting for the venue's session to take it, lets
     /// the client's through, which may fare better.
     fn cancel(&mut self, amend: Amend, named: (Side, CompactString), out: &mut Vec<Output>) {
         let refuse = |book: &Self, order: &Order| {
@@ -894,6 +901,12 @@ impl Book {
             venue_order_id: order.venue_order_id.clone(),
         });
         order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force });
+    }
+
+    /// Whether a refused send has left a gateway cancel waiting since the last call: the edge's
+    /// retry tick looks for waiting cancels only then.
+    pub fn take_cancel_unsent(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_unsent)
     }
 
     /// The scopes operators have blocked, in the order they were blocked.
@@ -1022,7 +1035,8 @@ impl Book {
         }
         let order = self.orders.get_mut(&id).expect("looked up above");
         let orig_downstream = order.downstream.clone();
-        order.gateway_cancel = Some(GatewayCancel { tries: 0, unsent: true, stuck: false, orig_downstream });
+        order.gateway_cancel =
+            Some(GatewayCancel { tries: 0, unsent: true, stuck: false, orig_downstream, refused_sends: 0 });
         if outstanding.is_some() {
             return tracing::info!(order = %order.name, "gateway cancel waits on the client's");
         }
@@ -1132,20 +1146,26 @@ impl Book {
         if order.venue != *venue {
             return tracing::warn!(%venue, %downstream, "send failed for another venue's order");
         }
-        // The gateway's own cancel waits for the venue to log on (`venue_up`): nothing to send now,
-        // which the edge relies on.
+        // The gateway's own cancel waits until the venue's session can take it (on logon or the
+        // edge's retry tick): nothing to send now, which the edge relies on.
         if sent.origin == Origin::Gateway {
             if sent.answered {
                 return tracing::debug!(%venue, %downstream, "send failed for an answered request; dropped");
             }
             self.downstream.get_mut(downstream).expect("looked up above").answered = true;
             // Done since, the order needs no more cancelling.
-            if let Some(gateway) = &mut order.gateway_cancel {
-                debug_assert!(gateway.tries > 0 && !gateway.unsent && !gateway.stuck);
-                gateway.tries -= 1;
-                gateway.unsent = true;
+            let Some(gateway) = &mut order.gateway_cancel else {
+                return tracing::debug!(%venue, %downstream, "send failed for a gateway cancel of a done order");
+            };
+            debug_assert!(gateway.tries > 0 && !gateway.unsent && !gateway.stuck);
+            gateway.tries -= 1;
+            gateway.unsent = true;
+            gateway.refused_sends = gateway.refused_sends.saturating_add(1);
+            self.cancel_unsent = true;
+            if gateway.refused_sends > 1 {
+                return tracing::debug!(%venue, %downstream, %text, refused = gateway.refused_sends, "gateway cancel not sent again");
             }
-            return tracing::warn!(%venue, %downstream, %text, "gateway cancel not sent; again when the venue logs on");
+            return tracing::warn!(%venue, %downstream, %text, "gateway cancel not sent; again when the venue's session can take it");
         }
         // A cancel or replace the venue never saw is refused even on a done order: nobody else
         // will answer it. `refuse_request` drops one already answered.

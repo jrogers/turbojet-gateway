@@ -30,7 +30,7 @@ pub struct Service {
     acceptor: Acceptor,
     initiators: Initiators,
     local_addr: SocketAddr,
-    /// [`Gateway::retry_cancels`], aborted when the service is dropped.
+    /// [`Gateway::retry_cancels`], aborted at shutdown, or when the service is dropped.
     retrying: JoinHandle<()>,
 }
 
@@ -134,6 +134,8 @@ impl Service {
     /// Logs the venues' and clients' sessions out, returning once all have closed, then logs
     /// what the stop loses.
     pub async fn shutdown(&self) {
+        // The sessions are going: no venue will take a retried cancel.
+        self.retrying.abort();
         tokio::join!(self.initiators.shutdown(Some(SHUTTING_DOWN)), self.acceptor.shutdown(Some(SHUTTING_DOWN)));
         // Lost at exit until stage 4 persists the book and the undelivered reports: open orders
         // stay open at their venues with no client to report to.
