@@ -791,7 +791,7 @@ impl Application for VenueApp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use tokio::net::TcpListener;
@@ -1368,10 +1368,11 @@ mod tests {
         assert!(!gateway.cancels_waiting.load(Ordering::Acquire));
     }
 
-    /// Memory storage whose commits wait while the gate is shut: a venue's session slow to store.
-    struct Gated {
-        inner: MemoryStorage,
-        open: tokio::sync::watch::Receiver<bool>,
+    /// Storage whose commits wait while the gate is shut: a venue's session slow to store. What a
+    /// commit would have written stays in memory until the gate opens and the next commit.
+    pub(crate) struct Gated {
+        pub(crate) inner: Arc<dyn SessionStorage>,
+        pub(crate) open: tokio::sync::watch::Receiver<bool>,
     }
 
     impl SessionStorage for Gated {
@@ -1410,6 +1411,10 @@ mod tests {
             self.inner.reset()
         }
 
+        fn evicted_through(&self) -> Option<u64> {
+            self.inner.evicted_through()
+        }
+
         fn in_flight(&self) -> Option<u64> {
             self.inner.in_flight()
         }
@@ -1420,6 +1425,14 @@ mod tests {
 
         fn set_next_incoming_in_flight(&mut self, seq: u64, in_flight: u64) -> std::io::Result<()> {
             self.inner.set_next_incoming_in_flight(seq, in_flight)
+        }
+
+        fn created_at(&self) -> Option<UtcTimestamp> {
+            self.inner.created_at()
+        }
+
+        fn set_created_at(&mut self, at: UtcTimestamp) -> std::io::Result<()> {
+            self.inner.set_created_at(at)
         }
 
         fn commit(&mut self) -> std::io::Result<Option<Commit>> {
@@ -1442,7 +1455,7 @@ mod tests {
         let (venue_app, mut venue_events) = peer();
         let venue_addr = serve("VENUE", venue_app).await;
         let (gate, open) = tokio::sync::watch::channel(true);
-        let storage = Arc::new(Gated { inner: MemoryStorage::new(), open });
+        let storage = Arc::new(Gated { inner: Arc::new(MemoryStorage::new()), open });
         let venue = initiator_with(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())), storage);
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());

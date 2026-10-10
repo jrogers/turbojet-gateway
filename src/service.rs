@@ -44,6 +44,8 @@ pub struct Service {
     retrying: JoinHandle<()>,
     /// The book's writer, with a database: aborted when the service is dropped.
     writing: Option<JoinHandle<()>>,
+    /// The database, if there is one.
+    store: Option<Store>,
 }
 
 impl Drop for Service {
@@ -68,7 +70,16 @@ impl Service {
     /// be bound, a venue speaks a FIX version the gateway doesn't convert, or TLS or a venue can't
     /// be set up.
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
-        let loaded = config::load(path)?;
+        Self::start_with_stores(path, Vec::new()).await
+    }
+
+    /// As [`start`](Self::start), the sessions file also naming `stores` (see
+    /// [`config::load_with_stores`]).
+    pub(crate) async fn start_with_stores(
+        path: &Path,
+        stores: Vec<(String, Arc<dyn turbojet::SessionStorage>)>,
+    ) -> Result<(Self, Serving), Error> {
+        let loaded = config::load_with_stores(path, stores)?;
         // First, so a database that won't open stops nothing half-started.
         let (database, writing) = match &loaded.database {
             Some(url) => {
@@ -83,15 +94,15 @@ impl Service {
             let sessions = sessions.clone();
             Schedules(Arc::new(move |comp_id| sessions.counterparty_config(comp_id)?.schedule))
         };
-        let mut gateway = Gateway::new(loaded.router, loaded.version)
+        let gateway = Gateway::new(loaded.router, loaded.version)
             .with_id_prefix(prefix)
             .with_limits(loaded.limits)
             .with_days(loaded.day_end, schedules);
-        let mut recovery = None;
-        if let Some((store, snapshot, writer)) = database {
-            gateway = gateway.with_writer(writer);
-            recovery = Some((store, snapshot));
-        }
+        let store = database.as_ref().map(|(store, ..)| store.clone());
+        let (gateway, recovery) = match database {
+            Some((store, snapshot, writer)) => (gateway.with_writer(writer), Some((store, snapshot))),
+            None => (gateway, None),
+        };
         let gateway = Arc::new(gateway);
         // Before any session starts: the clients' sessions find their orders and reports, and the
         // venues' stores are read before their initiators open them.
@@ -111,7 +122,6 @@ impl Service {
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
-        let database = loaded.database;
         let service = Self {
             path: path.to_path_buf(),
             gateway,
@@ -119,9 +129,10 @@ impl Service {
             acceptor,
             initiators,
             local_addr,
-            database,
+            database: loaded.database,
             retrying,
             writing,
+            store,
         };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
@@ -150,6 +161,11 @@ impl Service {
     /// The gateway: the book and where its outputs go.
     pub fn gateway(&self) -> &Arc<Gateway> {
         &self.gateway
+    }
+
+    /// The book's database, if there is one.
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
     }
 
     /// The client session `id`, connected or not.

@@ -47,13 +47,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::NaiveTime;
 use serde::Deserialize;
 use tracing::warn;
-use turbojet::SessionSchedule;
 use turbojet::fields::Decimal;
 use turbojet::schedule::ScheduleTimeZone;
+use turbojet::{SessionSchedule, SessionStorage};
 use turbojet_config::SessionsFile;
 
 use crate::fix::Version;
@@ -99,9 +100,18 @@ pub struct Loaded {
 /// Either file can't be read or doesn't load, the sessions file has no `[acceptor]` or one with a
 /// BeginString the gateway doesn't convert, or a route names a venue with no initiator.
 pub fn load(path: &Path) -> Result<Loaded, Error> {
+    load_with_stores(path, Vec::new())
+}
+
+/// As [`load`], the sessions file also naming `stores`, each registered by its name (the
+/// crash tests' gated stores, say).
+pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn SessionStorage>)>) -> Result<Loaded, Error> {
     let file = read(path)?;
     let sessions_path = path.parent().unwrap_or(Path::new(".")).join(&file.sessions);
-    let sessions = SessionsFile::load(&sessions_path).map_err(Error::new)?;
+    let builder = stores
+        .into_iter()
+        .fold(SessionsFile::builder(&sessions_path), |builder, (name, storage)| builder.with_store(name, storage));
+    let sessions = builder.load().map_err(Error::new)?;
     let Some(base) = sessions.base() else {
         return Err(Error(format!("{}: no [acceptor]: the clients log on to it", sessions_path.display())));
     };

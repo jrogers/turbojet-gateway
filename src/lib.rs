@@ -8,3 +8,6 @@ pub mod risk;
 pub mod router;
 pub mod service;
 pub mod store;
+
+#[cfg(test)]
+mod crash_tests;
