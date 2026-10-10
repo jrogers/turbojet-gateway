@@ -233,11 +233,13 @@ pub enum Input {
         /// OrderID(37), the venue's.
         venue_order_id: Option<CompactString>,
     },
-    /// The edge couldn't queue the request sent under `downstream` for the venue's session: it
-    /// isn't connected, or its queue is full. A cancel or replace is refused with `text` and the
-    /// order's status left as it is; an original order still PendingNew is rejected. One for an
-    /// answered request, an acked order or a done one is dropped. It never produces venue-bound
-    /// output, which the edge relies on.
+    /// The request sent under `downstream` never reached the venue's session, or the session
+    /// dropped it unsent: it isn't connected, its queue is full, or the connection ended first. A
+    /// cancel or replace is refused with `text` and the order's status left as it is, even when
+    /// the order is done, since the venue never saw the request to answer it; an original order
+    /// still PendingNew is rejected. One for an answered request, or an original order the venue
+    /// acked or that is done, is dropped. It never produces venue-bound output, which the edge
+    /// relies on.
     SendFailed {
         venue: VenueId,
         downstream: CompactString,
@@ -752,13 +754,15 @@ impl Book {
         if order.venue != *venue {
             return tracing::warn!(%venue, %downstream, "send failed for another venue's order");
         }
-        // A venue's report means the original got there; done is final, as in `stale`.
-        if sent.answered || order.status.is_done() || (sent.kind.is_none() && order.status != Status::PendingNew) {
-            return tracing::debug!(%venue, %downstream, "send failed for an answered request; dropped");
-        }
+        // A cancel or replace the venue never saw is refused even on a done order: nobody else
+        // will answer it. `refuse_request` drops one already answered.
         if sent.kind.is_some() {
             let refused = Refused { status: Some(order.status), text: Some(text), venue_order_id: None, reason: None };
             return self.refuse_request(venue, downstream, sent, refused, out);
+        }
+        // A venue's report means the original got there; done is final, as in `stale`.
+        if sent.answered || order.status != Status::PendingNew {
+            return tracing::debug!(%venue, %downstream, "send failed for an answered order; dropped");
         }
         self.downstream.get_mut(downstream).expect("looked up above").answered = true;
         order.set_status(Status::Rejected);
@@ -2709,6 +2713,22 @@ mod tests {
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((&order.request, order.pending.is_none()), (&request("C1"), true));
         assert!(matches!(replace(&mut book, "C3", "C1", 70, 11).as_slice(), [Output::Replace { .. }]));
+    }
+
+    /// The client's cancel gets an answer even when the order was rejected first: the venue
+    /// never saw the cancel, so it won't answer it either.
+    #[test]
+    fn a_cancel_the_venue_session_could_not_take_is_refused_after_its_order_is_rejected() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, send_failed("1"));
+        let out = run(&mut book, send_failed("1-1"));
+        assert_eq!(
+            cancel_reject(&out),
+            (Some(OrderId(1)), CancelKind::Cancel, Status::Rejected, CancelRejectReason::Other)
+        );
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
     }
 
     #[test]
