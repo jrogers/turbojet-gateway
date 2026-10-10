@@ -174,12 +174,15 @@ pub enum Input {
         redelivered: bool,
     },
     /// `side` and `symbol` must be the order's, as FIX requires them on the request.
+    /// `redelivered` as for `NewOrder`: a ClOrdID already used for the same order is answered
+    /// with the order's state rather than refused as a duplicate.
     Cancel {
         client: ClientId,
         cl_ord_id: CompactString,
         orig_cl_ord_id: CompactString,
         side: Side,
         symbol: CompactString,
+        redelivered: bool,
     },
     /// As `Cancel`. `ord_type` and `time_in_force` are `None` to keep the order's: that's for
     /// the book's own callers, since a FIX replace carries full terms and the edge always sets
@@ -194,6 +197,7 @@ pub enum Input {
         price: Option<Decimal>,
         ord_type: Option<OrdType>,
         time_in_force: Option<TimeInForce>,
+        redelivered: bool,
     },
     /// OrderStatusRequest. `side` and `symbol` are only for the answer about an unknown order,
     /// since FIX requires them on the request and on every ExecutionReport.
@@ -362,11 +366,23 @@ impl Book {
                 self.status_request(client, cl_ord_id, side, symbol, out)
             }
             Input::VenueReport { venue, report } => self.venue_report(&venue, report, out),
-            Input::Cancel { client, cl_ord_id, orig_cl_ord_id, side, symbol } => {
-                self.cancel(Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Cancel }, (side, symbol), out)
+            Input::Cancel { client, cl_ord_id, orig_cl_ord_id, side, symbol, redelivered } => {
+                let amend = Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Cancel, redelivered };
+                self.cancel(amend, (side, symbol), out)
             }
-            Input::Replace { client, cl_ord_id, orig_cl_ord_id, side, symbol, qty, price, ord_type, time_in_force } => {
-                let amend = Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Replace };
+            Input::Replace {
+                client,
+                cl_ord_id,
+                orig_cl_ord_id,
+                side,
+                symbol,
+                qty,
+                price,
+                ord_type,
+                time_in_force,
+                redelivered,
+            } => {
+                let amend = Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Replace, redelivered };
                 let terms = Terms { qty, price, ord_type, time_in_force };
                 self.replace(amend, (side, symbol), terms, out)
             }
@@ -604,19 +620,26 @@ impl Book {
     }
 
     /// The live order a cancel or replace names, or `None` with an OrderCancelReject refusing it
-    /// pushed. `refuse` adds the request's own checks after the shared ones, the last of which is
-    /// that the request `named` the order's side and symbol.
+    /// pushed, or the order's state answering a resend of a request already taken. `refuse` adds
+    /// the request's own checks after the shared ones, the last of which is that the request
+    /// `named` the order's side and symbol.
     fn amendable(
-        &self,
+        &mut self,
         amend: Amend,
         named: (Side, CompactString),
         refuse: impl Fn(&Order) -> Option<(CancelRejectReason, &'static str)>,
         out: &mut Vec<Output>,
     ) -> Option<(OrderId, Amend)> {
-        let id = self.index.get(&(amend.client.clone(), amend.orig_cl_ord_id.clone()));
-        let order = id.map(|id| self.orders.get(id).expect("indexed ClOrdIDs point at booked orders"));
+        let id = self.index.get(&(amend.client.clone(), amend.orig_cl_ord_id.clone())).copied();
         // Before `remember`, which asserts the ClOrdID is new.
-        let duplicate = self.index.contains_key(&(amend.client.clone(), amend.cl_ord_id.clone()));
+        let used_for = self.index.get(&(amend.client.clone(), amend.cl_ord_id.clone())).copied();
+        if let Some(id) = id.filter(|&id| amend.redelivered && used_for == Some(id)) {
+            let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
+            out.push(Output::Report { client: amend.client, report: order.status_report(amend.cl_ord_id) });
+            return None;
+        }
+        let order = id.map(|id| self.orders.get(&id).expect("indexed ClOrdIDs point at booked orders"));
+        let duplicate = used_for.is_some();
         let refusal = match order {
             _ if duplicate => Some((CancelRejectReason::Duplicate, "duplicate ClOrdID")),
             None => Some((CancelRejectReason::UnknownOrder, "unknown order")),
@@ -713,8 +736,8 @@ impl Book {
             }
             None => {}
         }
-        let amend =
-            Amend { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, kind: response_to };
+        let client = order.client.clone();
+        let amend = Amend { client, cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, kind: response_to, redelivered: false };
         let text = text.unwrap_or_else(|| "rejected by the venue".into());
         let reason = reason.map_or(CancelRejectReason::Other, CancelRejectReason::Venue);
         out.push(amend.refuse(Some(&*order), reason, text));
@@ -879,6 +902,8 @@ struct Amend {
     cl_ord_id: CompactString,
     orig_cl_ord_id: CompactString,
     kind: CancelKind,
+    /// Possibly a resend, as `Input::Cancel` says.
+    redelivered: bool,
 }
 
 /// A replace's new terms, as `Input::Replace` gives them.
@@ -1169,6 +1194,7 @@ mod tests {
             orig_cl_ord_id: orig.into(),
             side: Side::Buy,
             symbol: "AAPL".into(),
+            redelivered: false,
         }
     }
 
@@ -1341,6 +1367,7 @@ mod tests {
             price: Some(Decimal::from(price)),
             ord_type: None,
             time_in_force: None,
+            redelivered: false,
         }
     }
 
@@ -2326,6 +2353,65 @@ mod tests {
         run(&mut book, venue_report("1", Status::New, 0, 0));
         assert!(run(&mut book, venue_report("1", Status::PendingNew, 0, 0)).is_empty());
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    /// `input`, a cancel or replace, flagged as possibly redelivered.
+    fn redelivered(mut input: Input) -> Input {
+        let (Input::Cancel { redelivered, .. } | Input::Replace { redelivered, .. }) = &mut input else {
+            unreachable!()
+        };
+        *redelivered = true;
+        input
+    }
+
+    #[test]
+    fn a_redelivered_cancel_gets_the_orders_state_not_a_second_cancel() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 0));
+        let out = run(&mut book, redelivered(cancel_input("C2", "C1")));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(
+            (report.exec_type, report.status, report.order_id),
+            (ExecType::Status, Status::PendingCancel, Some(OrderId(1)))
+        );
+        assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C1", Some("C2")));
+        assert_eq!(book.order(OrderId(1)).unwrap().amendments, 1);
+    }
+
+    #[test]
+    fn a_redelivered_replace_gets_the_orders_state_not_a_second_replace() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+        let out = run(&mut book, redelivered(replace_input("C2", "C1", 80, 11)));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.exec_type, report.status, report.request.qty), (ExecType::Status, Status::New, 80.into()));
+        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C2", &None));
+        assert_eq!(book.order(OrderId(1)).unwrap().amendments, 1);
+    }
+
+    #[test]
+    fn a_reused_cl_ord_id_on_a_cancel_or_replace_is_a_duplicate_unless_redelivered_for_the_same_order() {
+        for input in [cancel_input("C2", "C1"), replace_input("C2", "C1", 80, 11)] {
+            let mut book = book();
+            new_order(&mut book, "C1");
+            new_order(&mut book, "C2");
+            // Not redelivered: a duplicate even for the order it names.
+            cancel(&mut book, "C3", "C1");
+            let mut again = input.clone();
+            let (Input::Cancel { cl_ord_id, .. } | Input::Replace { cl_ord_id, .. }) = &mut again else {
+                unreachable!()
+            };
+            *cl_ord_id = "C3".into();
+            assert_eq!(cancel_reject(&run(&mut book, again.clone())).3, CancelRejectReason::Duplicate);
+            // Redelivered, but C2 is another order's ClOrdID.
+            assert_eq!(cancel_reject(&run(&mut book, redelivered(input))).3, CancelRejectReason::Duplicate);
+            // Redelivered for the same order.
+            assert!(matches!(run(&mut book, redelivered(again)).as_slice(), [Output::Report { .. }]));
+        }
     }
 
     fn status_request(cl_ord_id: &str) -> Input {
