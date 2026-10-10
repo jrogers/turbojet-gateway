@@ -123,6 +123,8 @@ pub struct Order {
     pub pending: Option<Pending>,
     /// Client reports built for the order so far, numbering the next ExecID.
     pub exec_seq: u64,
+    /// The venue's OrderID(37), from the first report the book took that had one.
+    pub venue_order_id: Option<CompactString>,
 }
 
 /// A replace awaiting the venue's answer.
@@ -149,6 +151,8 @@ pub struct VenueReport {
     /// ExecID(17), for the logs: not a dedupe key, since `stale` goes by CumQty.
     pub exec_id: CompactString,
     pub text: Option<CompactString>,
+    /// OrderID(37), the venue's: some venues want it on cancels and replaces.
+    pub venue_order_id: Option<CompactString>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +254,7 @@ pub enum Output {
         downstream: CompactString,
         orig_downstream: CompactString,
         request: OrderRequest,
+        venue_order_id: Option<CompactString>,
     },
     /// `request` carries the new quantity and price.
     Replace {
@@ -257,6 +262,7 @@ pub enum Output {
         downstream: CompactString,
         orig_downstream: CompactString,
         request: OrderRequest,
+        venue_order_id: Option<CompactString>,
     },
 }
 
@@ -401,6 +407,7 @@ impl Book {
             avg_px: Decimal::ZERO,
             pending: None,
             exec_seq: 0,
+            venue_order_id: None,
         };
         let previous = self.orders.insert(id, order);
         debug_assert!(previous.is_none(), "order {id:?} booked twice");
@@ -416,7 +423,8 @@ impl Book {
         let rejected = report.status == Status::Rejected || report.exec_type == ExecType::Rejected;
         if rejected && sent.kind.is_some() {
             let status = (report.status != Status::Rejected).then_some(report.status);
-            return self.refuse_request(venue, &report.downstream, sent, status, report.text, out);
+            let refused = Refused { status, text: report.text, venue_order_id: report.venue_order_id };
+            return self.refuse_request(venue, &report.downstream, sent, refused, out);
         }
         let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind, .. } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
@@ -443,6 +451,7 @@ impl Book {
         if report.cum_qty > qty {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, cum_qty = %report.cum_qty, "overfill");
         }
+        order.record_venue_order_id(report.venue_order_id);
         if accepted {
             let pending = order.pending.take().expect("checked above");
             order.request.cl_ord_id = pending.cl_ord_id;
@@ -478,6 +487,7 @@ impl Book {
             downstream,
             orig_downstream: order.downstream.clone(),
             request: order.request.clone(),
+            venue_order_id: order.venue_order_id.clone(),
         });
     }
 
@@ -501,6 +511,7 @@ impl Book {
             downstream: downstream.clone(),
             orig_downstream: order.downstream.clone(),
             request: OrderRequest { qty, price, ..order.request.clone() },
+            venue_order_id: order.venue_order_id.clone(),
         });
         order.pending = Some(Pending { downstream, cl_ord_id, qty, price });
     }
@@ -569,22 +580,21 @@ impl Book {
         let Some(sent) = self.downstream.get(downstream).cloned() else {
             return tracing::warn!(%venue, %downstream, "cancel reject for an unknown request");
         };
-        self.refuse_request(venue, downstream, sent, Some(status), text, out);
+        self.refuse_request(venue, downstream, sent, Refused { status: Some(status), text, venue_order_id: None }, out);
     }
 
     /// The venue refused the cancel or replace `sent` under `downstream`, by OrderCancelReject or
     /// by a Rejected ExecutionReport: tell the client, under the ClOrdIDs of its own request.
-    /// `status` is the order's status as the venue gives it, if it does. Anything that doesn't
-    /// name such a request is dropped.
+    /// Anything that doesn't name such a request is dropped.
     fn refuse_request(
         &mut self,
         venue: &VenueId,
         downstream: &CompactString,
         sent: Sent,
-        status: Option<Status>,
-        text: Option<CompactString>,
+        refused: Refused,
         out: &mut Vec<Output>,
     ) {
+        let Refused { status, text, venue_order_id } = refused;
         let (Some(response_to), Some(orig_cl_ord_id)) = (sent.kind, sent.orig_cl_ord_id) else {
             return tracing::warn!(%venue, %downstream, "request rejected naming an order, not a cancel or replace");
         };
@@ -596,6 +606,8 @@ impl Book {
             return tracing::debug!(%venue, %downstream, "rejection of an answered request dropped");
         }
         self.downstream.get_mut(downstream).expect("looked up by the caller").answered = true;
+        // The venue named its order while refusing the request: as good as any report's.
+        order.record_venue_order_id(venue_order_id);
         // Only the replace it names: an older one's late reject leaves a newer one pending.
         if order.pending.as_ref().is_some_and(|pending| pending.downstream == *downstream) {
             order.pending = None;
@@ -685,6 +697,19 @@ impl Order {
         }
     }
 
+    /// Keeps the first OrderID the venue gives; venues don't change it, so a different one is
+    /// logged and ignored.
+    fn record_venue_order_id(&mut self, venue_order_id: Option<CompactString>) {
+        match (&self.venue_order_id, venue_order_id) {
+            (_, None) => {}
+            (None, Some(new)) => self.venue_order_id = Some(new),
+            (Some(kept), Some(new)) if *kept != new => {
+                tracing::warn!(order = self.id.0, %kept, %new, "venue changed its OrderID; keeping the first");
+            }
+            (Some(_), Some(_)) => {}
+        }
+    }
+
     fn leaves_qty(&self) -> Decimal {
         if self.status.is_done() { Decimal::ZERO } else { self.request.qty - self.cum_qty }
     }
@@ -697,6 +722,14 @@ fn stale(order: &Order, report: &VenueReport) -> bool {
     order.status.is_done()
         || report.cum_qty < order.cum_qty
         || (report.last_qty > Decimal::ZERO && report.cum_qty == order.cum_qty)
+}
+
+/// A venue's refusal of a cancel or replace. `status` is the order's status as the venue gives
+/// it, if it does.
+struct Refused {
+    status: Option<Status>,
+    text: Option<CompactString>,
+    venue_order_id: Option<CompactString>,
 }
 
 /// A client's cancel or replace request.
@@ -881,6 +914,7 @@ mod tests {
                 avg_px: Decimal::from(10),
                 exec_id: "V1".into(),
                 text: None,
+                venue_order_id: None,
             },
         }
     }
@@ -995,7 +1029,8 @@ mod tests {
                 venue: "NASDAQ".into(),
                 downstream: "1-1".into(),
                 orig_downstream: "1".into(),
-                request: request("C1")
+                request: request("C1"),
+                venue_order_id: None,
             }]
         );
     }
@@ -1070,7 +1105,8 @@ mod tests {
                 venue: "NASDAQ".into(),
                 downstream: "1-2".into(),
                 orig_downstream: "1".into(),
-                request: request("C1")
+                request: request("C1"),
+                venue_order_id: None,
             }]
         );
         let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-2", Status::New));
@@ -1148,7 +1184,8 @@ mod tests {
                 venue: "NASDAQ".into(),
                 downstream: "1-1".into(),
                 orig_downstream: "1".into(),
-                request: replaced("C1", 80, 11)
+                request: replaced("C1", 80, 11),
+                venue_order_id: None,
             }]
         );
         assert_eq!(book.order(OrderId(1)).unwrap().request, request("C1"));
@@ -1196,7 +1233,8 @@ mod tests {
                 venue: "NASDAQ".into(),
                 downstream: "1-2".into(),
                 orig_downstream: "1-1".into(),
-                request: replaced("C2", 80, 11)
+                request: replaced("C2", 80, 11),
+                venue_order_id: None,
             }]
         );
     }
@@ -1457,7 +1495,8 @@ mod tests {
                 venue: "NASDAQ".into(),
                 downstream: "1-2".into(),
                 orig_downstream: "1".into(),
-                request: request("C1")
+                request: request("C1"),
+                venue_order_id: None,
             }]
         );
     }
@@ -1607,5 +1646,98 @@ mod tests {
         let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
         assert_eq!(cancel_reject(&out).2, Status::PartiallyFilled);
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PartiallyFilled);
+    }
+
+    /// `input`, a venue report, carrying the venue's OrderID(37).
+    fn with_venue_order_id(mut input: Input, venue_order_id: &str) -> Input {
+        let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+        report.venue_order_id = Some(venue_order_id.into());
+        input
+    }
+
+    fn venue_order_id(book: &Book) -> Option<&str> {
+        book.order(OrderId(1)).unwrap().venue_order_id.as_deref()
+    }
+
+    #[test]
+    fn the_venues_order_id_is_kept_from_its_ack() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        assert_eq!(venue_order_id(&book), None);
+        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        assert_eq!(venue_order_id(&book), Some("V-1"));
+    }
+
+    #[test]
+    fn a_later_different_venue_order_id_is_ignored() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        let out = run(&mut book, with_venue_order_id(venue_report("1", Status::PartiallyFilled, 40, 40), "V-2"));
+        assert_eq!(out.len(), 1, "the report itself still goes through");
+        assert_eq!(venue_order_id(&book), Some("V-1"));
+    }
+
+    #[test]
+    fn a_report_without_one_keeps_the_venue_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        assert_eq!(venue_order_id(&book), Some("V-1"));
+    }
+
+    #[test]
+    fn cancels_and_replaces_carry_the_venue_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        let out = replace(&mut book, "C2", "C1", 80, 11);
+        let [Output::Replace { venue_order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(venue_order_id.as_deref(), Some("V-1"));
+        let out = cancel(&mut book, "C3", "C1");
+        let [Output::Cancel { venue_order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(venue_order_id.as_deref(), Some("V-1"));
+    }
+
+    #[test]
+    fn cancels_and_replaces_before_an_ack_carry_no_venue_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = replace(&mut book, "C2", "C1", 80, 11);
+        let [Output::Replace { venue_order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(*venue_order_id, None);
+        let out = cancel(&mut book, "C3", "C1");
+        let [Output::Cancel { venue_order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(*venue_order_id, None);
+    }
+
+    #[test]
+    fn a_dropped_report_records_no_venue_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let Input::VenueReport { report, .. } = with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1") else {
+            unreachable!()
+        };
+        assert!(run(&mut book, Input::VenueReport { venue: "LSE".into(), report }).is_empty());
+        // Overfill.
+        assert!(run(&mut book, with_venue_order_id(venue_report("1", Status::Filled, 150, 150), "V-2")).is_empty());
+        assert_eq!(venue_order_id(&book), None);
+        run(&mut book, with_venue_order_id(venue_report("1", Status::PartiallyFilled, 40, 40), "V-3"));
+        // Stale: a resend of that fill, under another ID.
+        assert!(
+            run(&mut book, with_venue_order_id(venue_report("1", Status::PartiallyFilled, 40, 40), "V-4")).is_empty()
+        );
+        assert_eq!(venue_order_id(&book), Some("V-3"));
+    }
+
+    #[test]
+    fn a_rejected_amendment_records_the_venue_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        let out = run(&mut book, with_venue_order_id(venue_report("1-1", Status::Rejected, 0, 0), "V-1"));
+        assert_eq!(cancel_reject(&out).1, CancelKind::Replace);
+        assert_eq!(venue_order_id(&book), Some("V-1"));
     }
 }
