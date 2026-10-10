@@ -569,13 +569,14 @@ impl Gateway {
     /// Waits for the venue's session to store a request, and if it drops it unsent, tells the
     /// book, so the client hears rather than waiting on an order the venue never saw. `hold`, the
     /// client's message the request came from, is released once the receipt resolves and, if the
-    /// request was dropped, the book has heard.
+    /// request was dropped, what the book made of that has committed.
     ///
     /// ponytail: one task per venue request; a per-venue drain like the outbox's if it measures.
     fn settle(self: &Arc<Self>, receipt: Receipt, venue: VenueId, downstream: CompactString, hold: Option<Hold>) {
         let gateway = self.clone();
         tokio::spawn(async move {
-            // Dropped at the end, after the book has handled a SendFailed, not before.
+            // Dropped at the end, after the SendFailed the book handled has committed, not before:
+            // a stop in between would leave the order pending with nothing to redeliver it.
             let _hold = hold;
             let dropped = match receipt.await {
                 Ok(_) => return,
@@ -588,6 +589,7 @@ impl Gateway {
             };
             let text = format_compact!("{VENUE_UNAVAILABLE}: {dropped}");
             gateway.handle(Input::SendFailed { venue, downstream, text });
+            gateway.committed().await;
         });
     }
 
@@ -1681,5 +1683,42 @@ mod tests {
         gateway.cancel_all(Scope::All).await;
         assert!(gateway.unblock(Scope::All).await);
         assert_eq!(gateway.lock().book.take_changes(), crate::book::Changes::default());
+    }
+
+    /// A request the venue's session drops unsent keeps the client's order in flight until the
+    /// reject the book made of it has committed: a stop before then has the order redelivered,
+    /// rather than leave it pending with nothing to answer it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_requests_order_stays_in_flight_until_its_reject_commits() {
+        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let (holding, mut held) = unbounded_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
+        let venue_addr = serve("VENUE", refuser).await;
+        let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        tokio::spawn(venue.clone().run());
+        timeout(Duration::from_secs(5), held.recv()).await.expect("logon not held");
+        let clients = Arc::new(MemoryStorage::new());
+        let addr = serve_with("JETBRIDGE", Arc::new(ClientApp(gateway.clone())), clients.clone()).await;
+        let (app, mut events) = peer();
+        let client = initiator(&addr, "FUNDA", "JETBRIDGE", app);
+        tokio::spawn(client.clone().run());
+        assert!(matches!(next(&mut events).await, Event::LoggedOn));
+        let log = clients.open(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA")).unwrap();
+
+        client.handle().send(order("C1")).unwrap();
+        wait_for(log.as_ref(), (3, Some(2))).await;
+        // The order's own batch has committed; the venue's receipt still holds it.
+        timeout(Duration::from_secs(5), gateway.committed()).await.expect("not committed");
+        assert_eq!(log.in_flight(), Some(2));
+        store.hooks.gate.send_replace(false);
+        release.send(()).unwrap();
+        let rejected = report(&mut events).await;
+        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(log.in_flight(), Some(2), "released before the reject committed");
+        store.hooks.gate.send_replace(true);
+        wait_for(log.as_ref(), (3, Some(3))).await;
     }
 }
