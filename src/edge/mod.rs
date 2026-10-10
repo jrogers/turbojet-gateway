@@ -19,7 +19,7 @@ use chrono::{DateTime, NaiveTime, Utc};
 use tracing::{error, info, warn};
 use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
 use turbojet::{
-    Application, Clock, ConnectionInfo, Context, Disconnect, Dropped, Message, MessageReject, Receipt, SendError,
+    Application, Clock, ConnectionInfo, Context, Disconnect, Dropped, Hold, Message, MessageReject, Receipt, SendError,
     SessionHandle, SessionId, SessionSchedule,
 };
 
@@ -285,7 +285,7 @@ impl Gateway {
         }
         warn!(working = ?orders, "shutting down: cancelling the working orders of clients with cancel on disconnect");
         let inputs = orders.into_keys().map(|client| Input::CancelAll { scope: Scope::Session(client) });
-        self.handle_locked(&mut state, inputs);
+        self.handle_locked(&mut state, inputs, None);
     }
 
     /// Routes and checks new orders by `router` and `limits` from now on, both changed under one
@@ -345,15 +345,16 @@ impl Gateway {
 
     /// As [`handle`](Self::handle), each of `inputs` in turn under one lock.
     fn handle_all(self: &Arc<Self>, inputs: impl IntoIterator<Item = Input>) {
-        self.handle_locked(&mut self.lock(), inputs);
+        self.handle_locked(&mut self.lock(), inputs, None);
     }
 
     /// Handles `input` from `client`, rolling the client's trading day over first if it has ended,
-    /// so the input lands in the day it arrived in.
-    fn handle_from(self: &Arc<Self>, client: &ClientId, input: Input) {
+    /// so the input lands in the day it arrived in. `ctx` is the client's message's, held in
+    /// flight until each venue request it led to is stored.
+    fn handle_from(self: &Arc<Self>, client: &ClientId, input: Input, ctx: &mut Context<'_>) {
         let mut state = self.lock();
         let new_day = new_day(&state, client, self.clock.now()).map(|day| Input::DaysStarted { days: vec![day] });
-        self.handle_locked(&mut state, new_day.into_iter().chain([input]));
+        self.handle_locked(&mut state, new_day.into_iter().chain([input]), Some(ctx));
     }
 
     /// One tick's roll: every session whose trading day has ended, quiet ones too, starts its
@@ -370,12 +371,18 @@ impl Gateway {
             .filter_map(|(client, _)| new_day(state_now, client, now))
             .collect();
         if !days.is_empty() {
-            self.handle_locked(&mut state, [Input::DaysStarted { days }]);
+            self.handle_locked(&mut state, [Input::DaysStarted { days }], None);
         }
     }
 
-    /// As [`handle_all`](Self::handle_all), under the lock held as `state`.
-    fn handle_locked(self: &Arc<Self>, state: &mut State, inputs: impl IntoIterator<Item = Input>) {
+    /// As [`handle_all`](Self::handle_all), under the lock held as `state`. With `ctx`, the
+    /// client's message the inputs came from, which [`send`](Self::send) holds.
+    fn handle_locked(
+        self: &Arc<Self>,
+        state: &mut State,
+        inputs: impl IntoIterator<Item = Input>,
+        mut ctx: Option<&mut Context<'_>>,
+    ) {
         // After the lock, so TransactTimes rise in the order the book answers.
         let now = UtcTimestamp::from(self.clock.now());
         let mut inputs = VecDeque::from_iter(inputs);
@@ -384,7 +391,7 @@ impl Gateway {
             let send_failed = matches!(input, Input::SendFailed { .. });
             state.book.handle(input, &mut outputs);
             for output in outputs.drain(..) {
-                if let Some(failed) = self.send(state, &output, now) {
+                if let Some(failed) = self.send(state, &output, now, ctx.as_deref_mut()) {
                     debug_assert!(!send_failed, "SendFailed made venue-bound output");
                     inputs.push_back(failed);
                 }
@@ -435,8 +442,16 @@ impl Gateway {
         }
     }
 
-    /// Sends `output` where it's going. `Some` for a venue request its session refused.
-    fn send(self: &Arc<Self>, state: &State, output: &Output, now: UtcTimestamp) -> Option<Input> {
+    /// Sends `output` where it's going. `Some` for a venue request its session refused. A venue
+    /// request queued holds `ctx`'s message in flight until the venue's session has stored it,
+    /// so a stop before then has the client resend it rather than the order be lost.
+    fn send(
+        self: &Arc<Self>,
+        state: &State,
+        output: &Output,
+        now: UtcTimestamp,
+        ctx: Option<&mut Context<'_>>,
+    ) -> Option<Input> {
         match output {
             Output::Report { client, .. } | Output::CancelReject { client, .. } => {
                 let msg = self.client_version.client_message(output, now).expect("a client-bound output");
@@ -459,7 +474,7 @@ impl Gateway {
                 let msg = to.version.venue_message(output, now).expect("a venue-bound output");
                 match to.session.send(msg) {
                     Ok(receipt) => {
-                        self.settle(receipt, venue.clone(), downstream.clone());
+                        self.settle(receipt, venue.clone(), downstream.clone(), ctx.map(Context::hold));
                         None
                     }
                     Err(SendError::Full(_)) => Some(failed(VENUE_BUSY)),
@@ -471,12 +486,14 @@ impl Gateway {
     }
 
     /// Waits for the venue's session to store a request, and if it drops it unsent, tells the
-    /// book, so the client hears rather than waiting on an order the venue never saw.
+    /// book, so the client hears rather than waiting on an order the venue never saw. `hold`, the
+    /// client's message the request came from, is released once the receipt resolves.
     ///
     /// ponytail: one task per venue request; a per-venue drain like the outbox's if it measures.
-    fn settle(self: &Arc<Self>, receipt: Receipt, venue: VenueId, downstream: CompactString) {
+    fn settle(self: &Arc<Self>, receipt: Receipt, venue: VenueId, downstream: CompactString, hold: Option<Hold>) {
         let gateway = self.clone();
         tokio::spawn(async move {
+            let _hold = hold;
             let dropped = match receipt.await {
                 Ok(_) => return,
                 Err(dropped @ (Dropped::Disconnected | Dropped::LoggingOut | Dropped::Rejected(_))) => dropped,
@@ -554,7 +571,7 @@ impl Application for ClientApp {
         if let Input::NewOrder { redelivered: true, sent, .. } = &mut input {
             *sent = fix::first_sent(msg);
         }
-        self.0.handle_from(&client, input);
+        self.0.handle_from(&client, input, ctx);
         Ok(())
     }
 }
@@ -608,8 +625,10 @@ mod tests {
     use tokio::time::timeout;
     use turbojet::fields::Decimal;
     use turbojet::message::tags;
+    use turbojet::store::{Commit, SentMessages, SessionLog};
     use turbojet::{
         Acceptor, FixMessage, Initiator, InitiatorConfig, MemoryStorage, MsgType, ReconnectPolicy, SessionConfig,
+        SessionStorage,
     };
     use turbojet_fix44 as v44;
 
@@ -769,8 +788,13 @@ mod tests {
 
     /// Serves `app` as `comp_id` on loopback; its address.
     async fn serve(comp_id: &str, app: Arc<dyn Application>) -> String {
+        serve_with(comp_id, app, Arc::new(MemoryStorage::new())).await
+    }
+
+    /// As [`serve`], keeping its sessions in `storage`.
+    async fn serve_with(comp_id: &str, app: Arc<dyn Application>, storage: Arc<dyn SessionStorage>) -> String {
         let config = SessionConfig::new("FIX.4.4", comp_id);
-        let acceptor = Acceptor::new(config, Arc::new(MemoryStorage::new()), app).unwrap();
+        let acceptor = Acceptor::new(config, storage, app).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(acceptor.serve(listener));
@@ -779,9 +803,20 @@ mod tests {
 
     /// An initiator from `comp_id` to `target` at `addr`, serving `app`, not yet running.
     fn initiator(addr: &str, comp_id: &str, target: &str, app: Arc<dyn Application>) -> Initiator {
+        initiator_with(addr, comp_id, target, app, Arc::new(MemoryStorage::new()))
+    }
+
+    /// As [`initiator`], keeping its session in `storage`.
+    fn initiator_with(
+        addr: &str,
+        comp_id: &str,
+        target: &str,
+        app: Arc<dyn Application>,
+        storage: Arc<dyn SessionStorage>,
+    ) -> Initiator {
         let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", comp_id), target);
         config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
-        Initiator::new(addr, config, Arc::new(MemoryStorage::new()), app).unwrap()
+        Initiator::new(addr, config, storage, app).unwrap()
     }
 
     /// Jetbridge serving clients with `gateway`, and a client logged on to it.
@@ -1149,5 +1184,154 @@ mod tests {
         assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), ("1-2", "1"));
         assert_eq!(unsent(&gateway), [false]);
         assert!(!gateway.cancels_waiting.load(Ordering::Acquire));
+    }
+
+    /// Memory storage whose commits wait while the gate is shut: a venue's session slow to store.
+    struct Gated {
+        inner: MemoryStorage,
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl SessionStorage for Gated {
+        fn open(&self, id: &SessionId) -> std::io::Result<Box<dyn SessionLog>> {
+            Ok(Box::new(GatedLog { inner: self.inner.open(id)?, open: self.open.clone() }))
+        }
+    }
+
+    struct GatedLog {
+        inner: Box<dyn SessionLog>,
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl SessionLog for GatedLog {
+        fn next_outgoing(&self) -> u64 {
+            self.inner.next_outgoing()
+        }
+
+        fn next_incoming(&self) -> u64 {
+            self.inner.next_incoming()
+        }
+
+        fn set_next_incoming(&mut self, seq: u64) -> std::io::Result<()> {
+            self.inner.set_next_incoming(seq)
+        }
+
+        fn record_outgoing(&mut self, seq: u64, msg: Option<&[u8]>) -> std::io::Result<()> {
+            self.inner.record_outgoing(seq, msg)
+        }
+
+        fn sent_messages(&mut self, begin: u64, end: u64) -> std::io::Result<SentMessages> {
+            self.inner.sent_messages(begin, end)
+        }
+
+        fn reset(&mut self) -> std::io::Result<()> {
+            self.inner.reset()
+        }
+
+        fn commit(&mut self) -> std::io::Result<Option<Commit>> {
+            if *self.open.borrow() {
+                return self.inner.commit();
+            }
+            let mut open = self.open.clone();
+            Ok(Some(Commit::future(async move {
+                open.wait_for(|open| *open).await.map(drop).map_err(std::io::Error::other)
+            })))
+        }
+    }
+
+    /// A gateway serving FUNDA from `clients`, its venue's session storing only once the gate
+    /// opens. The gate's sender, the venue's events and the client's acceptor address.
+    async fn gated_venue(
+        gateway: &Arc<Gateway>,
+        clients: Arc<MemoryStorage>,
+    ) -> (tokio::sync::watch::Sender<bool>, UnboundedReceiver<Event>, String) {
+        let (venue_app, mut venue_events) = peer();
+        let venue_addr = serve("VENUE", venue_app).await;
+        let (gate, open) = tokio::sync::watch::channel(true);
+        let storage = Arc::new(Gated { inner: MemoryStorage::new(), open });
+        let venue = initiator_with(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())), storage);
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        tokio::spawn(venue.clone().run());
+        assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
+        gate.send_replace(false);
+        let addr = serve_with("JETBRIDGE", Arc::new(ClientApp(gateway.clone())), clients).await;
+        (gate, venue_events, addr)
+    }
+
+    /// Waits for `log`'s next incoming number and in-flight marker to be `want`.
+    async fn wait_for(log: &dyn SessionLog, want: (u64, Option<u64>)) {
+        let reached = async {
+            while (log.next_incoming(), log.in_flight()) != want {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let waited = timeout(Duration::from_secs(5), reached).await;
+        assert!(waited.is_ok(), "{want:?}, at {:?}", (log.next_incoming(), log.in_flight()));
+    }
+
+    /// A client's order stays in flight on its session, recorded as received but with the
+    /// store's marker at it, until the venue's session has stored what it was forwarded as.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clients_order_stays_in_flight_until_its_venue_has_stored_it() {
+        let gateway = gateway();
+        let clients = Arc::new(MemoryStorage::new());
+        let (gate, mut venue_events, addr) = gated_venue(&gateway, clients.clone()).await;
+        let (app, mut client_events) = peer();
+        let client = initiator(&addr, "FUNDA", "JETBRIDGE", app);
+        tokio::spawn(client.clone().run());
+        assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
+        let log = clients.open(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA")).unwrap();
+
+        client.handle().send(order("C1")).unwrap();
+        wait_for(log.as_ref(), (3, Some(2))).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(log.in_flight(), Some(2), "not before the venue stores the order");
+        assert!(venue_events.try_recv().is_err(), "sent before it was stored");
+
+        gate.send_replace(true);
+        let sent: v44::NewOrderSingle = next_message(&mut venue_events).await.parse().unwrap();
+        assert_eq!(sent.cl_ord_id, "1");
+        wait_for(log.as_ref(), (3, Some(3))).await;
+        assert_eq!(report(&mut client_events).await.exec_type, v44::ExecType::New);
+    }
+
+    /// A client gone before its order was stored at the venue resends it when it's back, as after
+    /// a crash: the book knows the ClOrdID and answers with the order's state, so the venue gets
+    /// the order once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_order_resent_after_the_client_reconnects_reaches_the_venue_once() {
+        let gateway = gateway();
+        let clients = Arc::new(MemoryStorage::new());
+        let (gate, mut venue_events, addr) = gated_venue(&gateway, clients.clone()).await;
+        let funda = Arc::new(MemoryStorage::new());
+        let (app, mut client_events) = peer();
+        let client = initiator_with(&addr, "FUNDA", "JETBRIDGE", app.clone(), funda.clone());
+        tokio::spawn(client.clone().run());
+        assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
+        let log = clients.open(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA")).unwrap();
+        client.handle().send(order("C1")).unwrap();
+        wait_for(log.as_ref(), (3, Some(2))).await;
+
+        client.shutdown(None).await;
+        assert!(matches!(next(&mut client_events).await, Event::LoggedOut));
+        let client = initiator_with(&addr, "FUNDA", "JETBRIDGE", app, funda);
+        tokio::spawn(client.clone().run());
+        assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
+        let resent = report(&mut client_events).await;
+        assert_eq!(
+            (resent.cl_ord_id.as_deref(), resent.exec_type, resent.ord_status),
+            (Some("C1"), v44::ExecType::OrderStatus, v44::OrdStatus::PendingNew)
+        );
+
+        gate.send_replace(true);
+        let sent: v44::NewOrderSingle = next_message(&mut venue_events).await.parse().unwrap();
+        assert_eq!(sent.cl_ord_id, "1");
+        let new = report(&mut client_events).await;
+        assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let again = std::iter::from_fn(|| venue_events.try_recv().ok())
+            .filter(|event| matches!(event, Event::Message(msg) if msg.msg_type() == MsgType::NewOrderSingle))
+            .count();
+        assert_eq!(again, 0, "the venue got the order again");
     }
 }
