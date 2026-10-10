@@ -16,6 +16,11 @@ pub type VenueId = CompactString;
 /// is in memory, so it has a bound; a busy client sends tens of thousands of orders a day.
 pub const MAX_CL_ORD_IDS_PER_CLIENT: usize = 1_000_000;
 
+/// ClOrdIDs past [`MAX_CL_ORD_IDS_PER_CLIENT`] kept for cancels and replaces, so a client refused
+/// new orders can still take its working orders off the market. It also keeps each order's
+/// `amendments` far below `u32::MAX`.
+pub const MAX_AMEND_RESERVE: usize = 10_000;
+
 /// Our OrderID(37), and the root of every downstream ClOrdID for the order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
@@ -403,8 +408,6 @@ impl Book {
     }
 
     /// A cancel goes to the venue even while PendingNew, under the next numbered downstream ClOrdID.
-    /// Its ClOrdID counts against the client's bound through `remember`; the bound isn't checked
-    /// here, since a client must always be able to cancel.
     fn cancel(&mut self, amend: Amend, out: &mut Vec<Output>) {
         let Some((id, amend)) = self.amendable(amend, |_| None, out) else { return };
         let (downstream, order) = self.number(id, amend);
@@ -456,6 +459,14 @@ impl Book {
             _ if duplicate => Some((CancelRejectReason::Duplicate, "duplicate ClOrdID")),
             None => Some((CancelRejectReason::UnknownOrder, "unknown order")),
             Some(order) if order.status.is_done() => Some((CancelRejectReason::TooLate, "order is done")),
+            Some(_)
+                if self
+                    .used
+                    .get(&amend.client)
+                    .is_some_and(|&used| used >= MAX_CL_ORD_IDS_PER_CLIENT + MAX_AMEND_RESERVE) =>
+            {
+                Some((CancelRejectReason::Other, "too many requests today"))
+            }
             Some(order) => refuse(order).map(|text| (CancelRejectReason::Other, text)),
         };
         if let Some((reason, text)) = refusal {
@@ -1305,6 +1316,30 @@ mod tests {
                 orig_downstream: "1".into(),
                 request: request("C1")
             }]
+        );
+    }
+
+    #[test]
+    fn a_client_at_its_new_order_bound_can_still_cancel() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT);
+        assert!(matches!(cancel(&mut book, "C2", "C1").as_slice(), [Output::Cancel { .. }]));
+    }
+
+    #[test]
+    fn a_client_past_its_reserve_cannot_cancel() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT + MAX_AMEND_RESERVE);
+        let out = cancel(&mut book, "C2", "C1");
+        let [Output::CancelReject { text, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(text, "too many requests today");
+        assert_eq!(cancel_reject(&out).3, CancelRejectReason::Other);
+        let out = replace(&mut book, "C2", "C1", 80, 10);
+        assert_eq!(
+            cancel_reject(&out),
+            (Some(OrderId(1)), CancelKind::Replace, Status::PendingNew, CancelRejectReason::Other)
         );
     }
 }
