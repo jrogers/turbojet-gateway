@@ -90,6 +90,13 @@ pub fn possibly_resent(msg: &Message) -> bool {
     msg.flag(tags::POSS_DUP_FLAG) || msg.flag(tags::POSS_RESEND)
 }
 
+/// When a message was first sent: OrigSendingTime(122) on a resend, else SendingTime(52). `None`
+/// if it has neither, or they don't parse (the session would have rejected that).
+pub fn first_sent(msg: &Message) -> Option<chrono::DateTime<chrono::Utc>> {
+    let time = |tag| msg.field::<UtcTimestamp>(tag).ok();
+    time(tags::ORIG_SENDING_TIME).or_else(|| time(tags::SENDING_TIME)).map(Into::into)
+}
+
 // Helpers the versions share: nothing here touches a generated type.
 
 /// OrderQty(38): optional in FIX 4.2 and 4.4 (CashOrderQty may stand in), but the book needs it.

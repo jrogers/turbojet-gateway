@@ -37,7 +37,7 @@ fn run(book: &mut Book, input: Input) -> Vec<Output> {
 }
 
 fn new_order(book: &mut Book, cl_ord_id: &str) -> Vec<Output> {
-    run(book, Input::NewOrder { client: "FUNDA".into(), request: request(cl_ord_id), redelivered: false })
+    run(book, Input::NewOrder { client: "FUNDA".into(), request: request(cl_ord_id), redelivered: false, sent: None })
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn an_unroutable_order_is_rejected_and_not_booked() {
     let mut book = book();
     let mut req = request("C1");
     req.ex_destination = None;
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false });
+    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false, sent: None });
     let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(
         (report.status, report.reject, report.order_id.as_deref()),
@@ -88,7 +88,10 @@ fn a_reused_cl_ord_id_is_rejected_as_a_duplicate() {
 fn a_redelivered_order_gets_its_state_not_a_second_order() {
     let mut book = book();
     new_order(&mut book, "C1");
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+    let out = run(
+        &mut book,
+        Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true, sent: None },
+    );
     let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!((report.order_id.as_deref(), report.status, report.reject), (Some("1"), Status::PendingNew, None));
     assert_eq!(report.exec_type, ExecType::Status);
@@ -100,7 +103,10 @@ fn a_redelivered_order_gets_its_state_not_a_second_order() {
 #[test]
 fn a_redelivered_order_we_never_saw_is_booked() {
     let mut book = book();
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+    let out = run(
+        &mut book,
+        Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true, sent: None },
+    );
     assert!(matches!(out.as_slice(), [Output::NewOrder { .. }]));
 }
 
@@ -110,7 +116,7 @@ fn a_redelivery_for_a_different_order_is_still_a_duplicate() {
     new_order(&mut book, "C1");
     let mut other = request("C1");
     other.side = Side::Sell;
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: other, redelivered: true });
+    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: other, redelivered: true, sent: None });
     let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(report.reject, Some(RejectReason::Duplicate));
 }
@@ -119,7 +125,10 @@ fn a_redelivery_for_a_different_order_is_still_a_duplicate() {
 fn the_same_cl_ord_id_from_another_client_is_a_new_order() {
     let mut book = book();
     new_order(&mut book, "C1");
-    let out = run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: request("C1"), redelivered: false });
+    let out = run(
+        &mut book,
+        Input::NewOrder { client: "FUNDB".into(), request: request("C1"), redelivered: false, sent: None },
+    );
     assert!(matches!(out.as_slice(), [Output::NewOrder { .. }]));
 }
 
@@ -129,7 +138,7 @@ fn desk(sub_id: &str) -> ClientId {
 }
 
 fn order_from(client: &ClientId, cl_ord_id: &str) -> Input {
-    Input::NewOrder { client: client.clone(), request: request(cl_ord_id), redelivered: false }
+    Input::NewOrder { client: client.clone(), request: request(cl_ord_id), redelivered: false, sent: None }
 }
 
 #[test]
@@ -776,7 +785,10 @@ fn a_redelivery_after_a_replace_reports_the_current_cl_ord_id() {
     new_order(&mut book, "C1");
     replace(&mut book, "C2", "C1", 80, 11);
     run(&mut book, venue_report("1-1", Status::New, 0, 0));
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+    let out = run(
+        &mut book,
+        Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true, sent: None },
+    );
     let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
     assert_eq!((report.exec_type, report.reject, report.request.qty), (ExecType::Status, None, 80.into()));
@@ -998,7 +1010,10 @@ fn a_status_answer_takes_the_next_exec_id() {
     let mut book = book();
     new_order(&mut book, "C1");
     run(&mut book, venue_report("1", Status::New, 0, 0));
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+    let out = run(
+        &mut book,
+        Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true, sent: None },
+    );
     assert_eq!(exec_ids(&out), ["1.2"]);
     assert_eq!(exec_ids(&run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40))), ["1.3"]);
 }
@@ -1010,7 +1025,7 @@ fn unbooked_rejects_number_their_exec_ids_across_the_book() {
     assert_eq!(exec_ids(&new_order(&mut book, "C1")), ["R1"]);
     let mut req = request("C2");
     req.ex_destination = None;
-    let out = run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: req, redelivered: false });
+    let out = run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: req, redelivered: false, sent: None });
     assert_eq!(exec_ids(&out), ["R2"]);
 }
 
@@ -1040,7 +1055,10 @@ fn a_status_answer_after_an_acked_replace_takes_the_next_exec_id() {
     new_order(&mut book, "C1");
     replace(&mut book, "C2", "C1", 80, 11);
     assert_eq!(exec_ids(&run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0))), ["1.1"]);
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+    let out = run(
+        &mut book,
+        Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true, sent: None },
+    );
     assert_eq!(exec_ids(&out), ["1.2"]);
 }
 
@@ -1252,7 +1270,7 @@ fn a_rule_reject_says_route_rejected_and_no_match_says_no_route() {
     assert_eq!((report.reject, report.text.as_deref()), (Some(RejectReason::RouteRejected), Some("venue closed")));
     let mut req = request("C2");
     req.ex_destination = None;
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false });
+    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false, sent: None });
     let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(report.reject, Some(RejectReason::NoRoute));
 }
@@ -1376,7 +1394,7 @@ fn a_market_replace_without_a_price_goes_out_without_one() {
 fn a_market_order_replaced_to_limit_reaches_the_venue_with_its_price() {
     let mut book = book();
     let market = OrderRequest { ord_type: OrdType::Market, price: None, ..request("C1") };
-    run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: market.clone(), redelivered: false });
+    run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: market.clone(), redelivered: false, sent: None });
     let mut input = replace_input("C2", "C1", 80, 11);
     let Input::Replace { ord_type, .. } = &mut input else { unreachable!() };
     *ord_type = Some(OrdType::Limit);
@@ -1391,7 +1409,7 @@ fn a_market_order_replaced_to_limit_reaches_the_venue_with_its_price() {
 fn a_replace_keeping_time_in_force_leaves_gtc() {
     let mut book = book();
     let gtc = OrderRequest { time_in_force: Some(TimeInForce::Gtc), ..request("C1") };
-    run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: gtc, redelivered: false });
+    run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: gtc, redelivered: false, sent: None });
     let out = replace(&mut book, "C2", "C1", 80, 11);
     let [Output::Replace { request, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(request.time_in_force, Some(TimeInForce::Gtc));
@@ -2318,7 +2336,10 @@ fn a_blocked_clients_redelivered_order_already_booked_gets_its_state() {
     let mut book = book();
     new_order(&mut book, "C1");
     block(&mut book, Scope::All);
-    let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+    let out = run(
+        &mut book,
+        Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true, sent: None },
+    );
     let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!((report.exec_type, report.reject, report.order_id.as_deref()), (ExecType::Status, None, Some("1")));
 }
@@ -2386,7 +2407,7 @@ fn risk_checked(book: &mut Book, request: OrderRequest) -> Result<(), RiskReject
 }
 
 fn risk_checked_from(book: &mut Book, client: &ClientId, request: OrderRequest) -> Result<(), RiskReject> {
-    let out = run(book, Input::NewOrder { client: client.clone(), request, redelivered: false });
+    let out = run(book, Input::NewOrder { client: client.clone(), request, redelivered: false, sent: None });
     match out.as_slice() {
         [Output::NewOrder { .. }] => Ok(()),
         [Output::Report { report, .. }] => {
@@ -2645,7 +2666,7 @@ fn day(hour: u32) -> Day {
 }
 
 fn day_started(client: &str, day: Day) -> Input {
-    Input::DayStarted { client: client.into(), day }
+    Input::DaysStarted { days: vec![(client.into(), day)] }
 }
 
 /// What a new order from FUNDA was answered with: the venue's order, or the reject's reason.
@@ -2666,7 +2687,7 @@ fn a_new_day_drops_the_sessions_done_orders_and_keeps_its_live_ones() {
     new_order(&mut book, "C1");
     run(&mut book, venue_report("1", Status::Filled, 100, 100));
     new_order(&mut book, "C2");
-    run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: request("C1"), redelivered: false });
+    run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: request("C1"), redelivered: false, sent: None });
     run(&mut book, venue_report("3", Status::Filled, 100, 100));
 
     assert!(run(&mut book, day_started("FUNDA", day(2))).is_empty());
@@ -2720,4 +2741,105 @@ fn a_first_or_earlier_day_drops_nothing() {
     assert_eq!(book.day(&"FUNDA".into()), Some(day(2)));
     assert!(book.order(OrderId(1)).is_some());
     assert_eq!(answer(&new_order(&mut book, "C1")), Some(RejectReason::Duplicate));
+}
+
+/// A redelivered order the book doesn't know is rejected if it was first sent before its
+/// session's day began, since the book forgot that day's done orders; one sent since, or that
+/// doesn't say when, is booked. One the book knows is answered with its state, as always.
+#[test]
+fn a_redelivered_order_from_a_previous_day_is_rejected() {
+    let mut book = book();
+    run(&mut book, day_started("FUNDA", day(1)));
+    let sent_at = |cl_ord_id: &str, hour: Option<u32>, redelivered: bool| Input::NewOrder {
+        client: "FUNDA".into(),
+        request: request(cl_ord_id),
+        redelivered,
+        sent: hour.map(|hour| day(hour).0),
+    };
+    let resent = |cl_ord_id: &str, hour: Option<u32>| sent_at(cl_ord_id, hour, true);
+    // The first day began whenever: nothing is from before it.
+    assert_eq!(answer(&run(&mut book, resent("C1", Some(0)))), None);
+    run(&mut book, day_started("FUNDA", day(2)));
+    let out = run(&mut book, resent("C2", Some(0)));
+    assert_eq!(answer(&out), Some(RejectReason::Duplicate));
+    let [Output::Report { report, .. }] = out.as_slice() else { unreachable!() };
+    assert_eq!(report.text.as_deref(), Some("ClOrdID from a previous trading day"));
+    assert_eq!(answer(&run(&mut book, resent("C3", Some(1)))), None);
+    assert_eq!(answer(&run(&mut book, resent("C4", None))), None);
+    assert_eq!(answer(&run(&mut book, sent_at("C5", Some(0), false))), None);
+    // C1 is live, so known: its state.
+    let out = run(&mut book, resent("C1", Some(0)));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.exec_type, report.reject), (ExecType::Status, None));
+}
+
+/// A redelivered cancel naming an order dropped at the end of its day is refused as unknown.
+#[test]
+fn a_cancel_for_an_order_dropped_at_the_days_end_is_refused_as_unknown() {
+    let mut book = book();
+    run(&mut book, day_started("FUNDA", day(1)));
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::Filled, 100, 100));
+    run(&mut book, day_started("FUNDA", day(2)));
+    let Input::Cancel { client, cl_ord_id, orig_cl_ord_id, side, symbol, .. } = cancel_input("C2", "C1") else {
+        unreachable!()
+    };
+    let resent = Input::Cancel { client, cl_ord_id, orig_cl_ord_id, side, symbol, redelivered: true };
+    assert_eq!(cancel_reject(&run(&mut book, resent)).3, CancelRejectReason::UnknownOrder);
+}
+
+/// Several sessions roll in one input, each its own way; one the book hasn't seen only records
+/// its day.
+#[test]
+fn several_sessions_roll_at_once() {
+    let mut book = book();
+    let from = |client: &str, cl_ord_id: &str| Input::NewOrder {
+        client: client.into(),
+        request: request(cl_ord_id),
+        redelivered: false,
+        sent: None,
+    };
+    let days = |clients: &[&str], day: Day| Input::DaysStarted {
+        days: clients.iter().map(|client| (ClientId::from(*client), day)).collect(),
+    };
+    run(&mut book, days(&["FUNDA", "FUNDB"], day(1)));
+    run(&mut book, from("FUNDA", "A1"));
+    run(&mut book, venue_report("1", Status::Filled, 100, 100));
+    run(&mut book, from("FUNDB", "B1"));
+    run(&mut book, venue_report("2", Status::Canceled, 0, 0));
+    run(&mut book, from("FUNDB", "B2"));
+    run(&mut book, from("FUNDC", "C1"));
+    run(&mut book, venue_report("4", Status::Filled, 100, 100));
+
+    run(&mut book, days(&["FUNDA", "FUNDB", "FUNDC"], day(2)));
+    assert!(book.order(OrderId(1)).is_none() && book.order(OrderId(2)).is_none());
+    assert!(book.order(OrderId(3)).is_some() && book.order(OrderId(4)).is_some());
+    assert!(!book.used.contains_key(&ClientId::from("FUNDA")));
+    assert_eq!(book.used[&ClientId::from("FUNDB")], 1);
+    assert_eq!(book.day(&"FUNDC".into()), Some(day(2)));
+}
+
+/// A live order crosses the roll with every ClOrdID it has used, a replace's and an outstanding
+/// cancel's too; the cancel's answer still reaches the client, and once done, the order goes at
+/// the next roll.
+#[test]
+fn a_live_order_with_a_replace_and_a_cancel_crosses_the_roll() {
+    let mut book = book();
+    run(&mut book, day_started("FUNDA", day(1)));
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    replace(&mut book, "C2", "C1", 80, 11);
+    run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    cancel(&mut book, "C3", "C2");
+    run(&mut book, day_started("FUNDA", day(2)));
+    assert_eq!(book.used[&ClientId::from("FUNDA")], 3);
+    for used in ["C1", "C2", "C3"] {
+        assert_eq!(answer(&new_order(&mut book, used)), Some(RejectReason::Duplicate), "{used}");
+    }
+    let out = run(&mut book, venue_report("1-2", Status::Canceled, 0, 0));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.cl_ord_id.as_str(), report.exec_type), ("C3", ExecType::Canceled));
+    run(&mut book, day_started("FUNDA", day(3)));
+    assert!(book.order(OrderId(1)).is_none());
+    assert_eq!(answer(&new_order(&mut book, "C1")), None);
 }

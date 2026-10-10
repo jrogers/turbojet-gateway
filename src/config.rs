@@ -2,7 +2,7 @@
 //!
 //! ```toml
 //! sessions = "sessions.toml"      # relative to this file
-//! day_end = "17:00 America/New_York"  # when a session with no schedule ends its trading day
+//! day_end = "17:00 America/New_York"  # when client sessions' trading days end
 //!
 //! [[route]]                       # first match wins
 //! client = "FUNDA"                # SenderCompID; any, if left out
@@ -34,9 +34,9 @@
 //! `sessions` key is read at start only: a reload rereads the routes and limits, and the sessions
 //! file in use.
 //!
-//! A client session's trading day is its schedule's period, from the sessions file; a session
-//! with none ends its day at `day_end`: a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`, an
-//! offset (`+05:30`) or an IANA name, UTC if left out. Midnight UTC if `day_end` is left out.
+//! A client session's trading day ends at `day_end`, or sooner when its schedule's period (from
+//! the sessions file) ends. `day_end` is a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`,
+//! an offset (`+05:30`) or an IANA name, UTC if left out; midnight UTC if left out.
 //!
 //! Turbojet-config's `validation` feature stays off: a dictionary on a venue initiator would
 //! reject venue reports with custom codes before the gateway sees them.
@@ -124,8 +124,8 @@ pub fn reload(path: &Path, venues: &[String]) -> Result<(Router, risk::Config, S
 }
 
 /// `day_end` as written, `HH:MM[:SS] [ZONE]`, as a schedule whose periods run from one end of day
-/// to the next, so the period containing a time is its trading day, as for a session with a
-/// schedule. Turbojet's schedules read the time and zone, and handle daylight saving.
+/// to the next: the period containing a time ends when its trading day does, at the latest.
+/// Turbojet's schedules read the time and zone, and handle daylight saving.
 ///
 /// # Errors
 ///
@@ -541,7 +541,6 @@ self_trade = false
         assert!(warnings(&Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ")])).is_empty());
     }
 
-    /// The example files the readme shows load.
     /// When the trading day containing `time` (RFC 3339) ends, by `day_end`.
     fn day_ends(day_end: &SessionSchedule, time: &str) -> String {
         let time = time.parse().unwrap();
@@ -583,6 +582,7 @@ self_trade = false
         assert_eq!(reloaded, day_end("17:00").unwrap());
     }
 
+    /// The example files the readme shows load.
     #[test]
     fn the_examples_load() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/jetbridge.toml");

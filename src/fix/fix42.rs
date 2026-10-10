@@ -142,7 +142,7 @@ fn new_order(client: ClientId, order: fix::NewOrderSingleRef<'_>, redelivered: b
         ex_destination: order.ex_destination.map(CompactString::from),
         time_in_force: order.time_in_force.map(time_in_force_in).transpose()?,
     };
-    Ok(Input::NewOrder { client, request, redelivered })
+    Ok(Input::NewOrder { client, request, redelivered, sent: None })
 }
 
 fn cancel(client: ClientId, cancel: fix::OrderCancelRequestRef<'_>, redelivered: bool) -> Result<Input, MessageReject> {
@@ -733,7 +733,7 @@ mod tests {
         let mut order = limit_order();
         order.time_in_force = Some(fix::TimeInForce::ImmediateOrCancel);
         let msg = order.to_message();
-        let Input::NewOrder { client, request: parsed, redelivered } = client_input(&client(), &msg, true).unwrap()
+        let Input::NewOrder { client, request: parsed, redelivered, .. } = client_input(&client(), &msg, true).unwrap()
         else {
             panic!()
         };

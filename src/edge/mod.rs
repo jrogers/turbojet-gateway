@@ -48,8 +48,8 @@ pub const MAX_SESSIONS_PER_COMP_ID: usize = 16;
 /// quiet session's day rolls within a second of its end.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Each client CompID's schedule, if it has one (the sessions file's, say): its sessions'
-/// trading day is the schedule's period. See [`Gateway::with_days`].
+/// Each client CompID's schedule, if it has one (the sessions file's, say): its sessions' trading
+/// day ends with the schedule's period, or at `day_end` within it. See [`Gateway::with_days`].
 #[derive(Clone)]
 pub struct Schedules(pub Arc<ScheduleOf>);
 
@@ -145,10 +145,10 @@ impl Gateway {
         self
     }
 
-    /// Each client session's trading day is its CompID's schedule's period, from `schedules`; a
-    /// session with none ends its day at `day_end`'s period ends (see
-    /// [`config::day_end`](crate::config::day_end)). By default every session's day ends at
-    /// midnight UTC. See [`Input::DayStarted`] for what a new day changes.
+    /// Each client session's trading day ends at `day_end`'s period ends (see
+    /// [`config::day_end`](crate::config::day_end)), or sooner when its CompID's schedule's period
+    /// ends, from `schedules`. By default every session's day ends at midnight UTC, and none has a
+    /// schedule. See [`Input::DaysStarted`] for what a new day changes.
     #[must_use]
     pub fn with_days(mut self, day_end: SessionSchedule, schedules: Schedules) -> Self {
         let state = self.state.get_mut().expect("nothing has used the gateway yet");
@@ -163,8 +163,8 @@ impl Gateway {
         self
     }
 
-    /// Ends the days of sessions with no schedule at `day_end`'s period ends from each one's
-    /// next new day on: the day each is in ends when it was going to.
+    /// Ends the sessions' days at `day_end`'s period ends from each one's next new day on: the
+    /// day each is in ends when it was going to.
     pub fn set_day_end(&self, day_end: SessionSchedule) {
         self.lock().day_end = day_end;
     }
@@ -352,24 +352,25 @@ impl Gateway {
     /// so the input lands in the day it arrived in.
     fn handle_from(self: &Arc<Self>, client: &ClientId, input: Input) {
         let mut state = self.lock();
-        let new_day = new_day(&state, client, self.clock.now());
+        let new_day = new_day(&state, client, self.clock.now()).map(|day| Input::DaysStarted { days: vec![day] });
         self.handle_locked(&mut state, new_day.into_iter().chain([input]));
     }
 
     /// One tick's roll: every session whose trading day has ended, quiet ones too, starts its
-    /// next, freeing what the book kept for its done orders.
+    /// next, freeing what the book kept for its done orders. One input for all of them, so the
+    /// book walks its orders once.
     fn roll_days(self: &Arc<Self>) {
         let mut state = self.lock();
         let now = self.clock.now();
         let state_now = &*state;
-        let inputs: Vec<Input> = state_now
+        let days: Vec<(ClientId, Day)> = state_now
             .book
             .days()
             .filter(|(_, day)| now >= day.0)
             .filter_map(|(client, _)| new_day(state_now, client, now))
             .collect();
-        if !inputs.is_empty() {
-            self.handle_locked(&mut state, inputs);
+        if !days.is_empty() {
+            self.handle_locked(&mut state, [Input::DaysStarted { days }]);
         }
     }
 
@@ -502,25 +503,27 @@ impl Gateway {
     }
 }
 
-/// When `client`'s trading day ends, as of `now`: the end of its schedule's period containing
-/// `now`, or between periods, of the next one, since a day ends when its period does; with no
-/// schedule, the next of `day_end`'s. `None` for a schedule with no period ahead.
+/// When `client`'s trading day ends, as of `now`: at the next `day_end`, or sooner, when its
+/// schedule's period ends (the period containing `now`, or between periods the next one). So a
+/// weekly period is several days, each ending at `day_end`, the last when the period does, and a
+/// session without a schedule, or whose schedule has no period ahead, ends its day at `day_end`.
+/// `None` only if `day_end` has no period at `now`, which its periods, end to end, rule out.
 fn day_of(state: &State, client: &ClientId, now: DateTime<Utc>) -> Option<Day> {
-    let schedule = (state.schedules.0)(client.comp_id());
-    let schedule = schedule.as_ref().unwrap_or(&state.day_end);
-    let period = schedule.period_at(now).or_else(|| schedule.period_at(schedule.next_start(now)?))?;
-    Some(Day(period.end))
+    let day_end = state.day_end.period_at(now)?.end;
+    let Some(schedule) = (state.schedules.0)(client.comp_id()) else { return Some(Day(day_end)) };
+    let period = schedule.period_at(now).or_else(|| schedule.period_at(schedule.next_start(now)?));
+    Some(Day(period.map_or(day_end, |period| period.end.min(day_end))))
 }
 
-/// The input starting `client`'s next trading day, if the one the book has for it has ended or
-/// it has none yet. A day is known by its end, so until then there's nothing to look up.
-fn new_day(state: &State, client: &ClientId, now: DateTime<Utc>) -> Option<Input> {
+/// `client` and its next trading day, if the one the book has for it has ended or it has none
+/// yet. A day is known by its end, so until then there's nothing to look up.
+fn new_day(state: &State, client: &ClientId, now: DateTime<Utc>) -> Option<(ClientId, Day)> {
     let current = state.book.day(client);
     if current.is_some_and(|day| now < day.0) {
         return None;
     }
     let day = day_of(state, client, now)?;
-    (current != Some(day)).then(|| Input::DayStarted { client: client.clone(), day })
+    (current != Some(day)).then(|| (client.clone(), day))
 }
 
 /// The acceptor's application: clients, each its own session (see [`ClientId`]).
@@ -547,7 +550,10 @@ impl Application for ClientApp {
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
         let client = self.0.client(ctx.session_id());
         let redelivered = ctx.maybe_redelivered() || fix::possibly_resent(msg);
-        let input = self.0.client_version.client_input(&client, msg, redelivered)?;
+        let mut input = self.0.client_version.client_input(&client, msg, redelivered)?;
+        if let Input::NewOrder { redelivered: true, sent, .. } = &mut input {
+            *sent = fix::first_sent(msg);
+        }
         self.0.handle_from(&client, input);
         Ok(())
     }
@@ -927,10 +933,10 @@ mod tests {
             ex_destination: None,
             time_in_force: None,
         };
-        gateway
-            .lock()
-            .book
-            .handle(Input::NewOrder { client: "FUNDA".into(), request, redelivered: false }, &mut Vec::new());
+        gateway.lock().book.handle(
+            Input::NewOrder { client: "FUNDA".into(), request, redelivered: false, sent: None },
+            &mut Vec::new(),
+        );
     }
 
     fn unsent(gateway: &Gateway) -> Vec<bool> {
@@ -1003,13 +1009,21 @@ mod tests {
 
     /// FUNDA sends order `cl_ord_id`; with no venue set, it's booked and rejected, so it's done.
     fn send_order(gateway: &Arc<Gateway>, cl_ord_id: &str) {
-        let funda = session("FIX.4.4", "FUNDA");
-        ClientApp(gateway.clone()).on_message(&mut Context::new(&funda), &order(cl_ord_id)).unwrap();
+        send_message(gateway, "FUNDA", &order(cl_ord_id));
     }
 
-    /// With a schedule, the day is its period: the first message after the period ends starts the
-    /// next day before it's handled, so a done order's ClOrdID is free again for it. Between
-    /// periods, the day is the next period's.
+    fn send_message(gateway: &Arc<Gateway>, comp_id: &str, msg: &Message) {
+        let client = session("FIX.4.4", comp_id);
+        ClientApp(gateway.clone()).on_message(&mut Context::new(&client), msg).unwrap();
+    }
+
+    fn set(now: &Mutex<DateTime<Utc>>, time: &str) {
+        *now.lock().unwrap() = at(time);
+    }
+
+    /// With a schedule, the day ends with its period: the first message after the period ends
+    /// starts the next day before it's handled, so a done order's ClOrdID is free again for it.
+    /// Between periods, the day ends at the next `day_end`, sooner than the next period does.
     #[tokio::test]
     async fn a_message_after_the_sessions_period_ends_starts_its_next_day() {
         let daily: SessionSchedule = "daily 08:00-17:00".parse().unwrap();
@@ -1019,10 +1033,63 @@ mod tests {
         assert_eq!(day_ends(&gateway), Some(at("2026-10-10T17:00:00Z")));
         *now.lock().unwrap() = at("2026-10-10T17:00:00Z");
         send_order(&gateway, "C1");
-        assert_eq!(day_ends(&gateway), Some(at("2026-10-11T17:00:00Z")));
+        assert_eq!(day_ends(&gateway), Some(at("2026-10-11T00:00:00Z")));
         let state = gateway.lock();
         assert!(state.book.order(OrderId(1)).is_none());
         assert_eq!(state.book.order(OrderId(2)).unwrap().request.cl_ord_id, "C1");
+    }
+
+    /// A weekly period is a day per `day_end`, the last ending with the period; the weekend
+    /// between periods ends at the next `day_end`.
+    #[tokio::test]
+    async fn a_weekly_period_rolls_at_each_day_end_and_at_its_end() {
+        let weekly: SessionSchedule = "weekly sun 17:00-fri 17:00".parse().unwrap();
+        let (gateway, now) = gateway_at_noon(Schedules(Arc::new(move |_| Some(weekly.clone()))));
+        set(&now, "2026-10-12T12:00:00Z");
+        send_order(&gateway, "C1");
+        assert_eq!(day_ends(&gateway), Some(at("2026-10-13T00:00:00Z")));
+        for (time, ends) in [
+            ("2026-10-13T00:00:00Z", "2026-10-14T00:00:00Z"),
+            ("2026-10-16T00:00:01Z", "2026-10-16T17:00:00Z"),
+            ("2026-10-16T17:00:00Z", "2026-10-17T00:00:00Z"),
+            ("2026-10-17T00:00:00Z", "2026-10-18T00:00:00Z"),
+        ] {
+            set(&now, time);
+            gateway.roll_days();
+            assert_eq!(day_ends(&gateway), Some(at(ends)), "at {time}");
+        }
+        assert!(gateway.lock().book.order(OrderId(1)).is_none());
+    }
+
+    /// One tick rolls every session whose day has ended.
+    #[tokio::test]
+    async fn one_tick_rolls_several_sessions() {
+        let (gateway, now) = gateway_at_noon(Schedules(Arc::new(|_| None)));
+        send_message(&gateway, "FUNDA", &order("C1"));
+        send_message(&gateway, "FUNDB", &order("C1"));
+        set(&now, "2026-10-11T00:00:00Z");
+        gateway.roll_days();
+        let state = gateway.lock();
+        assert!(state.book.order(OrderId(1)).is_none() && state.book.order(OrderId(2)).is_none());
+        for client in ["FUNDA", "FUNDB"] {
+            assert_eq!(state.book.day(&client.into()).map(|day| day.0), Some(at("2026-10-12T00:00:00Z")));
+        }
+    }
+
+    /// A possible resend of an order the book doesn't know, first sent before the session's day
+    /// began (by OrigSendingTime), is rejected rather than booked; one first sent since is booked.
+    #[tokio::test]
+    async fn a_resent_order_from_before_the_day_began_is_rejected() {
+        let (gateway, now) = gateway_at_noon(Schedules(Arc::new(|_| None)));
+        send_order(&gateway, "C1");
+        set(&now, "2026-10-11T00:00:05Z");
+        let resent = |cl_ord_id: &str, first_sent: &str| {
+            order(cl_ord_id).with(tags::POSS_DUP_FLAG, "Y").with(tags::ORIG_SENDING_TIME, first_sent)
+        };
+        send_message(&gateway, "FUNDA", &resent("C2", "20261010-23:59:59.000"));
+        assert!(gateway.lock().book.order(OrderId(2)).is_none());
+        send_message(&gateway, "FUNDA", &resent("C3", "20261011-00:00:00.000"));
+        assert_eq!(gateway.lock().book.order(OrderId(2)).unwrap().request.cl_ord_id, "C3");
     }
 
     /// A session without a schedule ends its day at `day_end`, and the tick rolls it while it's
