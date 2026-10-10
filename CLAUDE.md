@@ -1,0 +1,10 @@
+# Working on Jetbridge
+
+Jetbridge is a FIX connectivity gateway built on the Turbojet engine (`../turbojet`, by path).
+
+- House style is Turbojet's [STYLE.md](../turbojet/STYLE.md); read it before writing code.
+- Plans and working notes go in `docs/plans/` (gitignored).
+- Feature branches are git worktrees under `.worktrees/` (gitignored).
+- Commits are small and each says why.
+- Before committing: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`.
+- Engine bugs found here are fixed in the Turbojet repo, in their own commits.

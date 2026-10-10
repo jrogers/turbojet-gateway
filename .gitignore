@@ -1,0 +1,5 @@
+/target
+/docs/plans
+/.worktrees
+/web/node_modules
+/web/dist
