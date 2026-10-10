@@ -401,8 +401,12 @@ impl Book {
             return tracing::warn!(%venue, downstream = %report.downstream, "execution report for an unknown order");
         };
         // Rejected under a cancel's or replace's ClOrdID is about that request, not the order.
-        if report.status == Status::Rejected && sent.kind.is_some() {
-            return self.refuse_request(venue, &report.downstream, sent, None, report.text, out);
+        // Some venues refuse an amendment with ExecType=8 and the order's live OrdStatus: that
+        // status stands, as an OrderCancelReject's would.
+        let rejected = report.status == Status::Rejected || report.exec_type == ExecType::Rejected;
+        if rejected && sent.kind.is_some() {
+            let status = (report.status != Status::Rejected).then_some(report.status);
+            return self.refuse_request(venue, &report.downstream, sent, status, report.text, out);
         }
         let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind, .. } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
@@ -414,7 +418,7 @@ impl Book {
         }
         let pending_here = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
         // Any answer under the replace's ClOrdID but these means the venue took it.
-        let accepted = pending_here && !matches!(report.status, Status::PendingReplace | Status::Rejected);
+        let accepted = pending_here && !rejected && report.status != Status::PendingReplace;
         // A cancel's reports and a pending replace's (up to the one accepting it) answer that
         // request; any other report is about the order, under the client's latest ClOrdID.
         let answers_request = match kind {
@@ -1322,6 +1326,44 @@ mod tests {
         assert!(order.pending.is_none());
         // The order is still live, so it can still be cancelled.
         assert!(matches!(cancel(&mut book, "C3", "C1").as_slice(), [Output::Cancel { .. }]));
+    }
+
+    #[test]
+    fn exec_type_rejected_under_a_replace_rejects_the_replace() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        replace(&mut book, "C2", "C1", 80, 11);
+        // Some venues refuse an amendment with ExecType=8 and the order's live OrdStatus.
+        let out = run(&mut book, venue_report_as("1-1", ExecType::Rejected, Status::New, 0, 0));
+        assert_eq!(
+            cancel_reject(&out),
+            (Some(OrderId(1)), CancelKind::Replace, Status::New, CancelRejectReason::Other)
+        );
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, &order.request, order.downstream.as_str()), (Status::New, &request("C1"), "1"));
+        assert!(order.pending.is_none());
+    }
+
+    #[test]
+    fn exec_type_rejected_under_a_cancel_rejects_the_cancel() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        cancel(&mut book, "C2", "C1");
+        let out = run(&mut book, venue_report_as("1-1", ExecType::Rejected, Status::New, 0, 0));
+        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    #[test]
+    fn a_restatement_passes_through() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        let out = run(&mut book, venue_report_as("1", ExecType::Restated, Status::New, 0, 0));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.exec_type, report.status), (ExecType::Restated, Status::New));
     }
 
     #[test]
