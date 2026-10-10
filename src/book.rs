@@ -241,7 +241,8 @@ impl Book {
     pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
         match input {
             Input::NewOrder { client, request, redelivered } => self.new_order(client, request, redelivered, out),
-            Input::Cancel { .. } | Input::VenueReport { .. } | Input::VenueCancelReject { .. } => todo!(),
+            Input::VenueReport { venue, report } => self.venue_report(&venue, report, out),
+            Input::Cancel { .. } | Input::VenueCancelReject { .. } => todo!(),
         }
     }
 
@@ -288,6 +289,30 @@ impl Book {
         };
         let previous = self.orders.insert(id, order);
         debug_assert!(previous.is_none(), "order {id:?} booked twice");
+    }
+
+    fn venue_report(&mut self, venue: &VenueId, report: VenueReport, out: &mut Vec<Output>) {
+        let Some((id, cl_ord_id)) = self.downstream.get(&report.downstream).cloned() else {
+            return tracing::warn!(%venue, downstream = %report.downstream, "execution report for an unknown order");
+        };
+        let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
+        if order.venue != *venue {
+            return tracing::warn!(%venue, downstream = %report.downstream, "execution report for another venue's order");
+        }
+        // Fills are known by LastQty, not status: a fill on an order pending cancel says PendingCancel.
+        if report.last_qty > Decimal::ZERO && report.cum_qty <= order.cum_qty {
+            return tracing::debug!(%venue, downstream = %report.downstream, "resent fill dropped");
+        }
+        let orig_cl_ord_id = (cl_ord_id != order.request.cl_ord_id).then(|| order.request.cl_ord_id.clone());
+        order.status = report.status;
+        order.cum_qty = report.cum_qty;
+        order.avg_px = report.avg_px;
+        let mut client_report = order.report(&cl_ord_id, ReportKind::Event);
+        client_report.orig_cl_ord_id = orig_cl_ord_id;
+        client_report.last_qty = report.last_qty;
+        client_report.last_px = report.last_px;
+        client_report.text = report.text;
+        out.push(Output::Report { client: order.client.clone(), report: client_report });
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
@@ -464,5 +489,55 @@ mod tests {
         let out = new_order(&mut book, "C1");
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(report.reject, Some(RejectReason::TooManyOrders));
+    }
+
+    fn venue_report(downstream: &str, status: Status, last_qty: i64, cum_qty: i64) -> Input {
+        Input::VenueReport {
+            venue: "NASDAQ".into(),
+            report: VenueReport {
+                downstream: downstream.into(),
+                status,
+                last_qty: Decimal::from(last_qty),
+                last_px: Decimal::from(10),
+                cum_qty: Decimal::from(cum_qty),
+                avg_px: Decimal::from(10),
+                text: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_fill_goes_back_under_the_clients_cl_ord_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((client.as_str(), report.cl_ord_id.as_str()), ("FUNDA", "C1"));
+        assert_eq!((report.last_qty, report.cum_qty, report.leaves_qty), (40.into(), 40.into(), 60.into()));
+        assert_eq!(report.kind, ReportKind::Event);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PartiallyFilled);
+    }
+
+    #[test]
+    fn a_resent_fill_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        assert!(run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().cum_qty, Decimal::from(40));
+    }
+
+    #[test]
+    fn a_report_for_an_unknown_order_is_not_forwarded() {
+        let mut book = book();
+        assert!(run(&mut book, venue_report("99", Status::New, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn a_report_from_another_venue_is_not_forwarded() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let Input::VenueReport { report, .. } = venue_report("1", Status::New, 0, 0) else { unreachable!() };
+        assert!(run(&mut book, Input::VenueReport { venue: "LSE".into(), report }).is_empty());
     }
 }
