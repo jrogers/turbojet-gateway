@@ -121,6 +121,9 @@ struct State {
     /// Those orders' downstream ClOrdIDs, and their cancels': the venue's reports under them are
     /// logged, not handed to the book.
     orphan_ids: HashSet<CompactString>,
+    /// Requests the store has as sent that each venue's session never stored, to send at its next
+    /// logon: see [`orphans`].
+    unsent: HashMap<VenueId, Vec<CompactString>>,
 }
 
 #[derive(Debug)]
@@ -141,6 +144,7 @@ impl Gateway {
             schedules: Schedules(Arc::new(|_| None)),
             orphan_cancels: HashMap::new(),
             orphan_ids: HashSet::new(),
+            unsent: HashMap::new(),
         };
         Self {
             state: Mutex::new(state),
@@ -772,11 +776,15 @@ impl Application for VenueApp {
         }
     }
 
-    /// The gateway's cancels that couldn't be sent to the venue go now.
+    /// The requests a stop kept from the venue, and the gateway's cancels that couldn't be sent
+    /// to it, go now.
     fn on_logon(&self, session: &SessionHandle) {
         let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
         if let Some(venue) = venue {
-            self.0.handle(Input::VenueUp { venue: venue.clone() });
+            // Sent before anything the book sends now, as they would have been.
+            let unsent = self.0.lock().unsent.remove(&venue).unwrap_or_default();
+            let unsent = unsent.into_iter().map(|downstream| Input::Unsent { venue: venue.clone(), downstream });
+            self.0.handle_all(unsent.chain([Input::VenueUp { venue: venue.clone() }]));
             self.0.send_orphan_cancels(&venue);
         }
     }
@@ -2124,7 +2132,7 @@ pub(crate) mod tests {
         store_sent(&venues, &id(), &[orphan, order("OLDOLD2"), order("FOREIGN1")]);
 
         let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues.clone())]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 3, orders: 1, amendments: 0 });
+        assert_eq!(found, Orphans { scanned: 3, orders: 1, amendments: 0, unsent: 0 });
         let (addr, mut events) = venue_expecting(4).await;
         let venue_store: Arc<dyn SessionStorage> = venues.clone();
         start_venue(&gateway, &addr, venues);
@@ -2183,7 +2191,7 @@ pub(crate) mod tests {
         (replace.symbol, replace.order_qty, replace.price) = (Some("AAPL".into()), Some(200.into()), Some(10.into()));
         store_sent(&venues, &id(), &[order("OLDOLD5"), replace.to_message()]);
         let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 2, orders: 1, amendments: 0 });
+        assert_eq!(found, Orphans { scanned: 2, orders: 1, amendments: 0, unsent: 0 });
         let state = gateway.lock();
         let [orphan] = state.orphan_cancels[VENUE].as_slice() else { panic!() };
         assert_eq!(orphan.cancel.get(tags::ORIG_CL_ORD_ID), Some("OLDOLD5-1"));
@@ -2278,7 +2286,7 @@ pub(crate) mod tests {
         orphan.symbol = Some("AAPL".into());
         store_sent(&venues, &id, &[orphan.to_message()]);
         let found = after.cancel_orphans(&store, vec![(VENUE.into(), id, venues.clone())]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 1, orders: 0, amendments: 1 });
+        assert_eq!(found, Orphans { scanned: 1, orders: 0, amendments: 1, unsent: 0 });
         assert_eq!(unsent(&after), [true]);
         after.committed().await;
         assert!(store.unknown_downstreams(&["OLDOLD1-1".into()]).await.unwrap().is_empty(), "recorded");

@@ -320,6 +320,53 @@ impl Book {
         out.push(Output::Report { client: order.client.clone(), report });
     }
 
+    /// See [`Input::Unsent`](super::Input::Unsent).
+    pub(super) fn unsent(&mut self, venue: &VenueId, downstream: CompactString, out: &mut Vec<Output>) {
+        let Some(sent) = self.downstream.get(&downstream) else {
+            return tracing::warn!(%venue, %downstream, "an unknown request to send again");
+        };
+        let order = &self.orders[&sent.order];
+        let resendable = !sent.answered && !order.status.is_done() && order.venue == *venue;
+        let output = match sent.kind {
+            _ if !resendable => None,
+            None => (order.status == Status::PendingNew).then(|| Output::NewOrder {
+                venue: venue.clone(),
+                downstream: downstream.clone(),
+                request: order.request.clone(),
+            }),
+            Some(CancelKind::Cancel) => Some(Output::Cancel {
+                venue: venue.clone(),
+                downstream: downstream.clone(),
+                orig_downstream: order.downstream.clone(),
+                request: order.request.clone(),
+                venue_order_id: order.venue_order_id.clone(),
+            }),
+            Some(CancelKind::Replace) => order.pending.as_ref().filter(|p| p.downstream == downstream).map(|p| {
+                let request = OrderRequest {
+                    qty: p.qty,
+                    price: p.price,
+                    ord_type: p.ord_type,
+                    time_in_force: p.time_in_force,
+                    ..order.request.clone()
+                };
+                Output::Replace {
+                    venue: venue.clone(),
+                    downstream: downstream.clone(),
+                    orig_downstream: order.downstream.clone(),
+                    request,
+                    venue_order_id: order.venue_order_id.clone(),
+                }
+            }),
+        };
+        match output {
+            Some(output) => {
+                tracing::warn!(%venue, %downstream, "sending again a request the venue's session never stored");
+                out.push(output);
+            }
+            None => self.send_failed(venue, &downstream, "not sent before the gateway restarted".into(), out),
+        }
+    }
+
     /// The venue refused the cancel or replace `sent` under `downstream`, by OrderCancelReject or
     /// by a Rejected ExecutionReport: tell the client, under the ClOrdIDs of its own request.
     /// Anything that doesn't name such a request is dropped.

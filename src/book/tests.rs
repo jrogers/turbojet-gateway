@@ -3249,3 +3249,40 @@ fn an_orphaned_replace_waits_for_the_pending_replaces_answer() {
     // What's stored from here restores the same book.
     assert_eq!(restored(&book).snapshot(), book.snapshot());
 }
+
+fn unsent(downstream: &str) -> Input {
+    Input::Unsent { venue: "NASDAQ".into(), downstream: downstream.into() }
+}
+
+/// What a request was sent as, `Unsent` sends again: an order, a cancel and a replace, listed by
+/// `unanswered` in the order they went.
+#[test]
+fn an_unsent_request_goes_again_as_it_was_sent() {
+    let mut book = book();
+    let order = new_order(&mut book, "C1");
+    let cancel = cancel(&mut book, "C2", "C1");
+    new_order(&mut book, "C3");
+    run(&mut book, venue_report("2", Status::New, 0, 0));
+    let replace = replace(&mut book, "C4", "C3", 80, 11);
+    assert_eq!(book.unanswered(&"NASDAQ".into()), ["1", "1-1", "2-1"]);
+    for (downstream, sent) in [("1", order), ("1-1", cancel), ("2-1", replace)] {
+        assert_eq!(run(&mut book, unsent(downstream)), sent, "{downstream}");
+    }
+}
+
+/// One answered since, or whose order is done, isn't sent again: an order the venue acked is
+/// left alone, and a cancel of an order filled since is refused, as a failed send.
+#[test]
+fn an_unsent_request_answered_since_is_not_sent_again() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    cancel(&mut book, "C2", "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    assert_eq!(book.unanswered(&"NASDAQ".into()), ["1-1"]);
+    assert!(run(&mut book, unsent("1")).is_empty());
+    run(&mut book, venue_report("1", Status::Filled, 100, 100));
+    assert!(book.unanswered(&"NASDAQ".into()).is_empty());
+    let out = run(&mut book, unsent("1-1"));
+    assert_eq!(cancel_reject(&out).1, CancelKind::Cancel);
+    assert_eq!(cancel_reject(&out).2, Status::Filled);
+}

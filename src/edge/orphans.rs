@@ -17,6 +17,13 @@
 //! Each orphan is recorded once handled (see [`Changes::orphans`]), so a restart doesn't take it
 //! again.
 //!
+//! The scan also finds the converse: requests the database has as sent, unanswered, that the
+//! venue's session never stored, so never sent (the gateway stopped after their change committed,
+//! before the session stored them). They go at the venue's next logon as they were
+//! ([`Input::Unsent`]). A request gone from the store for another reason (a sequence reset, or
+//! evicted from a full store) looks the same, and goes again too: the venue may refuse it as a
+//! duplicate.
+//!
 //! ponytail: the whole of each venue's store is read and decoded, every start, in windows of
 //! [`SCAN_WINDOW`], and its requests looked up: a million stored NewOrderSingles, all ours, took
 //! 3.9 s (2.2 s reading and decoding, 1.7 s looking up), a release build on an M3 from a
@@ -53,6 +60,8 @@ pub struct Orphans {
     pub orders: usize,
     /// Cancels and replaces of orders the book holds, which the gateway is cancelling.
     pub amendments: usize,
+    /// Requests the database has that the venues' sessions never stored, to send at their logons.
+    pub unsent: usize,
 }
 
 /// The cancel of an order the database never had, waiting for its venue's logon.
@@ -106,6 +115,7 @@ impl Gateway {
             let requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
             self.check_prefix(&venue, &requests)?;
             let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
+            found.unsent += self.find_unsent(&venue, &ids);
             let chains = chains(requests);
             ids.extend(chains.keys().cloned());
             let unknown: HashSet<CompactString> = store.unknown_downstreams(&ids).await?.into_iter().collect();
@@ -124,9 +134,26 @@ impl Gateway {
             scanned = found.scanned,
             orders = found.orders,
             amendments = found.amendments,
-            "looked for venue requests the database lacks"
+            unsent = found.unsent,
+            "looked for venue requests the database lacks, and the converse"
         );
         Ok(found)
+    }
+
+    /// Keeps for `venue`'s next logon the requests the book has as sent to it, unanswered, that
+    /// aren't among those its session `stored`, returning how many.
+    fn find_unsent(&self, venue: &VenueId, stored: &[CompactString]) -> usize {
+        let stored: HashSet<&CompactString> = stored.iter().collect();
+        let mut state = self.lock();
+        let unsent: Vec<CompactString> =
+            state.book.unanswered(venue).into_iter().filter(|downstream| !stored.contains(downstream)).collect();
+        if unsent.is_empty() {
+            return 0;
+        }
+        warn!(%venue, ?unsent, "the database has requests the venue's session never stored: sending them at its logon");
+        let count = unsent.len();
+        state.unsent.insert(venue.clone(), unsent);
+        count
     }
 
     /// Refuses a request under this start's prefix: its IDs would be this start's orders'.

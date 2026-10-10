@@ -400,6 +400,14 @@ pub enum Input {
         downstream: CompactString,
         text: CompactString,
     },
+    /// At a start: a request the database recorded as sent to `venue` under `downstream` that the
+    /// venue's session never stored, so never sent (the gateway stopped after its change committed,
+    /// before the session stored it). Sent again as it was, unless it's been answered or its order
+    /// is done, when it's handled as `SendFailed`.
+    Unsent {
+        venue: VenueId,
+        downstream: CompactString,
+    },
     /// The gateway cancels every live order in `scope` itself, except those with a cancel
     /// outstanding. The client hears only the venue's Canceled, as an unsolicited report under
     /// the order's current ClOrdID. A venue's refusal is logged and the cancel sent again, up to
@@ -706,6 +714,27 @@ impl Book {
         self.downstream.get(downstream)
     }
 
+    /// The downstream ClOrdIDs of requests sent to `venue` for live orders that it hasn't
+    /// answered (an original order, while it's PendingNew), in the order they were sent: those
+    /// [`Input::Unsent`] can send again.
+    pub fn unanswered(&self, venue: &VenueId) -> Vec<CompactString> {
+        let mut unanswered: Vec<(OrderId, &CompactString)> = self
+            .downstream
+            .iter()
+            .filter(|(_, sent)| !sent.answered)
+            .filter(|(_, sent)| {
+                let order = &self.orders[&sent.order];
+                order.venue == *venue
+                    && !order.status.is_done()
+                    && (sent.kind.is_some() || order.status == Status::PendingNew)
+            })
+            .map(|(downstream, sent)| (sent.order, downstream))
+            .collect();
+        // `<name>` before `<name>-1`, and `<name>-9` before `<name>-10`.
+        unanswered.sort_unstable_by_key(|&(order, downstream)| (order.0, downstream.len(), downstream));
+        unanswered.into_iter().map(|(_, downstream)| downstream.clone()).collect()
+    }
+
     pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
         match input {
             Input::NewOrder { client, request, redelivered, sent } => {
@@ -743,6 +772,7 @@ impl Book {
             Input::CancelAll { scope } => self.cancel_all(&scope, out),
             Input::CancelOrder { order } => self.cancel_order(order, out),
             Input::VenueUp { venue } => self.venue_up(&venue, out),
+            Input::Unsent { venue, downstream } => self.unsent(&venue, downstream, out),
             Input::Orphan { venue, downstream, replace } => self.orphan(&venue, downstream, replace),
             Input::Block { scope } => {
                 if !self.blocked.contains(&scope) {

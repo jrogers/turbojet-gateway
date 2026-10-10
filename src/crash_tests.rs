@@ -346,6 +346,16 @@ impl Setup {
         self.events.logged_on().await;
     }
 
+    /// Waits until the database satisfies `done`.
+    async fn until_stored(&self, done: impl Fn(&Snapshot) -> bool) {
+        let wait = async {
+            while !done(&self.database().await) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(WAIT, wait).await.expect("timed out waiting for the database");
+    }
+
     /// The database, once everything the book changed has committed.
     async fn database(&self) -> Snapshot {
         self.gateway().committed().await;
@@ -796,4 +806,53 @@ async fn a_fill_lost_in_a_crash_is_redelivered_and_reported_again_as_possibly_re
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::Filled, 100.into())]);
+}
+
+/// Crash before the venue's session stores a new order: it never left, and the database has it
+/// booked. After the restart it goes at the venue's logon, once (the client's redelivery of it
+/// is answered with its status), and the client sees one ack.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_before_the_venue_stores_an_order_sends_it_once_after_the_restart() {
+    let mut setup = Setup::new().await;
+    setup.venue_gate.send_replace(false);
+    setup.send(order("C1"));
+    setup.until_stored(|database| !stored(database, "C1").is_empty()).await;
+    setup.venue_events.assert_empty();
+
+    setup.crash_and_restart().await;
+    let sent: v44::NewOrderSingle = setup.venue_events.parse().await;
+    assert_eq!(sent.cl_ord_id.as_str(), setup.id(0, "1"));
+    setup.venue_send(acked(&sent.cl_ord_id, 100));
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+    assert_eq!(new.order_id.as_str(), setup.id(0, "1"));
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
+}
+
+/// A replace the venue's session never stored at the crash, though the database has it pending:
+/// after the restart it reaches the venue once; the client hears it replaced, and of the fills
+/// after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_the_venue_never_got_before_a_crash_goes_after_it() {
+    let mut setup = Setup::new().await;
+    let order = partly_filled(&mut setup).await;
+    setup.venue_gate.send_replace(false);
+    setup.send(replace("C2", "C1", 150));
+    setup.until_stored(|database| database.orders.values().any(|row| row.order.pending.is_some())).await;
+    setup.venue_events.assert_empty();
+
+    setup.crash_and_restart().await;
+    let sent: v44::OrderCancelReplaceRequest = setup.venue_events.parse().await;
+    assert_eq!((sent.orig_cl_ord_id.as_str(), sent.order_qty), (&*order, Some(150.into())));
+    setup.venue_send(replaced(&sent.cl_ord_id, &order));
+    setup.venue_send(fill_of(&sent.cl_ord_id, "E-2", 110, (150, 150)));
+    let replaced = setup.events.execution_report().await;
+    assert_eq!(terms(&replaced), (Some("C2".into()), v44::ExecType::Replaced, Some(150.into()), 40.into(), 110.into()));
+    let filled = setup.events.execution_report().await;
+    assert_eq!(terms(&filled), (Some("C2".into()), v44::ExecType::Trade, Some(150.into()), 150.into(), 0.into()));
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C2"), [(Status::Filled, 150.into())]);
 }
