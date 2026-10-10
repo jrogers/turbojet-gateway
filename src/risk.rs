@@ -215,7 +215,8 @@ impl State {
     /// Sets the reference prices and what sessions have filled in a new state, from a snapshot,
     /// before the book tracks its live orders again.
     pub fn restore(&mut self, references: HashMap<CompactString, Decimal>, filled: HashMap<ClientId, Decimal>) {
-        assert!(self.references.is_empty() && self.sessions.is_empty(), "restore fills a new state");
+        assert!(self.references.is_empty(), "restore fills a new state");
+        assert!(self.sessions.is_empty(), "restore fills a new state");
         self.references = references;
         // A session with nothing filled and no orders has no entry, as after `new_day`.
         for (client, filled) in filled.into_iter().filter(|(_, filled)| *filled != Decimal::ZERO) {
@@ -311,7 +312,6 @@ impl State {
     /// The state's invariants, given every live order's exposure as the book computes it now
     /// (`live`): what's tracked is exactly that, each session's open notional is their sum, and
     /// its resting orders are those orders.
-    #[cfg(debug_assertions)]
     pub fn check(&self, live: impl Iterator<Item = (OrderId, Exposure)>) {
         let mut count = 0;
         for (id, exposure) in live {

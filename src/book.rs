@@ -707,8 +707,7 @@ impl Book {
 
     /// The book's invariants, after every input. It walks every order and request sent, so a
     /// debug build slows as the book grows, O(book) per message: don't load-test one. Release
-    /// builds leave it out.
-    #[cfg(debug_assertions)]
+    /// builds check only once, at restore.
     fn check(&self) {
         for (id, order) in &self.orders {
             let sent = self.downstream.get(&order.downstream).expect("an order's downstream is recorded");

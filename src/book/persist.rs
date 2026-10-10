@@ -29,7 +29,7 @@ pub struct Changes {
 }
 
 /// An order, and its client's trading day when the row was written: a done order stays in the
-/// book until its client's next day.
+/// book until its client's next day. `day` is `None` for a client with no day yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderRow {
     pub order: Order,
@@ -37,7 +37,9 @@ pub struct OrderRow {
 }
 
 /// A ClOrdID a client used for `order`, and its trading day when the row was written: a
-/// ClOrdID can be used again on a later day, once its order is done.
+/// ClOrdID can be used again on a later day, once its order is done. `day` is `None` for a
+/// client with no day yet, and is part of the key: SQL's UNIQUE counts NULLs as distinct, so a
+/// store keying on it needs a sentinel (or COALESCE) for `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClOrdIdRow {
     pub client: ClientId,
@@ -152,7 +154,9 @@ impl Book {
     /// taken. Set the book's prefix and configuration first, as for any new book. Risk's view of
     /// live orders is worked out again from them.
     pub fn restore(&mut self, snapshot: Snapshot) {
-        assert!(self.orders.is_empty() && self.next_id == 1 && self.days.is_empty(), "restore fills a new book");
+        assert!(self.orders.is_empty(), "restore fills a new book");
+        assert_eq!(self.next_id, 1, "restore fills a new book");
+        assert!(self.days.is_empty(), "restore fills a new book");
         let Snapshot { orders, sent, cl_ord_ids, days, blocked, references, filled, next_order_id } = snapshot;
         for id in orders.keys() {
             assert!(id.0 < next_order_id, "the snapshot's next OrderId is past {id:?}");
@@ -178,7 +182,8 @@ impl Book {
         }
         self.next_id = next_order_id.max(1);
         self.touched = Touched::default();
-        #[cfg(debug_assertions)]
+        // Once a start, so in release builds too: a store that gave back something the book
+        // couldn't have held stops the gateway before it trades. O(clients x ClOrdIDs).
         self.check();
     }
 
@@ -218,7 +223,7 @@ fn held(row: &OrderRow, today: Option<&Today>) -> bool {
         // Written before the client's first day: a roll since has dropped it.
         (None, Some(today)) => today.began.is_none(),
         (_, None) => {
-            debug_assert!(row.day.is_none(), "a row's day is its client's");
+            assert!(row.day.is_none(), "a row's day is its client's");
             true
         }
     }
