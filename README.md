@@ -144,6 +144,21 @@ including ones that log on later), or everyone.
 
 Each call is logged as a warning naming its scope.
 
+## Cancel on disconnect
+
+A counterparty's `cancel_on_disconnect` in the sessions file turns it on for its sessions:
+
+```toml
+[counterparty.FUNDA]
+cancel_on_disconnect = "disconnect"   # or "disconnect_or_logout": Logouts count too
+cancel_grace = "5s"                   # how long it has to log back on; 0s by default
+```
+
+When such a session's connection ends and it doesn't log back on within the grace, the gateway
+cancels its live orders at their venues, as `cancel_all` does for one session but without a
+block: the client may log back on and trade. Each cancel is logged as a warning. The client gets
+an unsolicited Canceled report for each order as its venue confirms it, when it next logs on.
+
 ## Signals
 
 - **SIGHUP** (Unix) reloads. The sessions file first, as turbojet-config reloads it: changed

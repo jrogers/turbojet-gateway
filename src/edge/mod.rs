@@ -17,8 +17,8 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
 use turbojet::{
-    Application, Clock, ConnectionInfo, Context, Dropped, Message, MessageReject, Receipt, SendError, SessionHandle,
-    SessionId,
+    Application, Clock, ConnectionInfo, Context, Disconnect, Dropped, Message, MessageReject, Receipt, SendError,
+    SessionHandle, SessionId,
 };
 
 use crate::book::{Book, ClientId, GatewayCancel, Input, OrderId, Output, Scope, VenueId};
@@ -389,6 +389,14 @@ impl Application for ClientApp {
         self.0.outbox.logged_on(&self.0.client(session.id()), session);
     }
 
+    /// Cancels the session's working orders at the venues, without a block: the client may log
+    /// back on and trade. It hears of each order's end through the outbox, when it's back.
+    fn on_cancel_on_disconnect(&self, session: &SessionHandle, ended: Disconnect) {
+        warn!(%session, ?ended, "cancelling the orders of a client that didn't come back");
+        let client = self.0.client(session.id());
+        self.0.handle(Input::CancelAll { scope: Scope::Session(client) });
+    }
+
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
         let client = self.0.client(ctx.session_id());
         let redelivered = ctx.maybe_redelivered() || fix::possibly_resent(msg);
@@ -564,7 +572,7 @@ mod tests {
             let _ = self.events.send(Event::LoggedOn);
         }
 
-        fn on_logout(&self, _session: &SessionHandle, _ended: turbojet::Disconnect) {
+        fn on_logout(&self, _session: &SessionHandle, _ended: Disconnect) {
             let _ = self.events.send(Event::LoggedOut);
         }
 

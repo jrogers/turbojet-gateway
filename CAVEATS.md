@@ -82,8 +82,10 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 - A client holds up to 100,000 undelivered reports. The first past that is dropped, with an
   error logged, and the client is logged out; later ones are dropped and counted until its queue
   empties.
-- Cancel on disconnect isn't implemented: `cancel_on_disconnect` in the sessions file cancels
-  nothing.
+- Cancel on disconnect countdowns still pending when the gateway shuts down fire then (and under
+  `disconnect_or_logout`, the shutdown's own Logouts start them), but the venues are logging out
+  at the same time, so those cancels may not reach them; the shutdown log lists them. A process
+  that stops without shutting down loses its countdowns, as it loses the book until stage 4.
 - There are no risk checks: every order a route sends to a venue goes there.
 - A panic in the book stops the process rather than carry on with a book that may be half
   changed.

@@ -27,6 +27,8 @@ Notable changes to Jetbridge.
 - A kill switch, as library calls on the gateway: block a client session, a CompID or everyone
   (new orders rejected; cancels and replaces that don't raise the quantity pass), cancel their
   orders at the venues, and unblock.
+- Cancel on disconnect: a client session with `cancel_on_disconnect` in the sessions file has
+  its orders cancelled at the venues when it doesn't log back on within its grace.
 - SIGHUP reloads the sessions file and the routes, keeping either if it doesn't load; Ctrl-C or
   SIGTERM logs every session out and says what the stop leaves open. Optional TLS (feature
   `tls`).

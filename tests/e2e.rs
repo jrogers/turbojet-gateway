@@ -42,6 +42,8 @@ const REFUSED_SYMBOL: &str = "MSFT";
 const REFUSED_TEXT: &str = "MSFT is not traded here";
 /// How long any one event may take.
 const WAIT: Duration = Duration::from_secs(2);
+/// The client's cancel-on-disconnect grace, where it has one.
+const GRACE: Duration = Duration::from_millis(200);
 
 /// Something a client or venue session saw.
 #[derive(Debug)]
@@ -196,7 +198,10 @@ fn routes(symbol: &str, text: &str) -> String {
 /// The gateway's two files, its clients speaking `client_version` and its venue
 /// `venue_version` at `venue_port`.
 fn write_config(dir: &tempfile::TempDir, options: &Options, venue_port: u16) {
-    let Options { client_version, venue_version, .. } = options;
+    let Options { client_version, venue_version, cancel_on_disconnect, .. } = options;
+    let cancel = cancel_on_disconnect
+        .map(|trigger| format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", GRACE.as_millis()))
+        .unwrap_or_default();
     let sessions = format!(
         r#"
 [acceptor]
@@ -205,7 +210,7 @@ sender_comp_id = "{GATEWAY}"
 listen = "127.0.0.1:0"
 
 [counterparty.{CLIENT}]
-
+{cancel}
 [initiator.{VENUE}]
 begin_string = "{venue_version}"
 target_comp_id = "{VENUE}"
@@ -224,11 +229,19 @@ struct Options {
     relay: bool,
     /// The venue answers every order itself.
     answers: bool,
+    /// The client's `cancel_on_disconnect` setting, with a grace of [`GRACE`].
+    cancel_on_disconnect: Option<&'static str>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { client_version: "FIX.4.4", venue_version: "FIX.4.4", relay: false, answers: false }
+        Self {
+            client_version: "FIX.4.4",
+            venue_version: "FIX.4.4",
+            relay: false,
+            answers: false,
+            cancel_on_disconnect: None,
+        }
     }
 }
 
@@ -715,6 +728,76 @@ async fn a_comp_id_block_covers_a_session_that_logs_on_later() {
     let rejected: v44::ExecutionReport = events.parse().await;
     assert_unbooked_reject(&rejected, "C1", &setup.id("R1"));
     assert_eq!(rejected.text.as_deref(), Some("blocked by an operator"));
+}
+
+/// A client with cancel on disconnect and a working order, its connection dropped without a
+/// Logout and the gateway having seen it go.
+async fn dropped_with_a_working_order(trigger: &'static str) -> Setup {
+    let mut setup = Setup::with(Options { cancel_on_disconnect: Some(trigger), ..Options::default() }).await;
+    setup.working_order().await;
+    setup.running.abort();
+    assert!((&mut setup.running).await.unwrap_err().is_cancelled());
+    setup.events.logged_out().await;
+    let client = setup.service.client_session(&SessionId::new("FIX.4.4", GATEWAY, CLIENT));
+    until(|| !client.is_connected()).await;
+    setup
+}
+
+/// After the grace, the gateway cancels the order of a client that dropped; the client isn't
+/// blocked, and hears of the cancel once it logs back on.
+#[tokio::test]
+async fn a_client_that_drops_has_its_orders_cancelled_after_the_grace() {
+    let dropped = std::time::Instant::now();
+    let mut setup = dropped_with_a_working_order("disconnect").await;
+    let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
+    assert!(dropped.elapsed() >= GRACE, "cancelled within the grace");
+    assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), (&*setup.id("1-1"), &*setup.id("1")));
+    setup.venue.send(canceled(&sent.cl_ord_id, &sent.orig_cl_ord_id));
+    let gateway = setup.service.gateway().clone();
+    until(|| gateway.unfinished().open_orders.is_empty()).await;
+    assert!(gateway.blocked().is_empty() && gateway.cancelling().is_empty());
+
+    tokio::spawn(setup.client.clone().run());
+    setup.events.logged_on().await;
+    let canceled: v44::ExecutionReport = setup.events.parse().await;
+    assert_eq!((canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref()), (Some("C1"), None));
+    assert_eq!((canceled.exec_type, canceled.ord_status), (v44::ExecType::Canceled, v44::OrdStatus::Canceled));
+    assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("2"));
+}
+
+/// A client back within the grace keeps its orders.
+#[tokio::test]
+async fn a_client_back_within_the_grace_keeps_its_orders() {
+    let mut setup = dropped_with_a_working_order("disconnect").await;
+    tokio::spawn(setup.client.clone().run());
+    setup.events.logged_on().await;
+    tokio::time::sleep(2 * GRACE).await;
+    assert!(setup.venue.events.0.try_recv().is_err(), "the venue got a cancel");
+    assert_eq!(setup.service.gateway().unfinished().open_orders.len(), 1);
+}
+
+/// Under `disconnect`, a Logout isn't a disconnect: the orders stay.
+#[tokio::test]
+async fn a_client_that_logs_out_keeps_its_orders() {
+    let mut setup = Setup::with(Options { cancel_on_disconnect: Some("disconnect"), ..Options::default() }).await;
+    setup.working_order().await;
+    setup.client.shutdown(None).await;
+    setup.events.logged_out().await;
+    tokio::time::sleep(2 * GRACE).await;
+    assert!(setup.venue.events.0.try_recv().is_err(), "the venue got a cancel");
+    assert_eq!(setup.service.gateway().unfinished().open_orders.len(), 1);
+}
+
+/// Under `disconnect_or_logout`, it is.
+#[tokio::test]
+async fn a_client_that_logs_out_under_disconnect_or_logout_has_its_orders_cancelled() {
+    let mut setup =
+        Setup::with(Options { cancel_on_disconnect: Some("disconnect_or_logout"), ..Options::default() }).await;
+    setup.working_order().await;
+    setup.client.shutdown(None).await;
+    setup.events.logged_out().await;
+    let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
+    assert_eq!(sent.orig_cl_ord_id.as_str(), &*setup.id("1"));
 }
 
 #[tokio::test]
