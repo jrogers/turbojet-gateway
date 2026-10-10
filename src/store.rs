@@ -217,9 +217,9 @@ impl Store {
         Ok(snapshot)
     }
 
-    /// Those of `downstreams` the store has no request sent under, history included: what
-    /// [`load`](Self::load) doesn't say, as it reads only held orders' requests. In `downstreams`'
-    /// order, each once.
+    /// Those of `downstreams` the store has no request sent under, history included, nor an
+    /// orphan handled (see [`Changes::orphans`]): what [`load`](Self::load) doesn't say, as it
+    /// reads only held orders' requests. In `downstreams`' order, each once.
     ///
     /// # Errors
     ///
@@ -229,7 +229,11 @@ impl Store {
         let mut connection = self.pool.acquire().await.map_err(database("looking up requests sent"))?;
         for chunk in downstreams.chunks(LOOKUP_CHUNK) {
             let placeholders: Vec<String> = (1..=chunk.len()).map(|n| format!("${n}")).collect();
-            let sql = format!("SELECT downstream FROM sent WHERE downstream IN ({})", placeholders.join(", "));
+            let placeholders = placeholders.join(", ");
+            let sql = format!(
+                "SELECT downstream FROM sent WHERE downstream IN ({placeholders}) \
+                 UNION SELECT downstream FROM orphans WHERE downstream IN ({placeholders})"
+            );
             let query = chunk.iter().fold(sqlx::query(&sql), |query, downstream| query.bind(downstream.as_str()));
             for row in query.fetch_all(&mut *connection).await.map_err(database("looking up requests sent"))? {
                 known.insert(Columns(&row).compact("downstream")?);
@@ -333,6 +337,8 @@ const TABLES: &[&str] = &[
         answered BIGINT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS sent_order_id ON sent (order_id)",
+    // Orphaned venue requests handled: see `Changes::orphans`.
+    "CREATE TABLE IF NOT EXISTS orphans (downstream TEXT PRIMARY KEY)",
     "CREATE TABLE IF NOT EXISTS cl_ord_ids (
         client TEXT NOT NULL,
         client_comp_id TEXT NOT NULL,
@@ -485,7 +491,9 @@ fn upsert(table: &str, key: &[&str], columns: &[&str]) -> String {
 type Query<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>>;
 
 async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io::Result<()> {
-    let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered } = changes;
+    let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered, orphans } =
+        changes;
+    write_orphans(connection, orphans).await?;
     for row in orders {
         run(connection, bind_order(sqlx::query(&UPSERT_ORDER), row)?, "writing an order").await?;
     }
@@ -546,6 +554,15 @@ async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io:
     for id in delivered {
         let query = sqlx::query("DELETE FROM undelivered WHERE id = $1").bind(signed(*id)?);
         run(connection, query, "deleting a delivered report").await?;
+    }
+    Ok(())
+}
+
+async fn write_orphans(connection: &mut AnyConnection, orphans: &[CompactString]) -> io::Result<()> {
+    for downstream in orphans {
+        let query = sqlx::query("INSERT INTO orphans (downstream) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(downstream.as_str());
+        run(connection, query, "writing an orphan").await?;
     }
     Ok(())
 }

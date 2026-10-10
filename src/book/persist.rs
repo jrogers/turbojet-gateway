@@ -31,6 +31,11 @@ pub struct Changes {
     pub undelivered: Vec<(u64, Undelivered)>,
     /// Rows of `undelivered` to delete, their reports stored by the client's session or lost.
     pub delivered: Vec<u64>,
+    /// Downstream ClOrdIDs of orphaned venue requests handled, so a restart doesn't take them
+    /// again: the gateway adds these (see [`edge::orphans`](crate::edge::orphans)); the book never
+    /// does. Not loaded: [`Store::unknown_downstreams`](crate::store::Store::unknown_downstreams)
+    /// reads them.
+    pub orphans: Vec<CompactString>,
 }
 
 impl Changes {
@@ -51,7 +56,9 @@ impl Changes {
         let mut filled = HashMap::new();
         let mut undelivered = BTreeMap::new();
         let mut delivered = BTreeSet::new();
+        let mut orphans = BTreeSet::new();
         for changes in changes {
+            orphans.extend(changes.orphans);
             orders.extend(changes.orders.into_iter().map(|row| (row.order.id, row)));
             sent.extend(changes.sent);
             let key = |row: &ClOrdIdRow| (row.client.clone(), row.day, row.cl_ord_id.clone());
@@ -82,6 +89,7 @@ impl Changes {
             filled: filled.into_iter().collect(),
             undelivered: undelivered.into_iter().collect(),
             delivered: delivered.into_iter().collect(),
+            orphans: orphans.into_iter().collect(),
         }
     }
 }
@@ -142,7 +150,9 @@ impl Snapshot {
 
     /// Writes `changes` over the records, as the store does.
     pub fn apply(&mut self, changes: Changes) {
-        let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered } = changes;
+        // Orphans aren't loaded, so not in a snapshot.
+        let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered, orphans: _ } =
+            changes;
         for row in orders {
             self.next_order_id = self.next_order_id.max(row.order.id.0 + 1);
             self.orders.insert(row.order.id, row);

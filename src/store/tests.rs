@@ -182,6 +182,7 @@ async fn every_row_reads_back_as_written() {
             (2, Undelivered { client: fundb.clone(), message: vec![0xff, 0, 1] }),
         ],
         delivered: Vec::new(),
+        orphans: vec!["Z1".into()],
     };
     store.write(std::slice::from_ref(&changes)).await.unwrap();
     let loaded = store.load().await.unwrap();
@@ -615,8 +616,8 @@ async fn creating_says_whether_the_database_was_new() {
     assert!(!create(&pool).await.unwrap());
 }
 
-/// Requests sent under downstreams the store has, of orders it no longer loads too, aren't
-/// unknown; the rest are, each once, in the order asked, past one query's worth of IDs.
+/// Requests sent under downstreams the store has, of orders it no longer loads too, and orphans
+/// handled, aren't unknown; the rest are, each once, in the order asked, past one query's worth of IDs.
 #[tokio::test]
 async fn unknown_downstreams_are_those_without_a_request_sent() {
     let store = memory().await;
@@ -624,9 +625,11 @@ async fn unknown_downstreams_are_those_without_a_request_sent() {
     let mut asked: Vec<CompactString> = (0..LOOKUP_CHUNK + 10).map(|n| format!("X{n}").into()).collect();
     asked.splice(0..0, ["2-2".into(), "9".into(), "1".into(), "9".into()]);
     asked.push("2-1".into());
+    // An orphan handled is as good as known.
+    store.write(&[Changes { orphans: vec!["X0".into()], ..Changes::default() }]).await.unwrap();
     let unknown = store.unknown_downstreams(&asked).await.unwrap();
-    assert_eq!(unknown.len(), LOOKUP_CHUNK + 11);
-    assert_eq!(unknown[..2], ["9", "X0"]);
+    assert_eq!(unknown.len(), LOOKUP_CHUNK + 10);
+    assert_eq!(unknown[..2], ["9", "X1"]);
     assert!(!unknown.iter().any(|d| ["1", "2-1", "2-2"].contains(&d.as_str())));
     assert!(store.unknown_downstreams(&[]).await.unwrap().is_empty());
 }
