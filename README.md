@@ -70,7 +70,7 @@ Two files: `jetbridge.toml`, given with `--config`, and the sessions file it nam
 # Jetbridge: the sessions file, how orders are routed and the clients' risk limits. First match
 # wins; an order no route matches is rejected.
 sessions = "sessions.toml"
-day_end = "17:00 America/New_York"  # a session without a schedule's end of trading day
+day_end = "17:00 America/New_York"  # when client sessions' trading days end
 
 # FUNDA's orders for XNAS go to NASDAQ.
 [[route]]
@@ -110,7 +110,7 @@ order is rejected, and routes after one with no conditions can never match; both
 warning logged. Unknown keys are errors, and so is a route to a venue the sessions file has no
 initiator for. Cancels and replaces go to the venue the order went to, whatever the routes say
 now.
-- `day_end`: when a client session without a schedule ends its trading day: see
+- `day_end`: when client sessions' trading days end (a schedule's period may end one sooner): see
   [Trading day](#trading-day).
 - `[risk.defaults]` and `[risk.client.COMPID]`: see [Risk limits](#risk-limits).
 
@@ -203,12 +203,24 @@ Each client session has a trading day. When it ends, the session starts the next
 
 Symbols' last fill prices are every client's, and carry over.
 
-A session's day is its schedule's period, from the sessions file (`schedule = "daily
-08:00-17:00 America/New_York"`, say): it ends when the period ends, and between periods the
-session is in the next period's day. A session without a schedule ends its day at `day_end` in
-`jetbridge.toml`: a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`, an offset such as
-`+05:30` or an IANA name such as `America/New_York` (daylight saving followed). The zone is UTC if
-left out, and `day_end` is midnight UTC if left out.
+A session's day ends at `day_end` in `jetbridge.toml`, or sooner, when its schedule's period
+(from the sessions file) ends: whichever comes first. `day_end` is a time, `HH:MM` or
+`HH:MM:SS`, and a time zone, `UTC`, an offset such as `+05:30` or an IANA name such as
+`America/New_York` (daylight saving followed). The zone is UTC if left out, and `day_end` is
+midnight UTC if left out. So:
+
+- without a schedule, a session's day ends at each `day_end`;
+- with a daily schedule, `daily 08:00-17:00 America/New_York` say, it ends at 17:00 New York
+  time with the period, and again at `day_end` while the session is logged out, which changes
+  nothing it would notice;
+- with a weekly schedule, `weekly sun 17:00-fri 17:00` say, each day of the week ends at
+  `day_end`, and the last when the period ends.
+
+A possible resend (PossDupFlag or PossResend, or one Turbojet says may have been delivered
+before) of an order the gateway doesn't know is rejected as a duplicate, "ClOrdID from a previous
+trading day", if it was first sent (its OrigSendingTime, else its SendingTime) before the
+session's day began: the gateway has forgotten that day's done orders, so can't tell whether it
+took it.
 
 The day rolls over at a session's first message after its end, before that message is handled,
 or within a second by itself if the session is quiet. A SIGHUP rereads `day_end` with the routes

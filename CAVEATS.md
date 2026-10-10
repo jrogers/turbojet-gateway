@@ -34,12 +34,27 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   correction, a resend) is for an unknown order: it's dropped with a warning, and the client
   doesn't hear of it. So is a cancel reject for one.
 - A day rolls over at the session's next message, or the next tick, once a second: a quiet
-  session's done orders and fills count up to a second past its end.
+  session's done orders and fills count up to a second past its end. A day with a schedule
+  ends at the earlier of `day_end` and the period's end, so a daily schedule's sessions also roll
+  at `day_end` while they're logged out, which drops nothing they'd miss.
+- Days follow the gateway's clock. A clock stepped forward past a day's end rolls the day; stepped
+  back again, the session stays in that later day until it ends, and the days it skipped never
+  start: a day earlier than a session's own is ignored.
+- A live order carries every ClOrdID it has used into the next day, its original's and those of
+  every replace and cancel since, and they count against the new day's 1,000,000.
+- The last fill price a Market order or the price band works from is a symbol's last fill on any
+  day, however old.
 - A changed `day_end` or schedule applies from each session's next day: the day under way ends
-  when it was going to, even if the new setting puts its end earlier or later. A schedule with no
-  period in the next 400 days (all holidays, say) leaves its sessions' day as it is.
-- The roll walks the whole book once per session rolled, under the book's lock: many sessions
-  ending their day at once with a large book hold it for a while.
+  when it was going to, even if the new setting puts its end earlier or later. Turbojet applies a
+  changed schedule at the session's next logon, so for a while the gateway's day and the
+  session's hours can follow different schedules.
+- A possible resend of an order the gateway doesn't know is booked if it doesn't say when it was
+  first sent, or was first sent since its session's day began; one first sent before is rejected
+  as a duplicate. In a session's first day since the gateway started, every such resend is
+  booked.
+- The roll walks the whole book, under the book's lock, once for all the sessions whose day ends
+  at the same tick, or once for a session rolled by its own message: a large book holds the lock
+  for a while.
 
 ## Orders and reports
 

@@ -28,10 +28,11 @@ Notable changes to Jetbridge.
   plus filled today) and self-trade prevention, checked per session on each order and
   replace after routing. A replace that adds no risk passes. Refused orders get OrdRejReason 3
   for quantity, notional and credit, and a Text naming the limit.
-- A trading day per client session: its schedule's period from the sessions file, or ending at
-  `day_end` in `jetbridge.toml` (a time and time zone; midnight UTC by default). When it ends, the
-  session's done orders and their ClOrdIDs are dropped, its ClOrdID count and filled notional start
-  again, and its live orders carry over.
+- A trading day per client session, ending at `day_end` in `jetbridge.toml` (a time and time
+  zone; midnight UTC by default) or when its schedule's period ends, whichever comes first. When
+  it ends, the session's done orders and their ClOrdIDs are dropped, its ClOrdID count and filled
+  notional start again, and its live orders carry over. A possible resend of an order first sent
+  before the session's day began, and not known, is rejected as a duplicate.
 - Reports for a client that's disconnected or slow are held in a bounded queue per client and
   delivered in order once it can take them.
 - An order whose venue isn't connected, or whose session drops it unsent, is rejected as venue
