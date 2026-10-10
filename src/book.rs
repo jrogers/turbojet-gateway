@@ -97,12 +97,17 @@ pub enum ExecType {
     Status,
 }
 
-/// Why we rejected an order ourselves; the FIX side maps it to OrdRejReason(103).
+/// Why an order was rejected; the FIX side maps it to OrdRejReason(103).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     Duplicate,
+    /// No routing rule matched.
     NoRoute,
+    /// A routing rule rejects it.
+    RouteRejected,
     TooManyOrders,
+    /// The venue's OrdRejReason, passed through.
+    Venue(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +159,8 @@ pub struct VenueReport {
     pub text: Option<CompactString>,
     /// OrderID(37), the venue's: some venues want it on cancels and replaces.
     pub venue_order_id: Option<CompactString>,
+    /// OrdRejReason(103), passed to the client when the venue rejects the order.
+    pub ord_rej_reason: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +193,10 @@ pub enum Input {
         /// OrdStatus(39), required on OrderCancelReject.
         status: Status,
         text: Option<CompactString>,
+        /// CxlRejReason(102).
+        reason: Option<u32>,
+        /// OrderID(37), the venue's.
+        venue_order_id: Option<CompactString>,
     },
 }
 
@@ -219,13 +230,15 @@ pub enum CancelKind {
     Replace,
 }
 
-/// CxlRejReason(102): 0, 1, 6 and 99; the FIX side maps it per version.
+/// CxlRejReason(102): 0, 1, 6 and 99, or the venue's; the FIX side maps it per version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelRejectReason {
     TooLate,
     UnknownOrder,
     Duplicate,
     Other,
+    /// The venue's CxlRejReason, passed through.
+    Venue(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,8 +343,9 @@ impl Book {
                 let amend = Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Replace };
                 self.replace(amend, qty, price, out)
             }
-            Input::VenueCancelReject { venue, downstream, status, text } => {
-                self.venue_cancel_reject(&venue, &downstream, status, text, out)
+            Input::VenueCancelReject { venue, downstream, status, text, reason, venue_order_id } => {
+                let refused = Refused { status: Some(status), text, venue_order_id, reason };
+                self.venue_cancel_reject(&venue, &downstream, refused, out)
             }
         }
         #[cfg(debug_assertions)]
@@ -384,8 +398,14 @@ impl Book {
             return out.push(self.reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
         }
         let venue = match self.router.route(&client, &request) {
-            Target::Venue(venue) => venue,
-            Target::Reject(text) => return out.push(self.reject(client, request, RejectReason::NoRoute, text)),
+            Some(Target::Venue(venue)) => venue,
+            Some(Target::Reject(text)) => {
+                return out.push(self.reject(client, request, RejectReason::RouteRejected, text));
+            }
+            None => {
+                let text = "no route for this order".into();
+                return out.push(self.reject(client, request, RejectReason::NoRoute, text));
+            }
         };
         let id = OrderId(self.next_id);
         self.next_id += 1;
@@ -424,7 +444,8 @@ impl Book {
         let rejected = report.status == Status::Rejected || report.exec_type == ExecType::Rejected;
         if rejected && sent.kind.is_some() {
             let status = (report.status != Status::Rejected).then_some(report.status);
-            let refused = Refused { status, text: report.text, venue_order_id: report.venue_order_id };
+            // An ExecutionReport has no CxlRejReason: the refusal's reason is Other.
+            let refused = Refused { status, text: report.text, venue_order_id: report.venue_order_id, reason: None };
             return self.refuse_request(venue, &report.downstream, sent, refused, out);
         }
         let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind, .. } = sent;
@@ -476,6 +497,9 @@ impl Book {
         client_report.last_qty = report.last_qty;
         client_report.last_px = report.last_px;
         client_report.text = report.text;
+        if report.status == Status::Rejected {
+            client_report.reject = report.ord_rej_reason.map(RejectReason::Venue);
+        }
         out.push(Output::Report { client: order.client.clone(), report: client_report });
     }
 
@@ -574,14 +598,13 @@ impl Book {
         &mut self,
         venue: &VenueId,
         downstream: &CompactString,
-        status: Status,
-        text: Option<CompactString>,
+        refused: Refused,
         out: &mut Vec<Output>,
     ) {
         let Some(sent) = self.downstream.get(downstream).cloned() else {
             return tracing::warn!(%venue, %downstream, "cancel reject for an unknown request");
         };
-        self.refuse_request(venue, downstream, sent, Refused { status: Some(status), text, venue_order_id: None }, out);
+        self.refuse_request(venue, downstream, sent, refused, out);
     }
 
     /// The venue refused the cancel or replace `sent` under `downstream`, by OrderCancelReject or
@@ -595,7 +618,7 @@ impl Book {
         refused: Refused,
         out: &mut Vec<Output>,
     ) {
-        let Refused { status, text, venue_order_id } = refused;
+        let Refused { status, text, venue_order_id, reason } = refused;
         let (Some(response_to), Some(orig_cl_ord_id)) = (sent.kind, sent.orig_cl_ord_id) else {
             return tracing::warn!(%venue, %downstream, "request rejected naming an order, not a cancel or replace");
         };
@@ -626,7 +649,8 @@ impl Book {
         let amend =
             Amend { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, kind: response_to };
         let text = text.unwrap_or_else(|| "rejected by the venue".into());
-        out.push(amend.refuse(Some(&*order), CancelRejectReason::Other, text));
+        let reason = reason.map_or(CancelRejectReason::Other, CancelRejectReason::Venue);
+        out.push(amend.refuse(Some(&*order), reason, text));
     }
 
     /// A reject for an order we didn't book, under the book's next `R` ExecID.
@@ -735,6 +759,8 @@ struct Refused {
     status: Option<Status>,
     text: Option<CompactString>,
     venue_order_id: Option<CompactString>,
+    /// The venue's CxlRejReason; `None` reports Other.
+    reason: Option<u32>,
 }
 
 /// A client's cancel or replace request.
@@ -920,6 +946,7 @@ mod tests {
                 exec_id: "V1".into(),
                 text: None,
                 venue_order_id: None,
+                ord_rej_reason: None,
             },
         }
     }
@@ -1095,7 +1122,14 @@ mod tests {
     }
 
     fn venue_cancel_reject(venue: &str, downstream: &str, status: Status) -> Input {
-        Input::VenueCancelReject { venue: venue.into(), downstream: downstream.into(), status, text: None }
+        Input::VenueCancelReject {
+            venue: venue.into(),
+            downstream: downstream.into(),
+            status,
+            text: None,
+            reason: None,
+            venue_order_id: None,
+        }
     }
 
     #[test]
@@ -1787,5 +1821,73 @@ mod tests {
         let resent = with_venue_order_id(venue_report("1-1", Status::Rejected, 0, 0), "V-1");
         assert!(run(&mut book, resent).is_empty());
         assert_eq!(venue_order_id(&book), None);
+    }
+
+    #[test]
+    fn a_venue_reject_passes_its_reason_to_the_client() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let mut input = venue_report("1", Status::Rejected, 0, 0);
+        let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+        report.ord_rej_reason = Some(3);
+        let out = run(&mut book, input);
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.reject, Some(RejectReason::Venue(3)));
+    }
+
+    #[test]
+    fn a_venue_reject_without_a_reason_gives_none() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, venue_report("1", Status::Rejected, 0, 0));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.reject, None);
+    }
+
+    #[test]
+    fn a_venue_cancel_reject_passes_its_reason_to_the_client() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        let mut input = venue_cancel_reject("NASDAQ", "1-1", Status::New);
+        let Input::VenueCancelReject { reason, .. } = &mut input else { unreachable!() };
+        *reason = Some(1);
+        assert_eq!(cancel_reject(&run(&mut book, input)).3, CancelRejectReason::Venue(1));
+    }
+
+    #[test]
+    fn a_venue_cancel_reject_records_the_venue_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        cancel(&mut book, "C3", "C1");
+        let with_id = |downstream: &str, id: &str| {
+            let mut input = venue_cancel_reject("NASDAQ", downstream, Status::New);
+            let Input::VenueCancelReject { venue_order_id, .. } = &mut input else { unreachable!() };
+            *venue_order_id = Some(id.into());
+            input
+        };
+        run(&mut book, with_id("1-1", "NONE"));
+        assert_eq!(venue_order_id(&book), None);
+        run(&mut book, with_id("1-2", "V-1"));
+        assert_eq!(venue_order_id(&book), Some("V-1"));
+    }
+
+    #[test]
+    fn a_rule_reject_says_route_rejected_and_no_match_says_no_route() {
+        let mut book = Book::new(Router::new(vec![Rule {
+            client: None,
+            ex_destination: Some("XNAS".into()),
+            symbol: None,
+            target: Target::Reject("venue closed".into()),
+        }]));
+        let out = new_order(&mut book, "C1");
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.reject, report.text.as_deref()), (Some(RejectReason::RouteRejected), Some("venue closed")));
+        let mut req = request("C2");
+        req.ex_destination = None;
+        let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false });
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.reject, Some(RejectReason::NoRoute));
     }
 }

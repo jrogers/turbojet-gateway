@@ -39,12 +39,10 @@ impl Router {
         Self { rules }
     }
 
-    /// The first rule that matches decides; with none, the order is rejected.
-    pub fn route(&self, client: &str, request: &OrderRequest) -> Target {
-        self.rules
-            .iter()
-            .find(|rule| rule.matches(client, request))
-            .map_or_else(|| Target::Reject("no route for this order".into()), |rule| rule.target.clone())
+    /// The first rule that matches decides; `None` when none does, which the book rejects as no
+    /// route, telling it apart from a rule's own [`Target::Reject`].
+    pub fn route(&self, client: &str, request: &OrderRequest) -> Option<Target> {
+        self.rules.iter().find(|rule| rule.matches(client, request)).map(|rule| rule.target.clone())
     }
 }
 
@@ -83,20 +81,20 @@ mod tests {
             rule(Some("FUNDA"), Some("XNAS"), None, "NASDAQ-A"),
             rule(None, Some("XNAS"), None, "NASDAQ-B"),
         ]);
-        assert_eq!(router.route("FUNDA", &request("AAPL", Some("XNAS"))), Target::Venue("NASDAQ-A".into()));
-        assert_eq!(router.route("FUNDB", &request("AAPL", Some("XNAS"))), Target::Venue("NASDAQ-B".into()));
+        assert_eq!(router.route("FUNDA", &request("AAPL", Some("XNAS"))), Some(Target::Venue("NASDAQ-A".into())));
+        assert_eq!(router.route("FUNDB", &request("AAPL", Some("XNAS"))), Some(Target::Venue("NASDAQ-B".into())));
     }
 
     #[test]
     fn symbol_rules_match_on_symbol() {
         let router = Router::new(vec![rule(None, None, Some("VOD.L"), "LSE")]);
-        assert_eq!(router.route("FUNDA", &request("VOD.L", None)), Target::Venue("LSE".into()));
+        assert_eq!(router.route("FUNDA", &request("VOD.L", None)), Some(Target::Venue("LSE".into())));
     }
 
     #[test]
-    fn no_match_rejects() {
+    fn no_match_is_none() {
         let router = Router::new(vec![rule(None, Some("XNAS"), None, "NASDAQ")]);
-        assert!(matches!(router.route("FUNDA", &request("AAPL", None)), Target::Reject(_)));
+        assert_eq!(router.route("FUNDA", &request("AAPL", None)), None);
     }
 
     #[test]
@@ -107,6 +105,6 @@ mod tests {
             symbol: None,
             target: Target::Reject("account closed".into()),
         }]);
-        assert_eq!(router.route("FUNDA", &request("AAPL", None)), Target::Reject("account closed".into()));
+        assert_eq!(router.route("FUNDA", &request("AAPL", None)), Some(Target::Reject("account closed".into())));
     }
 }
