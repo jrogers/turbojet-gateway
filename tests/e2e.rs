@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jetbridge::book::ClientId;
+use jetbridge::book::{ClientId, Scope};
 use jetbridge::service::Service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -654,6 +654,67 @@ async fn sessions_of_one_comp_id_each_get_their_own_reports() {
     let gateway = setup.service.gateway().clone();
     until(|| gateway.unfinished().undelivered.is_empty()).await;
     assert!(desks[0].1.0.try_recv().is_err() && setup.events.0.try_recv().is_err());
+}
+
+/// The venue's Canceled for the gateway's cancel `downstream` of order `orig`.
+fn canceled(downstream: &str, orig: &str) -> Message {
+    let mut canceled =
+        report(downstream, &format!("{downstream}-cxl"), (v44::ExecType::Canceled, v44::OrdStatus::Canceled), (0, 0));
+    canceled.orig_cl_ord_id = Some(orig.into());
+    canceled.to_message()
+}
+
+/// The kill switch on the client's session: the venue gets a cancel for each working order, the
+/// client hears of each end unasked, and its new orders are refused until it's unblocked.
+#[tokio::test]
+async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
+    let mut setup = Setup::new().await;
+    setup.working_order().await;
+    setup.order("C2").await;
+    setup.venue.send(acked(&setup.id("2")));
+    let new: v44::ExecutionReport = setup.events.parse().await;
+    assert_eq!(new.cl_ord_id.as_deref(), Some("C2"));
+
+    let gateway = setup.service.gateway().clone();
+    let session = Scope::Session(ClientId::new(&SessionId::new("FIX.4.4", GATEWAY, CLIENT)));
+    gateway.cancel_all(session.clone());
+    assert_eq!(gateway.blocked(), std::slice::from_ref(&session));
+    for n in ["1", "2"] {
+        let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
+        assert_eq!(
+            (sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()),
+            (&*setup.id(&format!("{n}-1")), &*setup.id(n))
+        );
+        setup.venue.send(canceled(&sent.cl_ord_id, &sent.orig_cl_ord_id));
+    }
+    for cl_ord_id in ["C1", "C2"] {
+        let canceled: v44::ExecutionReport = setup.events.parse().await;
+        assert_eq!((canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref()), (Some(cl_ord_id), None));
+        assert_eq!((canceled.exec_type, canceled.ord_status), (v44::ExecType::Canceled, v44::OrdStatus::Canceled));
+    }
+    assert!(gateway.cancelling().is_empty());
+
+    setup.send(order("C3", "AAPL"));
+    let rejected: v44::ExecutionReport = setup.events.parse().await;
+    assert_unbooked_reject(&rejected, "C3", &setup.id("R1"));
+    assert_eq!(rejected.text.as_deref(), Some("blocked by an operator"));
+    assert_eq!(rejected.ord_rej_reason, Some(v44::OrdRejReason::Other));
+    gateway.unblock(session);
+    assert_eq!(setup.order("C4").await.cl_ord_id, &*setup.id("3"));
+}
+
+/// A block of the CompID covers a session of it that logs on afterwards.
+#[tokio::test]
+async fn a_comp_id_block_covers_a_session_that_logs_on_later() {
+    let setup = Setup::new().await;
+    setup.service.gateway().block(Scope::CompId(CLIENT.into()));
+    let (desk, mut events) = client(&setup.service, "FIX.4.4", Some("DESK1"));
+    tokio::spawn(desk.clone().run());
+    events.logged_on().await;
+    desk.handle().send(order("C1", "AAPL")).expect("the desk is logged on");
+    let rejected: v44::ExecutionReport = events.parse().await;
+    assert_unbooked_reject(&rejected, "C1", &setup.id("R1"));
+    assert_eq!(rejected.text.as_deref(), Some("blocked by an operator"));
 }
 
 #[tokio::test]

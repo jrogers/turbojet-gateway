@@ -473,7 +473,8 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
         RejectReason::NoRoute
         | RejectReason::RouteRejected
         | RejectReason::TooManyOrders
-        | RejectReason::VenueUnavailable => fix::OrdRejReason::Other,
+        | RejectReason::VenueUnavailable
+        | RejectReason::Blocked => fix::OrdRejReason::Other,
         RejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::OrdRejReason::Other),
     }
 }
@@ -616,6 +617,7 @@ mod tests {
             (RejectReason::RouteRejected, "99"),
             (RejectReason::TooManyOrders, "99"),
             (RejectReason::VenueUnavailable, "99"),
+            (RejectReason::Blocked, "99"),
             (RejectReason::Venue(3), "3"),
             (RejectReason::Venue(15), "15"),
             // FIX 5.0 added 16 onwards; a 4.4 client gets Other and the Text.

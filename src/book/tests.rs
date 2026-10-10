@@ -2143,3 +2143,79 @@ fn cancelling_an_unknown_or_done_order_does_nothing() {
     assert!(run(&mut book, Input::CancelOrder { order: OrderId(1) }).is_empty());
     assert!(book.cancelling().is_empty());
 }
+
+fn block(book: &mut Book, scope: Scope) {
+    assert!(run(book, Input::Block { scope }).is_empty());
+}
+
+fn unblock(book: &mut Book, scope: Scope) {
+    assert!(run(book, Input::Unblock { scope }).is_empty());
+}
+
+/// Whether `out` is the book's reject of a new order from a blocked client.
+fn blocked_reject(out: &[Output]) -> bool {
+    match out {
+        [Output::Report { report, .. }] => {
+            report.reject == Some(RejectReason::Blocked) && report.text.as_deref() == Some("blocked by an operator")
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn a_blocked_clients_new_orders_are_rejected_and_its_cancels_pass() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    block(&mut book, Scope::Session("FUNDA".into()));
+    let out = new_order(&mut book, "C2");
+    assert!(blocked_reject(&out), "{out:?}");
+    let [Output::Report { report, .. }] = out.as_slice() else { unreachable!() };
+    assert_eq!((report.exec_type, report.order_id.as_deref()), (ExecType::Rejected, None));
+    // Not booked, so not a duplicate later; other clients carry on.
+    assert!(matches!(run(&mut book, order_from(&"FUNDB".into(), "C1")).as_slice(), [Output::NewOrder { .. }]));
+    assert_eq!(cancels(&cancel(&mut book, "C3", "C1")), ["1-1"]);
+}
+
+#[test]
+fn a_blocked_client_may_replace_only_without_raising_the_quantity() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    block(&mut book, Scope::All);
+    let raised = (Some("1"), CancelKind::Replace, Status::New, CancelRejectReason::Other);
+    let out = replace(&mut book, "C2", "C1", 101, 10);
+    assert_eq!(cancel_reject(&out), raised);
+    let [Output::CancelReject { text, .. }] = out.as_slice() else { unreachable!() };
+    assert_eq!(text, "blocked: a replace may not raise the quantity");
+    // The same quantity at another price, and less, pass.
+    assert!(matches!(replace(&mut book, "C3", "C1", 100, 11).as_slice(), [Output::Replace { .. }]));
+    run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    assert!(matches!(replace(&mut book, "C4", "C3", 50, 11).as_slice(), [Output::Replace { .. }]));
+}
+
+#[test]
+fn a_comp_id_block_covers_its_sessions_including_new_ones() {
+    let mut book = book();
+    block(&mut book, Scope::CompId("FUNDA".into()));
+    // A session the book has never seen.
+    assert!(blocked_reject(&run(&mut book, order_from(&desk("LATER"), "C1"))));
+    assert!(blocked_reject(&new_order(&mut book, "C1")));
+    assert!(matches!(run(&mut book, order_from(&"FUNDB".into(), "C1")).as_slice(), [Output::NewOrder { .. }]));
+}
+
+#[test]
+fn unblocking_lifts_exactly_its_scope() {
+    let mut book = book();
+    let session = Scope::Session(desk("DESK1"));
+    for scope in [session.clone(), Scope::CompId("FUNDA".into()), Scope::All, Scope::All] {
+        block(&mut book, scope);
+    }
+    assert_eq!(book.blocked(), [session.clone(), Scope::CompId("FUNDA".into()), Scope::All]);
+    unblock(&mut book, session.clone());
+    assert!(blocked_reject(&run(&mut book, order_from(&desk("DESK1"), "C1"))), "the CompID's block stands");
+    unblock(&mut book, Scope::CompId("FUNDA".into()));
+    assert!(blocked_reject(&run(&mut book, order_from(&desk("DESK1"), "C1"))), "everyone's block stands");
+    unblock(&mut book, Scope::All);
+    assert!(book.blocked().is_empty());
+    assert!(matches!(run(&mut book, order_from(&desk("DESK1"), "C1")).as_slice(), [Output::NewOrder { .. }]));
+}

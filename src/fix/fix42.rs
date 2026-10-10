@@ -513,7 +513,8 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
         RejectReason::NoRoute
         | RejectReason::RouteRejected
         | RejectReason::TooManyOrders
-        | RejectReason::VenueUnavailable => fix::OrdRejReason::BrokerCredit,
+        | RejectReason::VenueUnavailable
+        | RejectReason::Blocked => fix::OrdRejReason::BrokerCredit,
         RejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::OrdRejReason::BrokerCredit),
     }
 }
@@ -685,6 +686,7 @@ mod tests {
             (RejectReason::RouteRejected, "0"),
             (RejectReason::TooManyOrders, "0"),
             (RejectReason::VenueUnavailable, "0"),
+            (RejectReason::Blocked, "0"),
             (RejectReason::Venue(3), "3"),
             (RejectReason::Venue(8), "8"),
             // FIX 4.3 added 9 onwards; a 4.2 client gets Broker option and the Text.

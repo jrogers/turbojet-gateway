@@ -12,14 +12,14 @@ pub mod outbox;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tracing::error;
+use tracing::{error, warn};
 use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
 use turbojet::{
     Application, Clock, ConnectionInfo, Context, Dropped, Message, MessageReject, Receipt, SendError, SessionHandle,
     SessionId,
 };
 
-use crate::book::{Book, ClientId, Input, Output, VenueId};
+use crate::book::{Book, ClientId, GatewayCancel, Input, OrderId, Output, Scope, VenueId};
 use crate::fix::{self, Version};
 use crate::router::Router;
 pub use outbox::Outbox;
@@ -56,6 +56,8 @@ pub struct Unfinished {
     pub open_orders: BTreeMap<VenueId, usize>,
     /// Reports not yet delivered, per client holding any.
     pub undelivered: BTreeMap<ClientId, usize>,
+    /// Orders the gateway is still cancelling itself, stuck ones too: see [`Book::cancelling`].
+    pub cancelling: Vec<(OrderId, GatewayCancel)>,
 }
 
 /// Everything sending needs, under one lock so reports leave in the book's order.
@@ -136,7 +138,45 @@ impl Gateway {
 
     /// What a stop would lose until the book is persisted.
     pub fn unfinished(&self) -> Unfinished {
-        Unfinished { open_orders: self.lock().book.open_orders_by_venue(), undelivered: self.outbox.held_by_client() }
+        let state = self.lock();
+        Unfinished {
+            open_orders: state.book.open_orders_by_venue(),
+            undelivered: self.outbox.held_by_client(),
+            cancelling: state.book.cancelling(),
+        }
+    }
+
+    /// Blocks the clients in `scope`: their new orders are rejected until [`unblock`](Self::unblock)
+    /// lifts this scope (see [`Input::Block`]). Their working orders stay; see
+    /// [`cancel_all`](Self::cancel_all).
+    pub fn block(self: &Arc<Self>, scope: Scope) {
+        warn!(?scope, "blocking clients");
+        self.handle_all([Input::Block { scope }]);
+    }
+
+    /// The kill switch: blocks the clients in `scope` and cancels their live orders at the
+    /// venues, as one step, so no order slips in between. Each client hears of each order's end
+    /// as the venue's Canceled comes back. [`cancelling`](Self::cancelling) lists the cancels
+    /// still going.
+    pub fn cancel_all(self: &Arc<Self>, scope: Scope) {
+        warn!(?scope, "blocking clients and cancelling their orders");
+        self.handle_all([Input::Block { scope: scope.clone() }, Input::CancelAll { scope }]);
+    }
+
+    /// Lifts the block of exactly `scope`: a block of a session's CompID, or of everyone, stays.
+    pub fn unblock(self: &Arc<Self>, scope: Scope) {
+        warn!(?scope, "unblocking clients");
+        self.handle_all([Input::Unblock { scope }]);
+    }
+
+    /// The scopes blocked now.
+    pub fn blocked(&self) -> Vec<Scope> {
+        self.lock().book.blocked().to_vec()
+    }
+
+    /// Orders the gateway is cancelling itself: see [`Book::cancelling`].
+    pub fn cancelling(&self) -> Vec<(OrderId, GatewayCancel)> {
+        self.lock().book.cancelling()
     }
 
     /// Routes new orders by `router` from now on.
@@ -183,11 +223,16 @@ impl Gateway {
     /// request that can't be queued goes back in as [`Input::SendFailed`], which never makes
     /// venue-bound output, so this ends after one more round per refused request.
     fn handle(self: &Arc<Self>, input: Input) {
+        self.handle_all([input]);
+    }
+
+    /// As [`handle`](Self::handle), each of `inputs` in turn under one lock.
+    fn handle_all(self: &Arc<Self>, inputs: impl IntoIterator<Item = Input>) {
         let mut state = self.lock();
         // After the lock, so TransactTimes rise in the order the book answers.
         let now = UtcTimestamp::from(self.clock.now());
         let state = &mut *state;
-        let mut inputs = VecDeque::from([input]);
+        let mut inputs = VecDeque::from_iter(inputs);
         let mut outputs = Vec::new();
         while let Some(input) = inputs.pop_front() {
             let send_failed = matches!(input, Input::SendFailed { .. });

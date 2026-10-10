@@ -16,6 +16,7 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   venue's ClOrdID length limit.
 - A client's request is committed by its session before the report answering it is stored by
   the client's session: a stop in between loses the report.
+- Operators' blocks (see the README's kill switch) are kept in memory: a restart lifts them.
 - Nothing is cleared at the end of the day: orders, ClOrdIDs and requests sent stay in memory
   until a restart. The bound of 1,000,000 ClOrdIDs per client (plus 10,000 for cancels and
   replaces once it's reached) counts from start, not per day.

@@ -135,7 +135,9 @@ impl Service {
             warn!(
                 open_orders = ?unfinished.open_orders,
                 undelivered = ?unfinished.undelivered,
-                "stopping with open orders (per venue) and undelivered reports (per client)"
+                gateway_cancels = ?unfinished.cancelling,
+                "stopping with open orders (per venue), undelivered reports (per client) and the \
+                 gateway's own cancels still going (stuck ones given up)"
             );
         }
     }

@@ -123,6 +123,24 @@ Jetbridge:
 - Sessions are kept in the `memory` store unless the file says otherwise, so sequence numbers
   start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them.
 
+## Kill switch
+
+An operator can stop a client trading. For now these are library calls on the running gateway
+(`Service::gateway()`); operator access over HTTP is planned for a later stage. Each takes a
+`Scope`: one client session, a CompID (all its sessions, including ones that log on later), or
+everyone.
+
+- `cancel_all(scope)` blocks the scope and cancels its clients' live orders at their venues, in
+  one step. Each client gets an unsolicited Canceled report for each order as its venue confirms
+  it. A cancel the venue refuses is sent again, up to three times; `cancelling()` lists the
+  cancels still going and those given up.
+- `block(scope)` only blocks: a blocked client's new orders are rejected ("blocked by an
+  operator"). Its cancels pass, and so do replaces that don't raise the quantity.
+- `unblock(scope)` lifts the block of that scope exactly: unblocking a session leaves a block of
+  its CompID in force. `blocked()` lists the blocked scopes.
+
+Each call is logged as a warning naming its scope.
+
 ## Signals
 
 - **SIGHUP** (Unix) reloads. The sessions file first, as turbojet-config reloads it: changed

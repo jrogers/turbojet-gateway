@@ -24,6 +24,9 @@ Notable changes to Jetbridge.
   delivered in order once it can take them.
 - An order whose venue isn't connected, or whose session drops it unsent, is rejected as venue
   unavailable.
+- A kill switch, as library calls on the gateway: block a client session, a CompID or everyone
+  (new orders rejected; cancels and replaces that don't raise the quantity pass), cancel their
+  orders at the venues, and unblock.
 - SIGHUP reloads the sessions file and the routes, keeping either if it doesn't load; Ctrl-C or
   SIGTERM logs every session out and says what the stop leaves open. Optional TLS (feature
   `tls`).

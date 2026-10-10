@@ -166,6 +166,8 @@ pub enum RejectReason {
     Venue(u32),
     /// The venue's session couldn't take the order: not connected, or its queue full.
     VenueUnavailable,
+    /// An operator blocked the client: see [`Input::Block`].
+    Blocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,12 +219,12 @@ pub struct GatewayCancel {
     pub orig_downstream: CompactString,
 }
 
-/// Whose orders the gateway cancels.
+/// Whose orders the gateway cancels, or which clients it blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// One client session.
     Session(ClientId),
-    /// Every session of a CompID.
+    /// Every session of a CompID, those that log on later too.
     CompId(CompactString),
     /// Every client.
     All,
@@ -359,9 +361,21 @@ pub enum Input {
     CancelOrder {
         order: OrderId,
     },
-    /// The venue's session logged on: the gateway's cancels that couldn't be sent to it go now.
+    /// The venue's session logged on, or can take requests again: the gateway's cancels that
+    /// couldn't be sent to it go now.
     VenueUp {
         venue: VenueId,
+    },
+    /// An operator blocks the clients in `scope`: their new orders are rejected
+    /// ([`RejectReason::Blocked`]) until an `Unblock` of the same scope. What takes orders off the
+    /// market passes: cancels, and replaces that don't raise the quantity.
+    Block {
+        scope: Scope,
+    },
+    /// Lifts the block of exactly `scope`: unblocking a session leaves a block of its CompID, or
+    /// of everyone, in force.
+    Unblock {
+        scope: Scope,
     },
 }
 
@@ -498,6 +512,8 @@ pub struct Book {
     /// with real orders rather than a million.
     max_cl_ord_ids: usize,
     amend_reserve: usize,
+    /// Operators' blocks, each scope once: a handful, so a list.
+    blocked: Vec<Scope>,
 }
 
 impl Book {
@@ -513,6 +529,7 @@ impl Book {
             rejects: 0,
             max_cl_ord_ids: MAX_CL_ORD_IDS_PER_CLIENT,
             amend_reserve: MAX_AMEND_RESERVE,
+            blocked: Vec::new(),
         }
     }
 
@@ -584,6 +601,12 @@ impl Book {
             Input::CancelAll { scope } => self.cancel_all(&scope, out),
             Input::CancelOrder { order } => self.cancel_order(order, out),
             Input::VenueUp { venue } => self.venue_up(&venue, out),
+            Input::Block { scope } => {
+                if !self.blocked.contains(&scope) {
+                    self.blocked.push(scope);
+                }
+            }
+            Input::Unblock { scope } => self.blocked.retain(|blocked| *blocked != scope),
         }
         #[cfg(debug_assertions)]
         self.check();
@@ -659,6 +682,9 @@ impl Book {
                 self.reject(client, request, RejectReason::Duplicate, "duplicate ClOrdID".into())
             };
             return out.push(output);
+        }
+        if self.is_blocked(&client) {
+            return out.push(self.reject(client, request, RejectReason::Blocked, "blocked by an operator".into()));
         }
         if self.used.get(&client).is_some_and(|&used| used >= self.max_cl_ord_ids) {
             return out.push(self.reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
@@ -833,7 +859,7 @@ impl Book {
 
     /// A replace goes to the venue like a cancel, one at a time; the order keeps its terms until
     /// the venue accepts it (see `venue_report`). Refused, like a cancel, while the gateway's own
-    /// cancel is in flight.
+    /// cancel is in flight, and for a blocked client, if it raises the quantity.
     fn replace(&mut self, amend: Amend, named: (Side, CompactString), terms: Terms, out: &mut Vec<Output>) {
         let Terms { qty, price, ord_type, time_in_force } = terms;
         let refuse = |book: &Self, order: &Order| {
@@ -843,6 +869,8 @@ impl Book {
                 Some((CancelRejectReason::AlreadyPending, "replace pending"))
             } else if qty < order.cum_qty {
                 Some((CancelRejectReason::Other, "quantity below filled quantity"))
+            } else if qty > order.request.qty && book.is_blocked(&order.client) {
+                Some((CancelRejectReason::Other, "blocked: a replace may not raise the quantity"))
             } else {
                 None
             }
@@ -866,6 +894,15 @@ impl Book {
             venue_order_id: order.venue_order_id.clone(),
         });
         order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force });
+    }
+
+    /// The scopes operators have blocked, in the order they were blocked.
+    pub fn blocked(&self) -> &[Scope] {
+        &self.blocked
+    }
+
+    fn is_blocked(&self, client: &ClientId) -> bool {
+        self.blocked.iter().any(|scope| scope.covers(client))
     }
 
     /// The live order a cancel or replace names, or `None` with an OrderCancelReject refusing it
