@@ -307,13 +307,61 @@ async fn merged_changes_write_what_the_changes_do() {
     assert_eq!(merged.references, [("AAPL".into(), decimal("11"))]);
     assert_eq!(merged.blocked, Some(vec![Scope::All]));
     assert_eq!(merged.undelivered, [(2, report(2)), (4, report(4))]);
-    assert_eq!(merged.delivered, [9]);
+    assert_eq!(merged.delivered, [1, 3, 9]);
     assert_eq!(applied(std::slice::from_ref(&merged)), applied(&written));
 
     let (one, each) = (memory().await, memory().await);
     one.write(std::slice::from_ref(&merged)).await.unwrap();
     each.write(&written).await.unwrap();
     assert_eq!(one.load().await.unwrap(), each.load().await.unwrap());
+}
+
+/// Random sequences of batches inserting and deleting a few undelivered rows, some already in the
+/// store, and setting the blocks or not: applying the merge leaves what applying each does.
+#[test]
+fn merging_random_changes_applies_as_each_in_turn() {
+    // A fixed-seed linear congruential generator: the same cases every run.
+    let mut seed: u64 = 0x5eed;
+    let mut next = move |below: u64| {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % below
+    };
+    let funda = ClientId::from("FUNDA");
+    let report = |n: u64| Undelivered { client: funda.clone(), message: n.to_be_bytes().to_vec() };
+    for case in 0..2_000 {
+        let mut before = Snapshot::default();
+        for id in 0..4 {
+            if next(2) == 0 {
+                before.undelivered.insert(id, report(1_000 + id));
+            }
+        }
+        let batches: Vec<Changes> = (0..next(5) + 1)
+            .map(|_| {
+                let mut changes = Changes::default();
+                for _ in 0..next(4) {
+                    let id = next(4);
+                    if next(2) == 0 {
+                        changes.undelivered.push((id, report(next(100))));
+                    } else {
+                        changes.delivered.push(id);
+                    }
+                }
+                changes.blocked = match next(3) {
+                    0 => None,
+                    1 => Some(Vec::new()),
+                    _ => Some(vec![Scope::All]),
+                };
+                changes
+            })
+            .collect();
+        let mut each = before.clone();
+        for changes in batches.clone() {
+            each.apply(changes);
+        }
+        let mut merged = before;
+        merged.apply(Changes::merge(batches.clone()));
+        assert_eq!(merged, each, "case {case}: {batches:?}");
+    }
 }
 
 fn order_row(id: u64) -> OrderRow {

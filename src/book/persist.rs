@@ -39,8 +39,8 @@ impl Changes {
     }
 
     /// `changes` as one, which [`Snapshot::apply`] leaves as applying each in turn would: each
-    /// key's last row wins, and an undelivered row inserted and deleted among them is in neither
-    /// list. The writer coalesces a transaction's batches so, writing each row once.
+    /// key's last row wins, and an undelivered row's last insert or delete is what's written. The
+    /// writer coalesces a transaction's batches so, writing each row once.
     pub fn merge(changes: impl IntoIterator<Item = Changes>) -> Self {
         let mut orders = HashMap::new();
         let mut sent = HashMap::new();
@@ -61,16 +61,15 @@ impl Changes {
             references.extend(changes.references);
             filled.extend(changes.filled);
             // Within one Changes, inserts before deletes, as `Snapshot::apply` and the store take
-            // them. An insert after a delete of the same row leaves it; a delete after an insert
-            // in these changes means neither is written.
+            // them. An insert after a delete of the same row leaves it. A delete is always
+            // written, even of a row inserted in these changes: the store may hold an older one.
             for (id, row) in changes.undelivered {
                 delivered.remove(&id);
                 undelivered.insert(id, row);
             }
             for id in changes.delivered {
-                if undelivered.remove(&id).is_none() {
-                    delivered.insert(id);
-                }
+                undelivered.remove(&id);
+                delivered.insert(id);
             }
         }
         Self {
