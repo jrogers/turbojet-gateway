@@ -5,6 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -12,6 +13,7 @@ use tracing::{info, warn};
 use turbojet::{Acceptor, SessionHandle};
 use turbojet_config::{Initiators, SessionsFile};
 
+use crate::book;
 use crate::config::{self, Error};
 use crate::edge::{ClientApp, Gateway, VenueApp};
 
@@ -42,7 +44,8 @@ impl Service {
     /// can't be set up.
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
         let loaded = config::load(path)?;
-        let gateway = Arc::new(Gateway::new(loaded.router, loaded.version));
+        let prefix = book::start_prefix(SystemTime::now());
+        let gateway = Arc::new(Gateway::new(loaded.router, loaded.version).with_id_prefix(prefix));
         let sessions = loaded.sessions;
         let listen = sessions.listen().expect("load checked the file has [acceptor]");
         // Bound before the venues start, so a port in use stops nothing half-started.
@@ -54,7 +57,13 @@ impl Service {
         let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr };
         config::check_venues(path, &service.gateway.router(), &service.set_venues())?;
         let serving = service.serve(listener)?;
-        info!(addr = %local_addr, version = ?loaded.version, venues = ?service.initiators.names(), "gateway listening");
+        info!(
+            addr = %local_addr,
+            version = ?loaded.version,
+            venues = ?service.initiators.names(),
+            id_prefix = %service.gateway.id_prefix(),
+            "gateway listening"
+        );
         Ok((service, serving))
     }
 

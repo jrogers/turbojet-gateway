@@ -5,7 +5,7 @@ use turbojet::fields::{CompactString, Decimal, FixEnum, UtcTimestamp, format_com
 use turbojet::message::tags;
 use turbojet::{Message, MessageReject};
 
-use crate::book::{ClientId, Input, OrdType, OrderId, Output, Status, VenueId};
+use crate::book::{ClientId, Input, OrdType, Output, Status, VenueId};
 
 pub mod fix42;
 pub mod fix44;
@@ -140,8 +140,8 @@ fn reason_code(venue: &VenueId, downstream: &str, msg: &Message, tag: u32) -> Op
 }
 
 /// OrderID(37) is required on ExecutionReport and OrderCancelReject; "NONE" for no order.
-fn order_id_out(order_id: Option<OrderId>) -> CompactString {
-    order_id.map_or_else(|| "NONE".into(), |id| format_compact!("{}", id.0))
+fn order_id_out(order_id: Option<&CompactString>) -> CompactString {
+    order_id.cloned().unwrap_or_else(|| "NONE".into())
 }
 
 /// The enum value for a numeric FIX code, if the enum has it.

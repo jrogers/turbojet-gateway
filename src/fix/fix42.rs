@@ -61,7 +61,7 @@ pub fn client_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
                 CancelKind::Replace => fix::CxlRejResponseTo::OrderCancel,
             };
             let mut reject = fix::OrderCancelReject::new(
-                order_id_out(*order_id),
+                order_id_out(order_id.as_ref()),
                 cl_ord_id.as_str(),
                 orig_cl_ord_id.as_str(),
                 ord_status_to_fix(*status),
@@ -205,7 +205,7 @@ fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionR
     let request = &report.request;
     let (exec_trans_type, exec_type) = exec_type_to_fix(report.exec_type, report.status);
     let mut message = fix::ExecutionReport::new(
-        order_id_out(report.order_id),
+        order_id_out(report.order_id.as_ref()),
         report.exec_id.as_str(),
         exec_trans_type,
         exec_type,
@@ -533,7 +533,6 @@ fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> fix::CxlRejReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::book::OrderId;
 
     fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
@@ -886,7 +885,7 @@ mod tests {
     fn report() -> ClientReport {
         ClientReport {
             exec_type: ExecType::Trade,
-            order_id: Some(OrderId(7)),
+            order_id: Some("7".into()),
             cl_ord_id: "C2".into(),
             orig_cl_ord_id: Some("C1".into()),
             request: request(),
@@ -1005,7 +1004,7 @@ mod tests {
             text: "replace pending".into(),
         };
         let reject: fix::OrderCancelReject =
-            client_message(&output(Some(OrderId(7)), CancelKind::Replace), time()).unwrap().parse().unwrap();
+            client_message(&output(Some("7".into()), CancelKind::Replace), time()).unwrap().parse().unwrap();
         assert_eq!(
             (reject.order_id.as_str(), reject.cl_ord_id.as_str(), reject.orig_cl_ord_id.as_str()),
             ("7", "C3", "C2")

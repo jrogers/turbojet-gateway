@@ -2,6 +2,7 @@
 //! send onto `out`; the FIX side turns those into typed messages for each session's version.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::SystemTime;
 
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
@@ -21,7 +22,10 @@ pub const MAX_CL_ORD_IDS_PER_CLIENT: usize = 1_000_000;
 /// `amendments` far below `u32::MAX`.
 pub const MAX_AMEND_RESERVE: usize = 10_000;
 
-/// Our OrderID(37), and the root of every downstream ClOrdID for the order.
+/// The start of the seconds [`start_prefix`] counts: 2026-01-01T00:00:00Z, in Unix seconds.
+pub const ID_EPOCH: u64 = 1_767_225_600;
+
+/// The book's key for an order. On the wire it's [`Order::name`], the book's prefix before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
 
@@ -115,6 +119,9 @@ pub enum RejectReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Order {
     pub id: OrderId,
+    /// Our OrderID(37): the book's prefix, then `id`. The root of every ID the order goes by: its
+    /// ExecIDs and downstream ClOrdIDs.
+    pub name: CompactString,
     pub client: ClientId,
     pub venue: VenueId,
     /// As last accepted: `cl_ord_id` is the client's current ClOrdID.
@@ -253,8 +260,9 @@ pub struct ClientReport {
     /// The venue's, except for the book's own rejects (`Rejected`) and answers to redeliveries
     /// and status requests (`Status`).
     pub exec_type: ExecType,
-    /// `None` for an order rejected before it was booked, or a status request for none.
-    pub order_id: Option<OrderId>,
+    /// [`Order::name`]; `None` for an order rejected before it was booked, or a status request
+    /// for none.
+    pub order_id: Option<CompactString>,
     pub cl_ord_id: CompactString,
     pub orig_cl_ord_id: Option<CompactString>,
     /// For a status request about no order: the ClOrdID, side and symbol asked, Market, quantity 0.
@@ -266,7 +274,7 @@ pub struct ClientReport {
     pub cum_qty: Decimal,
     pub leaves_qty: Decimal,
     pub avg_px: Decimal,
-    /// ExecID(17): `<OrderID>.<n>` for a booked order, `R<n>` for a reject before booking.
+    /// ExecID(17): `<OrderID>.<n>` for a booked order, `<prefix>R<n>` for a reject before booking.
     pub exec_id: CompactString,
     pub text: Option<CompactString>,
 }
@@ -299,7 +307,7 @@ pub enum Output {
     },
     CancelReject {
         client: ClientId,
-        order_id: Option<OrderId>,
+        order_id: Option<CompactString>,
         cl_ord_id: CompactString,
         orig_cl_ord_id: CompactString,
         response_to: CancelKind,
@@ -344,9 +352,17 @@ struct Sent {
     answered: bool,
 }
 
+/// Every ID the book issues starts with its prefix: OrderIDs, the ExecIDs `<OrderID>.<n>` and
+/// `<prefix>R<n>`, and the downstream ClOrdIDs `<OrderID>` and `<OrderID>-<n>`. The numbering
+/// starts again at each start, and a venue's late report or resend about an order from before a
+/// restart must not land on this start's order of the same number, so the gateway sets the
+/// prefix from its start time ([`start_prefix`]). A report under an ID without this start's
+/// prefix is for an unknown order.
 #[derive(Debug)]
 pub struct Book {
     router: Router,
+    /// Empty unless set by [`set_prefix`](Self::set_prefix).
+    prefix: CompactString,
     orders: HashMap<OrderId, Order>,
     /// (client, ClOrdID) -> order, for every ClOrdID each client used today.
     index: HashMap<(ClientId, CompactString), OrderId>,
@@ -367,6 +383,7 @@ impl Book {
     pub fn new(router: Router) -> Self {
         Self {
             router,
+            prefix: CompactString::default(),
             orders: HashMap::new(),
             index: HashMap::new(),
             used: HashMap::new(),
@@ -376,6 +393,17 @@ impl Book {
             max_cl_ord_ids: MAX_CL_ORD_IDS_PER_CLIENT,
             amend_reserve: MAX_AMEND_RESERVE,
         }
+    }
+
+    /// Starts every ID the book issues with `prefix`; see [`Book`]. Set it before the book
+    /// issues any.
+    pub fn set_prefix(&mut self, prefix: CompactString) {
+        debug_assert!(self.next_id == 1 && self.rejects == 0, "the prefix changed after the book issued IDs");
+        self.prefix = prefix;
+    }
+
+    pub fn prefix(&self) -> &CompactString {
+        &self.prefix
     }
 
     /// Routes orders from now on; orders already routed keep their venue.
@@ -488,7 +516,8 @@ impl Book {
         };
         let id = OrderId(self.next_id);
         self.next_id += 1;
-        let downstream = format_compact!("{}", id.0);
+        let name = format_compact!("{}{}", self.prefix, id.0);
+        let downstream = name.clone();
         self.remember(&client, request.cl_ord_id.clone(), id);
         let sent =
             Sent { order: id, cl_ord_id: request.cl_ord_id.clone(), orig_cl_ord_id: None, kind: None, answered: false };
@@ -497,6 +526,7 @@ impl Book {
         out.push(Output::NewOrder { venue: venue.clone(), downstream: downstream.clone(), request: request.clone() });
         let order = Order {
             id,
+            name,
             client,
             venue,
             request,
@@ -726,7 +756,7 @@ impl Book {
     fn number(&mut self, id: OrderId, amend: Amend) -> (CompactString, &mut Order) {
         let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
         order.amendments += 1;
-        let downstream = format_compact!("{}-{}", id.0, order.amendments);
+        let downstream = format_compact!("{}-{}", order.name, order.amendments);
         let sent = Sent {
             order: id,
             cl_ord_id: amend.cl_ord_id.clone(),
@@ -855,7 +885,7 @@ impl Book {
             cum_qty: Decimal::ZERO,
             leaves_qty: Decimal::ZERO,
             avg_px: Decimal::ZERO,
-            exec_id: format_compact!("R{}", self.rejects),
+            exec_id: format_compact!("{}R{}", self.prefix, self.rejects),
             text: Some(text),
         }
     }
@@ -865,6 +895,24 @@ impl Book {
         debug_assert!(previous.is_none(), "ClOrdID reused by {client}");
         *self.used.entry(client.clone()).or_default() += 1;
     }
+}
+
+/// The prefix for a book started at `start`: the seconds since [`ID_EPOCH`] in base 36, upper
+/// case, zero-padded to six digits (enough until 2095). The fixed width keeps IDs from
+/// different starts apart with no separator, which would cost a character of a venue's ClOrdID
+/// limit and could be read as one of the `-<n>` and `.<n>` suffixes. Digits and upper-case
+/// letters, so a venue that ignores case or allows only alphanumerics takes it. Two starts in
+/// the same second share it; a clock before 2026 gives "000000".
+pub fn start_prefix(start: SystemTime) -> CompactString {
+    const DIGITS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let unix = start.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let mut secs = unix.saturating_sub(ID_EPOCH);
+    let mut digits = Vec::new();
+    while secs > 0 || digits.len() < 6 {
+        digits.push(DIGITS[(secs % 36) as usize]);
+        secs /= 36;
+    }
+    digits.iter().rev().map(|&digit| char::from(digit)).collect()
 }
 
 impl Order {
@@ -877,7 +925,7 @@ impl Order {
         self.exec_seq = self.exec_seq.saturating_add(1);
         ClientReport {
             exec_type,
-            order_id: Some(self.id),
+            order_id: Some(self.name.clone()),
             cl_ord_id: cl_ord_id.clone(),
             orig_cl_ord_id: None,
             request: self.request.clone(),
@@ -888,7 +936,7 @@ impl Order {
             cum_qty: self.cum_qty,
             leaves_qty: self.leaves_qty(),
             avg_px: self.avg_px,
-            exec_id: format_compact!("{}.{}", self.id.0, self.exec_seq),
+            exec_id: format_compact!("{}.{}", self.name, self.exec_seq),
             text: None,
         }
     }
@@ -1015,7 +1063,7 @@ impl Amend {
     fn refuse(self, order: Option<&Order>, reason: CancelRejectReason, text: CompactString) -> Output {
         Output::CancelReject {
             client: self.client,
-            order_id: order.map(|order| order.id),
+            order_id: order.map(|order| order.name.clone()),
             cl_ord_id: self.cl_ord_id,
             orig_cl_ord_id: self.orig_cl_ord_id,
             response_to: self.kind,
@@ -1028,6 +1076,9 @@ impl Amend {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
     use super::*;
     use crate::router::Rule;
 
@@ -1080,7 +1131,7 @@ mod tests {
         let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false });
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(
-            (report.status, report.reject, report.order_id),
+            (report.status, report.reject, report.order_id.as_deref()),
             (Status::Rejected, Some(RejectReason::NoRoute), None)
         );
         assert_eq!(report.exec_type, ExecType::Rejected);
@@ -1114,7 +1165,7 @@ mod tests {
         new_order(&mut book, "C1");
         let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
-        assert_eq!((report.order_id, report.status, report.reject), (Some(OrderId(1)), Status::PendingNew, None));
+        assert_eq!((report.order_id.as_deref(), report.status, report.reject), (Some("1"), Status::PendingNew, None));
         assert_eq!(report.exec_type, ExecType::Status);
         assert_eq!(report.leaves_qty, Decimal::from(100));
         assert_eq!(report.cl_ord_id, "C1");
@@ -1306,9 +1357,9 @@ mod tests {
         }
     }
 
-    fn cancel_reject(out: &[Output]) -> (Option<OrderId>, CancelKind, Status, CancelRejectReason) {
+    fn cancel_reject(out: &[Output]) -> (Option<&str>, CancelKind, Status, CancelRejectReason) {
         let [Output::CancelReject { order_id, response_to, status, reason, .. }] = out else { panic!("{out:?}") };
-        (*order_id, *response_to, *status, *reason)
+        (order_id.as_deref(), *response_to, *status, *reason)
     }
 
     #[test]
@@ -1355,10 +1406,7 @@ mod tests {
         new_order(&mut book, "C1");
         run(&mut book, venue_report("1", Status::Filled, 100, 100));
         let out = cancel(&mut book, "C2", "C1");
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Cancel, Status::Filled, CancelRejectReason::TooLate)
-        );
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::Filled, CancelRejectReason::TooLate));
     }
 
     #[test]
@@ -1368,7 +1416,7 @@ mod tests {
         let out = cancel(&mut book, "C1", "C1");
         assert_eq!(
             cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Cancel, Status::PendingNew, CancelRejectReason::Duplicate)
+            (Some("1"), CancelKind::Cancel, Status::PendingNew, CancelRejectReason::Duplicate)
         );
     }
 
@@ -1381,7 +1429,7 @@ mod tests {
         let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, text, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str()), ("C2", "C1"));
         assert_eq!(text, "rejected by the venue");
-        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
     }
 
     #[test]
@@ -1396,7 +1444,7 @@ mod tests {
         let Input::VenueCancelReject { status, .. } = &mut input else { unreachable!() };
         *status = None;
         let out = run(&mut book, input);
-        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
     }
 
@@ -1593,10 +1641,7 @@ mod tests {
         new_order(&mut book, "C1");
         replace(&mut book, "C2", "C1", 80, 11);
         let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::New, CancelRejectReason::Other)
-        );
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Replace, Status::New, CancelRejectReason::Other));
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((&order.request, order.downstream.as_str()), (&request("C1"), "1"));
         assert!(order.pending.is_none());
@@ -1647,7 +1692,7 @@ mod tests {
         assert_eq!(text, "replace pending");
         assert_eq!(
             cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::PendingNew, CancelRejectReason::AlreadyPending)
+            (Some("1"), CancelKind::Replace, Status::PendingNew, CancelRejectReason::AlreadyPending)
         );
     }
 
@@ -1724,10 +1769,7 @@ mod tests {
         let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, text, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str()), ("C2", "C1"));
         assert_eq!(text, "rejected by the venue");
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::New, CancelRejectReason::Other)
-        );
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Replace, Status::New, CancelRejectReason::Other));
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((order.status, &order.request, order.downstream.as_str()), (Status::New, &request("C1"), "1"));
         assert!(order.pending.is_none());
@@ -1743,10 +1785,7 @@ mod tests {
         replace(&mut book, "C2", "C1", 80, 11);
         // Some venues refuse an amendment with ExecType=8 and the order's live OrdStatus.
         let out = run(&mut book, venue_report_as("1-1", ExecType::Rejected, Status::New, 0, 0));
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::New, CancelRejectReason::Other)
-        );
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Replace, Status::New, CancelRejectReason::Other));
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((order.status, &order.request, order.downstream.as_str()), (Status::New, &request("C1"), "1"));
         assert!(order.pending.is_none());
@@ -1759,7 +1798,7 @@ mod tests {
         run(&mut book, venue_report("1", Status::New, 0, 0));
         cancel(&mut book, "C2", "C1");
         let out = run(&mut book, venue_report_as("1-1", ExecType::Rejected, Status::New, 0, 0));
-        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
     }
 
@@ -1780,7 +1819,7 @@ mod tests {
         run(&mut book, venue_report("1", Status::New, 0, 0));
         cancel(&mut book, "C2", "C1");
         let out = run(&mut book, venue_report("1-1", Status::Rejected, 0, 0));
-        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
     }
 
@@ -1871,7 +1910,7 @@ mod tests {
         let out = replace(&mut book, "C3", "C1", 80, 10);
         assert_eq!(
             cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::PendingNew, CancelRejectReason::Other)
+            (Some("1"), CancelKind::Replace, Status::PendingNew, CancelRejectReason::Other)
         );
     }
 
@@ -2247,8 +2286,8 @@ mod tests {
                 let out = run(&mut book, misnamed(input, other_side));
                 let [Output::CancelReject { text, reason, order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
                 assert_eq!(
-                    (text.as_str(), *reason, *order_id),
-                    ("side or symbol does not match", CancelRejectReason::Other, Some(OrderId(1)))
+                    (text.as_str(), *reason, order_id.as_deref()),
+                    ("side or symbol does not match", CancelRejectReason::Other, Some("1"))
                 );
                 assert!(book.order(OrderId(1)).unwrap().pending.is_none());
                 // Refused before it's numbered: the right request still goes out as the first.
@@ -2361,6 +2400,7 @@ mod tests {
     fn dropped(status: Status, report: Status, under: Under, answered: bool, pending: bool) -> bool {
         let order = Order {
             id: OrderId(1),
+            name: "1".into(),
             client: "FUNDA".into(),
             venue: "NASDAQ".into(),
             request: request("C1"),
@@ -2581,8 +2621,8 @@ mod tests {
         let out = run(&mut book, redelivered(cancel_input("C2", "C1")));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(
-            (report.exec_type, report.status, report.order_id),
-            (ExecType::Status, Status::PendingCancel, Some(OrderId(1)))
+            (report.exec_type, report.status, report.order_id.as_deref()),
+            (ExecType::Status, Status::PendingCancel, Some("1"))
         );
         // It answers the cancel, under the cancel's own ClOrdIDs.
         assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
@@ -2641,7 +2681,7 @@ mod tests {
         let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(client, "FUNDA");
         assert_eq!((report.exec_type, report.status, report.reject), (ExecType::Status, Status::PartiallyFilled, None));
-        assert_eq!((report.order_id, report.cum_qty, report.leaves_qty), (Some(OrderId(1)), 40.into(), 60.into()));
+        assert_eq!((report.order_id.as_deref(), report.cum_qty, report.leaves_qty), (Some("1"), 40.into(), 60.into()));
         assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id, report.exec_id.as_str()), ("C1", &None, "1.2"));
     }
 
@@ -2666,7 +2706,7 @@ mod tests {
         let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(client, "FUNDA");
         assert_eq!((report.exec_type, report.status, report.reject), (ExecType::Status, Status::Rejected, None));
-        assert_eq!((report.order_id, report.cl_ord_id.as_str()), (None, "C9"));
+        assert_eq!((report.order_id.as_deref(), report.cl_ord_id.as_str()), (None, "C9"));
         assert_eq!((report.text.as_deref(), report.exec_id.as_str()), (Some("unknown order"), "R2"));
         assert_eq!((report.request.side, report.request.symbol.as_str()), (Side::Buy, "AAPL"));
         assert_eq!((report.cum_qty, report.leaves_qty), (Decimal::ZERO, Decimal::ZERO));
@@ -2695,7 +2735,10 @@ mod tests {
         new_order(&mut book, "C1");
         let out = run(&mut book, send_failed("1"));
         let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
-        assert_eq!((client.as_str(), report.cl_ord_id.as_str(), report.order_id), ("FUNDA", "C1", Some(OrderId(1))));
+        assert_eq!(
+            (client.as_str(), report.cl_ord_id.as_str(), report.order_id.as_deref()),
+            ("FUNDA", "C1", Some("1"))
+        );
         assert_eq!((report.exec_type, report.status), (ExecType::Rejected, Status::Rejected));
         assert_eq!(
             (report.reject, report.text.as_deref()),
@@ -2704,10 +2747,7 @@ mod tests {
         assert_eq!((report.exec_id.as_str(), report.leaves_qty), ("1.1", Decimal::ZERO));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
         let out = cancel(&mut book, "C2", "C1");
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Cancel, Status::Rejected, CancelRejectReason::TooLate)
-        );
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::Rejected, CancelRejectReason::TooLate));
     }
 
     #[test]
@@ -2717,7 +2757,7 @@ mod tests {
         run(&mut book, venue_report("1", Status::New, 0, 0));
         cancel(&mut book, "C2", "C1");
         let out = run(&mut book, send_failed("1-1"));
-        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
         let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, text, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str(), text.as_str()), ("C2", "C1", "session not connected"));
         let order = book.order(OrderId(1)).unwrap();
@@ -2731,10 +2771,7 @@ mod tests {
         run(&mut book, venue_report("1", Status::New, 0, 0));
         replace(&mut book, "C2", "C1", 80, 11);
         let out = run(&mut book, send_failed("1-1"));
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::New, CancelRejectReason::Other)
-        );
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Replace, Status::New, CancelRejectReason::Other));
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((&order.request, order.pending.is_none()), (&request("C1"), true));
         assert!(matches!(replace(&mut book, "C3", "C1", 70, 11).as_slice(), [Output::Replace { .. }]));
@@ -2749,10 +2786,7 @@ mod tests {
         cancel(&mut book, "C2", "C1");
         run(&mut book, send_failed("1"));
         let out = run(&mut book, send_failed("1-1"));
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Cancel, Status::Rejected, CancelRejectReason::Other)
-        );
+        assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Cancel, Status::Rejected, CancelRejectReason::Other));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
     }
 
@@ -2796,7 +2830,7 @@ mod tests {
         let out = run(&mut book, send_failed("1-2"));
         assert_eq!(
             cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Cancel, Status::PendingReplace, CancelRejectReason::Other)
+            (Some("1"), CancelKind::Cancel, Status::PendingReplace, CancelRejectReason::Other)
         );
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((order.status, order.pending.is_some()), (Status::PendingReplace, true));
@@ -2813,7 +2847,7 @@ mod tests {
         let out = run(&mut book, send_failed("1-2"));
         assert_eq!(
             cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::PendingCancel, CancelRejectReason::Other)
+            (Some("1"), CancelKind::Replace, Status::PendingCancel, CancelRejectReason::Other)
         );
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((order.status, order.pending.is_none()), (Status::PendingCancel, true));
@@ -2878,5 +2912,65 @@ mod tests {
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.status, report.reject), (Status::New, None));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    const PREFIX: &str = "0K3J9X";
+
+    fn prefixed() -> Book {
+        let mut book = book();
+        book.set_prefix(PREFIX.into());
+        book
+    }
+
+    #[test]
+    fn a_prefixed_book_puts_its_prefix_on_every_id() {
+        let mut book = prefixed();
+        let [Output::NewOrder { downstream, .. }] = &new_order(&mut book, "C1")[..] else { panic!() };
+        assert_eq!(downstream, "0K3J9X1");
+        let out = run(&mut book, venue_report("0K3J9X1", Status::New, 0, 0));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.order_id.as_deref(), report.exec_id.as_str()), (Some("0K3J9X1"), "0K3J9X1.1"));
+        let out = cancel(&mut book, "C2", "C1");
+        let [Output::Cancel { downstream, orig_downstream, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((downstream.as_str(), orig_downstream.as_str()), ("0K3J9X1-1", "0K3J9X1"));
+        assert_eq!(exec_ids(&new_order(&mut book, "C1")), ["0K3J9XR1"]);
+    }
+
+    /// A late report or a resend from before a restart names an order of the last start's.
+    #[test]
+    fn a_report_for_an_order_of_an_earlier_start_is_unknown() {
+        let mut book = prefixed();
+        new_order(&mut book, "C1");
+        assert!(run(&mut book, venue_report("1", Status::Filled, 100, 100)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingNew);
+    }
+
+    #[test]
+    fn books_started_a_second_apart_share_no_id() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(ID_EPOCH + 1_000_000);
+        let ids = |start| {
+            let mut book = book();
+            book.set_prefix(start_prefix(start));
+            let mut ids = HashSet::new();
+            for n in 0..20 {
+                let [Output::NewOrder { downstream, .. }] = &new_order(&mut book, &format!("C{n}"))[..] else {
+                    panic!()
+                };
+                ids.insert(downstream.clone());
+            }
+            ids
+        };
+        assert!(ids(start).is_disjoint(&ids(start + Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn the_start_prefix_is_six_base36_digits_of_seconds_since_2026() {
+        let at = |secs| start_prefix(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        assert_eq!(at(ID_EPOCH), "000000");
+        assert_eq!(at(ID_EPOCH + 35), "00000Z");
+        assert_eq!(at(ID_EPOCH + 36), "000010");
+        // 2026-10-10T00:00:00Z.
+        assert_eq!(at(1_791_590_400), "0EI800");
+        assert_eq!(at(0), "000000", "a clock before 2026");
     }
 }

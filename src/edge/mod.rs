@@ -71,6 +71,18 @@ impl Gateway {
         self
     }
 
+    /// Starts every ID the book issues with `prefix`, such as [`start_prefix`](crate::book::start_prefix)'s.
+    #[must_use]
+    pub fn with_id_prefix(mut self, prefix: CompactString) -> Self {
+        self.state.get_mut().expect("nothing has used the gateway yet").book.set_prefix(prefix);
+        self
+    }
+
+    /// What every ID the book issues starts with.
+    pub fn id_prefix(&self) -> CompactString {
+        self.lock().book.prefix().clone()
+    }
+
     /// The venues, by name (`[initiator.NAME]`), each with its initiator's session; replaces any
     /// set before. Call it once the initiators are made, and again after a reload changes them.
     /// Until a venue is set, its session's logons are refused (see [`VenueApp`]) and orders for
