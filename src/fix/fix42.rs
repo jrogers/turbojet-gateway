@@ -518,8 +518,8 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
     }
 }
 
-/// FIX 4.2's CxlRejReason has 0 to 3 only: Duplicate and Other say Broker option, which is 2
-/// here (the repository names it BrokerCredit), and the Text says why.
+/// FIX 4.2's CxlRejReason has codes 0 to 3 only. Duplicate, Other and a venue's code 4.2 lacks
+/// become 2, Broker option (BrokerCredit in the generated enum); the Text says why.
 fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> fix::CxlRejReason {
     match reason {
         CancelRejectReason::TooLate => fix::CxlRejReason::TooLateToCancel,

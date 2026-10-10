@@ -214,30 +214,58 @@ mod tests {
         let sent: v44::NewOrderSingle = venue.venue_message(&output, time()).unwrap().parse().unwrap();
         assert_eq!((sent.cl_ord_id.as_str(), sent.symbol.as_deref()), ("1", Some("AAPL")));
 
+        // LastQty, CumQty, LeavesQty.
         let fills = [
-            (40, 60, v44::OrdStatus::PartiallyFilled, v42::ExecType::PartialFill),
-            (100, 0, v44::OrdStatus::Filled, v42::ExecType::Fill),
+            (40, 40, 60, v44::OrdStatus::PartiallyFilled, v42::ExecType::PartialFill),
+            (60, 100, 0, v44::OrdStatus::Filled, v42::ExecType::Fill),
         ];
-        for (cum_qty, leaves_qty, status, exec_type) in fills {
-            let (cum_qty, leaves_qty, px) = (Decimal::from(cum_qty), Decimal::from(leaves_qty), Decimal::from(10));
-            let mut fill = v44::ExecutionReport::new(
-                "V-9",
-                "X1",
-                v44::ExecType::Trade,
-                status,
-                v44::Side::Buy,
-                leaves_qty,
-                cum_qty,
-                px,
-            );
+        for (last_qty, cum_qty, leaves_qty, status, exec_type) in fills {
+            let [last_qty, cum_qty, leaves_qty, px] = [last_qty, cum_qty, leaves_qty, 10].map(Decimal::from);
+            let (trade, side) = (v44::ExecType::Trade, v44::Side::Buy);
+            let mut fill = v44::ExecutionReport::new("V-9", "X1", trade, status, side, leaves_qty, cum_qty, px);
             fill.cl_ord_id = Some(sent.cl_ord_id.clone());
-            (fill.last_qty, fill.last_px) = (Some(cum_qty.min(Decimal::from(60))), Some(px));
+            (fill.last_qty, fill.last_px) = (Some(last_qty), Some(px));
             let input = venue.venue_input(&"NASDAQ".into(), &fill.to_message()).unwrap().unwrap();
             let [output] = run(&mut book, input).try_into().unwrap();
             let er: v42::ExecutionReport = client.client_message(&output, time()).unwrap().parse().unwrap();
             assert_eq!((er.exec_trans_type, er.exec_type), (v42::ExecTransType::New, exec_type));
             assert_eq!((er.cl_ord_id.as_deref(), er.order_id.as_str()), (Some("C1"), "1"));
-            assert_eq!((er.last_shares, er.cum_qty, er.leaves_qty), (fill.last_qty, cum_qty, leaves_qty));
+            assert_eq!((er.last_shares, er.cum_qty, er.leaves_qty), (Some(last_qty), cum_qty, leaves_qty));
+        }
+    }
+
+    /// A 4.4 client's order reaches a 4.2 venue with HandlInst, and the venue's PartialFill and
+    /// Fill come back as 4.4 Trades.
+    #[test]
+    fn a_fix_44_client_trades_on_a_fix_42_venue() {
+        let (client, venue): (Version, Version) = ("FIX.4.4".parse().unwrap(), "FIX.4.2".parse().unwrap());
+        let mut book = book();
+        let mut order = v44::NewOrderSingle::new("C1", v44::Side::Buy, time(), v44::OrdType::Limit);
+        (order.symbol, order.order_qty, order.price) = (Some("AAPL".into()), Some(100.into()), Some(10.into()));
+        let input = client.client_input(&"FUNDA".into(), &order.to_message(), false).unwrap();
+        let [output] = run(&mut book, input).try_into().unwrap();
+        let sent: v42::NewOrderSingle = venue.venue_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!((sent.cl_ord_id.as_str(), sent.symbol.as_str()), ("1", "AAPL"));
+        assert_eq!(sent.handl_inst, v42::HandlInst::AutomatedExecutionNoIntervention);
+
+        // LastShares, CumQty, LeavesQty.
+        let fills = [
+            (40, 40, 60, v42::ExecType::PartialFill, v42::OrdStatus::PartiallyFilled, v44::OrdStatus::PartiallyFilled),
+            (60, 100, 0, v42::ExecType::Fill, v42::OrdStatus::Filled, v44::OrdStatus::Filled),
+        ];
+        for (last_qty, cum_qty, leaves_qty, exec_type, status, client_status) in fills {
+            let [last_qty, cum_qty, leaves_qty, px] = [last_qty, cum_qty, leaves_qty, 10].map(Decimal::from);
+            let (new, side) = (v42::ExecTransType::New, v42::Side::Buy);
+            let mut fill =
+                v42::ExecutionReport::new("V-9", "X1", new, exec_type, status, "AAPL", side, leaves_qty, cum_qty, px);
+            fill.cl_ord_id = Some(sent.cl_ord_id.clone());
+            (fill.last_shares, fill.last_px) = (Some(last_qty), Some(px));
+            let input = venue.venue_input(&"NASDAQ".into(), &fill.to_message()).unwrap().unwrap();
+            let [output] = run(&mut book, input).try_into().unwrap();
+            let er: v44::ExecutionReport = client.client_message(&output, time()).unwrap().parse().unwrap();
+            assert_eq!((er.exec_type, er.ord_status), (v44::ExecType::Trade, client_status));
+            assert_eq!((er.cl_ord_id.as_deref(), er.order_id.as_str()), (Some("C1"), "1"));
+            assert_eq!((er.last_qty, er.cum_qty, er.leaves_qty), (Some(last_qty), cum_qty, leaves_qty));
         }
     }
 }
