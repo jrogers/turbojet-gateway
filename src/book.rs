@@ -521,6 +521,10 @@ impl Book {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");
         }
         if stale(order, answered, &report) {
+            // A restatement is the venue changing the order: losing one needs a look.
+            if report.exec_type == ExecType::Restated {
+                return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "restatement dropped during a pending request");
+            }
             return tracing::debug!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "stale execution report dropped");
         }
         let pending_here = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
@@ -542,6 +546,9 @@ impl Book {
         }
         order.record_venue_order_id(report.venue_order_id, accepted);
         if accepted {
+            // The downstream the replace supersedes is settled like any other: its late reports
+            // without a fill are resends.
+            self.downstream.get_mut(&order.downstream).expect("an order's downstream is recorded").answered = true;
             let pending = order.pending.take().expect("checked above");
             order.request.cl_ord_id = pending.cl_ord_id;
             order.request.qty = pending.qty;
@@ -858,14 +865,16 @@ impl Order {
 /// - anything for a done order (busts and corrections come later);
 /// - a CumQty below the order's, or a fill at the order's CumQty (a resent fill).
 ///
-/// And without a fill:
+/// Other fills always apply. Without a fill:
 ///
-/// - (a) under a settled request, unless it's the order's current downstream: there only the
-///   accepted replace's own PendingReplace is a resend, and fills, cancels and restatements of
-///   the order come under it too;
-/// - (b) PendingNew once the order is past it;
-/// - (c) New while the order is PendingCancel or PendingReplace, unless it accepts the pending
-///   replace: the venue refuses a request with an OrderCancelReject, which comes another way.
+/// - (a) `settled`: under a settled request, unless it's the order's current downstream, where
+///   only the accepted replace's own PendingReplace is a resend (the order's later reports come
+///   under it too). A done status is exempt: it can't roll anything back, and dropping it would
+///   leave an order live here that the venue has ended;
+/// - (b) `behind_new`: PendingNew once the order is past it;
+/// - (c) `behind_pending`: New or PartiallyFilled while the order is PendingCancel or
+///   PendingReplace, unless it accepts the pending replace: the venue refuses a request with an
+///   OrderCancelReject, which comes another way.
 ///
 /// A pending state may follow PartiallyFilled, so status alone doesn't order reports. Fills are
 /// known by LastQty, not status, since a fill on an order pending cancel says PendingCancel.
@@ -876,14 +885,17 @@ fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool {
     {
         return true;
     }
+    if report.last_qty > Decimal::ZERO {
+        return false;
+    }
     let current = report.downstream == order.downstream;
+    let settled = answered && !report.status.is_done() && (!current || report.status == Status::PendingReplace);
+    let behind_new = report.status == Status::PendingNew && order.status != Status::PendingNew;
     let accepts_pending = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
-    report.last_qty == Decimal::ZERO
-        && ((answered && (!current || report.status == Status::PendingReplace))
-            || (report.status == Status::PendingNew && order.status != Status::PendingNew)
-            || (report.status == Status::New
-                && matches!(order.status, Status::PendingCancel | Status::PendingReplace)
-                && !accepts_pending))
+    let behind_pending = matches!(report.status, Status::New | Status::PartiallyFilled)
+        && matches!(order.status, Status::PendingCancel | Status::PendingReplace)
+        && !accepts_pending;
+    settled || behind_new || behind_pending
 }
 
 /// A venue's refusal of a cancel or replace. `status` is the order's status as the venue gives
@@ -1967,10 +1979,9 @@ mod tests {
         replace(&mut book, "C2", "C1", 80, 11);
         run(&mut book, with_venue_order_id(venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0), "V-2"));
         assert_eq!(venue_order_id(&book), Some("V-2"));
-        // A late report from before the replace doesn't roll it back.
-        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        // A late report from before the replace is dropped, so doesn't roll it back.
+        assert!(run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1")).is_empty());
         assert_eq!(venue_order_id(&book), Some("V-2"));
-        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
         let out = cancel(&mut book, "C3", "C2");
         let [Output::Cancel { venue_order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(venue_order_id.as_deref(), Some("V-2"));
@@ -2211,8 +2222,9 @@ mod tests {
     }
 
     /// Whether `stale` drops a report without a fill, with `report` status, under `under`, whose
-    /// request the venue has `answered`, for an order with `status` and a replace pending.
-    fn dropped(status: Status, report: Status, under: Under, answered: bool) -> bool {
+    /// request the venue has `answered`, for an order with `status` and, if `pending`, a replace
+    /// pending under "1-2".
+    fn dropped(status: Status, report: Status, under: Under, answered: bool, pending: bool) -> bool {
         let order = Order {
             id: OrderId(1),
             client: "FUNDA".into(),
@@ -2223,7 +2235,7 @@ mod tests {
             status,
             cum_qty: Decimal::ZERO,
             avg_px: Decimal::ZERO,
-            pending: Some(Pending {
+            pending: pending.then(|| Pending {
                 downstream: "1-2".into(),
                 cl_ord_id: "C3".into(),
                 qty: Decimal::from(80),
@@ -2266,10 +2278,16 @@ mod tests {
             (PendingReplace, New, Pending, false, false),
             (PendingCancel, New, Pending, false, false),
             (PendingCancel, Canceled, Other, false, false),
+            // So is PartiallyFilled without a fill: the order's state from before the request.
+            (PendingCancel, PartiallyFilled, Current, false, true),
+            (PendingReplace, PartiallyFilled, Current, true, true),
+            (PendingReplace, PartiallyFilled, Pending, false, false),
             // A settled request's reports, except on the order's current downstream.
             (New, PendingReplace, Other, true, true),
             (New, PendingCancel, Other, true, true),
-            (New, Canceled, Other, true, true),
+            (New, New, Other, true, true),
+            // Done can't be a rollback: the venue ended the order, whatever it came under.
+            (New, Canceled, Other, true, false),
             (New, Canceled, Current, true, false),
             (New, New, Current, true, false),
             // On the current downstream, the accepted replace's own pending state is a resend.
@@ -2280,11 +2298,67 @@ mod tests {
         ];
         for (status, report, under, answered, expected) in table {
             assert_eq!(
-                dropped(status, report, under, answered),
+                dropped(status, report, under, answered, true),
                 expected,
                 "{status:?} {report:?} {under:?} {answered}"
             );
         }
+        // Nothing pending: a cancel is, or nothing is.
+        let table = [
+            (PendingCancel, New, Current, false, true),
+            (PendingCancel, PartiallyFilled, Current, false, true),
+            (PendingCancel, PendingCancel, Other, false, false),
+            (PendingCancel, Canceled, Other, false, false),
+            (New, Canceled, Current, false, false),
+            (New, PendingReplace, Current, true, true),
+        ];
+        for (status, report, under, answered, expected) in table {
+            assert_eq!(
+                dropped(status, report, under, answered, false),
+                expected,
+                "{status:?} {report:?} {under:?} {answered}, nothing pending"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resent_replace_acceptance_while_another_replace_is_pending_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::PartiallyFilled, 0, 40));
+        replace(&mut book, "C3", "C2", 70, 11);
+        run(&mut book, venue_report("1-2", Status::PendingReplace, 0, 40));
+        let resent = venue_report_as("1-1", ExecType::Replaced, Status::PartiallyFilled, 0, 40);
+        assert!(run(&mut book, resent).is_empty());
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, order.request.qty), (Status::PendingReplace, 80.into()));
+        assert!(order.pending.is_some());
+    }
+
+    #[test]
+    fn an_unsolicited_cancel_under_a_rejected_cancels_downstream_is_applied() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
+        let out = run(&mut book, venue_report("1-1", Status::Canceled, 0, 0));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.status, Status::Canceled);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Canceled);
+    }
+
+    #[test]
+    fn a_late_new_under_a_replaced_downstream_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+        assert!(run(&mut book, venue_report("1", Status::New, 0, 0)).is_empty());
+        // Fills under it still count.
+        assert_eq!(run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40)).len(), 1);
     }
 
     #[test]
