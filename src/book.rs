@@ -280,9 +280,12 @@ impl Book {
         match input {
             Input::NewOrder { client, request, redelivered } => self.new_order(client, request, redelivered, out),
             Input::VenueReport { venue, report } => self.venue_report(&venue, report, out),
-            Input::Cancel { client, cl_ord_id, orig_cl_ord_id } => self.cancel(client, cl_ord_id, orig_cl_ord_id, out),
+            Input::Cancel { client, cl_ord_id, orig_cl_ord_id } => {
+                self.cancel(Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Cancel }, out)
+            }
             Input::Replace { client, cl_ord_id, orig_cl_ord_id, qty, price } => {
-                self.replace(client, cl_ord_id, orig_cl_ord_id, qty, price, out)
+                let amend = Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Replace };
+                self.replace(amend, qty, price, out)
             }
             Input::VenueCancelReject { venue, downstream, status, text } => {
                 self.venue_cancel_reject(&venue, &downstream, status, text, out)
@@ -402,96 +405,81 @@ impl Book {
     /// A cancel goes to the venue even while PendingNew, under the next numbered downstream ClOrdID.
     /// Its ClOrdID counts against the client's bound through `remember`; the bound isn't checked
     /// here, since a client must always be able to cancel.
-    fn cancel(
-        &mut self,
-        client: ClientId,
-        cl_ord_id: CompactString,
-        orig_cl_ord_id: CompactString,
-        out: &mut Vec<Output>,
-    ) {
-        let id = self.index.get(&(client.clone(), orig_cl_ord_id.clone())).copied();
-        let order = id.map(|id| self.orders.get(&id).expect("indexed ClOrdIDs point at booked orders"));
-        // Before `remember`, which asserts the ClOrdID is new.
-        let duplicate = self.index.contains_key(&(client.clone(), cl_ord_id.clone()));
-        let refusal = match order {
-            _ if duplicate => Some((CancelRejectReason::Duplicate, "duplicate ClOrdID")),
-            None => Some((CancelRejectReason::UnknownOrder, "unknown order")),
-            Some(order) if order.status.is_done() => Some((CancelRejectReason::TooLate, "order is done")),
-            Some(_) => None,
-        };
-        if let Some((reason, text)) = refusal {
-            let refusal = Refusal { client, cl_ord_id, orig_cl_ord_id, response_to: CancelKind::Cancel };
-            return out.push(refusal.output(order, reason, text.into()));
-        }
-        let id = id.expect("checked above");
-        let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
-        order.amendments += 1;
-        let downstream = format_compact!("{}-{}", id.0, order.amendments);
+    fn cancel(&mut self, amend: Amend, out: &mut Vec<Output>) {
+        let Some((id, amend)) = self.amendable(amend, |_| None, out) else { return };
+        let (downstream, order) = self.number(id, amend);
         out.push(Output::Cancel {
             venue: order.venue.clone(),
-            downstream: downstream.clone(),
+            downstream,
             orig_downstream: order.downstream.clone(),
             request: order.request.clone(),
         });
-        let sent = Sent {
-            order: id,
-            cl_ord_id: cl_ord_id.clone(),
-            orig_cl_ord_id: Some(orig_cl_ord_id),
-            kind: Some(CancelKind::Cancel),
-        };
-        let previous = self.downstream.insert(downstream.clone(), sent);
-        debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
-        self.remember(&client, cl_ord_id, id);
     }
 
     /// A replace goes to the venue like a cancel, one at a time; the order keeps its terms until
     /// the venue accepts it (see `venue_report`).
-    fn replace(
-        &mut self,
-        client: ClientId,
-        cl_ord_id: CompactString,
-        orig_cl_ord_id: CompactString,
-        qty: Decimal,
-        price: Option<Decimal>,
-        out: &mut Vec<Output>,
-    ) {
-        let id = self.index.get(&(client.clone(), orig_cl_ord_id.clone())).copied();
-        let order = id.map(|id| self.orders.get(&id).expect("indexed ClOrdIDs point at booked orders"));
-        // Before `remember`, which asserts the ClOrdID is new.
-        let duplicate = self.index.contains_key(&(client.clone(), cl_ord_id.clone()));
-        let refusal = match order {
-            _ if duplicate => Some((CancelRejectReason::Duplicate, "duplicate ClOrdID")),
-            None => Some((CancelRejectReason::UnknownOrder, "unknown order")),
-            Some(order) if order.status.is_done() => Some((CancelRejectReason::TooLate, "order is done")),
-            Some(order) if order.pending.is_some() => Some((CancelRejectReason::Other, "replace pending")),
-            Some(order) if qty < order.cum_qty => Some((CancelRejectReason::Other, "quantity below filled quantity")),
-            Some(_) => None,
+    fn replace(&mut self, amend: Amend, qty: Decimal, price: Option<Decimal>, out: &mut Vec<Output>) {
+        let refuse = |order: &Order| {
+            if order.pending.is_some() {
+                Some("replace pending")
+            } else if qty < order.cum_qty {
+                Some("quantity below filled quantity")
+            } else {
+                None
+            }
         };
-        if let Some((reason, text)) = refusal {
-            let refusal = Refusal { client, cl_ord_id, orig_cl_ord_id, response_to: CancelKind::Replace };
-            return out.push(refusal.output(order, reason, text.into()));
-        }
-        let id = id.expect("checked above");
-        let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
-        order.amendments += 1;
-        let downstream = format_compact!("{}-{}", id.0, order.amendments);
-        let request = OrderRequest { qty, price, ..order.request.clone() };
+        let Some((id, amend)) = self.amendable(amend, refuse, out) else { return };
+        let cl_ord_id = amend.cl_ord_id.clone();
+        let (downstream, order) = self.number(id, amend);
         out.push(Output::Replace {
             venue: order.venue.clone(),
             downstream: downstream.clone(),
             orig_downstream: order.downstream.clone(),
-            request,
+            request: OrderRequest { qty, price, ..order.request.clone() },
         });
-        order.pending = Some(Pending { downstream: downstream.clone(), cl_ord_id: cl_ord_id.clone(), qty, price });
+        order.pending = Some(Pending { downstream, cl_ord_id, qty, price });
+    }
+
+    /// The live order a cancel or replace names, or `None` with an OrderCancelReject refusing it
+    /// pushed. `refuse` adds the request's own checks, as reason Other, after the shared ones.
+    fn amendable(
+        &self,
+        amend: Amend,
+        refuse: impl Fn(&Order) -> Option<&'static str>,
+        out: &mut Vec<Output>,
+    ) -> Option<(OrderId, Amend)> {
+        let id = self.index.get(&(amend.client.clone(), amend.orig_cl_ord_id.clone()));
+        let order = id.map(|id| self.orders.get(id).expect("indexed ClOrdIDs point at booked orders"));
+        // Before `remember`, which asserts the ClOrdID is new.
+        let duplicate = self.index.contains_key(&(amend.client.clone(), amend.cl_ord_id.clone()));
+        let refusal = match order {
+            _ if duplicate => Some((CancelRejectReason::Duplicate, "duplicate ClOrdID")),
+            None => Some((CancelRejectReason::UnknownOrder, "unknown order")),
+            Some(order) if order.status.is_done() => Some((CancelRejectReason::TooLate, "order is done")),
+            Some(order) => refuse(order).map(|text| (CancelRejectReason::Other, text)),
+        };
+        if let Some((reason, text)) = refusal {
+            out.push(amend.refuse(order, reason, text.into()));
+            return None;
+        }
+        Some((order.expect("an unknown order is refused").id, amend))
+    }
+
+    /// Sends `amend` under the order's next numbered downstream ClOrdID, remembering what it was.
+    fn number(&mut self, id: OrderId, amend: Amend) -> (CompactString, &mut Order) {
+        let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
+        order.amendments += 1;
+        let downstream = format_compact!("{}-{}", id.0, order.amendments);
         let sent = Sent {
             order: id,
-            cl_ord_id: cl_ord_id.clone(),
-            orig_cl_ord_id: Some(orig_cl_ord_id),
-            kind: Some(CancelKind::Replace),
+            cl_ord_id: amend.cl_ord_id.clone(),
+            orig_cl_ord_id: Some(amend.orig_cl_ord_id),
+            kind: Some(amend.kind),
         };
         let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
-        self.remember(&client, cl_ord_id, id);
+        self.remember(&amend.client, amend.cl_ord_id, id);
+        (downstream, self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders"))
     }
 
     /// The venue refused a cancel or replace we sent under `downstream`, with the order's status
@@ -544,9 +532,10 @@ impl Book {
             }
             None => {}
         }
-        let refusal = Refusal { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, response_to };
+        let amend =
+            Amend { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, kind: response_to };
         let text = text.unwrap_or_else(|| "rejected by the venue".into());
-        out.push(refusal.output(Some(&*order), CancelRejectReason::Other, text));
+        out.push(amend.refuse(Some(&*order), CancelRejectReason::Other, text));
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
@@ -598,23 +587,23 @@ fn stale(order: &Order, report: &VenueReport) -> bool {
         || (report.last_qty > Decimal::ZERO && report.cum_qty == order.cum_qty)
 }
 
-/// A client's cancel or replace request, refused.
-struct Refusal {
+/// A client's cancel or replace request.
+struct Amend {
     client: ClientId,
     cl_ord_id: CompactString,
     orig_cl_ord_id: CompactString,
-    response_to: CancelKind,
+    kind: CancelKind,
 }
 
-impl Refusal {
-    /// An OrderCancelReject, naming the order when there is one.
-    fn output(self, order: Option<&Order>, reason: CancelRejectReason, text: CompactString) -> Output {
+impl Amend {
+    /// An OrderCancelReject refusing it, naming the order when there is one.
+    fn refuse(self, order: Option<&Order>, reason: CancelRejectReason, text: CompactString) -> Output {
         Output::CancelReject {
             client: self.client,
             order_id: order.map(|order| order.id),
             cl_ord_id: self.cl_ord_id,
             orig_cl_ord_id: self.orig_cl_ord_id,
-            response_to: self.response_to,
+            response_to: self.kind,
             status: order.map_or(Status::Rejected, |order| order.status),
             reason,
             text,
