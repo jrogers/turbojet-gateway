@@ -221,8 +221,10 @@ pub enum Input {
     VenueCancelReject {
         venue: VenueId,
         downstream: CompactString,
-        /// OrdStatus(39), required on OrderCancelReject.
-        status: Status,
+        /// OrdStatus(39), required on OrderCancelReject; `None` for one the book doesn't model
+        /// (DoneForDay, Stopped, Suspended, Calculated), which leaves the order's as for a
+        /// Rejected ExecutionReport without a status.
+        status: Option<Status>,
         text: Option<CompactString>,
         /// CxlRejReason(102).
         reason: Option<u32>,
@@ -409,7 +411,7 @@ impl Book {
                 self.replace(amend, (side, symbol), terms, out)
             }
             Input::VenueCancelReject { venue, downstream, status, text, reason, venue_order_id } => {
-                let refused = Refused { status: Some(status), text, venue_order_id, reason };
+                let refused = Refused { status, text, venue_order_id, reason };
                 self.venue_cancel_reject(&venue, &downstream, refused, out)
             }
             Input::SendFailed { venue, downstream, text } => self.send_failed(&venue, &downstream, text, out),
@@ -1349,11 +1351,27 @@ mod tests {
         assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
     }
 
+    #[test]
+    fn a_venue_cancel_reject_without_a_status_takes_the_order_out_of_pending() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_report_as("1-1", ExecType::PendingCancel, Status::PendingCancel, 0, 0));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingCancel);
+        let mut input = venue_cancel_reject("NASDAQ", "1-1", Status::New);
+        let Input::VenueCancelReject { status, .. } = &mut input else { unreachable!() };
+        *status = None;
+        let out = run(&mut book, input);
+        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
     fn venue_cancel_reject(venue: &str, downstream: &str, status: Status) -> Input {
         Input::VenueCancelReject {
             venue: venue.into(),
             downstream: downstream.into(),
-            status,
+            status: Some(status),
             text: None,
             reason: None,
             venue_order_id: None,
