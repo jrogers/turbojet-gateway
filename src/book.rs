@@ -79,6 +79,24 @@ impl Status {
     }
 }
 
+/// ExecType(150): what a report says happened. The FIX side maps it per version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecType {
+    PendingNew,
+    New,
+    Trade,
+    PendingCancel,
+    Canceled,
+    PendingReplace,
+    Replaced,
+    Rejected,
+    Expired,
+    Restated,
+    DoneForDay,
+    /// Nothing new, the order's state: ExecType=I (4.3+) or ExecTransType=3 (4.2).
+    Status,
+}
+
 /// Why we rejected an order ourselves; the FIX side maps it to OrdRejReason(103).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
@@ -119,6 +137,8 @@ pub struct Pending {
 pub struct VenueReport {
     /// The downstream ClOrdID it answers.
     pub downstream: CompactString,
+    /// Passed to the client as it is; fills are still known by `last_qty`, not `Trade`.
+    pub exec_type: ExecType,
     pub status: Status,
     pub last_qty: Decimal,
     pub last_px: Decimal,
@@ -160,19 +180,12 @@ pub enum Input {
     },
 }
 
-/// What a [`ClientReport`] tells the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReportKind {
-    /// Something happened to the order: an ack, a fill, a cancel, a reject.
-    Event,
-    /// An answer to a redelivery, nothing new: sent as ExecType=I (4.3+) or ExecTransType=3 (4.2).
-    Status,
-}
-
 /// An ExecutionReport for a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientReport {
-    pub kind: ReportKind,
+    /// The venue's, except for the book's own rejects (`Rejected`) and answers to redeliveries
+    /// (`Status`).
+    pub exec_type: ExecType,
     /// `None` for an order rejected before it was booked.
     pub order_id: Option<OrderId>,
     pub cl_ord_id: CompactString,
@@ -341,7 +354,7 @@ impl Book {
             let output = if resent {
                 // Reports carry the order's latest ClOrdID; after a replace, OrigClOrdID names the
                 // one the client asked about.
-                let mut report = order.report(&order.request.cl_ord_id, ReportKind::Status);
+                let mut report = order.report(&order.request.cl_ord_id, ExecType::Status);
                 if report.cl_ord_id != request.cl_ord_id {
                     report.orig_cl_ord_id = Some(request.cl_ord_id);
                 }
@@ -430,11 +443,11 @@ impl Book {
         order.avg_px = report.avg_px;
         order.set_status(report.status);
         let mut client_report = if answers_request {
-            let mut client_report = order.report(&cl_ord_id, ReportKind::Event);
+            let mut client_report = order.report(&cl_ord_id, report.exec_type);
             client_report.orig_cl_ord_id = orig_cl_ord_id;
             client_report
         } else {
-            order.report(&order.request.cl_ord_id, ReportKind::Event)
+            order.report(&order.request.cl_ord_id, report.exec_type)
         };
         client_report.last_qty = report.last_qty;
         client_report.last_px = report.last_px;
@@ -598,9 +611,9 @@ impl Book {
 
 impl Order {
     /// A report of where the order stands, answering the client's `cl_ord_id`.
-    fn report(&self, cl_ord_id: &CompactString, kind: ReportKind) -> ClientReport {
+    fn report(&self, cl_ord_id: &CompactString, exec_type: ExecType) -> ClientReport {
         ClientReport {
-            kind,
+            exec_type,
             order_id: Some(self.id),
             cl_ord_id: cl_ord_id.clone(),
             orig_cl_ord_id: None,
@@ -669,7 +682,7 @@ impl Amend {
 
 fn reject(client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
     let report = ClientReport {
-        kind: ReportKind::Event,
+        exec_type: ExecType::Rejected,
         order_id: None,
         cl_ord_id: request.cl_ord_id.clone(),
         orig_cl_ord_id: None,
@@ -743,6 +756,7 @@ mod tests {
             (report.status, report.reject, report.order_id),
             (Status::Rejected, Some(RejectReason::NoRoute), None)
         );
+        assert_eq!(report.exec_type, ExecType::Rejected);
         assert!(book.order(OrderId(1)).is_none());
     }
 
@@ -752,7 +766,7 @@ mod tests {
         new_order(&mut book, "C1");
         let out = new_order(&mut book, "C1");
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
-        assert_eq!(report.reject, Some(RejectReason::Duplicate));
+        assert_eq!((report.reject, report.exec_type), (Some(RejectReason::Duplicate), ExecType::Rejected));
     }
 
     #[test]
@@ -762,7 +776,7 @@ mod tests {
         let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.order_id, report.status, report.reject), (Some(OrderId(1)), Status::PendingNew, None));
-        assert_eq!(report.kind, ReportKind::Status);
+        assert_eq!(report.exec_type, ExecType::Status);
         assert_eq!(report.leaves_qty, Decimal::from(100));
         assert_eq!(report.cl_ord_id, "C1");
         assert_eq!(report.orig_cl_ord_id, None);
@@ -811,14 +825,31 @@ mod tests {
         new_order(&mut book, "C1");
         let out = new_order(&mut book, "C2");
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
-        assert_eq!(report.reject, Some(RejectReason::TooManyOrders));
+        assert_eq!((report.reject, report.exec_type), (Some(RejectReason::TooManyOrders), ExecType::Rejected));
     }
 
+    /// A venue report with the ExecType a venue would give it: Trade for a fill, else by status.
     fn venue_report(downstream: &str, status: Status, last_qty: i64, cum_qty: i64) -> Input {
+        let exec_type = match status {
+            _ if last_qty > 0 => ExecType::Trade,
+            Status::PendingNew => ExecType::PendingNew,
+            Status::New => ExecType::New,
+            Status::PendingCancel => ExecType::PendingCancel,
+            Status::PendingReplace => ExecType::PendingReplace,
+            Status::Canceled => ExecType::Canceled,
+            Status::Expired => ExecType::Expired,
+            Status::Rejected => ExecType::Rejected,
+            Status::PartiallyFilled | Status::Filled => ExecType::Status,
+        };
+        venue_report_as(downstream, exec_type, status, last_qty, cum_qty)
+    }
+
+    fn venue_report_as(downstream: &str, exec_type: ExecType, status: Status, last_qty: i64, cum_qty: i64) -> Input {
         Input::VenueReport {
             venue: "NASDAQ".into(),
             report: VenueReport {
                 downstream: downstream.into(),
+                exec_type,
                 status,
                 last_qty: Decimal::from(last_qty),
                 last_px: Decimal::from(10),
@@ -837,7 +868,7 @@ mod tests {
         let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((client.as_str(), report.cl_ord_id.as_str()), ("FUNDA", "C1"));
         assert_eq!((report.last_qty, report.cum_qty, report.leaves_qty), (40.into(), 40.into(), 60.into()));
-        assert_eq!(report.kind, ReportKind::Event);
+        assert_eq!(report.exec_type, ExecType::Trade);
         assert_eq!((report.last_px, report.avg_px, &report.orig_cl_ord_id), (10.into(), 10.into(), &None));
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((order.status, order.cum_qty, order.avg_px), (Status::PartiallyFilled, 40.into(), 10.into()));
@@ -952,7 +983,7 @@ mod tests {
         let out = run(&mut book, venue_report("1-1", Status::Canceled, 0, 0));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
-        assert_eq!(report.leaves_qty, Decimal::ZERO);
+        assert_eq!((report.leaves_qty, report.exec_type), (Decimal::ZERO, ExecType::Canceled));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Canceled);
     }
 
@@ -1117,10 +1148,11 @@ mod tests {
         let mut book = book();
         new_order(&mut book, "C1");
         replace(&mut book, "C2", "C1", 80, 11);
-        let out = run(&mut book, venue_report("1-1", Status::New, 0, 0));
+        let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
         assert_eq!((report.request.qty, report.leaves_qty), (80.into(), 80.into()));
+        assert_eq!(report.exec_type, ExecType::Replaced);
         let order = book.order(OrderId(1)).unwrap();
         assert_eq!((&order.request, order.downstream.as_str()), (&replaced("C2", 80, 11), "1-1"));
         assert!(order.pending.is_none());
@@ -1256,6 +1288,7 @@ mod tests {
         let out = run(&mut book, venue_report("1-1", Status::Filled, 150, 150));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.cum_qty, report.request.qty), (150.into(), 150.into()));
+        assert_eq!(report.exec_type, ExecType::Trade);
     }
 
     #[test]
@@ -1267,7 +1300,7 @@ mod tests {
         let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
-        assert_eq!((report.kind, report.reject, report.request.qty), (ReportKind::Status, None, 80.into()));
+        assert_eq!((report.exec_type, report.reject, report.request.qty), (ExecType::Status, None, 80.into()));
     }
 
     #[test]
@@ -1308,7 +1341,7 @@ mod tests {
         new_order(&mut book, "C1");
         let out = run(&mut book, venue_report("1", Status::Rejected, 0, 0));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
-        assert_eq!(report.status, Status::Rejected);
+        assert_eq!((report.status, report.exec_type), (Status::Rejected, ExecType::Rejected));
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
     }
 
