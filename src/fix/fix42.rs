@@ -242,9 +242,12 @@ fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionR
     message.ord_type = Some(ord_type_to_fix(request.ord_type));
     message.price = request.price;
     message.time_in_force = request.time_in_force.map(time_in_force_to_fix);
-    if report.last_qty > Decimal::ZERO {
+    // FIX 4.2 requires LastShares(32) and LastPx(31) on every execution, 0 when it isn't a fill;
+    // a status report isn't one.
+    if exec_trans_type == fix::ExecTransType::New {
+        let filled = report.last_qty > Decimal::ZERO;
         message.last_shares = Some(report.last_qty);
-        message.last_px = Some(report.last_px);
+        message.last_px = Some(if filled { report.last_px } else { Decimal::ZERO });
     }
     message.ord_rej_reason = report.reject.map(ord_rej_reason_to_fix);
     // A status request about no order: FIX 4.2 answers Rejected, UnknownOrder.
@@ -987,8 +990,12 @@ mod tests {
     }
 
     #[test]
-    fn a_report_without_a_fill_has_no_last_shares() {
+    fn a_report_without_a_fill_says_last_shares_zero() {
+        let zero = Some(Decimal::ZERO);
         let er = client_report(ClientReport { exec_type: ExecType::New, last_qty: Decimal::ZERO, ..report() });
+        assert_eq!((er.last_shares, er.last_px), (zero, zero));
+        // A status report isn't an execution: it carries neither.
+        let er = client_report(ClientReport { exec_type: ExecType::Status, last_qty: Decimal::ZERO, ..report() });
         assert_eq!((er.last_shares, er.last_px), (None, None));
     }
 
