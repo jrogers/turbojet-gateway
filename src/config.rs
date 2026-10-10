@@ -35,7 +35,7 @@
 //! The sessions file is Turbojet's (`turbojet-config`): its `[acceptor]` serves the clients, all
 //! speaking its `begin_string`, and each `[initiator.NAME]` logs on to venue `NAME`. The
 //! `sessions` key is read at start only: a reload rereads the routes and limits, and the sessions
-//! file in use. Nor does a reload read `[database]`: the gateway keeps the database it started with.
+//! file in use. A reload keeps the `[database]` in use: a changed url is logged, for the next start.
 //!
 //! A client session's trading day ends at `day_end`, or sooner when its schedule's period (from
 //! the sessions file) ends. `day_end` is a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`,
@@ -115,13 +115,21 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 }
 
 /// Reads the routes, limits and `day_end` in the configuration file at `path` again, checking
-/// that each venue the routes name is one of `venues`.
+/// that each venue the routes name is one of `venues`. A `[database] url` other than `database`,
+/// the one in use, is logged: it applies at the next start.
 ///
 /// # Errors
 ///
 /// As [`load`], for the routes, limits and `day_end`, or a route names a venue not in `venues`.
-pub fn reload(path: &Path, venues: &[String]) -> Result<(Router, risk::Config, SessionSchedule), Error> {
+pub fn reload(
+    path: &Path,
+    venues: &[String],
+    database: Option<&str>,
+) -> Result<(Router, risk::Config, SessionSchedule), Error> {
     let file = read(path)?;
+    if file.database.as_ref().map(|database| database.url.as_str()) != database {
+        warn!(file = %path.display(), "[database] url changed: the gateway keeps its database until the next start");
+    }
     let router = file.router(path)?;
     check_venues(path, &router, venues)?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
@@ -469,10 +477,10 @@ reject = "no route"
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"")
             .unwrap();
         let venues = loaded.sessions.initiator_names();
-        let (router, ..) = reload(&path, &venues).unwrap();
+        let (router, ..) = reload(&path, &venues, None).unwrap();
         assert_eq!(router, Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ")]));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"LSE\"").unwrap();
-        assert!(reload(&path, &venues).is_err());
+        assert!(reload(&path, &venues, None).is_err());
     }
 
     fn limits(risk: &str) -> Result<risk::Config, String> {
@@ -552,10 +560,10 @@ self_trade = false
         let path = dir.path().join("jetbridge.toml");
         let venues = load(&path).unwrap().sessions.initiator_names();
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = 5").unwrap();
-        let (_, limits, _) = reload(&path, &venues).unwrap();
+        let (_, limits, _) = reload(&path, &venues, None).unwrap();
         assert_eq!(limits.limits("FUNDA").max_order_qty, Some(decimal("5")));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = -5").unwrap();
-        assert!(reload(&path, &venues).is_err());
+        assert!(reload(&path, &venues, None).is_err());
     }
 
     #[test]
@@ -604,7 +612,7 @@ self_trade = false
     #[test]
     fn reloading_reads_day_end() {
         let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
-        let (.., reloaded) = reload(&dir.path().join("jetbridge.toml"), &[]).unwrap();
+        let (.., reloaded) = reload(&dir.path().join("jetbridge.toml"), &[], None).unwrap();
         assert_eq!(reloaded, day_end("17:00").unwrap());
     }
 

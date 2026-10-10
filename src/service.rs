@@ -37,6 +37,8 @@ pub struct Service {
     acceptor: Acceptor,
     initiators: Initiators,
     local_addr: SocketAddr,
+    /// The `[database] url` the gateway started with: a reload doesn't change it.
+    database: Option<String>,
     /// [`Gateway::run_ticks`], aborted at shutdown, or when the service is dropped.
     retrying: JoinHandle<()>,
 }
@@ -79,7 +81,9 @@ impl Service {
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
-        let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr, retrying };
+        let database = loaded.database;
+        let service =
+            Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr, database, retrying };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
         let serving = match service.check_versions().and_then(|()| service.serve(listener)) {
@@ -141,7 +145,7 @@ impl Service {
             Err(e) => warn!("keeping the sessions file in use: {e}"),
         }
         let venues = self.set_venues();
-        match config::reload(&self.path, &venues) {
+        match config::reload(&self.path, &venues, self.database.as_deref()) {
             Ok((router, limits, day_end)) => {
                 info!(
                     routes = router.rules().len(),
