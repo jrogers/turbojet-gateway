@@ -6,13 +6,16 @@
 //! other than Buy, Sell or SellShort, a quantity that isn't positive, a Limit order without a
 //! price and a Market order with one.
 
-use turbojet::fields::{CompactString, Decimal, FixEnum, UtcTimestamp, format_compact};
+use turbojet::fields::{CompactString, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{FixMessage, Message, MessageReject};
 use turbojet_fix44 as fix;
 
+use super::{
+    check_price, from_code_number, order_id_out, quantity, reason_code, replaced_status, required, unsupported,
+};
 use crate::book::{
-    CancelKind, CancelRejectReason, ClientId, ClientReport, ExecType, Input, OrdType, OrderId, OrderRequest, Output,
+    CancelKind, CancelRejectReason, ClientId, ClientReport, ExecType, Input, OrdType, OrderRequest, Output,
     RejectReason, Side, Status, TimeInForce, VenueId, VenueReport,
 };
 
@@ -180,24 +183,6 @@ fn symbol(symbol: Option<&str>) -> Result<CompactString, MessageReject> {
     symbol.map(CompactString::from).ok_or(MessageReject::required_tag_missing(tags::SYMBOL))
 }
 
-/// OrderQty(38): optional in FIX 4.4 (CashOrderQty may stand in), but the book needs it.
-fn quantity(qty: Option<Decimal>) -> Result<Decimal, MessageReject> {
-    let qty = qty.ok_or(MessageReject::conditionally_required_field_missing(tags::ORDER_QTY))?;
-    if qty <= Decimal::ZERO {
-        return Err(MessageReject::value_incorrect(tags::ORDER_QTY, "OrderQty must be positive"));
-    }
-    Ok(qty)
-}
-
-/// A Limit order needs Price(44) and a Market order mustn't have one.
-fn check_price(ord_type: OrdType, price: Option<Decimal>) -> Result<(), MessageReject> {
-    match (ord_type, price) {
-        (OrdType::Limit, None) => Err(MessageReject::conditionally_required_field_missing(tags::PRICE)),
-        (OrdType::Market, Some(_)) => Err(MessageReject::value_incorrect(tags::PRICE, "A market order takes no Price")),
-        _ => Ok(()),
-    }
-}
-
 fn side_in(side: fix::Side) -> Result<Side, MessageReject> {
     side_from_fix(side).ok_or_else(|| unsupported(tags::SIDE, "Side", side))
 }
@@ -208,10 +193,6 @@ fn ord_type_in(ord_type: fix::OrdType) -> Result<OrdType, MessageReject> {
 
 fn time_in_force_in(time_in_force: fix::TimeInForce) -> Result<TimeInForce, MessageReject> {
     time_in_force_from_fix(time_in_force).ok_or_else(|| unsupported(tags::TIME_IN_FORCE, "TimeInForce", time_in_force))
-}
-
-fn unsupported(tag: u32, name: &str, value: impl FixEnum + std::fmt::Debug) -> MessageReject {
-    MessageReject::value_incorrect(tag, format!("{name} {value:?} ({}) is not supported", value.code()))
 }
 
 fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionReport {
@@ -335,10 +316,6 @@ fn venue_cancel_reject(venue: &VenueId, msg: &Message) -> Result<Input, MessageR
     })
 }
 
-fn required(msg: &Message, tag: u32) -> Result<&str, MessageReject> {
-    msg.get(tag).ok_or(MessageReject::required_tag_missing(tag))
-}
-
 /// The book's ExecType for a venue's code; `None` for a trade bust or correction. A code the
 /// book doesn't model, or FIX 4.4 doesn't list, is passed on as Restated.
 fn venue_exec_type(venue: &VenueId, downstream: &str, code: &str) -> Option<ExecType> {
@@ -359,31 +336,6 @@ fn venue_status(venue: &VenueId, downstream: &str, code: &str) -> Option<Status>
         tracing::warn!(%venue, downstream, ord_status = code, "OrdStatus not modelled; the order keeps its own");
     }
     status
-}
-
-/// OrdStatus Replaced says the replace was accepted, not where the order stands: that's in the
-/// quantities.
-fn replaced_status(cum_qty: Decimal, leaves_qty: Option<Decimal>) -> Status {
-    match leaves_qty {
-        _ if cum_qty <= Decimal::ZERO => Status::New,
-        Some(leaves_qty) if leaves_qty <= Decimal::ZERO => Status::Filled,
-        _ => Status::PartiallyFilled,
-    }
-}
-
-/// OrdRejReason(103) or CxlRejReason(102) as the venue's number, whatever dictionary it's from.
-fn reason_code(venue: &VenueId, downstream: &str, msg: &Message, tag: u32) -> Option<u32> {
-    let code = msg.get(tag)?;
-    let number = code.parse().ok();
-    if number.is_none() {
-        tracing::warn!(%venue, downstream, tag, code, "reason code isn't a number; dropped");
-    }
-    number
-}
-
-/// OrderID(37) is required on ExecutionReport and OrderCancelReject; "NONE" for no order.
-fn order_id_out(order_id: Option<OrderId>) -> CompactString {
-    order_id.map_or_else(|| "NONE".into(), |id| format_compact!("{}", id.0))
 }
 
 // The mapping tables, one per enum pair.
@@ -537,14 +489,10 @@ fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> fix::CxlRejReason {
     }
 }
 
-/// The enum value for a numeric FIX code, if the enum has it.
-fn from_code_number<E: FixEnum>(code: u32) -> Option<E> {
-    E::from_code(&format_compact!("{code}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::book::OrderId;
 
     fn dec(s: &str) -> Decimal {
         s.parse().unwrap()

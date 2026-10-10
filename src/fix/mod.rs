@@ -1,11 +1,11 @@
 //! Conversion between FIX messages and the book's types, one module per FIX version. Pure: no
 //! sessions and no clocks; the caller passes the time for TransactTime.
 
-use turbojet::fields::UtcTimestamp;
+use turbojet::fields::{CompactString, Decimal, FixEnum, UtcTimestamp, format_compact};
 use turbojet::message::tags;
 use turbojet::{Message, MessageReject};
 
-use crate::book::{ClientId, Input, Output, VenueId};
+use crate::book::{ClientId, Input, OrdType, OrderId, Output, Status, VenueId};
 
 pub mod fix42;
 pub mod fix44;
@@ -90,13 +90,71 @@ pub fn possibly_resent(msg: &Message) -> bool {
     msg.flag(tags::POSS_DUP_FLAG) || msg.flag(tags::POSS_RESEND)
 }
 
+// Helpers the versions share: nothing here touches a generated type.
+
+/// OrderQty(38): optional in FIX 4.2 and 4.4 (CashOrderQty may stand in), but the book needs it.
+fn quantity(qty: Option<Decimal>) -> Result<Decimal, MessageReject> {
+    let qty = qty.ok_or(MessageReject::conditionally_required_field_missing(tags::ORDER_QTY))?;
+    if qty <= Decimal::ZERO {
+        return Err(MessageReject::value_incorrect(tags::ORDER_QTY, "OrderQty must be positive"));
+    }
+    Ok(qty)
+}
+
+/// A Limit order needs Price(44) and a Market order mustn't have one.
+fn check_price(ord_type: OrdType, price: Option<Decimal>) -> Result<(), MessageReject> {
+    match (ord_type, price) {
+        (OrdType::Limit, None) => Err(MessageReject::conditionally_required_field_missing(tags::PRICE)),
+        (OrdType::Market, Some(_)) => Err(MessageReject::value_incorrect(tags::PRICE, "A market order takes no Price")),
+        _ => Ok(()),
+    }
+}
+
+/// The reject for an enumerated value the book doesn't model.
+fn unsupported(tag: u32, name: &str, value: impl FixEnum + std::fmt::Debug) -> MessageReject {
+    MessageReject::value_incorrect(tag, format!("{name} {value:?} ({}) is not supported", value.code()))
+}
+
+fn required(msg: &Message, tag: u32) -> Result<&str, MessageReject> {
+    msg.get(tag).ok_or(MessageReject::required_tag_missing(tag))
+}
+
+/// OrdStatus Replaced says the replace was accepted, not where the order stands: that's in the
+/// quantities.
+fn replaced_status(cum_qty: Decimal, leaves_qty: Option<Decimal>) -> Status {
+    match leaves_qty {
+        _ if cum_qty <= Decimal::ZERO => Status::New,
+        Some(leaves_qty) if leaves_qty <= Decimal::ZERO => Status::Filled,
+        _ => Status::PartiallyFilled,
+    }
+}
+
+/// OrdRejReason(103) or CxlRejReason(102) as the venue's number, whatever dictionary it's from.
+fn reason_code(venue: &VenueId, downstream: &str, msg: &Message, tag: u32) -> Option<u32> {
+    let code = msg.get(tag)?;
+    let number = code.parse().ok();
+    if number.is_none() {
+        tracing::warn!(%venue, downstream, tag, code, "reason code isn't a number; dropped");
+    }
+    number
+}
+
+/// OrderID(37) is required on ExecutionReport and OrderCancelReject; "NONE" for no order.
+fn order_id_out(order_id: Option<OrderId>) -> CompactString {
+    order_id.map_or_else(|| "NONE".into(), |id| format_compact!("{}", id.0))
+}
+
+/// The enum value for a numeric FIX code, if the enum has it.
+fn from_code_number<E: FixEnum>(code: u32) -> Option<E> {
+    E::from_code(&format_compact!("{code}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::book::Book;
     use crate::router::{Router, Rule, Target};
     use turbojet::FixMessage;
-    use turbojet::fields::Decimal;
     use {turbojet_fix42 as v42, turbojet_fix44 as v44};
 
     #[test]
