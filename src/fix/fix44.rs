@@ -91,19 +91,23 @@ pub fn venue_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
 /// CumQty, which the book would drop silently as stale, so it's logged here as an error for an
 /// operator and the caller drops it. The session still takes the message: a reject wouldn't
 /// make the venue send anything the book could use. ExecTypes and OrdStatuses the book doesn't
-/// model are logged as warnings and passed on as Restated, and as no status.
+/// model, and codes outside the FIX 4.4 dictionary, are logged as warnings and passed on as
+/// Restated, and as no status.
+///
+/// Only the fields the book needs are read, from the raw message: a strict typed parse would
+/// refuse the whole report, fill and all, over a venue's own code in a field the book ignores.
 ///
 /// # Errors
 ///
-/// The reject to answer with: any other MsgType, a malformed message, or a report without
-/// ClOrdID(11), which the book finds the order by.
+/// The reject to answer with: any other MsgType, a field the book needs missing or malformed
+/// (ClOrdID(11), which the book finds the order by, among them), or a fill without LastPx(31).
 pub fn venue_input(venue: &VenueId, msg: &Message) -> Result<Option<Input>, MessageReject> {
     match msg.get(tags::MSG_TYPE) {
         Some("8") => {
-            let report = venue_report(venue, msg.parse()?)?;
+            let report = venue_report(venue, msg)?;
             Ok(report.map(|report| Input::VenueReport { venue: venue.clone(), report }))
         }
-        Some("9") => Ok(Some(venue_cancel_reject(venue, msg.parse()?))),
+        Some("9") => venue_cancel_reject(venue, msg).map(Some),
         _ => Err(MessageReject::unsupported_message_type()),
     }
 }
@@ -276,63 +280,105 @@ fn replace_request(
     replace
 }
 
-fn venue_report(venue: &VenueId, report: fix::ExecutionReportRef<'_>) -> Result<Option<VenueReport>, MessageReject> {
-    let downstream = report.cl_ord_id.ok_or(MessageReject::conditionally_required_field_missing(tags::CL_ORD_ID))?;
-    let fix_exec_type = report.exec_type;
-    let Some(exec_type) = exec_type_from_fix(fix_exec_type) else {
-        tracing::error!(%venue, downstream, exec_id = report.exec_id, exec_type = ?fix_exec_type,
+fn venue_report(venue: &VenueId, msg: &Message) -> Result<Option<VenueReport>, MessageReject> {
+    let downstream =
+        msg.get(tags::CL_ORD_ID).ok_or(MessageReject::conditionally_required_field_missing(tags::CL_ORD_ID))?;
+    let exec_id = required(msg, tags::EXEC_ID)?;
+    let exec_type_code = required(msg, tags::EXEC_TYPE)?;
+    let ord_status_code = required(msg, tags::ORD_STATUS)?;
+    let cum_qty: Decimal = msg.field(fix::tags::CUM_QTY)?;
+    let avg_px: Decimal = msg.field(fix::tags::AVG_PX)?;
+    let last_qty = msg.opt_field(fix::tags::LAST_QTY)?.unwrap_or(Decimal::ZERO);
+    let last_px = match msg.opt_field(fix::tags::LAST_PX)? {
+        Some(last_px) => last_px,
+        None if last_qty > Decimal::ZERO => {
+            tracing::error!(%venue, downstream, exec_id, %last_qty, "fill without LastPx needs an operator; rejected");
+            return Err(MessageReject::conditionally_required_field_missing(fix::tags::LAST_PX));
+        }
+        None => Decimal::ZERO,
+    };
+    let Some(exec_type) = venue_exec_type(venue, downstream, exec_type_code) else {
+        tracing::error!(%venue, downstream, exec_id, exec_type = exec_type_code,
             "trade bust or correction needs an operator; dropped");
         return Ok(None);
     };
-    if exec_type == ExecType::Restated && fix_exec_type != fix::ExecType::Restated {
-        tracing::warn!(%venue, downstream, exec_type = ?fix_exec_type, "ExecType not modelled; passed on as Restated");
-    }
-    let status = match report.ord_status {
+    let status = match fix::OrdStatus::from_code(ord_status_code) {
         // Deprecated since FIX 4.3, but some venues still accept a replace with it.
-        fix::OrdStatus::Replaced if report.cum_qty > Decimal::ZERO => Some(Status::PartiallyFilled),
-        fix::OrdStatus::Replaced => Some(Status::New),
-        status => venue_status(venue, downstream, status),
+        Some(fix::OrdStatus::Replaced) => Some(replaced_status(cum_qty, msg.opt_field(fix::tags::LEAVES_QTY)?)),
+        _ => venue_status(venue, downstream, ord_status_code),
     };
     Ok(Some(VenueReport {
         downstream: downstream.into(),
         exec_type,
         status,
-        last_qty: report.last_qty.unwrap_or(Decimal::ZERO),
-        last_px: report.last_px.unwrap_or(Decimal::ZERO),
-        cum_qty: report.cum_qty,
-        avg_px: report.avg_px,
-        exec_id: report.exec_id.into(),
-        text: report.text.map(CompactString::from),
+        last_qty,
+        last_px,
+        cum_qty,
+        avg_px,
+        exec_id: exec_id.into(),
+        text: msg.get(tags::TEXT).map(CompactString::from),
         // As the venue sent it: the book ignores "NONE".
-        venue_order_id: Some(report.order_id.into()),
-        ord_rej_reason: report.ord_rej_reason.map(code_number),
+        venue_order_id: msg.get(tags::ORDER_ID).map(CompactString::from),
+        ord_rej_reason: reason_code(venue, downstream, msg, tags::ORD_REJ_REASON),
     }))
 }
 
-fn venue_cancel_reject(venue: &VenueId, reject: fix::OrderCancelRejectRef<'_>) -> Input {
-    Input::VenueCancelReject {
+fn venue_cancel_reject(venue: &VenueId, msg: &Message) -> Result<Input, MessageReject> {
+    let downstream = required(msg, tags::CL_ORD_ID)?;
+    Ok(Input::VenueCancelReject {
         venue: venue.clone(),
-        downstream: reject.cl_ord_id.into(),
-        status: venue_status(venue, reject.cl_ord_id, reject.ord_status),
-        text: reject.text.map(CompactString::from),
-        reason: reject.cxl_rej_reason.map(code_number),
-        venue_order_id: Some(reject.order_id.into()),
+        downstream: downstream.into(),
+        status: venue_status(venue, downstream, required(msg, tags::ORD_STATUS)?),
+        text: msg.get(tags::TEXT).map(CompactString::from),
+        reason: reason_code(venue, downstream, msg, tags::CXL_REJ_REASON),
+        venue_order_id: msg.get(tags::ORDER_ID).map(CompactString::from),
+    })
+}
+
+fn required(msg: &Message, tag: u32) -> Result<&str, MessageReject> {
+    msg.get(tag).ok_or(MessageReject::required_tag_missing(tag))
+}
+
+/// The book's ExecType for a venue's code; `None` for a trade bust or correction. A code the
+/// book doesn't model, or FIX 4.4 doesn't list, is passed on as Restated.
+fn venue_exec_type(venue: &VenueId, downstream: &str, code: &str) -> Option<ExecType> {
+    let fix_exec_type = fix::ExecType::from_code(code);
+    let exec_type = fix_exec_type.map_or(Some(ExecType::Restated), exec_type_from_fix);
+    if exec_type == Some(ExecType::Restated) && fix_exec_type != Some(fix::ExecType::Restated) {
+        tracing::warn!(%venue, downstream, exec_type = code, "ExecType not modelled; passed on as Restated");
+    }
+    exec_type
+}
+
+/// The book's status for a venue's OrdStatus code; `None`, keeping the order's, for one it
+/// doesn't model or FIX 4.4 doesn't list. DoneForDay is expected; the others are logged.
+fn venue_status(venue: &VenueId, downstream: &str, code: &str) -> Option<Status> {
+    let fix_status = fix::OrdStatus::from_code(code);
+    let status = fix_status.and_then(ord_status_from_fix);
+    if status.is_none() && fix_status != Some(fix::OrdStatus::DoneForDay) {
+        tracing::warn!(%venue, downstream, ord_status = code, "OrdStatus not modelled; the order keeps its own");
+    }
+    status
+}
+
+/// OrdStatus Replaced says the replace was accepted, not where the order stands: that's in the
+/// quantities.
+fn replaced_status(cum_qty: Decimal, leaves_qty: Option<Decimal>) -> Status {
+    match leaves_qty {
+        _ if cum_qty <= Decimal::ZERO => Status::New,
+        Some(leaves_qty) if leaves_qty <= Decimal::ZERO => Status::Filled,
+        _ => Status::PartiallyFilled,
     }
 }
 
-/// The book's status for a venue's OrdStatus; `None`, keeping the order's, for one it doesn't
-/// model. DoneForDay is expected; the others are logged.
-fn venue_status(venue: &VenueId, downstream: &str, status: fix::OrdStatus) -> Option<Status> {
-    let mapped = ord_status_from_fix(status);
-    if mapped.is_none() && status != fix::OrdStatus::DoneForDay {
-        tracing::warn!(%venue, downstream, ord_status = ?status, "OrdStatus not modelled; the order keeps its own");
+/// OrdRejReason(103) or CxlRejReason(102) as the venue's number, whatever dictionary it's from.
+fn reason_code(venue: &VenueId, downstream: &str, msg: &Message, tag: u32) -> Option<u32> {
+    let code = msg.get(tag)?;
+    let number = code.parse().ok();
+    if number.is_none() {
+        tracing::warn!(%venue, downstream, tag, code, "reason code isn't a number; dropped");
     }
-    mapped
-}
-
-/// A reason enum's numeric FIX code. The FIX 4.4 reason codes are all numbers.
-fn code_number(code: impl FixEnum) -> u32 {
-    code.code().parse().expect("FIX 4.4 reason codes are numbers")
+    number
 }
 
 /// OrderID(37) is required on ExecutionReport and OrderCancelReject; "NONE" for no order.
@@ -1009,12 +1055,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reason_codes_are_numbers() {
-        assert_eq!(code_number(fix::OrdRejReason::Other), 99);
-        assert_eq!(code_number(fix::CxlRejReason::OrderAlreadyInPendingStatus), 3);
-    }
-
     fn venue() -> VenueId {
         "NASDAQ".into()
     }
@@ -1154,6 +1194,84 @@ mod tests {
     fn other_venue_message_types_are_unsupported() {
         let msg = limit_order().to_message();
         assert_eq!(venue_input(&venue(), &msg).unwrap_err(), MessageReject::unsupported_message_type());
+    }
+
+    /// `msg` with `tag` set to `value`, in place of any it had.
+    fn with(msg: &Message, tag: u32, value: &str) -> Message {
+        let mut out = Message::default();
+        for (t, v) in msg.fields().filter(|&(t, _)| t != tag) {
+            out.push(t, v);
+        }
+        out.push(tag, value);
+        out
+    }
+
+    fn venue_report_from(msg: &Message) -> VenueReport {
+        let Some(Input::VenueReport { report, .. }) = venue_input(&venue(), msg).unwrap() else { panic!("{msg:?}") };
+        report
+    }
+
+    #[test]
+    fn codes_outside_the_fix_44_dictionary_dont_lose_a_report() {
+        let fill = venue_fill().to_message();
+        // LastLiquidityInd(851), ExecRestatementReason(378): not read, so any code passes.
+        for (tag, value) in [(851, "9"), (378, "123"), (847, "1001")] {
+            assert_eq!(venue_report_from(&with(&fill, tag, value)).last_qty, dec("40"), "{tag}={value}");
+        }
+        let report = venue_report_from(&with(&fill, fix::tags::ORD_REJ_REASON, "100"));
+        assert_eq!(report.ord_rej_reason, Some(100));
+        let report = venue_report_from(&with(&fill, fix::tags::ORD_REJ_REASON, "X"));
+        assert_eq!(report.ord_rej_reason, None);
+        let report = venue_report_from(&with(&fill, tags::EXEC_TYPE, "Z"));
+        assert_eq!((report.exec_type, report.last_qty), (ExecType::Restated, dec("40")));
+        let report = venue_report_from(&with(&fill, tags::ORD_STATUS, "Z"));
+        assert_eq!(report.status, None);
+
+        let mut reject = fix::OrderCancelReject::new(
+            "V-9",
+            "1-1",
+            "1",
+            fix::OrdStatus::New,
+            fix::CxlRejResponseTo::OrderCancelRequest,
+        );
+        reject.text = Some("no".into());
+        let msg = with(&reject.to_message(), fix::tags::CXL_REJ_REASON, "100");
+        let Some(Input::VenueCancelReject { reason, status, .. }) = venue_input(&venue(), &msg).unwrap() else {
+            panic!()
+        };
+        assert_eq!((reason, status), (Some(100), Some(Status::New)));
+        let msg = with(&reject.to_message(), tags::CXL_REJ_RESPONSE_TO, "7");
+        assert!(venue_input(&venue(), &msg).unwrap().is_some());
+    }
+
+    #[test]
+    fn venue_reports_without_what_the_book_needs_are_rejected() {
+        let fill = venue_fill().to_message();
+        for tag in [tags::EXEC_ID, tags::ORD_STATUS, tags::EXEC_TYPE, fix::tags::CUM_QTY, fix::tags::AVG_PX] {
+            let mut msg = Message::default();
+            for (t, v) in fill.fields().filter(|&(t, _)| t != tag) {
+                msg.push(t, v);
+            }
+            assert_eq!(venue_input(&venue(), &msg).unwrap_err(), MessageReject::required_tag_missing(tag), "{tag}");
+        }
+        let bad_qty = with(&fill, fix::tags::CUM_QTY, "lots");
+        assert!(matches!(venue_input(&venue(), &bad_qty), Err(MessageReject::Session { ref_tag: Some(14), .. })));
+    }
+
+    #[test]
+    fn a_fill_without_a_price_is_refused() {
+        let mut fill = venue_fill();
+        fill.last_px = None;
+        let reject = venue_input(&venue(), &fill.to_message()).unwrap_err();
+        assert_eq!(reject, MessageReject::conditionally_required_field_missing(fix::tags::LAST_PX));
+    }
+
+    #[test]
+    fn a_replaced_ord_status_with_nothing_left_is_filled() {
+        let mut report = venue_fill();
+        (report.exec_type, report.ord_status, report.cum_qty, report.leaves_qty) =
+            (fix::ExecType::Replaced, fix::OrdStatus::Replaced, dec("80"), Decimal::ZERO);
+        assert_eq!(venue_report_of(&report).unwrap().status, Some(Status::Filled));
     }
 
     // Venue messages out.
