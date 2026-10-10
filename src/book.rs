@@ -175,7 +175,8 @@ pub enum Input {
     },
     /// `side` and `symbol` must be the order's, as FIX requires them on the request.
     /// `redelivered` as for `NewOrder`: a ClOrdID already used for the same order is answered
-    /// with the order's state rather than refused as a duplicate.
+    /// with the order's state, under the request's own ClOrdIDs, rather than refused as a
+    /// duplicate.
     Cancel {
         client: ClientId,
         cl_ord_id: CompactString,
@@ -199,8 +200,9 @@ pub enum Input {
         time_in_force: Option<TimeInForce>,
         redelivered: bool,
     },
-    /// OrderStatusRequest. `side` and `symbol` are only for the answer about an unknown order,
-    /// since FIX requires them on the request and on every ExecutionReport.
+    /// OrderStatusRequest. Only the ClOrdID identifies the order, since the index is per client;
+    /// `side` and `symbol` are only for the answer about an unknown order, since FIX requires them
+    /// on the request and on every ExecutionReport.
     StatusRequest {
         client: ClientId,
         cl_ord_id: CompactString,
@@ -641,8 +643,12 @@ impl Book {
         // Before `remember`, which asserts the ClOrdID is new.
         let used_for = self.index.get(&(amend.client.clone(), amend.cl_ord_id.clone())).copied();
         if let Some(id) = id.filter(|&id| amend.redelivered && used_for == Some(id)) {
+            // Side and symbol aren't checked again: the ClOrdID already maps to this order.
             let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
-            out.push(Output::Report { client: amend.client, report: order.status_report(amend.cl_ord_id) });
+            // It answers that request, under its own ClOrdIDs, as the venue's reports for it do.
+            let mut report = order.report(&amend.cl_ord_id, ExecType::Status);
+            report.orig_cl_ord_id = Some(amend.orig_cl_ord_id);
+            out.push(Output::Report { client: amend.client, report });
             return None;
         }
         let order = id.map(|id| self.orders.get(&id).expect("indexed ClOrdIDs point at booked orders"));
@@ -813,7 +819,7 @@ impl Order {
     }
 
     /// Where the order stands, answering a client asking by `asked`: a status request or a
-    /// redelivered request. Reports carry the order's latest ClOrdID; after a replace, OrigClOrdID
+    /// redelivered new order. Reports carry the order's latest ClOrdID; after a replace, OrigClOrdID
     /// names the one the client asked about.
     fn status_report(&mut self, asked: CompactString) -> ClientReport {
         let mut report = self.report(&self.request.cl_ord_id.clone(), ExecType::Status);
@@ -2450,7 +2456,8 @@ mod tests {
             (report.exec_type, report.status, report.order_id),
             (ExecType::Status, Status::PendingCancel, Some(OrderId(1)))
         );
-        assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C1", Some("C2")));
+        // It answers the cancel, under the cancel's own ClOrdIDs.
+        assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
         assert_eq!(book.order(OrderId(1)).unwrap().amendments, 1);
     }
 
@@ -2463,7 +2470,7 @@ mod tests {
         let out = run(&mut book, redelivered(replace_input("C2", "C1", 80, 11)));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.exec_type, report.status, report.request.qty), (ExecType::Status, Status::New, 80.into()));
-        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C2", &None));
+        assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
         assert_eq!(book.order(OrderId(1)).unwrap().amendments, 1);
     }
 
