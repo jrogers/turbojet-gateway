@@ -153,7 +153,10 @@ pub struct VenueReport {
     pub downstream: CompactString,
     /// Passed to the client as it is; fills are still known by `last_qty`, not `Trade`.
     pub exec_type: ExecType,
-    pub status: Status,
+    /// OrdStatus(39); `None` keeps the order's, for reports whose status the book doesn't model
+    /// (DoneForDay, Stopped, Suspended, Calculated). Such a report never rejects anything or
+    /// accepts a pending replace.
+    pub status: Option<Status>,
     pub last_qty: Decimal,
     pub last_px: Decimal,
     pub cum_qty: Decimal,
@@ -528,9 +531,10 @@ impl Book {
         // Rejected under a cancel's or replace's ClOrdID is about that request, not the order.
         // Some venues refuse an amendment with ExecType=8 and the order's live OrdStatus: that
         // status stands, as an OrderCancelReject's would.
-        let rejected = report.status == Status::Rejected || report.exec_type == ExecType::Rejected;
+        let rejected =
+            report.status.is_some_and(|status| status == Status::Rejected || report.exec_type == ExecType::Rejected);
         if rejected && sent.kind.is_some() {
-            let status = (report.status != Status::Rejected).then_some(report.status);
+            let status = report.status.filter(|&status| status != Status::Rejected);
             // An ExecutionReport has no CxlRejReason: the refusal's reason is Other.
             let refused = Refused { status, text: report.text, venue_order_id: report.venue_order_id, reason: None };
             return self.refuse_request(venue, &report.downstream, sent, refused, out);
@@ -549,7 +553,8 @@ impl Book {
         }
         let pending_here = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
         // Any answer under the replace's ClOrdID but these means the venue took it.
-        let accepted = pending_here && !rejected && report.status != Status::PendingReplace;
+        let accepted =
+            pending_here && !rejected && report.status.is_some_and(|status| status != Status::PendingReplace);
         // A cancel's reports and a pending replace's (up to the one accepting it) answer that
         // request; any other report is about the order, under the client's latest ClOrdID.
         let answers_request = match kind {
@@ -577,12 +582,13 @@ impl Book {
             order.request.time_in_force = pending.time_in_force;
             order.downstream = pending.downstream;
         }
-        if accepted || (kind == Some(CancelKind::Cancel) && report.status == Status::Canceled) {
+        if accepted || (kind == Some(CancelKind::Cancel) && report.status == Some(Status::Canceled)) {
             self.downstream.get_mut(&report.downstream).expect("looked up above").answered = true;
         }
         order.cum_qty = report.cum_qty;
         order.avg_px = report.avg_px;
-        order.set_status(report.status);
+        // `None` keeps the status, through `set_status` so a fill makes a New order PartiallyFilled.
+        order.set_status(report.status.unwrap_or(order.status));
         let mut client_report = if answers_request {
             let mut client_report = order.report(&cl_ord_id, report.exec_type);
             client_report.orig_cl_ord_id = orig_cl_ord_id;
@@ -941,10 +947,13 @@ fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool {
         return false;
     }
     let current = report.downstream == order.downstream;
-    let settled = answered && !report.status.is_done() && (!current || report.status == Status::PendingReplace);
-    let behind_new = report.status == Status::PendingNew && order.status != Status::PendingNew;
+    // A report keeping the order's status is never done, PendingNew or New.
+    let status = report.status;
+    let settled =
+        answered && !status.is_some_and(Status::is_done) && (!current || status == Some(Status::PendingReplace));
+    let behind_new = status == Some(Status::PendingNew) && order.status != Status::PendingNew;
     let accepts_pending = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
-    let behind_pending = matches!(report.status, Status::New | Status::PartiallyFilled)
+    let behind_pending = matches!(status, Some(Status::New | Status::PartiallyFilled))
         && matches!(order.status, Status::PendingCancel | Status::PendingReplace)
         && !accepts_pending;
     settled || behind_new || behind_pending
@@ -1145,7 +1154,7 @@ mod tests {
             report: VenueReport {
                 downstream: downstream.into(),
                 exec_type,
-                status,
+                status: Some(status),
                 last_qty: Decimal::from(last_qty),
                 last_px: Decimal::from(10),
                 cum_qty: Decimal::from(cum_qty),
@@ -2735,5 +2744,50 @@ mod tests {
         assert!(matches!(out.as_slice(), [Output::NewOrder { venue, .. }] if venue == "NYSE"), "{out:?}");
         let out = cancel(&mut book, "C3", "C1");
         assert!(matches!(out.as_slice(), [Output::Cancel { venue, .. }] if venue == "NASDAQ"), "{out:?}");
+    }
+
+    /// `input`, a venue report, as ExecType `exec_type` keeping the order's status.
+    fn keeping_status(mut input: Input, exec_type: ExecType) -> Input {
+        let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+        (report.status, report.exec_type) = (None, exec_type);
+        input
+    }
+
+    #[test]
+    fn a_done_for_day_keeping_the_status_is_forwarded_with_the_orders() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        let out = run(&mut book, keeping_status(venue_report("1", Status::New, 0, 40), ExecType::DoneForDay));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(
+            (report.exec_type, report.status, report.reject),
+            (ExecType::DoneForDay, Status::PartiallyFilled, None)
+        );
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PartiallyFilled);
+    }
+
+    #[test]
+    fn a_report_keeping_the_status_does_not_accept_a_pending_replace() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        replace(&mut book, "C2", "C1", 80, 11);
+        let out = run(&mut book, keeping_status(venue_report("1-1", Status::New, 0, 0), ExecType::DoneForDay));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.status, report.request.qty), (Status::New, 100.into()));
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, &order.request, order.pending.is_some()), (Status::New, &request("C1"), true));
+    }
+
+    #[test]
+    fn exec_type_rejected_keeping_the_status_rejects_nothing() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        let out = run(&mut book, keeping_status(venue_report("1", Status::New, 0, 0), ExecType::Rejected));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.status, report.reject), (Status::New, None));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
     }
 }
