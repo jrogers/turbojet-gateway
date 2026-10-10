@@ -70,10 +70,10 @@ impl Service {
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
         let loaded = config::load(path)?;
         // First, so a database that won't open stops nothing half-started.
-        let (writer, writing) = match &loaded.database {
+        let (database, writing) = match &loaded.database {
             Some(url) => {
-                let (writer, writing) = start_writer(url).await?;
-                (Some(writer), Some(writing))
+                let (store, snapshot, writer, writing) = start_writer(url).await?;
+                (Some((store, snapshot, writer)), Some(writing))
             }
             None => (None, None),
         };
@@ -87,10 +87,22 @@ impl Service {
             .with_id_prefix(prefix)
             .with_limits(loaded.limits)
             .with_days(loaded.day_end, schedules);
-        if let Some(writer) = writer {
+        let mut recovery = None;
+        if let Some((store, snapshot, writer)) = database {
             gateway = gateway.with_writer(writer);
+            recovery = Some((store, snapshot));
         }
         let gateway = Arc::new(gateway);
+        // Before any session starts: the clients' sessions find their orders and reports, and the
+        // venues' stores are read before their initiators open them.
+        if let Some((store, snapshot)) = recovery {
+            gateway.restore(snapshot);
+            let venues = sessions.initiator_stores();
+            gateway
+                .cancel_orphans(&store, venues)
+                .await
+                .map_err(|e| Error::new(format!("cannot look for orphaned venue requests: {e}")))?;
+        }
         let listen = sessions.listen().expect("load checked the file has [acceptor]");
         // Bound before the venues start, so a port in use stops nothing half-started.
         let listener =
@@ -211,9 +223,8 @@ impl Service {
         // What the last messages changed, before the process goes. A database that's down holds
         // this up; a second signal exits (see the binary).
         self.gateway.committed().await;
-        // Lost at exit until a restart restores the book and the undelivered reports from the
-        // database (recovery isn't built yet): open orders stay open at their venues with no
-        // client to report to.
+        // Open orders stay open at their venues with no gateway to report to until a restart,
+        // which restores them and the undelivered reports from the database, if there is one.
         let unfinished = self.gateway.unfinished();
         if unfinished.open_orders.is_empty() && unfinished.undelivered.is_empty() {
             info!("no open orders or undelivered reports");
@@ -268,18 +279,12 @@ impl Service {
     }
 }
 
-/// Opens the database at `url` and starts the book's writer on it. A database with anything in
-/// it is refused: nothing is restored from it yet, and a new book would write over its rows.
-async fn start_writer(url: &str) -> Result<(Writer, JoinHandle<()>), Error> {
+/// Opens the database at `url`, loads what the book restores, and starts the book's writer on it.
+async fn start_writer(url: &str) -> Result<(Store, Snapshot, Writer, JoinHandle<()>), Error> {
     let store = Store::open(url).await.map_err(|e| Error::new(e.to_string()))?;
     let snapshot = store.load().await.map_err(|e| Error::new(format!("cannot load the database: {e}")))?;
-    // ponytail: until recovery (task D1) restores the book from it.
-    if snapshot != (Snapshot { next_order_id: 1, ..Snapshot::default() }) {
-        return Err(Error::new(
-            "the database isn't empty, and restoring the book from it isn't built yet: start with a new database",
-        ));
-    }
-    Ok(Writer::start(store, snapshot.next_undelivered_id()))
+    let (writer, writing) = Writer::start(store.clone(), snapshot.next_undelivered_id());
+    Ok((store, snapshot, writer, writing))
 }
 
 #[cfg(test)]
@@ -442,24 +447,23 @@ mod tests {
         assert!(error.to_string().starts_with("cannot bind"), "{error}");
     }
 
-    /// Until recovery is built, a database with rows in it is refused rather than written over;
-    /// a new one starts.
-    #[tokio::test]
-    async fn a_database_with_rows_is_refused() {
+    /// A database with rows in it is restored from at the next start: here a block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_restores_the_book_from_the_database() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
         let path = dir.path().join("jetbridge.toml");
         let (service, serving) = Service::start(&path).await.unwrap();
+        service.gateway().block(book::Scope::All).await;
         service.shutdown().await;
         serving.abort();
         drop(service);
 
-        let store = Store::open(&url).await.unwrap();
-        let blocked = book::Changes { blocked: Some(vec![book::Scope::All]), ..book::Changes::default() };
-        store.write(&[blocked]).await.unwrap();
-        let error = Service::start(&path).await.unwrap_err();
-        assert!(error.to_string().contains("the database isn't empty"), "{error}");
+        let (service, serving) = Service::start(&path).await.unwrap();
+        assert_eq!(service.gateway().blocked(), [book::Scope::All]);
+        service.shutdown().await;
+        serving.abort();
     }
 }

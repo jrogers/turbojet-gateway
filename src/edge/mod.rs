@@ -11,6 +11,7 @@
 //! to the [`Writer`] in the order the book made them, and the inbound message they came from is
 //! held in flight until they've committed: see [`writer`].
 
+pub mod orphans;
 pub mod outbox;
 pub mod writer;
 
@@ -30,10 +31,11 @@ use turbojet::{
     SessionHandle, SessionId, SessionSchedule,
 };
 
-use crate::book::{Book, ClientId, Day, GatewayCancel, Input, OrderId, Output, Scope, Undelivered, VenueId};
+use crate::book::{Book, ClientId, Day, GatewayCancel, Input, OrderId, Output, Scope, Snapshot, Undelivered, VenueId};
 use crate::fix::{self, Version};
 use crate::risk;
 use crate::router::Router;
+pub use orphans::Orphans;
 pub use outbox::Outbox;
 pub use writer::Writer;
 
@@ -77,6 +79,9 @@ pub struct Gateway {
     outbox: Outbox,
     /// Each client session seen since start, made once: see [`client`](Self::client).
     clients: Mutex<HashMap<SessionId, ClientId>>,
+    /// Clients the store had at the start, by session as it shows, until each logs on: counted
+    /// against their CompID's sessions as `clients` are. Locked after `clients`.
+    restored: Mutex<HashMap<String, ClientId>>,
     /// Every client's: the acceptor's BeginString.
     client_version: Version,
     /// For TransactTime(60) on what the gateway sends.
@@ -110,6 +115,9 @@ struct State {
     /// one end of day to the next.
     day_end: SessionSchedule,
     schedules: Schedules,
+    /// Cancels for orders a venue's session sent that the store never booked, by venue, to send
+    /// at its next logon: see [`orphans`].
+    orphan_cancels: HashMap<VenueId, Vec<Message>>,
 }
 
 #[derive(Debug)]
@@ -128,11 +136,13 @@ impl Gateway {
             venue_names: HashMap::new(),
             day_end: SessionSchedule::daily(NaiveTime::MIN, NaiveTime::MIN),
             schedules: Schedules(Arc::new(|_| None)),
+            orphan_cancels: HashMap::new(),
         };
         Self {
             state: Mutex::new(state),
             outbox: Outbox::new(),
             clients: Mutex::default(),
+            restored: Mutex::default(),
             client_version,
             clock: Clock::system(),
             cancels_waiting: AtomicBool::new(false),
@@ -182,6 +192,56 @@ impl Gateway {
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Fills the book from `snapshot`, a store's [`load`](crate::store::Store::load), and queues
+    /// the reports it holds undelivered for their clients again, marked PossResend(97), under
+    /// their rows, which go once each client's session has stored its report. Call it once, after
+    /// the `with_` calls (the prefix, limits and writer set) and before any session starts.
+    /// Restored orders keep their names; new ones take this start's prefix.
+    ///
+    /// # Panics
+    ///
+    /// If the book isn't new, or the snapshot holds what a book couldn't (see
+    /// [`Book::restore`]); outside a tokio runtime, with reports to queue.
+    pub fn restore(&self, mut snapshot: Snapshot) {
+        let undelivered = std::mem::take(&mut snapshot.undelivered);
+        let restored = restored_clients(&snapshot, undelivered.values().map(|row| &row.client));
+        let orders = snapshot.orders.len();
+        {
+            let mut state = self.lock();
+            state.book.restore(snapshot);
+            info!(
+                orders,
+                open_orders = ?state.book.open_orders_by_venue(),
+                blocked = ?state.book.blocked(),
+                clients = restored.len(),
+                undelivered = undelivered.len(),
+                "restored the book from the database"
+            );
+        }
+        *self.restored.lock().unwrap_or_else(PoisonError::into_inner) =
+            restored.into_iter().map(|client| (client.to_string(), client)).collect();
+        for (row, Undelivered { client, message }) in undelivered {
+            let msg = match codec::decode(&message) {
+                codec::Decoded::Message(msg, _) => msg.with(tags::POSS_RESEND, true),
+                other => {
+                    error!(%client, row, ?other, "an undelivered report doesn't decode; dropped");
+                    self.delivered(row);
+                    continue;
+                }
+            };
+            if !self.outbox.deliver(&client, msg, Some(row)) {
+                self.delivered(row);
+            }
+        }
+    }
+
+    /// Deletes undelivered row `row`, if there's a database.
+    fn delivered(&self, row: u64) {
+        if let Some(writer) = &self.writer {
+            writer.delivered(row);
+        }
     }
 
     /// Ends the sessions' days at `day_end`'s period ends from each one's next new day on: the
@@ -306,7 +366,9 @@ impl Gateway {
     pub fn cancel_at_shutdown(self: &Arc<Self>, on: impl Fn(&str) -> bool) {
         let sessions: Vec<ClientId> = {
             let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
-            clients.iter().filter(|(id, _)| on(&id.target_comp_id)).map(|(_, client)| client.clone()).collect()
+            let restored = self.restored.lock().unwrap_or_else(PoisonError::into_inner);
+            // Restored ones that haven't logged on since too: their orders are as unattended.
+            clients.values().chain(restored.values()).filter(|client| on(client.comp_id())).cloned().collect()
         };
         let mut state = self.lock();
         let working = state.book.working_by_client();
@@ -343,8 +405,14 @@ impl Gateway {
         if [&id.target_sub_id, &id.target_location_id].into_iter().flatten().any(|part| part.contains('/')) {
             return Err(format!("session {id}: a SubID or LocationID with '/' isn't accepted"));
         }
+        let mut restored = self.restored.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(client) = restored.remove(&id.to_string()) {
+            clients.insert(id.clone(), client);
+            return Ok(());
+        }
         // ponytail: a scan of every session, at logon only; a count per CompID if there are many.
-        let sessions = clients.keys().filter(|known| known.target_comp_id == id.target_comp_id).count();
+        let sessions = clients.keys().filter(|known| known.target_comp_id == id.target_comp_id).count()
+            + restored.values().filter(|client| client.comp_id() == id.target_comp_id).count();
         if sessions >= MAX_SESSIONS_PER_COMP_ID {
             return Err(format!("session {id}: its CompID has {sessions} sessions already, the most allowed"));
         }
@@ -629,6 +697,25 @@ fn new_day(state: &State, client: &ClientId, now: DateTime<Utc>) -> Option<(Clie
     (current != Some(day)).then(|| (client.clone(), day))
 }
 
+/// Every client `snapshot` names, and those of `undelivered`: the sessions the gateway had seen.
+fn restored_clients<'a>(snapshot: &'a Snapshot, undelivered: impl Iterator<Item = &'a ClientId>) -> BTreeSet<ClientId> {
+    let blocked = snapshot.blocked.iter().filter_map(|scope| match scope {
+        Scope::Session(client) => Some(client),
+        Scope::CompId(_) | Scope::All => None,
+    });
+    snapshot
+        .orders
+        .values()
+        .map(|row| &row.order.client)
+        .chain(snapshot.cl_ord_ids.keys().map(|(client, _, _)| client))
+        .chain(snapshot.days.keys())
+        .chain(snapshot.filled.keys())
+        .chain(blocked)
+        .chain(undelivered)
+        .cloned()
+        .collect()
+}
+
 /// The acceptor's application: clients, each its own session (see [`ClientId`]).
 #[derive(Debug, Clone)]
 pub struct ClientApp(pub Arc<Gateway>);
@@ -682,7 +769,8 @@ impl Application for VenueApp {
     fn on_logon(&self, session: &SessionHandle) {
         let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
         if let Some(venue) = venue {
-            self.0.handle(Input::VenueUp { venue });
+            self.0.handle(Input::VenueUp { venue: venue.clone() });
+            self.0.send_orphan_cancels(&venue);
         }
     }
 
@@ -1771,5 +1859,270 @@ mod tests {
         timeout(Duration::from_secs(5), gateway.committed()).await.expect("not committed");
         let rows = store.load().await.unwrap().undelivered;
         assert_eq!(rows.keys().copied().collect::<Vec<_>>(), [1], "only the report the outbox holds");
+    }
+
+    /// A gateway as a start makes it: [`gateway`]'s routes under `prefix`, committing to `store`
+    /// and restored from it.
+    async fn restarted(store: &Store, prefix: &str) -> Arc<Gateway> {
+        let snapshot = store.load().await.unwrap();
+        let (writer, _writing) = Writer::start(store.clone(), snapshot.next_undelivered_id());
+        let gateway = Arc::try_unwrap(gateway()).unwrap().with_id_prefix(prefix.into()).with_writer(writer);
+        let gateway = Arc::new(gateway);
+        gateway.restore(snapshot);
+        gateway
+    }
+
+    /// What `gateway`'s book answers `input` with, handled directly: nothing sent or committed.
+    fn book_input(gateway: &Gateway, input: Input) -> Vec<Output> {
+        let mut out = Vec::new();
+        gateway.lock().book.handle(input, &mut out);
+        out
+    }
+
+    /// An order `cl_ord_id` for 100 AAPL at 10 from `comp_id`'s session.
+    fn new_order_from(comp_id: &str, cl_ord_id: &str) -> Input {
+        let request = crate::book::OrderRequest {
+            cl_ord_id: cl_ord_id.into(),
+            account: None,
+            symbol: "AAPL".into(),
+            side: crate::book::Side::Buy,
+            ord_type: crate::book::OrdType::Limit,
+            qty: 100.into(),
+            price: Some(10.into()),
+            ex_destination: None,
+            time_in_force: None,
+        };
+        Input::NewOrder { client: comp_id.into(), request, redelivered: false, sent: None }
+    }
+
+    fn rejected_for(out: &[Output]) -> Option<crate::book::RejectReason> {
+        let [Output::Report { report, .. }] = out else { panic!("{out:?}") };
+        report.reject
+    }
+
+    /// A gateway restarted on its database has what the last committed: FUNDA's live order,
+    /// partly filled, answers a status request by its name; its ClOrdID is still today's, so a
+    /// duplicate; credit counts what FUNDA filled, as well as the order's open notional (1,000
+    /// open and filled, so another 1,000 is over 1,950); FUNDB's block holds. A new order takes
+    /// the new prefix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_gateway_has_what_its_database_committed() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let limits = risk::Config {
+            defaults: risk::Limits { credit: Some(1_950.into()), ..risk::Limits::default() },
+            ..risk::Config::default()
+        };
+        let before = restarted(&store, "OLDOLD").await;
+        before.set_config(before.router(), limits.clone());
+        let mut sessions = connected(&before, false).await;
+        send_order(&before, "C1");
+        let sent: v44::NewOrderSingle = next_message(&mut sessions.venue_events).await.parse().unwrap();
+        assert_eq!(sent.cl_ord_id, "OLDOLD1");
+        let venue = VenueApp(before.clone());
+        for msg in [venue_report("OLDOLD1", 0), venue_report("OLDOLD1", 10)] {
+            venue.on_message(&mut Context::new(&sessions.venue.handle()), &msg).unwrap();
+        }
+        before.block(Scope::CompId("FUNDB".into())).await;
+        before.committed().await;
+
+        let after = restarted(&store, "NEWNEW").await;
+        after.set_config(after.router(), limits);
+        assert_eq!(after.lock().book.snapshot(), before.lock().book.snapshot());
+        let status = Input::StatusRequest {
+            client: "FUNDA".into(),
+            cl_ord_id: "C1".into(),
+            side: crate::book::Side::Buy,
+            symbol: "AAPL".into(),
+        };
+        let out = book_input(&after, status);
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.order_id.as_deref(), report.cum_qty), (Some("OLDOLD1"), 10.into()));
+        assert_eq!(
+            rejected_for(&book_input(&after, new_order_from("FUNDA", "C1"))),
+            Some(crate::book::RejectReason::Duplicate)
+        );
+        assert_eq!(
+            rejected_for(&book_input(&after, new_order_from("FUNDA", "C2"))),
+            Some(crate::book::RejectReason::Risk(risk::RiskReject::Credit))
+        );
+        assert_eq!(
+            rejected_for(&book_input(&after, new_order_from("FUNDB", "B1"))),
+            Some(crate::book::RejectReason::Blocked)
+        );
+        let out = book_input(&after, new_order_from("FUNDC", "D1"));
+        assert!(matches!(out.as_slice(), [Output::NewOrder { downstream, .. }] if downstream == "NEWNEW2"), "{out:?}");
+    }
+
+    /// Sessions the database had count toward their CompID's [`MAX_SESSIONS_PER_COMP_ID`] before
+    /// they log on, and one logging on is the client it was.
+    #[tokio::test]
+    async fn restored_clients_count_toward_their_comp_ids_sessions() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let today = crate::book::Today { day: Day(at("2026-10-11T00:00:00Z")), began: None };
+        let days =
+            (0..MAX_SESSIONS_PER_COMP_ID).map(|n| (ClientId::new(desk(&format!("DESK{n}")).id()), today)).collect();
+        store.write(&[crate::book::Changes { days, ..crate::book::Changes::default() }]).await.unwrap();
+        let gateway = restarted(&store, "NEWNEW").await;
+        let app = ClientApp(gateway.clone());
+        assert!(logon(&app, &desk("ONE-TOO-MANY")).is_err());
+        assert_eq!(logon(&app, &desk("DESK3")), Ok(()));
+        assert_eq!(gateway.client(desk("DESK3").id()), ClientId::new(desk("DESK3").id()));
+        assert!(logon(&app, &desk("ONE-TOO-MANY")).is_err());
+        assert_eq!(logon(&app, &session("FIX.4.4", "FUNDB")), Ok(()));
+    }
+
+    /// A report the database holds undelivered goes to its client once it logs on to the
+    /// restarted gateway, marked PossResend, once; and its row goes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn undelivered_reports_go_again_marked_possibly_resent_and_their_rows_go() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let before = restarted(&store, "OLDOLD").await;
+        // No venue: booked and rejected, and FUNDA isn't logged on.
+        send_order(&before, "C1");
+        before.committed().await;
+        assert_eq!(store.load().await.unwrap().undelivered.len(), 1);
+        drop(before);
+
+        let after = restarted(&store, "NEWNEW").await;
+        let (_client, mut events) = client(&after).await;
+        let resent = next_message(&mut events).await;
+        assert_eq!(resent.get(tags::POSS_RESEND), Some("Y"));
+        let rejected: v44::ExecutionReport = resent.parse().unwrap();
+        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        delivered(&after).await;
+        assert!(store.load().await.unwrap().undelivered.is_empty());
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err(), "sent twice");
+    }
+
+    /// `messages` as `id`'s session sent them, in `storage`.
+    fn store_sent(storage: &MemoryStorage, id: &SessionId, messages: &[Message]) {
+        let mut log = storage.open(id).unwrap();
+        for (seq, msg) in (1..).zip(messages) {
+            let msg = msg
+                .clone()
+                .with(tags::BEGIN_STRING, "FIX.4.4")
+                .with(tags::MSG_SEQ_NUM, seq)
+                .with(tags::SENDER_COMP_ID, id.sender_comp_id.as_str())
+                .with(tags::TARGET_COMP_ID, id.target_comp_id.as_str())
+                .with(tags::SENDING_TIME, UtcTimestamp::now());
+            log.record_outgoing(seq, Some(&codec::encode(&msg).unwrap())).unwrap();
+        }
+    }
+
+    /// A venue as VENUE, answering nothing, expecting `next_incoming` from us: what our session
+    /// stored before is as if it had seen it.
+    async fn venue_expecting(next_incoming: u64) -> (String, UnboundedReceiver<Event>) {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut log = storage.open(&SessionId::new("FIX.4.4", "VENUE", "JETBRIDGE")).unwrap();
+        log.set_next_incoming(next_incoming).unwrap();
+        let (app, events) = quiet_peer();
+        (serve_with("VENUE", app, storage).await, events)
+    }
+
+    /// Starts `gateway`'s venue on `storage`, logging on to `addr`.
+    fn start_venue(gateway: &Arc<Gateway>, addr: &str, storage: Arc<MemoryStorage>) {
+        let venue = initiator_with(addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())), storage);
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        tokio::spawn(venue.run());
+    }
+
+    async fn next_of_type(events: &mut UnboundedReceiver<Event>, msg_type: MsgType) -> Message {
+        loop {
+            if let Event::Message(msg) = next(events).await
+                && msg.msg_type() == msg_type
+            {
+                return msg;
+            }
+        }
+    }
+
+    /// An order the venue's session stored that the database never had is cancelled at the venue
+    /// once it logs on, from the stored order's fields. One the database has, and one under an ID
+    /// of another shape, aren't.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphaned_order_in_a_venues_store_is_cancelled_when_it_logs_on() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let known = crate::book::Sent {
+            order: OrderId(2),
+            origin: crate::book::Origin::Client,
+            cl_ord_id: "C2".into(),
+            orig_cl_ord_id: None,
+            kind: None,
+            answered: false,
+        };
+        store
+            .write(&[crate::book::Changes { sent: vec![("OLDOLD2".into(), known)], ..Default::default() }])
+            .await
+            .unwrap();
+        let gateway = restarted(&store, "NEWNEW").await;
+        let venues = Arc::new(MemoryStorage::new());
+        let id = SessionId::new("FIX.4.4", "JETBRIDGE", "VENUE");
+        let orphan = order("OLDOLD1").with(tags::ACCOUNT, "ACC");
+        store_sent(&venues, &id, &[orphan, order("OLDOLD2"), order("FOREIGN1")]);
+
+        let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id, venues.clone())]).await.unwrap();
+        assert_eq!(found, Orphans { scanned: 3, new_orders: 1, amendments: 0 });
+        let (addr, mut events) = venue_expecting(4).await;
+        start_venue(&gateway, &addr, venues);
+        let cancel: v44::OrderCancelRequest =
+            next_of_type(&mut events, MsgType::OrderCancelRequest).await.parse().unwrap();
+        assert_eq!((cancel.orig_cl_ord_id.as_str(), cancel.cl_ord_id.as_str()), ("OLDOLD1", "NEWNEWC1"));
+        assert_eq!((cancel.account.as_deref(), cancel.symbol.as_deref()), (Some("ACC"), Some("AAPL")));
+        assert_eq!((cancel.side, cancel.order_qty), (v44::Side::Buy, Some(100.into())));
+        assert!(gateway.lock().orphan_cancels.is_empty());
+        assert!(
+            timeout(Duration::from_millis(100), next_of_type(&mut events, MsgType::OrderCancelRequest)).await.is_err()
+        );
+    }
+
+    /// A cancel the venue's session stored that the database never had, of an order it has: the
+    /// order gets the gateway's cancel when the venue logs on, and the venue's Canceled under the
+    /// orphan's ID ends it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphaned_cancel_cancels_its_order_and_the_venues_answer_applies() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let before = restarted(&store, "OLDOLD").await;
+        let mut sessions = connected(&before, false).await;
+        send_order(&before, "C1");
+        let _: v44::NewOrderSingle = next_message(&mut sessions.venue_events).await.parse().unwrap();
+        VenueApp(before.clone())
+            .on_message(&mut Context::new(&sessions.venue.handle()), &venue_report("OLDOLD1", 0))
+            .unwrap();
+        before.committed().await;
+        sessions.venue.shutdown(None).await;
+
+        let after = restarted(&store, "NEWNEW").await;
+        let venues = Arc::new(MemoryStorage::new());
+        let id = SessionId::new("FIX.4.4", "JETBRIDGE", "VENUE");
+        let mut orphan = v44::OrderCancelRequest::new("OLDOLD1", "OLDOLD1-1", v44::Side::Buy, UtcTimestamp::now());
+        orphan.symbol = Some("AAPL".into());
+        store_sent(&venues, &id, &[orphan.to_message()]);
+        let found = after.cancel_orphans(&store, vec![(VENUE.into(), id, venues.clone())]).await.unwrap();
+        assert_eq!(found, Orphans { scanned: 1, new_orders: 0, amendments: 1 });
+        assert_eq!(unsent(&after), [true]);
+        after.committed().await;
+        assert!(store.unknown_downstreams(&["OLDOLD1-1".into()]).await.unwrap().is_empty(), "recorded");
+
+        let (addr, mut events) = venue_expecting(2).await;
+        start_venue(&after, &addr, venues);
+        let cancel: v44::OrderCancelRequest =
+            next_of_type(&mut events, MsgType::OrderCancelRequest).await.parse().unwrap();
+        // -2 went to the session refusing it, the venue not set yet.
+        assert_eq!((cancel.cl_ord_id.as_str(), cancel.orig_cl_ord_id.as_str()), ("OLDOLD1-3", "OLDOLD1"));
+        let mut canceled = v44::ExecutionReport::new(
+            "V-1",
+            "X-C",
+            v44::ExecType::Canceled,
+            v44::OrdStatus::Canceled,
+            v44::Side::Buy,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        (canceled.cl_ord_id, canceled.orig_cl_ord_id) = (Some("OLDOLD1-1".into()), Some("OLDOLD1".into()));
+        let venue = after.lock().venues[VENUE].session.clone();
+        VenueApp(after.clone()).on_message(&mut Context::new(&venue), &canceled.to_message()).unwrap();
+        assert_eq!(after.lock().book.order(OrderId(1)).unwrap().status, crate::book::Status::Canceled);
+        assert!(after.cancelling().is_empty());
     }
 }
