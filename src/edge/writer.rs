@@ -8,8 +8,11 @@
 //! slows the counterparties, not the gateway's memory. Past [`MAX_UNCOMMITTED`] batches the
 //! gateway rejects new orders (see [`Book::set_unavailable`](crate::book::Book::set_unavailable)).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -56,6 +59,8 @@ pub struct Writer {
     uncommitted: Arc<AtomicUsize>,
     /// The next `undelivered` row's ID.
     next_row: Arc<AtomicU64>,
+    /// Set once the writer task has been cancelled: see [`Supervised`].
+    stopping: Arc<AtomicBool>,
     limit: usize,
 }
 
@@ -68,8 +73,12 @@ impl Writer {
     pub fn start(store: Store, next_row: u64) -> (Self, JoinHandle<()>) {
         let (queue, batches) = mpsc::unbounded_channel();
         let uncommitted = Arc::new(AtomicUsize::new(0));
-        let writing = tokio::spawn(run(store, batches, uncommitted.clone()));
-        let writer = Self { queue, uncommitted, next_row: Arc::new(AtomicU64::new(next_row)), limit: MAX_UNCOMMITTED };
+        let stopping = Arc::new(AtomicBool::new(false));
+        let task = Task { batches, waiting: Vec::with_capacity(MAX_BATCHES_PER_WRITE) };
+        let future = Box::pin(run(store, task, uncommitted.clone()));
+        let writing = tokio::spawn(Supervised { future, polling: false, stopping: stopping.clone() });
+        let next_row = Arc::new(AtomicU64::new(next_row));
+        let writer = Self { queue, uncommitted, next_row, stopping, limit: MAX_UNCOMMITTED };
         (writer, writing)
     }
 
@@ -97,7 +106,9 @@ impl Writer {
         let (done, committed) = oneshot::channel();
         self.send(Batch { changes: Changes::default(), hold: None, done: Some(done) });
         if committed.await.is_err() {
-            error!("the book's writer stopped before committing");
+            self.gone(None);
+            // Never as if committed.
+            std::future::pending::<()>().await;
         }
     }
 
@@ -118,32 +129,92 @@ impl Writer {
 
     fn send(&self, batch: Batch) {
         self.uncommitted.fetch_add(1, Ordering::AcqRel);
-        // Gone only if its task was aborted (the service dropped) or panicked: the batch is lost,
-        // its hold released. Not a panic here, on a session's task.
-        if self.queue.send(batch).is_err() {
+        if let Err(refused) = self.queue.send(batch) {
             self.uncommitted.fetch_sub(1, Ordering::AcqRel);
-            error!("the book's writer has stopped; a change is not written");
+            self.gone(refused.0.hold);
+        }
+    }
+
+    /// The writer task is gone, and `hold`'s message would be acknowledged with its changes never
+    /// written. While the gateway is being torn down (its task cancelled), the hold is forgotten,
+    /// never released, so the message is redelivered after a restart. Otherwise the task died
+    /// some other way: stop, as for a panic inside the book.
+    fn gone(&self, hold: Option<Hold>) {
+        if !self.stopping.load(Ordering::Acquire) {
+            error!("the book's writer has stopped; stopping rather than acknowledge what isn't written");
+            std::process::abort();
+        }
+        std::mem::forget(hold);
+    }
+}
+
+/// The writer task's future. A panic inside it leaves `polling` set when tokio drops it, which
+/// stops the process, since its batches' holds would otherwise be released unwritten. Dropped
+/// otherwise, the task was cancelled (the service dropped, or the runtime shut down): `stopping`
+/// is set, so writers forget the holds of what they can no longer queue, and [`Task`] forgets
+/// those it had.
+struct Supervised<F> {
+    future: Pin<Box<F>>,
+    polling: bool,
+    stopping: Arc<AtomicBool>,
+}
+
+impl<F: Future<Output = ()>> Future for Supervised<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        this.polling = true;
+        let poll = this.future.as_mut().poll(cx);
+        this.polling = false;
+        poll
+    }
+}
+
+impl<F> Drop for Supervised<F> {
+    fn drop(&mut self) {
+        if self.polling {
+            error!("the book's writer panicked; stopping rather than acknowledge what isn't written");
+            std::process::abort();
+        }
+        // Before the future, and with it the queue's receiver, is dropped.
+        self.stopping.store(true, Ordering::Release);
+    }
+}
+
+/// What the writer task holds: its queue, and the holds and waiters of the batches it's writing.
+struct Task {
+    batches: mpsc::UnboundedReceiver<Batch>,
+    waiting: Vec<(Option<Hold>, Option<oneshot::Sender<()>>)>,
+}
+
+impl Drop for Task {
+    /// Cancelled with batches unwritten: their holds are forgotten, not released.
+    fn drop(&mut self) {
+        self.batches.close();
+        let queued = std::iter::from_fn(|| self.batches.try_recv().ok()).map(|batch| batch.hold);
+        for hold in self.waiting.drain(..).map(|(hold, _)| hold).chain(queued) {
+            std::mem::forget(hold);
         }
     }
 }
 
 /// The writer task: takes what's queued, up to [`MAX_BATCHES_PER_WRITE`], writes it in one
 /// transaction, retrying until it commits, then lets go of its holds and says it's done.
-async fn run(store: Store, mut batches: mpsc::UnboundedReceiver<Batch>, uncommitted: Arc<AtomicUsize>) {
+async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>) {
     // Reused from one write to the next.
     let mut changes = Vec::with_capacity(MAX_BATCHES_PER_WRITE);
-    let mut waiting = Vec::with_capacity(MAX_BATCHES_PER_WRITE);
-    while let Some(first) = batches.recv().await {
+    while let Some(first) = task.batches.recv().await {
         let mut next = Some(first);
         while let Some(Batch { changes: batch, hold, done }) = next {
             changes.push(batch);
-            waiting.push((hold, done));
-            next = if changes.len() < MAX_BATCHES_PER_WRITE { batches.try_recv().ok() } else { None };
+            task.waiting.push((hold, done));
+            next = if changes.len() < MAX_BATCHES_PER_WRITE { task.batches.try_recv().ok() } else { None };
         }
         write(&store, &changes).await;
         let written = changes.len();
         changes.clear();
-        for (hold, done) in waiting.drain(..) {
+        for (hold, done) in task.waiting.drain(..) {
             drop(hold);
             if let Some(done) = done {
                 // The caller may have stopped waiting.

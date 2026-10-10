@@ -1443,10 +1443,16 @@ mod tests {
     /// [`gateway`], committing to an in-memory database, with new orders rejected past `limit`
     /// uncommitted batches; and the database, whose writes the test can gate and fail.
     async fn gateway_with_store(limit: usize) -> (Arc<Gateway>, Store) {
+        let (gateway, store, _writing) = gateway_with_writer(limit).await;
+        (gateway, store)
+    }
+
+    /// As [`gateway_with_store`], with the writer's task.
+    async fn gateway_with_writer(limit: usize) -> (Arc<Gateway>, Store, tokio::task::JoinHandle<()>) {
         let store = Store::open("sqlite::memory:").await.unwrap();
-        let (writer, _writing) = Writer::start(store.clone(), 1);
+        let (writer, writing) = Writer::start(store.clone(), 1);
         let gateway = Arc::try_unwrap(gateway()).unwrap().with_writer(writer.with_limit(limit));
-        (Arc::new(gateway), store)
+        (Arc::new(gateway), store, writing)
     }
 
     /// A venue (answering if `answers`) and FUNDA, both logged on to `gateway`, each of the
@@ -1720,5 +1726,22 @@ mod tests {
         assert_eq!(log.in_flight(), Some(2), "released before the reject committed");
         store.hooks.gate.send_replace(true);
         wait_for(log.as_ref(), (3, Some(3))).await;
+    }
+
+    /// Once the writer's task is cancelled, as when the service is dropped, a message that
+    /// changes the book is never released: its hold is forgotten, so it's redelivered after a
+    /// restart, and nothing waiting for a commit is told it happened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_writer_releases_nothing() {
+        let (gateway, _store, writing) = gateway_with_writer(writer::MAX_UNCOMMITTED).await;
+        let mut sessions = connected(&gateway, true).await;
+        writing.abort();
+        assert!(writing.await.unwrap_err().is_cancelled());
+
+        sessions.client.handle().send(order("C1")).unwrap();
+        assert_eq!(report(&mut sessions.client_events).await.exec_type, v44::ExecType::New);
+        wait_for(sessions.client_log.as_ref(), (3, Some(2))).await;
+        assert!(timeout(Duration::from_millis(100), gateway.committed()).await.is_err());
+        assert_eq!(sessions.client_log.in_flight(), Some(2), "released unwritten");
     }
 }
