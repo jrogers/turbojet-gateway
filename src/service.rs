@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
-use turbojet::{Acceptor, SessionHandle};
+use turbojet::{Acceptor, SessionHandle, SessionId};
 use turbojet_config::{Initiators, SessionsFile};
 
 use crate::book;
@@ -85,10 +85,9 @@ impl Service {
         &self.gateway
     }
 
-    /// The session of the client whose CompID is `comp_id`, with no SubIDs or LocationIDs,
-    /// connected or not.
-    pub fn client_session(&self, comp_id: &str) -> SessionHandle {
-        self.acceptor.session(comp_id)
+    /// The client session `id`, connected or not.
+    pub fn client_session(&self, id: &SessionId) -> SessionHandle {
+        self.acceptor.handle(id)
     }
 
     /// The session of venue `name` (its `[initiator.NAME]`), if its initiator is running.

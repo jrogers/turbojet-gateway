@@ -28,7 +28,7 @@ use turbojet::fields::{Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{
     Acceptor, Application, Context, Disconnect, FixMessage, Initiator, InitiatorConfig, MemoryStorage, Message,
-    MessageReject, MsgType, ReconnectPolicy, SessionConfig, SessionHandle,
+    MessageReject, MsgType, ReconnectPolicy, SessionConfig, SessionHandle, SessionId,
 };
 use turbojet_fix42 as v42;
 use turbojet_fix44 as v44;
@@ -515,7 +515,7 @@ async fn a_fill_for_a_disconnected_client_arrives_once_it_logs_back_on() {
     setup.running.abort();
     assert!((&mut setup.running).await.unwrap_err().is_cancelled());
     setup.events.logged_out().await;
-    let client = setup.service.client_session(CLIENT);
+    let client = setup.service.client_session(&SessionId::new("FIX.4.4", GATEWAY, CLIENT));
     until(|| !client.is_connected()).await;
     setup.venue.send(fill(&setup.id("1"), "E-1", 100, 100));
     // The book has taken the fill when the order's done.

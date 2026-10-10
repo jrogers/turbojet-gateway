@@ -30,6 +30,12 @@ const VENUE_UNAVAILABLE: &str = "venue unavailable";
 /// Text(58) of the reject for an order whose venue's send queue is full.
 const VENUE_BUSY: &str = "venue unavailable: its send queue is full";
 
+/// Sessions one CompID may log on with (told apart by SubID or LocationID). Each keeps a report
+/// queue and task, and its own ClOrdID budget in the book, until a restart, so the listed
+/// counterparties bound the gateway's memory only if their sessions are bounded too. A firm
+/// uses a few desks a CompID; 16 leaves room without letting one client cycle SubIDs unchecked.
+pub const MAX_SESSIONS_PER_COMP_ID: usize = 16;
+
 /// The book, and where its outputs go.
 #[derive(Debug)]
 pub struct Gateway {
@@ -136,6 +142,27 @@ impl Gateway {
     /// Routes new orders by `router` from now on.
     pub fn set_router(&self, router: Router) {
         self.lock().book.set_router(router);
+    }
+
+    /// Whether the acceptor's session `id` may log on: a session seen before may; a new one if
+    /// its CompID has fewer than [`MAX_SESSIONS_PER_COMP_ID`] and its SubID and LocationID have
+    /// no '/'. With one, `FUNDA` SubID `A/B` and `FUNDA` SubID `A` LocationID `B` print the same,
+    /// and would be one client. Records the session, checked and added under one lock.
+    fn admit(&self, id: &SessionId) -> Result<(), String> {
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        if clients.contains_key(id) {
+            return Ok(());
+        }
+        if [&id.target_sub_id, &id.target_location_id].into_iter().flatten().any(|part| part.contains('/')) {
+            return Err(format!("session {id}: a SubID or LocationID with '/' isn't accepted"));
+        }
+        // ponytail: a scan of every session, at logon only; a count per CompID if there are many.
+        let sessions = clients.keys().filter(|known| known.target_comp_id == id.target_comp_id).count();
+        if sessions >= MAX_SESSIONS_PER_COMP_ID {
+            return Err(format!("session {id}: its CompID has {sessions} sessions already, the most allowed"));
+        }
+        clients.insert(id.clone(), ClientId::new(id));
+        Ok(())
     }
 
     /// The client on the acceptor's session `id`. Made at the session's first logon or message
@@ -247,6 +274,10 @@ impl Gateway {
 pub struct ClientApp(pub Arc<Gateway>);
 
 impl Application for ClientApp {
+    fn verify_logon(&self, session: &SessionHandle, _logon: &Message, _: &ConnectionInfo) -> Result<(), String> {
+        self.0.admit(session.id())
+    }
+
     fn on_logon(&self, session: &SessionHandle) {
         self.0.outbox.logged_on(&self.0.client(session.id()), session);
     }
@@ -334,6 +365,34 @@ mod tests {
         let client = session("FIX.4.2", "FUNDA");
         let reject = app.on_message(&mut Context::new(&client), &order("C1")).unwrap_err();
         assert_eq!(reject, MessageReject::required_tag_missing(tags::HANDL_INST));
+    }
+
+    /// FUNDA's session with TargetSubID `sub_id`.
+    fn desk(sub_id: &str) -> SessionHandle {
+        SessionHandle::disconnected(SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA").with_target_sub_id(sub_id))
+    }
+
+    #[test]
+    fn a_comp_id_logs_on_with_a_bounded_number_of_sessions() {
+        let app = ClientApp(gateway());
+        for n in 0..MAX_SESSIONS_PER_COMP_ID {
+            assert_eq!(logon(&app, &desk(&format!("DESK{n}"))), Ok(()));
+        }
+        let refused = logon(&app, &desk("ONE-TOO-MANY")).unwrap_err();
+        assert!(refused.contains("sessions"), "{refused}");
+        // Known sessions log on again; other CompIDs aren't counted against FUNDA.
+        assert_eq!(logon(&app, &desk("DESK0")), Ok(()));
+        assert_eq!(logon(&app, &session("FIX.4.4", "FUNDB")), Ok(()));
+    }
+
+    /// The session would print as FUNDA's DESK SubID with LocationID 1, which is another session.
+    #[test]
+    fn a_sub_id_or_location_id_with_a_slash_is_refused() {
+        let app = ClientApp(gateway());
+        assert!(logon(&app, &desk("DESK/1")).is_err());
+        let located = SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA").with_target_location_id("LDN/2");
+        assert!(logon(&app, &SessionHandle::disconnected(located)).is_err());
+        assert_eq!(logon(&app, &desk("DESK")), Ok(()));
     }
 
     #[test]

@@ -70,10 +70,12 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 - A client is a session. Sessions of one CompID told apart by SubID or LocationID are separate
   clients, each with its own ClOrdIDs and reports; routes match their CompID, so they route alike.
 - Every client speaks the acceptor's BeginString.
-- Client sessions aren't bounded: each distinct session that logs on keeps a report queue and
-  its task, and each that orders a count in the book, until a restart. Listing the
-  counterparties bounds the CompIDs, not the SubIDs or LocationIDs a listed CompID logs on with;
-  `unknown = "admit"` bounds neither.
+- A CompID may log on with up to 16 sessions; a logon on a 17th is refused. A logon whose SubID
+  or LocationID contains '/' is refused too, since it could print the same as another session.
+- Each session that logs on keeps a report queue and its task, and each that orders a count in
+  the book, until a restart. Listing the counterparties bounds the CompIDs, and so the sessions;
+  under `unknown = "admit"` they aren't bounded.
+- The ClOrdID budget (1,000,000 a day) is per session, so one CompID can use up to 16 times it.
 - A client holds up to 100,000 undelivered reports. The first past that is dropped, with an
   error logged, and the client is logged out; later ones are dropped and counted until its queue
   empties.
