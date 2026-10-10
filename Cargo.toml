@@ -23,6 +23,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# Self-signed certificates for the TLS test, at Turbojet's version.
+rcgen = "0.14"
 tempfile = "3"
 # The end-to-end tests' relay between the gateway and a venue.
 tokio = { version = "1", features = ["io-util"] }

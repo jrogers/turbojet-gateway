@@ -267,6 +267,45 @@ mod tests {
         assert!(error.to_string().contains("venue \"C\": BeginString \"FIX.4.3\" is not supported"), "{error}");
     }
 
+    /// With `[acceptor.tls]`, clients log on over TLS: here a client from a sessions file of its
+    /// own, trusting the gateway's self-signed certificate.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn serves_clients_over_tls() {
+        /// Says when the client's logon is answered.
+        struct Client(tokio::sync::Notify);
+        impl turbojet::Application for Client {
+            fn on_logon(&self, _: &SessionHandle) {
+                self.0.notify_one();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key).unwrap();
+        write(&dir, "server.pem", &cert.pem());
+        write(&dir, "server.key", &key.serialize_pem());
+        let tls = "tls = { cert = \"server.pem\", key = \"server.key\" }\n";
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\nunknown = \"admit\"\n{tls}"));
+        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+
+        let client = format!(
+            "[initiator.JETBRIDGE]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"FUNDA\"\n\
+             target_comp_id = \"JETBRIDGE\"\nconnect = [\"{}\"]\n\
+             tls = {{ ca = \"server.pem\", server_name = \"localhost\" }}\n",
+            service.local_addr()
+        );
+        write(&dir, "client.toml", &client);
+        let client = SessionsFile::load(dir.path().join("client.toml")).unwrap();
+        let app = Arc::new(Client(tokio::sync::Notify::new()));
+        let initiators = client.initiators(app.clone()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.0.notified()).await.expect("no logon over TLS");
+        initiators.shutdown(None).await;
+        service.shutdown().await;
+        serving.abort();
+    }
+
     #[tokio::test]
     async fn a_port_in_use_is_an_error() {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
