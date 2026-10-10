@@ -16,6 +16,14 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   venue's ClOrdID length limit.
 - A client's request is committed by its session before the report answering it is stored by
   the client's session: a stop in between loses the report.
+- A client's order, cancel or replace counts as received by its session only once the venue's
+  session has stored what it was forwarded as. A stop after the venue's session stored it but
+  before the client's session recorded that has the client resend it, and with the book gone, it
+  goes to the venue again under a new ClOrdID: the venue can get it twice.
+- A venue session that's slow to store, or stuck, holds back the clients whose requests it hasn't
+  stored: 256 messages past the oldest one waiting, a client's session stops reading from it until
+  the venue's session catches up. Turbojet logs a warning when that happens. Its
+  `turbojet_held_back` gauge needs Turbojet's `metrics` feature, which Jetbridge isn't built with.
 - Operators' blocks (see the README's kill switch) are kept in memory: a restart lifts them.
 - So is what the risk limits count: a restart forgets each session's open and filled notional and
   every symbol's last fill price. Credit counts fills since the later of the trading day's start

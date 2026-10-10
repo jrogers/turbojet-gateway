@@ -29,6 +29,11 @@ reports back, keeping each order's state as it goes.
   then `0EI8001-1` for its first cancel or replace, and its reports carry ExecIDs `0EI8001.1`,
   `0EI8001.2` and so on. Every fill reaches the client as a fill (ExecType
   Trade; Partial fill or Fill on FIX 4.2), whatever the venue called it.
+- **An order counts as received once its venue has it stored.** A client's order, cancel or
+  replace stays in flight on the client's session until the venue's session has stored what it
+  was forwarded as. If the client's connection drops first, the client sends it again when it's
+  back, and the ClOrdID dedupe answers with the order's state. With a `disk` store, the same
+  happens after a restart.
 - **Reports held per client.** A report for a client that's disconnected, or reading slowly, waits
   in that client's queue and goes out, in order, once it can take it.
 - **Risk limits** per CompID, checked on each order and replace before it goes to a venue: order

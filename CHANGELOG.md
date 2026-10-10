@@ -37,6 +37,9 @@ Notable changes to Jetbridge.
   delivered in order once it can take them.
 - An order whose venue isn't connected, or whose session drops it unsent, is rejected as venue
   unavailable.
+- A client's order, cancel or replace stays in flight on its session (Turbojet's
+  `Context::hold`) until the venue's session has stored what it was forwarded as, so a client
+  connection lost before then resends it rather than the request be lost.
 - A kill switch, as library calls on the gateway: block a client session, a CompID or everyone
   (new orders rejected; cancels and replaces that don't raise the quantity pass), cancel their
   orders at the venues, and unblock. The gateway's own cancels are retried when a venue refuses
