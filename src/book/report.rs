@@ -49,7 +49,8 @@ impl Book {
         // that request; any other, the gateway's cancel's too, is about the order, unsolicited.
         let answers_request = match kind {
             Some(CancelKind::Cancel) => origin == Origin::Client,
-            Some(CancelKind::Replace) => pending_here,
+            // An orphaned replace's acks are the gateway's, as its cancel's are.
+            Some(CancelKind::Replace) => pending_here && origin == Origin::Client,
             None => false,
         };
         let qty = match &order.pending {

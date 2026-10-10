@@ -1,7 +1,8 @@
 use turbojet::fields::CompactString;
 
 use super::{
-    Book, CancelKind, GatewayCancel, MAX_GATEWAY_CANCEL_TRIES, Order, OrderId, Origin, Output, Scope, Sent, VenueId,
+    Book, CancelKind, GatewayCancel, MAX_GATEWAY_CANCEL_TRIES, Order, OrderId, Origin, OrphanedReplace, Output,
+    Pending, Scope, Sent, VenueId, limit_price,
 };
 
 impl Book {
@@ -39,25 +40,37 @@ impl Book {
     /// again gets a stuck order another round. One in flight is left alone; one waits behind the
     /// client's cancel outstanding, going if the venue refuses that.
     pub(super) fn cancel_order(&mut self, id: OrderId, out: &mut Vec<Output>) {
+        match self.start_gateway_cancel(id) {
+            Some(false) => self.send_gateway_cancel(id, out),
+            Some(true) => {
+                tracing::info!(order = %self.orders[&id].name, "gateway cancel waits on the client's");
+            }
+            None => {}
+        }
+    }
+
+    /// Starts the gateway's cancel for the order, unsent: `Some` with whether a client's cancel
+    /// is outstanding, or `None` if the order is unknown, done, or has the gateway's in flight.
+    fn start_gateway_cancel(&mut self, id: OrderId) -> Option<bool> {
         let Some(order) = self.orders.get(&id) else {
-            return tracing::warn!(order = id.0, "gateway cancel for an unknown order");
+            tracing::warn!(order = id.0, "gateway cancel for an unknown order");
+            return None;
         };
         if order.status.is_done() {
-            return tracing::debug!(order = %order.name, "gateway cancel for a done order");
+            tracing::debug!(order = %order.name, "gateway cancel for a done order");
+            return None;
         }
         let outstanding = self.outstanding_cancel(order).map(|sent| sent.origin);
         if outstanding == Some(Origin::Gateway) {
-            return tracing::debug!(order = %order.name, "gateway cancel already in flight");
+            tracing::debug!(order = %order.name, "gateway cancel already in flight");
+            return None;
         }
         let order = self.orders.get_mut(&id).expect("looked up above");
         self.touched.orders.insert(id);
         let orig_downstream = order.downstream.clone();
         order.gateway_cancel =
             Some(GatewayCancel { tries: 0, unsent: true, stuck: false, orig_downstream, refused_sends: 0 });
-        if outstanding.is_some() {
-            return tracing::info!(order = %order.name, "gateway cancel waits on the client's");
-        }
-        self.send_gateway_cancel(id, out);
+        Some(outstanding.is_some())
     }
 
     /// Sends the gateway's cancel for the order one more time.
@@ -103,7 +116,7 @@ impl Book {
     }
 
     /// See [`Input::Orphan`](super::Input::Orphan).
-    pub(super) fn orphan(&mut self, venue: &VenueId, downstream: CompactString, out: &mut Vec<Output>) {
+    pub(super) fn orphan(&mut self, venue: &VenueId, downstream: CompactString, replace: Option<OrphanedReplace>) {
         let Some((name, amendment)) =
             downstream.rsplit_once('-').and_then(|(name, n)| Some((name, n.parse::<u32>().ok()?)))
         else {
@@ -123,18 +136,35 @@ impl Book {
         self.touched.orders.insert(id);
         // Numbered past it, so no later request reuses its ID.
         order.amendments = order.amendments.max(amendment);
-        tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, "venue holds a request the store lacks: cancelling its order");
+        // A done order has no replace pending: its replace can only be refused.
+        let replace = replace.filter(|_| !order.status.is_done());
+        tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, ?replace, "venue holds a request the store lacks: cancelling its order");
+        let kind = if replace.is_some() { CancelKind::Replace } else { CancelKind::Cancel };
         let sent = Sent {
             order: id,
             origin: Origin::Gateway,
             cl_ord_id: CompactString::default(),
             orig_cl_ord_id: None,
-            kind: Some(CancelKind::Cancel),
+            kind: Some(kind),
             answered: false,
         };
         self.downstream.insert(downstream.clone(), sent);
-        self.touched.sent.insert(downstream);
-        self.cancel_order(id, out);
+        self.touched.sent.insert(downstream.clone());
+        if let Some(OrphanedReplace { qty, price, ord_type, time_in_force }) = replace {
+            let price = limit_price(ord_type, price);
+            let risk_price = self.risk.risk_price(&order.request.symbol, price);
+            if let Some(pending) = &order.pending {
+                tracing::warn!(order = %order.name, superseded = %pending.downstream, "an orphaned replace takes the place of the one pending");
+            }
+            // Accepted, it leaves the order's ClOrdID as it is: the client never asked for it.
+            let cl_ord_id = order.request.cl_ord_id.clone();
+            order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price });
+            self.risk.track(id, order.exposure());
+        }
+        // Sent at `VenueUp`, or by the edge's retry tick if the venue is up already.
+        if self.start_gateway_cancel(id).is_some() {
+            self.cancel_unsent = true;
+        }
     }
 
     /// The gateway's cancel is waiting to be sent, and nothing stands in its way.

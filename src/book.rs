@@ -418,12 +418,16 @@ pub enum Input {
     },
     /// At a start: a cancel or replace sent under `downstream` (`<order name>-<n>`) that `venue`'s
     /// session stored, but the store never recorded (the gateway stopped within a commit of
-    /// sending it). Recorded as the gateway's own cancel, so the venue's answers apply to the
-    /// order, and the order is cancelled as by `CancelOrder`: what the client asked for is
-    /// unknown. One for an order the book doesn't hold (done, and dropped at a roll) is logged.
+    /// sending it); `replace` holds a replace's terms. Recorded as the gateway's own request, so
+    /// the venue's answers apply to the order (a replace pending, its terms applied if the venue
+    /// accepts it), and the order gets the gateway's cancel, waiting for `VenueUp`: what the
+    /// client asked for is unknown. The client hears of neither request's acks, only of fills and
+    /// the order's end. One for an order the book doesn't hold (done, and dropped at a roll) is
+    /// logged.
     Orphan {
         venue: VenueId,
         downstream: CompactString,
+        replace: Option<OrphanedReplace>,
     },
     /// An operator blocks the clients in `scope`: their new orders are rejected
     /// ([`RejectReason::Blocked`]) until an `Unblock` of the same scope. What takes orders off the
@@ -445,6 +449,15 @@ pub enum Input {
     DaysStarted {
         days: Vec<(ClientId, Day)>,
     },
+}
+
+/// The terms of an orphaned replace: see [`Input::Orphan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedReplace {
+    pub qty: Decimal,
+    pub price: Option<Decimal>,
+    pub ord_type: OrdType,
+    pub time_in_force: Option<TimeInForce>,
 }
 
 /// An ExecutionReport for a client.
@@ -682,6 +695,11 @@ impl Book {
         self.orders.get(&id)
     }
 
+    /// What was sent to a venue under `downstream`, if the book holds it.
+    pub fn sent(&self, downstream: &str) -> Option<&Sent> {
+        self.downstream.get(downstream)
+    }
+
     pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
         match input {
             Input::NewOrder { client, request, redelivered, sent } => {
@@ -719,7 +737,7 @@ impl Book {
             Input::CancelAll { scope } => self.cancel_all(&scope, out),
             Input::CancelOrder { order } => self.cancel_order(order, out),
             Input::VenueUp { venue } => self.venue_up(&venue, out),
-            Input::Orphan { venue, downstream } => self.orphan(&venue, downstream, out),
+            Input::Orphan { venue, downstream, replace } => self.orphan(&venue, downstream, replace),
             Input::Block { scope } => {
                 if !self.blocked.contains(&scope) {
                     self.blocked.push(scope);
@@ -762,7 +780,8 @@ impl Book {
                         sent.cl_ord_id.is_empty() && sent.orig_cl_ord_id.is_none(),
                         "a gateway cancel uses no client ClOrdID"
                     );
-                    assert_eq!(sent.kind, Some(CancelKind::Cancel));
+                    // A replace only as an orphan's: see `Input::Orphan`.
+                    assert!(sent.kind.is_some(), "the gateway sends no orders");
                 }
             }
         }

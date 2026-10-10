@@ -295,7 +295,7 @@ mod tests {
     const ACCEPTOR: &str = "[acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n";
 
     /// An initiator section for venue `name`, speaking `begin_string`, retrying a closed port.
-    fn venue(name: &str, begin_string: &str) -> String {
+    fn venue_section(name: &str, begin_string: &str) -> String {
         format!(
             "[initiator.{name}]\nbegin_string = \"{begin_string}\"\ntarget_comp_id = \"{name}\"\n\
              connect = [\"127.0.0.1:1\"]\n"
@@ -343,7 +343,11 @@ mod tests {
         let path = dir.path().join("jetbridge.toml");
         let (service, serving) = Service::start(&path).await.unwrap();
 
-        write(&dir, "sessions.toml", &format!("{ACCEPTOR}{listen}{}{}", venue("B", "FIX.4.4"), venue("C", "FIX.4.3")));
+        write(
+            &dir,
+            "sessions.toml",
+            &format!("{ACCEPTOR}{listen}{}{}", venue_section("B", "FIX.4.4"), venue_section("C", "FIX.4.3")),
+        );
         write(&dir, "jetbridge.toml", &routes_to("B"));
         service.reload();
         let to_b = Router::new(vec![Rule {
@@ -391,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn a_venue_the_gateway_cant_convert_stops_startup() {
         let dir = tempfile::tempdir().unwrap();
-        let venues = format!("{}{}", venue("B", "FIX.4.4"), venue("C", "FIX.4.3"));
+        let venues = format!("{}{}", venue_section("B", "FIX.4.4"), venue_section("C", "FIX.4.3"));
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n{venues}"));
         write(&dir, "jetbridge.toml", &routes_to("B"));
         let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
@@ -445,6 +449,82 @@ mod tests {
         write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
         let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
         assert!(error.to_string().starts_with("cannot bind"), "{error}");
+    }
+
+    /// The venue's FIX session, telling the test each OrderCancelRequest it gets.
+    struct Venue(tokio::sync::mpsc::UnboundedSender<turbojet::Message>);
+
+    impl turbojet::Application for Venue {
+        fn on_message(
+            &self,
+            _: &mut turbojet::Context<'_>,
+            msg: &turbojet::Message,
+        ) -> Result<(), turbojet::MessageReject> {
+            if msg.msg_type() == turbojet::MsgType::OrderCancelRequest {
+                let _ = self.0.send(msg.clone());
+            }
+            Ok(())
+        }
+    }
+
+    /// An order the venue's disk store holds and the database never had is cancelled once the
+    /// venue logs on: the start reads the store before its initiator opens (and locks) it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_cancels_an_order_orphaned_in_a_venues_disk_store() {
+        use turbojet::SessionStorage;
+        use turbojet::message::tags;
+        let dir = tempfile::tempdir().unwrap();
+        let (cancels, mut cancelled) = tokio::sync::mpsc::unbounded_channel();
+        let venue_store = Arc::new(turbojet::MemoryStorage::new());
+        let venue = turbojet::Acceptor::new(
+            turbojet::SessionConfig::new("FIX.4.4", "VENUE"),
+            venue_store.clone(),
+            Arc::new(Venue(cancels)),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(venue.serve(listener));
+        let initiator = venue_section("VENUE", "FIX.4.4").replace("127.0.0.1:1", &addr.to_string());
+        let stores = "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n";
+        write(
+            &dir,
+            "sessions.toml",
+            &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n{stores}{initiator}store = \"disk\"\n"),
+        );
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
+
+        // What a gateway that stopped had sent: order PREVIO1, never committed.
+        let [(_, id, storage)] =
+            <[_; 1]>::try_from(SessionsFile::load(dir.path().join("sessions.toml")).unwrap().initiator_stores())
+                .map_err(|_| "one initiator")
+                .unwrap();
+        let order = turbojet::Message::new(turbojet::MsgType::NewOrderSingle)
+            .with(tags::BEGIN_STRING, "FIX.4.4")
+            .with(tags::MSG_SEQ_NUM, 1_u64)
+            .with(tags::SENDER_COMP_ID, id.sender_comp_id.as_str())
+            .with(tags::TARGET_COMP_ID, id.target_comp_id.as_str())
+            .with(tags::SENDING_TIME, turbojet::fields::UtcTimestamp::now())
+            .with(tags::CL_ORD_ID, "PREVIO1")
+            .with(tags::SYMBOL, "AAPL")
+            .with(tags::SIDE, "1")
+            .with(tags::ORDER_QTY, "100");
+        let mut log = storage.open(&id).unwrap();
+        log.record_outgoing(1, Some(&turbojet::codec::encode(&order).unwrap())).unwrap();
+        if let Some(commit) = log.commit().unwrap() {
+            commit.run().unwrap();
+        }
+        drop(log);
+        // The venue had it, so expects 2 next.
+        let venue_side = SessionId::new("FIX.4.4", id.target_comp_id.as_str(), id.sender_comp_id.as_str());
+        venue_store.open(&venue_side).unwrap().set_next_incoming(2).unwrap();
+
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let cancel = tokio::time::timeout(Duration::from_secs(5), cancelled.recv()).await.expect("no cancel").unwrap();
+        assert_eq!(cancel.get(tags::ORIG_CL_ORD_ID), Some("PREVIO1"));
+        service.shutdown().await;
+        serving.abort();
     }
 
     /// A database with rows in it is restored from at the next start: here a block.

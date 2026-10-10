@@ -15,7 +15,7 @@ pub mod orphans;
 pub mod outbox;
 pub mod writer;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -117,7 +117,10 @@ struct State {
     schedules: Schedules,
     /// Cancels for orders a venue's session sent that the store never booked, by venue, to send
     /// at its next logon: see [`orphans`].
-    orphan_cancels: HashMap<VenueId, Vec<Message>>,
+    orphan_cancels: HashMap<VenueId, Vec<orphans::OrphanCancel>>,
+    /// Those orders' downstream ClOrdIDs, and their cancels': the venue's reports under them are
+    /// logged, not handed to the book.
+    orphan_ids: HashSet<CompactString>,
 }
 
 #[derive(Debug)]
@@ -137,6 +140,7 @@ impl Gateway {
             day_end: SessionSchedule::daily(NaiveTime::MIN, NaiveTime::MIN),
             schedules: Schedules(Arc::new(|_| None)),
             orphan_cancels: HashMap::new(),
+            orphan_ids: HashSet::new(),
         };
         Self {
             state: Mutex::new(state),
@@ -364,16 +368,9 @@ impl Gateway {
     /// side ends, and these orders would otherwise stay working with no gateway to report to.
     /// Logged as one warning with each session's working orders, counted under the same lock.
     pub fn cancel_at_shutdown(self: &Arc<Self>, on: impl Fn(&str) -> bool) {
-        let sessions: Vec<ClientId> = {
-            let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
-            let restored = self.restored.lock().unwrap_or_else(PoisonError::into_inner);
-            // Restored ones that haven't logged on since too: their orders are as unattended.
-            clients.values().chain(restored.values()).filter(|client| on(client.comp_id())).cloned().collect()
-        };
         let mut state = self.lock();
-        let working = state.book.working_by_client();
-        let orders: BTreeMap<ClientId, usize> =
-            sessions.into_iter().filter_map(|client| Some((client.clone(), *working.get(&client)?))).collect();
+        let mut orders = state.book.working_by_client();
+        orders.retain(|client, _| on(client.comp_id()));
         if orders.is_empty() {
             return;
         }
@@ -697,7 +694,10 @@ fn new_day(state: &State, client: &ClientId, now: DateTime<Utc>) -> Option<(Clie
     (current != Some(day)).then(|| (client.clone(), day))
 }
 
-/// Every client `snapshot` names, and those of `undelivered`: the sessions the gateway had seen.
+/// The clients of `snapshot` whose sessions must log on as the clients they were: those with live
+/// orders, a block of their own, or reports in `undelivered`. Others (a day, filled notional, a
+/// done order's ClOrdIDs) need nothing of a session, so they don't count against their CompID's
+/// sessions after a restart.
 fn restored_clients<'a>(snapshot: &'a Snapshot, undelivered: impl Iterator<Item = &'a ClientId>) -> BTreeSet<ClientId> {
     let blocked = snapshot.blocked.iter().filter_map(|scope| match scope {
         Scope::Session(client) => Some(client),
@@ -706,10 +706,8 @@ fn restored_clients<'a>(snapshot: &'a Snapshot, undelivered: impl Iterator<Item 
     snapshot
         .orders
         .values()
+        .filter(|row| !row.order.status.is_done())
         .map(|row| &row.order.client)
-        .chain(snapshot.cl_ord_ids.keys().map(|(client, _, _)| client))
-        .chain(snapshot.days.keys())
-        .chain(snapshot.filled.keys())
         .chain(blocked)
         .chain(undelivered)
         .cloned()
@@ -783,7 +781,9 @@ impl Application for VenueApp {
             return Err(MessageReject::Business { reason, text: VENUE_UNAVAILABLE.into() });
         };
         // `None`: a report the book needn't see (a bust, say), logged inside.
-        if let Some(input) = version.venue_input(&venue, msg)? {
+        if let Some(input) = version.venue_input(&venue, msg)?
+            && !self.0.orphan_answer(&venue, &input)
+        {
             self.0.handle_with(input, ctx);
         }
         Ok(())
@@ -1953,22 +1953,55 @@ mod tests {
         assert!(matches!(out.as_slice(), [Output::NewOrder { downstream, .. }] if downstream == "NEWNEW2"), "{out:?}");
     }
 
-    /// Sessions the database had count toward their CompID's [`MAX_SESSIONS_PER_COMP_ID`] before
-    /// they log on, and one logging on is the client it was.
+    /// Sessions the database had that must keep their identity (here, by a block of their own)
+    /// count toward their CompID's [`MAX_SESSIONS_PER_COMP_ID`] before they log on, and one
+    /// logging on is the client it was, counted once; a session with only a day doesn't count.
     #[tokio::test]
     async fn restored_clients_count_toward_their_comp_ids_sessions() {
         let store = Store::open("sqlite::memory:").await.unwrap();
+        let client = |sub_id: &str| ClientId::new(desk(sub_id).id());
         let today = crate::book::Today { day: Day(at("2026-10-11T00:00:00Z")), began: None };
-        let days =
-            (0..MAX_SESSIONS_PER_COMP_ID).map(|n| (ClientId::new(desk(&format!("DESK{n}")).id()), today)).collect();
-        store.write(&[crate::book::Changes { days, ..crate::book::Changes::default() }]).await.unwrap();
+        let blocked = (0..MAX_SESSIONS_PER_COMP_ID - 1).map(|n| Scope::Session(client(&format!("DESK{n}")))).collect();
+        let changes = crate::book::Changes {
+            blocked: Some(blocked),
+            days: vec![(client("DAY-ONLY"), today)],
+            ..Default::default()
+        };
+        store.write(&[changes]).await.unwrap();
         let gateway = restarted(&store, "NEWNEW").await;
         let app = ClientApp(gateway.clone());
-        assert!(logon(&app, &desk("ONE-TOO-MANY")).is_err());
         assert_eq!(logon(&app, &desk("DESK3")), Ok(()));
-        assert_eq!(gateway.client(desk("DESK3").id()), ClientId::new(desk("DESK3").id()));
+        assert_eq!(gateway.client(desk("DESK3").id()), client("DESK3"));
+        // The 16th: DESK3 is counted once, and DAY-ONLY not at all.
+        assert_eq!(logon(&app, &desk("NEW")), Ok(()));
         assert!(logon(&app, &desk("ONE-TOO-MANY")).is_err());
+        assert!(logon(&app, &desk("DAY-ONLY")).is_err());
+        assert_eq!(logon(&app, &desk("DESK0")), Ok(()));
         assert_eq!(logon(&app, &session("FIX.4.4", "FUNDB")), Ok(()));
+    }
+
+    /// At restore, a stored report that doesn't decode has its row deleted, as has one past a
+    /// full outbox; the rest wait for their client.
+    #[tokio::test]
+    async fn undelivered_rows_that_cant_be_queued_are_deleted() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let funda = ClientId::from("FUNDA");
+        let report = codec::encode(&Message::new(MsgType::Heartbeat).with(tags::BEGIN_STRING, "FIX.4.4")).unwrap();
+        let undelivered = [vec![0xff, 0, 1], report.clone(), report]
+            .into_iter()
+            .zip(1..)
+            .map(|(message, row)| (row, Undelivered { client: funda.clone(), message }))
+            .collect();
+        store.write(&[crate::book::Changes { undelivered, ..Default::default() }]).await.unwrap();
+        let snapshot = store.load().await.unwrap();
+        let (writer, _writing) = Writer::start(store.clone(), snapshot.next_undelivered_id());
+        let mut gateway = Arc::try_unwrap(gateway()).unwrap();
+        gateway.outbox = Outbox::with_limit(1);
+        let gateway = Arc::new(gateway.with_writer(writer));
+        gateway.restore(snapshot);
+        gateway.committed().await;
+        let rows = store.load().await.unwrap().undelivered;
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), [2]);
     }
 
     /// A report the database holds undelivered goes to its client once it logs on to the
@@ -2056,13 +2089,13 @@ mod tests {
             .unwrap();
         let gateway = restarted(&store, "NEWNEW").await;
         let venues = Arc::new(MemoryStorage::new());
-        let id = SessionId::new("FIX.4.4", "JETBRIDGE", "VENUE");
         let orphan = order("OLDOLD1").with(tags::ACCOUNT, "ACC");
-        store_sent(&venues, &id, &[orphan, order("OLDOLD2"), order("FOREIGN1")]);
+        store_sent(&venues, &id(), &[orphan, order("OLDOLD2"), order("FOREIGN1")]);
 
-        let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id, venues.clone())]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 3, new_orders: 1, amendments: 0 });
+        let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues.clone())]).await.unwrap();
+        assert_eq!(found, Orphans { scanned: 3, orders: 1, amendments: 0 });
         let (addr, mut events) = venue_expecting(4).await;
+        let venue_store: Arc<dyn SessionStorage> = venues.clone();
         start_venue(&gateway, &addr, venues);
         let cancel: v44::OrderCancelRequest =
             next_of_type(&mut events, MsgType::OrderCancelRequest).await.parse().unwrap();
@@ -2073,6 +2106,81 @@ mod tests {
         assert!(
             timeout(Duration::from_millis(100), next_of_type(&mut events, MsgType::OrderCancelRequest)).await.is_err()
         );
+        // The venue's answers on the orphan are logged, not the book's.
+        let answer = |downstream: &str| Input::VenueCancelReject {
+            venue: VENUE.into(),
+            downstream: downstream.into(),
+            status: None,
+            text: None,
+            reason: Some(1),
+            venue_order_id: None,
+        };
+        assert!(gateway.orphan_answer(&VENUE.into(), &answer("NEWNEWC1")));
+        assert!(gateway.orphan_answer(&VENUE.into(), &answer("OLDOLD1")));
+        assert!(!gateway.orphan_answer(&VENUE.into(), &answer("OLDOLD2")));
+
+        // Recorded once sent: the next start doesn't cancel it again.
+        gateway.committed().await;
+        let restarted = restarted(&store, "NEWER1").await;
+        let again = restarted.cancel_orphans(&store, vec![(VENUE.into(), id(), venue_store)]).await.unwrap();
+        assert_eq!((again.orders, again.amendments), (0, 0));
+    }
+
+    /// An order and its replace both orphaned are one order to cancel, naming the replace, the
+    /// newest request, with its quantity.
+    #[tokio::test]
+    async fn an_orphaned_order_and_its_replace_are_cancelled_as_one() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let gateway = restarted(&store, "NEWNEW").await;
+        let venues = Arc::new(MemoryStorage::new());
+        let mut replace = v44::OrderCancelReplaceRequest::new(
+            "OLDOLD5",
+            "OLDOLD5-1",
+            v44::Side::Buy,
+            UtcTimestamp::now(),
+            v44::OrdType::Limit,
+        );
+        (replace.symbol, replace.order_qty, replace.price) = (Some("AAPL".into()), Some(200.into()), Some(10.into()));
+        store_sent(&venues, &id(), &[order("OLDOLD5"), replace.to_message()]);
+        let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap();
+        assert_eq!(found, Orphans { scanned: 2, orders: 1, amendments: 0 });
+        let state = gateway.lock();
+        let [orphan] = state.orphan_cancels[VENUE].as_slice() else { panic!() };
+        assert_eq!(orphan.cancel.get(tags::ORIG_CL_ORD_ID), Some("OLDOLD5-1"));
+        assert_eq!(orphan.cancel.get(tags::ORDER_QTY), Some("200"));
+        assert!(state.orphan_ids.contains("OLDOLD5"));
+    }
+
+    /// An orphan's cancel the venue's session can't take waits for its next logon.
+    #[tokio::test]
+    async fn an_orphan_cancel_the_session_refuses_waits_for_the_next_logon() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let gateway = restarted(&store, "NEWNEW").await;
+        let venues = Arc::new(MemoryStorage::new());
+        store_sent(&venues, &id(), &[order("OLDOLD1")]);
+        gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap();
+        assert!(gateway.set_venues([(VENUE.into(), SessionHandle::disconnected(id()))]).is_empty());
+        gateway.send_orphan_cancels(&VENUE.into());
+        assert_eq!(gateway.lock().orphan_cancels[VENUE].len(), 1);
+        gateway.committed().await;
+        assert_eq!(store.unknown_downstreams(&["OLDOLD1".into()]).await.unwrap(), ["OLDOLD1"], "recorded unsent");
+    }
+
+    /// A venue holding a request under this start's prefix stops the start: its IDs would be
+    /// this start's orders'.
+    #[tokio::test]
+    async fn a_request_under_this_starts_prefix_stops_the_start() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let gateway = restarted(&store, "SAMESS").await;
+        let venues = Arc::new(MemoryStorage::new());
+        store_sent(&venues, &id(), &[order("SAMESS1")]);
+        let error = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap_err();
+        assert!(error.to_string().contains("within a second of its last start"), "{error}");
+    }
+
+    /// Our session with the venue, as the gateway's initiator has it.
+    fn id() -> SessionId {
+        SessionId::new("FIX.4.4", "JETBRIDGE", "VENUE")
     }
 
     /// A cancel the venue's session stored that the database never had, of an order it has: the
@@ -2098,7 +2206,7 @@ mod tests {
         orphan.symbol = Some("AAPL".into());
         store_sent(&venues, &id, &[orphan.to_message()]);
         let found = after.cancel_orphans(&store, vec![(VENUE.into(), id, venues.clone())]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 1, new_orders: 0, amendments: 1 });
+        assert_eq!(found, Orphans { scanned: 1, orders: 0, amendments: 1 });
         assert_eq!(unsent(&after), [true]);
         after.committed().await;
         assert!(store.unknown_downstreams(&["OLDOLD1-1".into()]).await.unwrap().is_empty(), "recorded");
@@ -2107,8 +2215,7 @@ mod tests {
         start_venue(&after, &addr, venues);
         let cancel: v44::OrderCancelRequest =
             next_of_type(&mut events, MsgType::OrderCancelRequest).await.parse().unwrap();
-        // -2 went to the session refusing it, the venue not set yet.
-        assert_eq!((cancel.cl_ord_id.as_str(), cancel.orig_cl_ord_id.as_str()), ("OLDOLD1-3", "OLDOLD1"));
+        assert_eq!((cancel.cl_ord_id.as_str(), cancel.orig_cl_ord_id.as_str()), ("OLDOLD1-2", "OLDOLD1"));
         let mut canceled = v44::ExecutionReport::new(
             "V-1",
             "X-C",
@@ -2124,5 +2231,19 @@ mod tests {
         VenueApp(after.clone()).on_message(&mut Context::new(&venue), &canceled.to_message()).unwrap();
         assert_eq!(after.lock().book.order(OrderId(1)).unwrap().status, crate::book::Status::Canceled);
         assert!(after.cancelling().is_empty());
+    }
+
+    /// At shutdown, a restored client's working order is cancelled though it never logged on
+    /// since: its orders are as unattended as anyone's.
+    #[tokio::test]
+    async fn shutdown_cancels_the_working_orders_of_restored_clients() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let before = restarted(&store, "OLDOLD").await;
+        book_order(&before);
+        let changes = before.lock().book.take_changes();
+        store.write(&[changes]).await.unwrap();
+        let after = restarted(&store, "NEWNEW").await;
+        after.cancel_at_shutdown(|comp_id| comp_id == "FUNDA");
+        assert_eq!(unsent(&after), [true]);
     }
 }
