@@ -15,8 +15,9 @@ use turbojet_config::{Initiators, SessionsFile};
 
 use crate::book;
 use crate::config::{self, Error};
-use crate::edge::{ClientApp, Gateway, Schedules, TICK_INTERVAL, VenueApp};
+use crate::edge::{ClientApp, Gateway, Schedules, TICK_INTERVAL, VenueApp, Writer};
 use crate::fix::Version;
+use crate::store::Store;
 
 /// The Text(58) of the Logouts sent at shutdown.
 const SHUTTING_DOWN: &str = "gateway shutting down";
@@ -41,11 +42,16 @@ pub struct Service {
     database: Option<String>,
     /// [`Gateway::run_ticks`], aborted at shutdown, or when the service is dropped.
     retrying: JoinHandle<()>,
+    /// The book's writer, with a database: aborted when the service is dropped.
+    writing: Option<JoinHandle<()>>,
 }
 
 impl Drop for Service {
     fn drop(&mut self) {
         self.retrying.abort();
+        if let Some(writing) = &self.writing {
+            writing.abort();
+        }
     }
 }
 
@@ -58,20 +64,32 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// The configuration doesn't load, the acceptor's address can't be bound, a venue speaks a FIX
-    /// version the gateway doesn't convert, or TLS or a venue can't be set up.
+    /// The configuration doesn't load, the database can't be opened, the acceptor's address can't
+    /// be bound, a venue speaks a FIX version the gateway doesn't convert, or TLS or a venue can't
+    /// be set up.
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
         let loaded = config::load(path)?;
+        // First, so a database that won't open stops nothing half-started.
+        let (writer, writing) = match &loaded.database {
+            Some(url) => {
+                let (writer, writing) = start_writer(url).await?;
+                (Some(writer), Some(writing))
+            }
+            None => (None, None),
+        };
         let prefix = book::start_prefix(SystemTime::now());
         let sessions = Arc::new(loaded.sessions);
         let schedules = {
             let sessions = sessions.clone();
             Schedules(Arc::new(move |comp_id| sessions.counterparty_config(comp_id)?.schedule))
         };
-        let gateway = Gateway::new(loaded.router, loaded.version)
+        let mut gateway = Gateway::new(loaded.router, loaded.version)
             .with_id_prefix(prefix)
             .with_limits(loaded.limits)
             .with_days(loaded.day_end, schedules);
+        if let Some(writer) = writer {
+            gateway = gateway.with_writer(writer);
+        }
         let gateway = Arc::new(gateway);
         let listen = sessions.listen().expect("load checked the file has [acceptor]");
         // Bound before the venues start, so a port in use stops nothing half-started.
@@ -82,8 +100,17 @@ impl Service {
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
         let database = loaded.database;
-        let service =
-            Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr, database, retrying };
+        let service = Self {
+            path: path.to_path_buf(),
+            gateway,
+            sessions,
+            acceptor,
+            initiators,
+            local_addr,
+            database,
+            retrying,
+            writing,
+        };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
         let serving = match service.check_versions().and_then(|()| service.serve(listener)) {
@@ -181,8 +208,12 @@ impl Service {
         }
         self.retrying.abort();
         self.initiators.shutdown(Some(SHUTTING_DOWN)).await;
-        // Lost at exit until stage 4 persists the book and the undelivered reports: open orders
-        // stay open at their venues with no client to report to.
+        // What the last messages changed, before the process goes. A database that's down holds
+        // this up; a second signal exits (see the binary).
+        self.gateway.committed().await;
+        // Lost at exit until a restart restores the book and the undelivered reports from the
+        // database (recovery isn't built yet): open orders stay open at their venues with no
+        // client to report to.
         let unfinished = self.gateway.unfinished();
         if unfinished.open_orders.is_empty() && unfinished.undelivered.is_empty() {
             info!("no open orders or undelivered reports");
@@ -235,6 +266,14 @@ impl Service {
     fn serve(&self, listener: TcpListener) -> Result<Serving, Error> {
         Ok(tokio::spawn(self.acceptor.clone().serve(listener)))
     }
+}
+
+/// Opens the database at `url` and starts the book's writer on it. Nothing is restored from it
+/// yet: recovery is task D1.
+async fn start_writer(url: &str) -> Result<(Writer, JoinHandle<()>), Error> {
+    let store = Store::open(url).await.map_err(|e| Error::new(e.to_string()))?;
+    let snapshot = store.load().await.map_err(|e| Error::new(format!("cannot load the database: {e}")))?;
+    Ok(Writer::start(store, snapshot.next_undelivered_id()))
 }
 
 #[cfg(test)]

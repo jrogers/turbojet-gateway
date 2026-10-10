@@ -4,7 +4,9 @@
 //! each client gets a bounded queue, drained in order by a task of its own once the client can
 //! take them.
 //!
-//! ponytail: in memory until stage 4 persists undelivered reports with the book.
+//! With a database, each report is also an `undelivered` row, written with the change that made
+//! it; the outbox queues the row's deletion once the client's session has stored the report (or
+//! it's lost), so a restart can send again what hadn't reached the client.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +18,7 @@ use tokio::task::JoinSet;
 use tracing::{error, warn};
 use turbojet::{Dropped, Message, Receipt, SendError, SessionHandle};
 
+use super::writer::Writer;
 use crate::book::ClientId;
 
 /// Reports held for one client before it's logged out. A busy client sees a few thousand reports
@@ -59,6 +62,8 @@ pub struct Outbox {
     // ponytail: one lock for every client's push; per-client locks if it shows up in profiles.
     clients: Mutex<HashMap<ClientId, Client>>,
     tasks: Mutex<JoinSet<()>>,
+    /// Deletes each report's `undelivered` row once it's finished with, if there's a database.
+    writer: Option<Writer>,
 }
 
 impl Outbox {
@@ -70,7 +75,14 @@ impl Outbox {
     /// An outbox holding up to `limit` reports per client.
     fn with_limit(limit: usize) -> Self {
         assert!(limit > 0, "an outbox must hold at least one report");
-        Self { limit, clients: Mutex::default(), tasks: Mutex::default() }
+        Self { limit, clients: Mutex::default(), tasks: Mutex::default(), writer: None }
+    }
+
+    /// Deletes the `undelivered` row each report names as it's finished with: set it before any
+    /// report is delivered.
+    pub(crate) fn set_writer(&mut self, writer: Writer) {
+        debug_assert!(lock(&self.clients).is_empty(), "the writer is set before any report is delivered");
+        self.writer = Some(writer);
     }
 
     /// `client` logged on, on `session`: its held reports start going out. Call it from the
@@ -97,7 +109,7 @@ impl Outbox {
             overflow(&held.shared, self.limit);
             return false;
         }
-        held.enqueue(Entry { msg, receipt: None })
+        held.enqueue(Entry { report: Report { msg, row: None }, receipt: None })
     }
 
     /// Sends `msg` to `client` straight away if nothing is held for it and its session takes it;
@@ -107,10 +119,14 @@ impl Outbox {
     /// dropped logs an error and logs the client out; the rest are counted, and the count logged
     /// once the outbox empties.
     ///
+    /// `row` is the report's `undelivered` row, if it has one: its deletion is queued once the
+    /// session has stored the report, or it's lost after being taken here. Not if this returns
+    /// `false`: the caller deletes it then.
+    ///
     /// # Panics
     ///
     /// Outside a tokio runtime, for a client not seen before (its drain task is spawned).
-    pub fn deliver(&self, client: &ClientId, msg: Message) -> bool {
+    pub fn deliver(&self, client: &ClientId, msg: Message, row: Option<u64>) -> bool {
         let mut clients = lock(&self.clients);
         let held = self.client(&mut clients, client);
         // Something already held: queue behind it. Otherwise this one is now counted, so the next
@@ -120,18 +136,18 @@ impl Outbox {
                 overflow(&held.shared, self.limit);
                 return false;
             }
-            return held.enqueue(Entry { msg, receipt: None });
+            return held.enqueue(Entry { report: Report { msg, row }, receipt: None });
         }
         let entry = match lock(&held.shared.session).as_ref() {
             Some(session) => {
                 // A copy to send again if the receipt says the connection dropped it.
                 let copy = msg.clone();
                 match session.send(msg) {
-                    Ok(receipt) => Entry { msg: copy, receipt: Some(receipt) },
-                    Err(refused) => Entry { msg: refused.into_message(), receipt: None },
+                    Ok(receipt) => Entry { report: Report { msg: copy, row }, receipt: Some(receipt) },
+                    Err(refused) => Entry { report: Report { msg: refused.into_message(), row }, receipt: None },
                 }
             }
-            None => Entry { msg, receipt: None },
+            None => Entry { report: Report { msg, row }, receipt: None },
         };
         held.enqueue(entry)
     }
@@ -144,7 +160,13 @@ impl Outbox {
         // Holds at most `limit`, since `pending` counts what it holds and stops at `limit`.
         let (queue, receiver) = mpsc::channel(self.limit);
         let shared = Arc::new(Shared::new(id.clone()));
-        let drain = Drain { shared: shared.clone(), queue: receiver, flight: VecDeque::new(), retry: VecDeque::new() };
+        let drain = Drain {
+            shared: shared.clone(),
+            writer: self.writer.clone(),
+            queue: receiver,
+            flight: VecDeque::new(),
+            retry: VecDeque::new(),
+        };
         lock(&self.tasks).spawn(drain.run());
         Client { queue, shared }
     }
@@ -249,9 +271,16 @@ impl Shared {
     }
 }
 
+/// A report, and its `undelivered` row if it has one.
+#[derive(Debug)]
+struct Report {
+    msg: Message,
+    row: Option<u64>,
+}
+
 #[derive(Debug)]
 struct Entry {
-    msg: Message,
+    report: Report,
     /// Set when [`Outbox::deliver`] sent it straight away: the drain task watches it, to send the
     /// report again if the connection drops it.
     receipt: Option<Receipt>,
@@ -266,12 +295,13 @@ enum Step {
 /// Delivers one client's reports in order, on a task of its own.
 struct Drain {
     shared: Arc<Shared>,
+    writer: Option<Writer>,
     queue: mpsc::Receiver<Entry>,
     /// Queued on the session, oldest first, each with a copy to send again if it's dropped.
-    flight: VecDeque<(Message, Receipt)>,
+    flight: VecDeque<(Report, Receipt)>,
     /// To send before anything in `queue`, oldest first: dropped by a connection that ended. At
     /// most `IN_FLIGHT + 1`, as nothing more is taken from `queue` until it's empty.
-    retry: VecDeque<Message>,
+    retry: VecDeque<Report>,
 }
 
 impl Drain {
@@ -279,14 +309,14 @@ impl Drain {
         loop {
             debug_assert!(self.flight.len() + self.retry.len() <= IN_FLIGHT + 1);
             match self.next().await {
-                Step::Send(Entry { msg, receipt: Some(receipt) }) => {
+                Step::Send(Entry { report, receipt: Some(receipt) }) => {
                     debug_assert!(
                         self.flight.is_empty() && self.retry.is_empty(),
                         "sent straight away only when nothing was held"
                     );
-                    self.flight.push_back((msg, receipt));
+                    self.flight.push_back((report, receipt));
                 }
-                Step::Send(Entry { msg, receipt: None }) => self.send(msg).await,
+                Step::Send(Entry { report, receipt: None }) => self.send(report).await,
                 Step::Settled(outcome) => self.settled(outcome).await,
                 Step::Closed => return,
             }
@@ -297,8 +327,8 @@ impl Drain {
         if self.flight.len() >= IN_FLIGHT {
             return Step::Settled(oldest(&mut self.flight).await);
         }
-        if let Some(msg) = self.retry.pop_front() {
-            return Step::Send(Entry { msg, receipt: None });
+        if let Some(report) = self.retry.pop_front() {
+            return Step::Send(Entry { report, receipt: None });
         }
         // Settled first: a report dropped by a connection that ended must go back in `retry`
         // before anything newer is sent, perhaps on the next connection.
@@ -309,7 +339,7 @@ impl Drain {
         }
     }
 
-    async fn send(&mut self, msg: Message) {
+    async fn send(&mut self, Report { msg, row }: Report) {
         // Read at each send, not kept: always the latest logon's handle.
         let session = lock(&self.shared.session).clone();
         let copy = msg.clone();
@@ -318,11 +348,11 @@ impl Drain {
             None => Err(SendError::NotConnected(msg)),
         };
         match sent {
-            Ok(receipt) => self.flight.push_back((copy, receipt)),
+            Ok(receipt) => self.flight.push_back((Report { msg: copy, row }, receipt)),
             Err(refused) => {
                 // Not connected (or never logged on), or the connection ended while waiting for
                 // room: what's in flight went on that connection, ahead of this.
-                self.retry.push_front(refused.into_message());
+                self.retry.push_front(Report { msg: refused.into_message(), row });
                 self.requeue_flight().await;
                 self.wait_for_logon().await;
             }
@@ -330,12 +360,12 @@ impl Drain {
     }
 
     async fn settled(&mut self, outcome: Result<u64, Dropped>) {
-        let (msg, _) = self.flight.pop_front().expect("settled the oldest in flight");
+        let (report, _) = self.flight.pop_front().expect("settled the oldest in flight");
         match outcome {
-            Ok(_) => self.shared.settle(),
+            Ok(_) => self.finished(&report),
             Err(dropped @ (Dropped::Disconnected | Dropped::LoggingOut)) => {
                 self.requeue_flight().await;
-                self.retry.push_front(msg);
+                self.retry.push_front(report);
                 // Disconnected: the next send says whether there's a new connection yet. Logging
                 // out, the session is still connected and would drop each send at once until it
                 // disconnects; wait for the next logon rather than spin.
@@ -343,7 +373,7 @@ impl Drain {
                     self.wait_for_logon().await;
                 }
             }
-            Err(reason) => self.lost(&msg, &reason),
+            Err(reason) => self.lost(&report, &reason),
         }
     }
 
@@ -352,26 +382,35 @@ impl Drain {
     /// later one on that connection is too.
     async fn requeue_flight(&mut self) {
         let mut dropped = Vec::with_capacity(self.flight.len());
-        while let Some((msg, receipt)) = self.flight.pop_front() {
+        while let Some((report, receipt)) = self.flight.pop_front() {
             match receipt.await {
                 Ok(_) => {
                     // A guard: receipts settle oldest first, so this means a connection stored a
                     // report after dropping an earlier one. Seen, it's a Turbojet change or bug:
                     // this report reached the client ahead of the ones now being resent.
                     warn!(client = %self.shared.client, "a report went out ahead of one dropped before it");
-                    self.shared.settle();
+                    self.finished(&report);
                 }
-                Err(Dropped::Disconnected | Dropped::LoggingOut) => dropped.push(msg),
-                Err(reason) => self.lost(&msg, &reason),
+                Err(Dropped::Disconnected | Dropped::LoggingOut) => dropped.push(report),
+                Err(reason) => self.lost(&report, &reason),
             }
         }
-        for msg in dropped.into_iter().rev() {
-            self.retry.push_front(msg);
+        for report in dropped.into_iter().rev() {
+            self.retry.push_front(report);
         }
     }
 
-    fn lost(&self, msg: &Message, reason: &Dropped) {
-        error!(client = %self.shared.client, %reason, report = ?msg, "report not delivered");
+    fn lost(&self, report: &Report, reason: &Dropped) {
+        error!(client = %self.shared.client, %reason, report = ?report.msg, "report not delivered");
+        self.finished(report);
+    }
+
+    /// Done with `report`: the session stored it, or it's lost. Either way a restart mustn't send
+    /// it again, so its row goes.
+    fn finished(&self, report: &Report) {
+        if let (Some(writer), Some(row)) = (&self.writer, report.row) {
+            writer.delivered(row);
+        }
         self.shared.settle();
     }
 
@@ -383,7 +422,7 @@ impl Drain {
 }
 
 /// The outcome of the oldest report in flight; never, with none.
-async fn oldest(flight: &mut VecDeque<(Message, Receipt)>) -> Result<u64, Dropped> {
+async fn oldest(flight: &mut VecDeque<(Report, Receipt)>) -> Result<u64, Dropped> {
     match flight.front_mut() {
         Some((_, receipt)) => receipt.await,
         None => std::future::pending().await,
@@ -577,11 +616,11 @@ mod tests {
         assert_eq!(next(&mut events).await, Event::LoggedOn);
         until(|| lock(&outbox.clients).get(&client()).is_some_and(|c| lock(&c.shared.session).is_some())).await;
 
-        assert!(outbox.deliver(&client(), report(0)));
+        assert!(outbox.deliver(&client(), report(0), None));
         // Watched in flight until stored, so the next one queues behind it.
         assert_eq!(outbox.held(&client()), 1);
         assert_eq!(outbox.held_by_client(), BTreeMap::from([(client(), 1)]));
-        assert!(outbox.deliver(&client(), report(1)));
+        assert!(outbox.deliver(&client(), report(1), None));
         assert!(outbox.push(&client(), report(2)));
         assert_eq!(reports(&mut events, 3).await, numbered_reports(3));
         until(|| outbox.held(&client()) == 0).await;
@@ -674,7 +713,7 @@ mod tests {
         acceptor.session(CLIENT).logout(Some("bye")).unwrap();
         let logging_out = async { while sessions.recv().await.unwrap().kind != SessionEventKind::LoggingOut {} };
         timeout(Duration::from_secs(5), logging_out).await.expect("never logging out");
-        assert!(outbox.deliver(&client(), report(0)));
+        assert!(outbox.deliver(&client(), report(0), None));
         assert_eq!(outbox.held(&client()), 1);
         assert!(outbox.push(&client(), report(1)));
         release.send(()).unwrap();

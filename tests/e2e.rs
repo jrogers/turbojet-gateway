@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use jetbridge::book::{ClientId, Scope};
+use jetbridge::book::{ClientId, Scope, Status};
 use jetbridge::service::Service;
+use jetbridge::store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -200,7 +201,7 @@ fn routes(symbol: &str, text: &str) -> String {
 /// The gateway's two files, its clients speaking `client_version` and its venue
 /// `venue_version` at `venue_port`.
 fn write_config(dir: &tempfile::TempDir, options: &Options, venue_port: u16) {
-    let Options { client_version, venue_version, cancel_on_disconnect, .. } = options;
+    let Options { client_version, venue_version, cancel_on_disconnect, database, .. } = options;
     let cancel = cancel_on_disconnect
         .map(|(trigger, grace)| {
             format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", grace.as_millis())
@@ -223,7 +224,13 @@ reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
 "#
     );
     std::fs::write(dir.path().join("sessions.toml"), sessions).unwrap();
-    std::fs::write(dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT)).unwrap();
+    let database = if *database { format!("[database]\nurl = \"{}\"\n", database_url(dir)) } else { String::new() };
+    std::fs::write(dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + &database).unwrap();
+}
+
+/// The gateway's database, with [`Options::database`].
+fn database_url(dir: &tempfile::TempDir) -> String {
+    format!("sqlite://{}?mode=rwc", dir.path().join("jetbridge.db").display())
 }
 
 struct Options {
@@ -235,6 +242,8 @@ struct Options {
     answers: bool,
     /// The client's `cancel_on_disconnect` setting and its grace.
     cancel_on_disconnect: Option<(&'static str, Duration)>,
+    /// The gateway keeps its book in a SQLite file in the test's directory.
+    database: bool,
 }
 
 impl Default for Options {
@@ -245,6 +254,7 @@ impl Default for Options {
             relay: false,
             answers: false,
             cancel_on_disconnect: None,
+            database: false,
         }
     }
 }
@@ -694,7 +704,7 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
 
     let gateway = setup.service.gateway().clone();
     let session = Scope::Session(ClientId::new(&SessionId::new("FIX.4.4", GATEWAY, CLIENT)));
-    gateway.cancel_all(session.clone());
+    gateway.cancel_all(session.clone()).await;
     assert_eq!(gateway.blocked(), std::slice::from_ref(&session));
     for n in ["1", "2"] {
         let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
@@ -716,7 +726,7 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
     assert_unbooked_reject(&rejected, "C3", &setup.id("R1"));
     assert_eq!(rejected.text.as_deref(), Some("blocked by an operator"));
     assert_eq!(rejected.ord_rej_reason, Some(v44::OrdRejReason::Other));
-    gateway.unblock(session);
+    assert!(gateway.unblock(session).await);
     assert_eq!(setup.order("C4").await.cl_ord_id, &*setup.id("3"));
 }
 
@@ -724,7 +734,7 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
 #[tokio::test]
 async fn a_comp_id_block_covers_a_session_that_logs_on_later() {
     let setup = Setup::new().await;
-    setup.service.gateway().block(Scope::CompId(CLIENT.into()));
+    setup.service.gateway().block(Scope::CompId(CLIENT.into())).await;
     let (desk, mut events) = client(&setup.service, "FIX.4.4", Some("DESK1"));
     tokio::spawn(desk.clone().run());
     events.logged_on().await;
@@ -884,12 +894,35 @@ async fn shutting_down_logs_the_client_and_the_venue_out() {
     setup.venue.events.logged_out().await;
 }
 
-/// Many orders at once, each acked and filled twice by the venue as it arrives: every client
-/// sees each of its orders' reports in order, numbered by the book.
+/// See [`burst`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_burst_of_orders_each_reports_in_order() {
-    const ORDERS: usize = 200;
     let mut setup = Setup::with(Options { answers: true, ..Options::default() }).await;
+    burst(&mut setup).await;
+}
+
+/// The burst with a database: once the reports have reached the client, the database holds
+/// every order, filled, and no report left undelivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_with_a_database_commits_every_order() {
+    let mut setup = Setup::with(Options { answers: true, database: true, ..Options::default() }).await;
+    burst(&mut setup).await;
+    let gateway = setup.service.gateway();
+    until(|| gateway.unfinished().undelivered.is_empty()).await;
+    timeout(WAIT, gateway.committed()).await.expect("not committed");
+    let store = Store::open(&database_url(&setup.dir)).await.unwrap();
+    let loaded = store.load().await.unwrap();
+    assert_eq!(loaded.orders.len(), BURST);
+    assert!(loaded.orders.values().all(|row| row.order.status == Status::Filled));
+    assert!(loaded.undelivered.is_empty(), "{} undelivered", loaded.undelivered.len());
+}
+
+const BURST: usize = 200;
+
+/// [`BURST`] orders at once, each acked and filled twice by the venue as it arrives: every
+/// client sees each of its orders' reports in order, numbered by the book.
+async fn burst(setup: &mut Setup) {
+    const ORDERS: usize = BURST;
     for i in 0..ORDERS {
         setup.send(order(&format!("C{i}"), "AAPL"));
     }

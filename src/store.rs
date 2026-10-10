@@ -15,6 +15,8 @@
 use std::fmt::Display;
 use std::io;
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -35,6 +37,40 @@ pub const SCHEMA_VERSION: i64 = 1;
 #[derive(Debug, Clone)]
 pub struct Store {
     pool: AnyPool,
+    /// What the tests make a write do first.
+    #[cfg(test)]
+    pub(crate) hooks: Arc<Hooks>,
+}
+
+/// Test hooks on [`Store::write`]: it waits while `gate` is shut, then fails while `failures` is
+/// above zero, counting it down.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct Hooks {
+    pub(crate) gate: tokio::sync::watch::Sender<bool>,
+    pub(crate) failures: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Default for Hooks {
+    fn default() -> Self {
+        Self { gate: tokio::sync::watch::Sender::new(true), failures: std::sync::atomic::AtomicUsize::new(0) }
+    }
+}
+
+#[cfg(test)]
+impl Hooks {
+    async fn before_write(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut open = self.gate.subscribe();
+        open.wait_for(|open| *open).await.map_err(io::Error::other)?;
+        // One writer task writes, so nothing races the check and the count down.
+        if self.failures.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        self.failures.fetch_sub(1, Ordering::AcqRel);
+        Err(io::Error::other("failing as the test asked"))
+    }
 }
 
 impl Store {
@@ -74,7 +110,11 @@ impl Store {
         if create(&pool).await? {
             warn!("created a new, empty database at {}", without_password(url));
         }
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            #[cfg(test)]
+            hooks: Arc::default(),
+        })
     }
 
     /// Writes `changes` in order, in one transaction: each row replaces what the store has under
@@ -84,6 +124,8 @@ impl Store {
     ///
     /// The database refuses a statement or the commit; nothing is written then.
     pub async fn write(&self, changes: &[Changes]) -> io::Result<()> {
+        #[cfg(test)]
+        self.hooks.before_write().await?;
         let mut transaction = self.pool.begin().await.map_err(database("starting a write"))?;
         for changes in changes {
             write_changes(&mut transaction, changes).await?;

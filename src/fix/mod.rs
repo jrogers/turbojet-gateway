@@ -43,6 +43,14 @@ impl std::str::FromStr for Version {
 }
 
 impl Version {
+    /// BeginString(8).
+    pub fn begin_string(self) -> &'static str {
+        match self {
+            Self::Fix42 => "FIX.4.2",
+            Self::Fix44 => "FIX.4.4",
+        }
+    }
+
     /// The version's `client_input`.
     ///
     /// # Errors

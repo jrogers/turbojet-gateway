@@ -87,6 +87,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// The ID for the next `undelivered` row: past every one the store has. One deleted may be
+    /// used again, as nothing refers to a row once it's gone.
+    pub fn next_undelivered_id(&self) -> u64 {
+        self.undelivered.last_key_value().map_or(1, |(id, _)| id + 1)
+    }
+
     /// Writes `changes` over the records, as the store does.
     pub fn apply(&mut self, changes: Changes) {
         let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered } = changes;
@@ -167,6 +173,21 @@ impl Book {
             (client, filled)
         }));
         changes
+    }
+
+    /// Forgets the changes made since they were last taken: for a gateway with no store, so the
+    /// book's tracking holds nothing between inputs and copies no rows. A few sets cleared per
+    /// input, most of them already empty.
+    pub fn discard_changes(&mut self) {
+        let Touched { orders, sent, cl_ord_ids, days, blocked, references, filled } = &mut self.touched;
+        orders.clear();
+        sent.clear();
+        cl_ord_ids.clear();
+        days.clear();
+        *blocked = false;
+        references.clear();
+        filled.clear();
+        self.flushed = Changes::default();
     }
 
     /// Keeps the changes made so far for the next [`take_changes`](Self::take_changes), copied

@@ -6,8 +6,13 @@
 //! requests through each venue's [`SessionHandle`]. Neither waits, so the lock is held for
 //! microseconds, and every client gets its reports in the order the book made them, even when
 //! its own request and a venue's fill race on different threads.
+//!
+//! With a database, each input's changes to the book, and the reports it queued for clients, go
+//! to the [`Writer`] in the order the book made them, and the inbound message they came from is
+//! held in flight until they've committed: see [`writer`].
 
 pub mod outbox;
+pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -17,17 +22,20 @@ use std::time::Duration;
 
 use chrono::{DateTime, NaiveTime, Utc};
 use tracing::{error, info, warn};
+use turbojet::codec;
 use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
+use turbojet::message::tags;
 use turbojet::{
     Application, Clock, ConnectionInfo, Context, Disconnect, Dropped, Hold, Message, MessageReject, Receipt, SendError,
     SessionHandle, SessionId, SessionSchedule,
 };
 
-use crate::book::{Book, ClientId, Day, GatewayCancel, Input, OrderId, Output, Scope, VenueId};
+use crate::book::{Book, ClientId, Day, GatewayCancel, Input, OrderId, Output, Scope, Undelivered, VenueId};
 use crate::fix::{self, Version};
 use crate::risk;
 use crate::router::Router;
 pub use outbox::Outbox;
+pub use writer::Writer;
 
 /// Text(58) of the reject for an order whose venue isn't connected, or isn't configured.
 const VENUE_UNAVAILABLE: &str = "venue unavailable";
@@ -76,6 +84,8 @@ pub struct Gateway {
     /// A refused send left a gateway cancel waiting since the last retry tick (see
     /// [`Book::take_cancel_unsent`]): the tick looks at the book only then.
     cancels_waiting: AtomicBool,
+    /// Commits the book's changes, if there's a database: see [`with_writer`](Self::with_writer).
+    writer: Option<Writer>,
 }
 
 /// What a stop would lose until the book is persisted: see [`Gateway::unfinished`].
@@ -126,7 +136,18 @@ impl Gateway {
             client_version,
             clock: Clock::system(),
             cancels_waiting: AtomicBool::new(false),
+            writer: None,
         }
+    }
+
+    /// Commits every change to the book, and every report queued for a client until its session
+    /// has stored it, through `writer`, holding each inbound message until its changes have
+    /// committed. Without one, the book is kept in memory only.
+    #[must_use]
+    pub fn with_writer(mut self, writer: Writer) -> Self {
+        self.outbox.set_writer(writer.clone());
+        self.writer = Some(writer);
+        self
     }
 
     /// Starts every ID the book issues with `prefix`, such as [`start_prefix`](crate::book::start_prefix)'s.
@@ -221,34 +242,45 @@ impl Gateway {
 
     /// Blocks the clients in `scope`: their new orders are rejected until [`unblock`](Self::unblock)
     /// lifts this scope (see [`Input::Block`]). Their working orders stay; see
-    /// [`cancel_all`](Self::cancel_all).
-    pub fn block(self: &Arc<Self>, scope: Scope) {
+    /// [`cancel_all`](Self::cancel_all). Returns once the block is committed, with a database.
+    pub async fn block(self: &Arc<Self>, scope: Scope) {
         warn!(?scope, "blocking clients");
         self.handle_all([Input::Block { scope }]);
+        self.committed().await;
     }
 
     /// The kill switch: blocks the clients in `scope` and cancels their live orders at the
     /// venues, as one step, so no order slips in between. Each client hears of each order's end
     /// as the venue's Canceled comes back. [`cancelling`](Self::cancelling) lists the cancels
-    /// still going.
-    pub fn cancel_all(self: &Arc<Self>, scope: Scope) {
+    /// still going. Returns once the block and the cancels sent are committed, with a database.
+    pub async fn cancel_all(self: &Arc<Self>, scope: Scope) {
         warn!(?scope, "blocking clients and cancelling their orders");
         self.handle_all([Input::Block { scope: scope.clone() }, Input::CancelAll { scope }]);
+        self.committed().await;
     }
 
     /// Lifts the block of exactly `scope`: a block of a session's CompID, or of everyone, stays.
-    /// `false` if `scope` wasn't blocked, which changes nothing.
-    pub fn unblock(&self, scope: Scope) -> bool {
-        let mut state = self.lock();
-        if !state.book.blocked().contains(&scope) {
-            info!(?scope, blocked = ?state.book.blocked(), "nothing to unblock");
-            return false;
+    /// `false` if `scope` wasn't blocked, which changes nothing. Returns once the unblock is
+    /// committed, with a database.
+    pub async fn unblock(self: &Arc<Self>, scope: Scope) -> bool {
+        {
+            let mut state = self.lock();
+            if !state.book.blocked().contains(&scope) {
+                info!(?scope, blocked = ?state.book.blocked(), "nothing to unblock");
+                return false;
+            }
+            warn!(?scope, "unblocking clients");
+            self.handle_locked(&mut state, [Input::Unblock { scope }], None);
         }
-        warn!(?scope, "unblocking clients");
-        let mut out = Vec::new();
-        state.book.handle(Input::Unblock { scope }, &mut out);
-        debug_assert!(out.is_empty(), "an unblock sends nothing");
+        self.committed().await;
         true
+    }
+
+    /// Completes once every change to the book so far has committed; at once without a database.
+    pub async fn committed(&self) {
+        if let Some(writer) = &self.writer {
+            writer.committed().await;
+        }
     }
 
     /// The scopes blocked now.
@@ -375,28 +407,39 @@ impl Gateway {
         }
     }
 
+    /// Handles `input` from a venue's message, `ctx`'s, held until what it changed has committed.
+    fn handle_with(self: &Arc<Self>, input: Input, ctx: &mut Context<'_>) {
+        self.handle_locked(&mut self.lock(), [input], Some(ctx));
+    }
+
     /// As [`handle_all`](Self::handle_all), under the lock held as `state`. With `ctx`, the
-    /// client's message the inputs came from, which [`send`](Self::send) holds.
+    /// message the inputs came from, which [`send`](Self::send) and [`commit`](Self::commit)
+    /// hold.
     fn handle_locked(
         self: &Arc<Self>,
         state: &mut State,
         inputs: impl IntoIterator<Item = Input>,
         mut ctx: Option<&mut Context<'_>>,
     ) {
+        if let Some(writer) = &self.writer {
+            state.book.set_unavailable(writer.unavailable());
+        }
         // After the lock, so TransactTimes rise in the order the book answers.
         let now = UtcTimestamp::from(self.clock.now());
         let mut inputs = VecDeque::from_iter(inputs);
         let mut outputs = Vec::new();
+        let mut reports = Vec::new();
         while let Some(input) = inputs.pop_front() {
             let send_failed = matches!(input, Input::SendFailed { .. });
             state.book.handle(input, &mut outputs);
             for output in outputs.drain(..) {
-                if let Some(failed) = self.send(state, &output, now, ctx.as_deref_mut()) {
+                if let Some(failed) = self.send(state, &output, now, ctx.as_deref_mut(), &mut reports) {
                     debug_assert!(!send_failed, "SendFailed made venue-bound output");
                     inputs.push_back(failed);
                 }
             }
         }
+        self.commit(&mut state.book, reports, ctx);
         if state.book.take_cancel_unsent() {
             self.cancels_waiting.store(true, Ordering::Release);
         }
@@ -442,24 +485,26 @@ impl Gateway {
         }
     }
 
-    /// Sends `output` where it's going. `Some` for a venue request its session refused. A venue
-    /// request queued holds `ctx`'s message in flight until the venue's session has stored it,
-    /// so a stop before then has the client resend it rather than losing it.
+    /// Sends `output` where it's going, a client's report into `reports` for
+    /// [`commit`](Self::commit). `Some` for a venue request its session refused. A venue request
+    /// queued holds `ctx`'s message in flight until the venue's session has stored it, so a stop
+    /// before then has the client resend it rather than losing it.
     fn send(
         self: &Arc<Self>,
         state: &State,
         output: &Output,
         now: UtcTimestamp,
         ctx: Option<&mut Context<'_>>,
+        reports: &mut Vec<(ClientId, Message)>,
     ) -> Option<Input> {
         match output {
             Output::Report { client, .. } | Output::CancelReject { client, .. } => {
                 let msg = self.client_version.client_message(output, now).expect("a client-bound output");
                 // Not `ctx.send`, even to the client whose request this answers: the outbox keeps
-                // each client's reports in the book's order. The cost: the client's request can
-                // be committed before its report is stored, so a stop in between loses the
-                // report. Stage 4, persisting the book with undelivered reports, closes that.
-                self.outbox.deliver(client, msg);
+                // each client's reports in the book's order. Without a database, the client's
+                // request can be committed before its report is stored, so a stop in between
+                // loses the report; with one, the report's row outlives the stop.
+                reports.push((client.clone(), msg));
                 None
             }
             Output::NewOrder { venue, downstream, .. }
@@ -481,6 +526,42 @@ impl Gateway {
                     // NotConnected.
                     Err(_) => Some(failed(VENUE_UNAVAILABLE)),
                 }
+            }
+        }
+    }
+
+    /// Queues what `book` changed since it was last asked, with `reports`' rows, for the writer,
+    /// holding `ctx`'s message until they've committed, then hands the reports to the outbox.
+    /// Queued first, under the book's lock: a later change never commits before an earlier one,
+    /// and a report's row is queued before the outbox can queue its deletion. Without a writer,
+    /// the changes are dropped, so the book's tracking holds nothing.
+    fn commit(&self, book: &mut Book, reports: Vec<(ClientId, Message)>, ctx: Option<&mut Context<'_>>) {
+        let Some(writer) = &self.writer else {
+            book.discard_changes();
+            for (client, msg) in reports {
+                self.outbox.deliver(&client, msg, None);
+            }
+            return;
+        };
+        let mut changes = book.take_changes();
+        let begin_string = self.client_version.begin_string();
+        let rows: Vec<u64> = reports
+            .iter()
+            .map(|(client, msg)| {
+                let row = writer.next_row();
+                // Framed as the client's session would frame it, header aside, so it decodes.
+                let framed = msg.clone().with(tags::BEGIN_STRING, begin_string);
+                let message = codec::encode(&framed).expect("it has a BeginString");
+                changes.undelivered.push((row, Undelivered { client: client.clone(), message }));
+                row
+            })
+            .collect();
+        if !changes.is_empty() {
+            writer.queue(changes, ctx.map(|ctx| ctx.hold()));
+        }
+        for ((client, msg), row) in reports.into_iter().zip(rows) {
+            if !self.outbox.deliver(&client, msg, Some(row)) {
+                writer.delivered(row);
             }
         }
     }
@@ -612,7 +693,7 @@ impl Application for VenueApp {
         };
         // `None`: a report the book needn't see (a bust, say), logged inside.
         if let Some(input) = version.venue_input(&venue, msg)? {
-            self.0.handle(input);
+            self.0.handle_with(input, ctx);
         }
         Ok(())
     }
@@ -637,6 +718,7 @@ mod tests {
     use super::*;
     use crate::book::Scope;
     use crate::router::{Rule, Target};
+    use crate::store::Store;
 
     const VENUE: &str = "NASDAQ";
 
@@ -735,10 +817,11 @@ mod tests {
         Message(Message),
     }
 
-    /// A client or venue in the test: reports what it sees, and as a venue, acks and fills every
-    /// order in full at 10.
+    /// A client or venue in the test: reports what it sees, and as a venue that `answers`, acks
+    /// and fills every order in full at 10.
     struct Peer {
         events: UnboundedSender<Event>,
+        answers: bool,
     }
 
     impl Application for Peer {
@@ -752,7 +835,7 @@ mod tests {
 
         fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
             let _ = self.events.send(Event::Message(msg.clone()));
-            if msg.msg_type() == MsgType::NewOrderSingle {
+            if self.answers && msg.msg_type() == MsgType::NewOrderSingle {
                 let order: v44::NewOrderSingle = msg.parse()?;
                 let qty = order.order_qty.expect("orders carry OrderQty");
                 for (exec_type, status, last_qty) in
@@ -774,7 +857,13 @@ mod tests {
 
     fn peer() -> (Arc<Peer>, UnboundedReceiver<Event>) {
         let (events, rx) = unbounded_channel();
-        (Arc::new(Peer { events }), rx)
+        (Arc::new(Peer { events, answers: true }), rx)
+    }
+
+    /// A venue that answers nothing itself.
+    fn quiet_peer() -> (Arc<Peer>, UnboundedReceiver<Event>) {
+        let (events, rx) = unbounded_channel();
+        (Arc::new(Peer { events, answers: false }), rx)
     }
 
     async fn next(events: &mut UnboundedReceiver<Event>) -> Event {
@@ -990,7 +1079,7 @@ mod tests {
         let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         book_order(&gateway);
-        gateway.cancel_all(Scope::All);
+        gateway.cancel_all(Scope::All).await;
         assert!(gateway.cancels_waiting.load(Ordering::Acquire));
         // The venue isn't connected: the tick sends nothing, and leaves it to the logon.
         gateway.send_waiting_cancels();
@@ -1013,12 +1102,12 @@ mod tests {
         assert!(!gateway.cancels_waiting.load(Ordering::Acquire));
     }
 
-    #[test]
-    fn unblock_says_whether_the_scope_was_blocked() {
+    #[tokio::test]
+    async fn unblock_says_whether_the_scope_was_blocked() {
         let gateway = gateway();
-        gateway.block(Scope::All);
-        assert!(!gateway.unblock(Scope::CompId("FUNDA".into())));
-        assert!(gateway.unblock(Scope::All));
+        gateway.block(Scope::All).await;
+        assert!(!gateway.unblock(Scope::CompId("FUNDA".into())).await);
+        assert!(gateway.unblock(Scope::All).await);
         assert!(gateway.blocked().is_empty());
     }
 
@@ -1347,5 +1436,250 @@ mod tests {
             .filter(|event| matches!(event, Event::Message(msg) if msg.msg_type() == MsgType::NewOrderSingle))
             .count();
         assert_eq!(again, 0, "the venue got the order again");
+    }
+
+    /// [`gateway`], committing to an in-memory database, with new orders rejected past `limit`
+    /// uncommitted batches; and the database, whose writes the test can gate and fail.
+    async fn gateway_with_store(limit: usize) -> (Arc<Gateway>, Store) {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let (writer, _writing) = Writer::start(store.clone(), 1);
+        let gateway = Arc::try_unwrap(gateway()).unwrap().with_writer(writer.with_limit(limit));
+        (Arc::new(gateway), store)
+    }
+
+    /// A venue (answering if `answers`) and FUNDA, both logged on to `gateway`, each of the
+    /// gateway's sessions kept in a storage the test reads: the venue's initiator, the client and
+    /// their logs.
+    async fn connected(gateway: &Arc<Gateway>, answers: bool) -> Connected {
+        let (venue_app, mut venue_events) = if answers { peer() } else { quiet_peer() };
+        let venue_addr = serve("VENUE", venue_app).await;
+        let venues = Arc::new(MemoryStorage::new());
+        let app = Arc::new(VenueApp(gateway.clone()));
+        let venue = initiator_with(&venue_addr, "JETBRIDGE", "VENUE", app, venues.clone());
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        tokio::spawn(venue.clone().run());
+        assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
+        let clients = Arc::new(MemoryStorage::new());
+        let addr = serve_with("JETBRIDGE", Arc::new(ClientApp(gateway.clone())), clients.clone()).await;
+        let (app, mut client_events) = peer();
+        let client = initiator(&addr, "FUNDA", "JETBRIDGE", app);
+        tokio::spawn(client.clone().run());
+        assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
+        Connected {
+            venue_log: venues.open(&SessionId::new("FIX.4.4", "JETBRIDGE", "VENUE")).unwrap(),
+            client_log: clients.open(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA")).unwrap(),
+            venue,
+            venue_events,
+            client,
+            client_events,
+        }
+    }
+
+    struct Connected {
+        venue: Initiator,
+        venue_events: UnboundedReceiver<Event>,
+        venue_log: Box<dyn SessionLog>,
+        client: Initiator,
+        client_events: UnboundedReceiver<Event>,
+        client_log: Box<dyn SessionLog>,
+    }
+
+    fn uncommitted(gateway: &Gateway) -> usize {
+        gateway.writer.as_ref().expect("a gateway with a database").uncommitted()
+    }
+
+    /// Waits until every report the outbox took is stored or lost, and its row's deletion
+    /// committed.
+    async fn delivered(gateway: &Gateway) {
+        let settled = async {
+            while !gateway.outbox.held_by_client().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(Duration::from_secs(5), settled).await.expect("reports still held");
+        timeout(Duration::from_secs(5), gateway.committed()).await.expect("not committed");
+    }
+
+    /// With a database, a client's order and the venue's ack and fill each stay in flight on
+    /// their session until the batch with what they changed has committed, though the order goes
+    /// to the venue and the reports to the client without waiting for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn messages_stay_in_flight_until_their_changes_commit() {
+        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let mut sessions = connected(&gateway, true).await;
+        store.hooks.gate.send_replace(false);
+
+        sessions.client.handle().send(order("C1")).unwrap();
+        let sent: v44::NewOrderSingle = next_message(&mut sessions.venue_events).await.parse().unwrap();
+        assert_eq!(sent.cl_ord_id, "1");
+        assert_eq!(report(&mut sessions.client_events).await.exec_type, v44::ExecType::New);
+        assert_eq!(report(&mut sessions.client_events).await.exec_type, v44::ExecType::Trade);
+        // The order is 2 on the client's session; the ack and fill 2 and 3 on the venue's.
+        wait_for(sessions.client_log.as_ref(), (3, Some(2))).await;
+        wait_for(sessions.venue_log.as_ref(), (4, Some(2))).await;
+        assert!(store.load().await.unwrap().orders.is_empty(), "committed while the gate was shut");
+
+        store.hooks.gate.send_replace(true);
+        wait_for(sessions.client_log.as_ref(), (3, Some(3))).await;
+        wait_for(sessions.venue_log.as_ref(), (4, Some(4))).await;
+        let loaded = store.load().await.unwrap();
+        assert_eq!(loaded.orders[&OrderId(1)].order.status, crate::book::Status::Filled);
+    }
+
+    /// A database that fails holds every message that changed the book, and once it's back each
+    /// change is written: the store then holds what the book does, and nothing undelivered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_database_stalls_then_writes_every_change() {
+        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let mut sessions = connected(&gateway, true).await;
+        store.hooks.gate.send_replace(false);
+        store.hooks.failures.store(3, Ordering::Release);
+
+        for cl_ord_id in ["C1", "C2", "C3"] {
+            sessions.client.handle().send(order(cl_ord_id)).unwrap();
+        }
+        for _ in 0..6 {
+            report(&mut sessions.client_events).await;
+        }
+        wait_for(sessions.client_log.as_ref(), (5, Some(2))).await;
+        wait_for(sessions.venue_log.as_ref(), (8, Some(2))).await;
+
+        store.hooks.gate.send_replace(true);
+        wait_for(sessions.client_log.as_ref(), (5, Some(5))).await;
+        wait_for(sessions.venue_log.as_ref(), (8, Some(8))).await;
+        assert_eq!(store.hooks.failures.load(Ordering::Acquire), 0, "every failure was retried");
+        delivered(&gateway).await;
+        assert_eq!(uncommitted(&gateway), 0);
+        let loaded = store.load().await.unwrap();
+        assert!(loaded.undelivered.is_empty(), "{:?}", loaded.undelivered);
+        assert_eq!(loaded, gateway.lock().book.snapshot());
+        assert_eq!(loaded.orders.len(), 3);
+    }
+
+    /// A report from the venue for our order `downstream`: an ack, or a fill of `last_qty`.
+    fn venue_report(downstream: &str, last_qty: i64) -> Message {
+        let (exec_type, status) = if last_qty == 0 {
+            (v44::ExecType::New, v44::OrdStatus::New)
+        } else {
+            (v44::ExecType::Trade, v44::OrdStatus::PartiallyFilled)
+        };
+        let (last_qty, px) = (Decimal::from(last_qty), Decimal::from(10));
+        let exec_id = format!("{downstream}-{last_qty}");
+        let mut report = v44::ExecutionReport::new(
+            "V-1",
+            exec_id,
+            exec_type,
+            status,
+            v44::Side::Buy,
+            Decimal::from(100) - last_qty,
+            last_qty,
+            px,
+        );
+        report.cl_ord_id = Some(downstream.into());
+        (report.last_qty, report.last_px) = (Some(last_qty), Some(px));
+        report.to_message()
+    }
+
+    /// The reports queued for clients and not yet delivered, as the store has them.
+    async fn undelivered(store: &Store) -> Vec<Message> {
+        let rows = store.load().await.unwrap().undelivered;
+        rows.into_values()
+            .map(|row| match codec::decode(&row.message) {
+                codec::Decoded::Message(msg, _) => msg,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// Past the limit of uncommitted batches, a new order is rejected as "gateway unavailable",
+    /// and isn't booked; a cancel goes to the venue and a fill is booked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn past_the_uncommitted_limit_new_orders_are_rejected_and_the_rest_flow() {
+        let (gateway, store) = gateway_with_store(1).await;
+        let mut sessions = connected(&gateway, false).await;
+        let venue = VenueApp(gateway.clone());
+        let venue_message = |msg: &Message| venue.on_message(&mut Context::new(&sessions.venue.handle()), msg).unwrap();
+        // From FUNDA's session, though not through it: nothing is held.
+        send_order(&gateway, "C1");
+        let _: v44::NewOrderSingle = next_message(&mut sessions.venue_events).await.parse().unwrap();
+        venue_message(&venue_report("1", 0));
+        gateway.committed().await;
+
+        store.hooks.gate.send_replace(false);
+        send_order(&gateway, "C2");
+        let _: v44::NewOrderSingle = next_message(&mut sessions.venue_events).await.parse().unwrap();
+        assert_eq!(uncommitted(&gateway), 1);
+        send_order(&gateway, "C3");
+        assert!(gateway.lock().book.order(OrderId(3)).is_none());
+        let mut cancel = v44::OrderCancelRequest::new("C1", "C4", v44::Side::Buy, UtcTimestamp::now());
+        cancel.symbol = Some("AAPL".into());
+        send_message(&gateway, "FUNDA", &cancel.to_message());
+        let sent: v44::OrderCancelRequest = next_message(&mut sessions.venue_events).await.parse().unwrap();
+        assert_eq!(sent.orig_cl_ord_id, "1");
+        venue_message(&venue_report("1", 10));
+        assert_eq!(gateway.lock().book.order(OrderId(1)).unwrap().cum_qty, 10.into());
+
+        store.hooks.gate.send_replace(true);
+        timeout(Duration::from_secs(5), gateway.committed()).await.expect("not committed");
+        assert_eq!(store.load().await.unwrap().orders[&OrderId(1)].order.cum_qty, 10.into());
+        let rejected = loop {
+            let report = report(&mut sessions.client_events).await;
+            if report.cl_ord_id.as_deref() == Some("C3") {
+                break report;
+            }
+        };
+        assert_eq!(rejected.exec_type, v44::ExecType::Rejected);
+        assert_eq!(rejected.text.as_deref(), Some(crate::book::GATEWAY_UNAVAILABLE));
+    }
+
+    /// A report for a client that isn't logged on is a row once its batch commits, framed as the
+    /// client's session would send it; the row goes once the client is back and its session has
+    /// stored the report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reports_row_goes_once_the_clients_session_stores_it() {
+        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        // No venue: booked and rejected.
+        send_order(&gateway, "C1");
+        gateway.committed().await;
+        let rows = store.load().await.unwrap().undelivered;
+        assert_eq!(
+            rows.values().map(|row| &row.client).collect::<Vec<_>>(),
+            [&ClientId::new(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA"))]
+        );
+        let [msg] = undelivered(&store).await.try_into().unwrap();
+        assert_eq!(msg.get(tags::BEGIN_STRING), Some("FIX.4.4"));
+        let rejected: v44::ExecutionReport = msg.parse().unwrap();
+        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+
+        let (_client, mut events) = client(&gateway).await;
+        assert_eq!(report(&mut events).await.cl_ord_id.as_deref(), Some("C1"));
+        delivered(&gateway).await;
+        assert!(undelivered(&store).await.is_empty());
+    }
+
+    /// An operator's call returns only once its change has committed.
+    #[tokio::test]
+    async fn an_operator_call_returns_once_its_change_has_committed() {
+        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        store.hooks.gate.send_replace(false);
+        let mut blocking = tokio::spawn({
+            let gateway = gateway.clone();
+            async move { gateway.block(Scope::All).await }
+        });
+        assert!(timeout(Duration::from_millis(100), &mut blocking).await.is_err(), "returned before committing");
+        assert!(store.load().await.unwrap().blocked.is_empty());
+        store.hooks.gate.send_replace(true);
+        timeout(Duration::from_secs(5), blocking).await.expect("not committed").unwrap();
+        assert_eq!(store.load().await.unwrap().blocked, [Scope::All]);
+    }
+
+    /// Without a database, the book keeps none of its changes between inputs.
+    #[tokio::test]
+    async fn without_a_database_the_book_keeps_no_changes() {
+        let gateway = gateway();
+        send_order(&gateway, "C1");
+        gateway.cancel_all(Scope::All).await;
+        assert!(gateway.unblock(Scope::All).await);
+        assert_eq!(gateway.lock().book.take_changes(), crate::book::Changes::default());
     }
 }
