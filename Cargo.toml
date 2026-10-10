@@ -20,6 +20,8 @@ turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
 # Turbojet's clock and schedules speak chrono's times.
 chrono = { version = "0.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
+# The book's database, as Turbojet's turbojet-sql: `any` so PostgreSQL is a feature away.
+sqlx = { version = "0.8.6", default-features = false, features = ["any", "runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 tracing = "0.1"

@@ -41,6 +41,11 @@ impl ClientId {
         Self(Arc::new(ClientName { session: id.to_string(), comp_id: id.target_comp_id.as_str().into() }))
     }
 
+    /// The client a store kept as its session, as it shows, and CompID: all a client is.
+    pub(crate) fn from_parts(session: String, comp_id: CompactString) -> Self {
+        Self(Arc::new(ClientName { session, comp_id }))
+    }
+
     /// The client's CompID, which routes match on; its sessions share it.
     pub fn comp_id(&self) -> &str {
         &self.0.comp_id
@@ -154,7 +159,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn is_done(self) -> bool {
+    pub(crate) fn is_done(self) -> bool {
         matches!(self, Self::Filled | Self::Canceled | Self::Expired | Self::Rejected)
     }
 }

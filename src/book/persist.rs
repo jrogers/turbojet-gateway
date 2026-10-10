@@ -189,7 +189,7 @@ impl Book {
 
     /// The book's records, written now: what a store of every change taken, restored, gives back.
     #[cfg(test)]
-    pub(super) fn snapshot(&self) -> Snapshot {
+    pub(crate) fn snapshot(&self) -> Snapshot {
         let day = |client: &ClientId| self.days.get(client).map(|today| today.day);
         Snapshot {
             orders: self
