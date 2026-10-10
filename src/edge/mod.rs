@@ -461,8 +461,9 @@ impl Gateway {
         }
     }
 
-    /// One tick's retry of the gateway's cancels: see [`run_ticks`](Self::run_ticks). Takes the book's lock only after a
-    /// refused send. A refusal during this one sets the flag again for the next tick.
+    /// One tick's retry of the gateway's cancels: see [`run_ticks`](Self::run_ticks). Takes the
+    /// book's lock only after a refused send. A refusal during this one sets the flag again for
+    /// the next tick.
     fn send_waiting_cancels(self: &Arc<Self>) {
         if !self.cancels_waiting.swap(false, Ordering::AcqRel) {
             return;

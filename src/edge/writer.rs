@@ -263,8 +263,9 @@ async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>, ages: 
     info!("the book's writer stopped: nothing left to write");
 }
 
-/// Writes `changes`, merged from `batches` batches, in one transaction, retrying until it commits. Every row is an upsert or a
-/// delete by key, so writing them again after a failure writes each once.
+/// Writes `changes`, merged from `batches` batches, in one transaction, retrying until it
+/// commits. Every row is an upsert or a delete by key, so writing them again after a failure
+/// writes each once.
 async fn write(store: &Store, changes: &[Changes], batches: usize) {
     let mut wait = RETRY_FIRST;
     let mut failures: u32 = 0;
