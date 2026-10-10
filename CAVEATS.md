@@ -70,6 +70,9 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 - Clients are known by CompID. Sessions from one CompID told apart by SubID, LocationID or
   qualifier are one client to the gateway, and its reports go to the session that logged on last.
 - Every client speaks the acceptor's BeginString.
+- Under `unknown = "admit"`, distinct CompIDs aren't bounded: each that logs on keeps a report
+  queue and its task, and each that orders a count in the book, until a restart. Listing the
+  counterparties bounds them.
 - A client holds up to 100,000 undelivered reports. The first past that is dropped, with an
   error logged, and the client is logged out; later ones are dropped and counted until its queue
   empties.

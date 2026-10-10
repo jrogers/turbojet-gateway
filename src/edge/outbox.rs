@@ -38,9 +38,9 @@ const OVERFLOW_TEXT: &str = "too many undelivered reports";
 /// Holds reports per client, and delivers them as each client can take them.
 ///
 /// **Order.** A client receives its reports in the order [`deliver`](Self::deliver) was called
-/// for it (calls racing on different threads have no order
-/// to keep). A report the connection drops before storing it is sent again after the client logs
-/// back on, ahead of anything later; one that was stored is resent by the session as usual.
+/// for it (calls racing on different threads have no order to keep). A report the connection
+/// drops before storing it is sent again after the client logs back on, ahead of anything later;
+/// one that was stored is resent by the session as usual.
 ///
 /// **Loss.** A report is lost, with an error logged, only when the client's outbox is full (the
 /// client is logged out too), when the session refuses it for good ([`Dropped::Rejected`]), or
@@ -48,8 +48,10 @@ const OVERFLOW_TEXT: &str = "too many undelivered reports";
 /// there; sending it again could duplicate it).
 ///
 /// **Limits.** Each client holds up to [`MAX_OUTBOX`] reports. Its queue and task are made on
-/// first use and kept, so there's one per client seen since start: clients that logged on, which
-/// the acceptor's configuration bounds. Dropping the outbox aborts the drain tasks, and what they
+/// first use and kept, so there's one per client seen since start. The listed counterparties bound
+/// that, but not turbojet-config's `unknown = "admit"`: every distinct CompID that logs on over
+/// the process's life keeps a drain task here, and one that orders a `used` entry in the book,
+/// until a restart. Dropping the outbox aborts the drain tasks, and what they
 /// hold is lost.
 #[derive(Debug)]
 pub struct Outbox {
