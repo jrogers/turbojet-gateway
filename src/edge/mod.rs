@@ -1750,4 +1750,22 @@ mod tests {
         assert!(timeout(Duration::from_millis(100), gateway.committed()).await.is_err());
         assert_eq!(sessions.client_log.in_flight(), Some(2), "released unwritten");
     }
+
+    /// A report the outbox refuses (FUNDA's holds one, and has one) has its row's deletion queued
+    /// at once, inside `commit`: after the batch inserting the row, or the insert would win and
+    /// the row stay for a restart to send.
+    #[tokio::test]
+    async fn a_report_the_outbox_refuses_leaves_no_row() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let (writer, _writing) = Writer::start(store.clone(), 1);
+        let mut gateway = Arc::try_unwrap(gateway()).unwrap();
+        gateway.outbox = Outbox::with_limit(1);
+        let gateway = Arc::new(gateway.with_writer(writer));
+        // No venue: each is booked and rejected, and FUNDA isn't logged on.
+        send_order(&gateway, "C1");
+        send_order(&gateway, "C2");
+        timeout(Duration::from_secs(5), gateway.committed()).await.expect("not committed");
+        let rows = store.load().await.unwrap().undelivered;
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), [1], "only the report the outbox holds");
+    }
 }

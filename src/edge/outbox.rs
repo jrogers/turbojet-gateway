@@ -73,7 +73,7 @@ impl Outbox {
     }
 
     /// An outbox holding up to `limit` reports per client.
-    fn with_limit(limit: usize) -> Self {
+    pub(super) fn with_limit(limit: usize) -> Self {
         assert!(limit > 0, "an outbox must hold at least one report");
         Self { limit, clients: Mutex::default(), tasks: Mutex::default(), writer: None }
     }
