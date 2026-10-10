@@ -294,6 +294,11 @@ impl Book {
         }
         self.risk.track(order.id, order.exposure());
         if sent.origin == Origin::Gateway {
+            // Not the order's latest cancel: an orphaned request (see `Input::Orphan`), whose
+            // refusal leaves the gateway's own cancel to go on.
+            if order.cancel.as_ref() != Some(downstream) {
+                return tracing::warn!(%venue, %downstream, ?reason, ?text, "venue refused an orphaned request");
+            }
             return self.gateway_cancel_refused(sent.order, downstream, reason, text, out);
         }
         let orig_cl_ord_id = sent.orig_cl_ord_id.expect("a client's cancel or replace names an order");

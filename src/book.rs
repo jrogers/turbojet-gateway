@@ -416,6 +416,15 @@ pub enum Input {
     VenueUp {
         venue: VenueId,
     },
+    /// At a start: a cancel or replace sent under `downstream` (`<order name>-<n>`) that `venue`'s
+    /// session stored, but the store never recorded (the gateway stopped within a commit of
+    /// sending it). Recorded as the gateway's own cancel, so the venue's answers apply to the
+    /// order, and the order is cancelled as by `CancelOrder`: what the client asked for is
+    /// unknown. One for an order the book doesn't hold (done, and dropped at a roll) is logged.
+    Orphan {
+        venue: VenueId,
+        downstream: CompactString,
+    },
     /// An operator blocks the clients in `scope`: their new orders are rejected
     /// ([`RejectReason::Blocked`]) until an `Unblock` of the same scope. What takes orders off the
     /// market passes: cancels, and replaces that don't raise the quantity.
@@ -710,6 +719,7 @@ impl Book {
             Input::CancelAll { scope } => self.cancel_all(&scope, out),
             Input::CancelOrder { order } => self.cancel_order(order, out),
             Input::VenueUp { venue } => self.venue_up(&venue, out),
+            Input::Orphan { venue, downstream } => self.orphan(&venue, downstream, out),
             Input::Block { scope } => {
                 if !self.blocked.contains(&scope) {
                     self.blocked.push(scope);

@@ -102,6 +102,41 @@ impl Book {
         }
     }
 
+    /// See [`Input::Orphan`](super::Input::Orphan).
+    pub(super) fn orphan(&mut self, venue: &VenueId, downstream: CompactString, out: &mut Vec<Output>) {
+        let Some((name, amendment)) =
+            downstream.rsplit_once('-').and_then(|(name, n)| Some((name, n.parse::<u32>().ok()?)))
+        else {
+            return tracing::error!(%venue, %downstream, "orphaned request isn't a cancel's or replace's");
+        };
+        if self.downstream.contains_key(&downstream) {
+            return tracing::debug!(%venue, %downstream, "orphaned request already recorded");
+        }
+        // ponytail: a walk of every order per orphan, at a start only; a map by name if many.
+        let Some(order) = self.orders.values_mut().find(|order| order.name == name) else {
+            return tracing::error!(%venue, %downstream, "venue holds a request the store lacks, for an order no longer held (done); nothing to cancel");
+        };
+        if order.venue != *venue {
+            return tracing::error!(%venue, %downstream, order_venue = %order.venue, "orphaned request for another venue's order");
+        }
+        let id = order.id;
+        self.touched.orders.insert(id);
+        // Numbered past it, so no later request reuses its ID.
+        order.amendments = order.amendments.max(amendment);
+        tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, "venue holds a request the store lacks: cancelling its order");
+        let sent = Sent {
+            order: id,
+            origin: Origin::Gateway,
+            cl_ord_id: CompactString::default(),
+            orig_cl_ord_id: None,
+            kind: Some(CancelKind::Cancel),
+            answered: false,
+        };
+        self.downstream.insert(downstream.clone(), sent);
+        self.touched.sent.insert(downstream);
+        self.cancel_order(id, out);
+    }
+
     /// The gateway's cancel is waiting to be sent, and nothing stands in its way.
     fn gateway_cancel_waiting(&self, order: &Order) -> bool {
         order.gateway_cancel.as_ref().is_some_and(|gateway| gateway.unsent) && self.outstanding_cancel(order).is_none()

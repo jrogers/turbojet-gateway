@@ -614,3 +614,19 @@ async fn creating_says_whether_the_database_was_new() {
     assert!(create(&pool).await.unwrap());
     assert!(!create(&pool).await.unwrap());
 }
+
+/// Requests sent under downstreams the store has, of orders it no longer loads too, aren't
+/// unknown; the rest are, each once, in the order asked, past one query's worth of IDs.
+#[tokio::test]
+async fn unknown_downstreams_are_those_without_a_request_sent() {
+    let store = memory().await;
+    store.write(&[Changes { sent: every_sent(), ..Changes::default() }]).await.unwrap();
+    let mut asked: Vec<CompactString> = (0..LOOKUP_CHUNK + 10).map(|n| format!("X{n}").into()).collect();
+    asked.splice(0..0, ["2-2".into(), "9".into(), "1".into(), "9".into()]);
+    asked.push("2-1".into());
+    let unknown = store.unknown_downstreams(&asked).await.unwrap();
+    assert_eq!(unknown.len(), LOOKUP_CHUNK + 11);
+    assert_eq!(unknown[..2], ["9", "X0"]);
+    assert!(!unknown.iter().any(|d| ["1", "2-1", "2-2"].contains(&d.as_str())));
+    assert!(store.unknown_downstreams(&[]).await.unwrap().is_empty());
+}

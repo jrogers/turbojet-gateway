@@ -2995,3 +2995,63 @@ fn only_inputs_changing_what_survives_leave_changes() {
     assert_eq!(changes.orders.iter().map(|row| row.order.exec_seq).collect::<Vec<_>>(), [1]);
     assert_eq!(changes, Changes { orders: changes.orders.clone(), ..Changes::default() });
 }
+
+fn orphan(downstream: &str) -> Input {
+    Input::Orphan { venue: "NASDAQ".into(), downstream: downstream.into() }
+}
+
+/// An orphaned cancel (`1-2`, past the order's one amendment) gets the order a gateway cancel,
+/// numbered past it, and the venue's Canceled under the orphan's ID ends the order.
+#[test]
+fn an_orphaned_cancel_cancels_its_order_and_the_venues_answer_applies() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    replace(&mut book, "C2", "C1", 200, 10);
+    let out = run(&mut book, orphan("1-3"));
+    let [Output::Cancel { downstream, orig_downstream, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((downstream.as_str(), orig_downstream.as_str()), ("1-4", "1"));
+    assert_eq!(book.downstream["1-3"].origin, Origin::Gateway);
+    // Recorded once: a second start finds it in the store.
+    assert!(run(&mut book, orphan("1-3")).is_empty());
+
+    let out = run(&mut book, venue_report("1-3", Status::Canceled, 0, 0));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(
+        (report.exec_type, report.status, report.cl_ord_id.as_str()),
+        (ExecType::Canceled, Status::Canceled, "C1")
+    );
+    assert!(book.cancelling().is_empty());
+}
+
+/// The venue refusing the orphan leaves the gateway's own cancel in flight, neither retried nor
+/// stuck; refusing that one retries as usual.
+#[test]
+fn a_refused_orphan_leaves_the_gateway_cancel_going() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    run(&mut book, orphan("1-1"));
+    let mut refused = venue_cancel_reject("NASDAQ", "1-1", Status::New);
+    if let Input::VenueCancelReject { reason, .. } = &mut refused {
+        *reason = Some(1);
+    }
+    assert!(run(&mut book, refused).is_empty());
+    let [(_, cancel)] = book.cancelling().try_into().unwrap();
+    assert_eq!((cancel.tries, cancel.unsent, cancel.stuck), (1, false, false));
+    let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-2", Status::New));
+    assert!(matches!(out.as_slice(), [Output::Cancel { downstream, .. }] if downstream == "1-3"), "{out:?}");
+}
+
+/// Not ours to cancel: an order the book doesn't hold, another venue's, or an ID that isn't an
+/// amendment's.
+#[test]
+fn an_orphan_naming_no_order_here_changes_nothing() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    for input in [orphan("7-1"), orphan("1"), Input::Orphan { venue: "NYSE".into(), downstream: "1-1".into() }] {
+        assert!(run(&mut book, input).is_empty());
+    }
+    assert!(!book.downstream.contains_key("1-1"));
+    assert!(book.cancelling().is_empty());
+}
