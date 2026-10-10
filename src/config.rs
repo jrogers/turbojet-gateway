@@ -38,6 +38,12 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    pub(crate) fn new(message: impl fmt::Display) -> Self {
+        Self(message.to_string())
+    }
+}
+
 impl std::error::Error for Error {}
 
 /// A configuration, loaded and checked.

@@ -5,3 +5,4 @@ pub mod config;
 pub mod edge;
 pub mod fix;
 pub mod router;
+pub mod service;

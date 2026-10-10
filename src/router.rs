@@ -39,6 +39,10 @@ impl Router {
         Self { rules }
     }
 
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
     /// The first rule that matches decides; `None` when none does, which the book rejects as no
     /// route, telling it apart from a rule's own [`Target::Reject`].
     pub fn route(&self, client: &str, request: &OrderRequest) -> Option<Target> {
