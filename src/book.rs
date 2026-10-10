@@ -499,12 +499,12 @@ impl Book {
             let refused = Refused { status, text: report.text, venue_order_id: report.venue_order_id, reason: None };
             return self.refuse_request(venue, &report.downstream, sent, refused, out);
         }
-        let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind, .. } = sent;
+        let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind, answered } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");
         }
-        if stale(order, &report) {
+        if stale(order, answered, &report) {
             return tracing::debug!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "stale execution report dropped");
         }
         let pending_here = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
@@ -829,12 +829,38 @@ impl Order {
 }
 
 /// A report the book has already moved past, such as a venue resend after a reconnect: applying it
-/// would roll the order back. Done is final (busts and corrections come later). Fills are known by
-/// LastQty, not status, since a fill on an order pending cancel says PendingCancel.
-fn stale(order: &Order, report: &VenueReport) -> bool {
-    order.status.is_done()
+/// would roll the order back. `answered` is whether the venue has settled the request the report
+/// comes under. Dropped:
+///
+/// - anything for a done order (busts and corrections come later);
+/// - a CumQty below the order's, or a fill at the order's CumQty (a resent fill).
+///
+/// And without a fill:
+///
+/// - (a) under a settled request, unless it's the order's current downstream: there only the
+///   accepted replace's own PendingReplace is a resend, and fills, cancels and restatements of
+///   the order come under it too;
+/// - (b) PendingNew once the order is past it;
+/// - (c) New while the order is PendingCancel or PendingReplace, unless it accepts the pending
+///   replace: the venue refuses a request with an OrderCancelReject, which comes another way.
+///
+/// A pending state may follow PartiallyFilled, so status alone doesn't order reports. Fills are
+/// known by LastQty, not status, since a fill on an order pending cancel says PendingCancel.
+fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool {
+    if order.status.is_done()
         || report.cum_qty < order.cum_qty
         || (report.last_qty > Decimal::ZERO && report.cum_qty == order.cum_qty)
+    {
+        return true;
+    }
+    let current = report.downstream == order.downstream;
+    let accepts_pending = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
+    report.last_qty == Decimal::ZERO
+        && ((answered && (!current || report.status == Status::PendingReplace))
+            || (report.status == Status::PendingNew && order.status != Status::PendingNew)
+            || (report.status == Status::New
+                && matches!(order.status, Status::PendingCancel | Status::PendingReplace)
+                && !accepts_pending))
 }
 
 /// A venue's refusal of a cancel or replace. `status` is the order's status as the venue gives
@@ -1917,6 +1943,7 @@ mod tests {
         // A late report from before the replace doesn't roll it back.
         run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
         assert_eq!(venue_order_id(&book), Some("V-2"));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
         let out = cancel(&mut book, "C3", "C2");
         let [Output::Cancel { venue_order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(venue_order_id.as_deref(), Some("V-2"));
@@ -2143,6 +2170,162 @@ mod tests {
         assert_eq!(request.time_in_force, Some(TimeInForce::Gtc));
         run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
         assert_eq!(book.order(OrderId(1)).unwrap().request.time_in_force, Some(TimeInForce::Gtc));
+    }
+
+    /// Which downstream ClOrdID a report in `stale_rules` comes under.
+    #[derive(Debug, Clone, Copy)]
+    enum Under {
+        /// The order's current one, "1".
+        Current,
+        /// The pending replace's, "1-2".
+        Pending,
+        /// An earlier request's, "1-1".
+        Other,
+    }
+
+    /// Whether `stale` drops a report without a fill, with `report` status, under `under`, whose
+    /// request the venue has `answered`, for an order with `status` and a replace pending.
+    fn dropped(status: Status, report: Status, under: Under, answered: bool) -> bool {
+        let order = Order {
+            id: OrderId(1),
+            client: "FUNDA".into(),
+            venue: "NASDAQ".into(),
+            request: request("C1"),
+            downstream: "1".into(),
+            amendments: 2,
+            status,
+            cum_qty: Decimal::ZERO,
+            avg_px: Decimal::ZERO,
+            pending: Some(Pending {
+                downstream: "1-2".into(),
+                cl_ord_id: "C3".into(),
+                qty: Decimal::from(80),
+                price: Some(Decimal::from(11)),
+                ord_type: OrdType::Limit,
+                time_in_force: None,
+            }),
+            exec_seq: 0,
+            venue_order_id: None,
+        };
+        let downstream = match under {
+            Under::Current => "1",
+            Under::Pending => "1-2",
+            Under::Other => "1-1",
+        };
+        let Input::VenueReport { report, .. } = venue_report(downstream, report, 0, 0) else { unreachable!() };
+        stale(&order, answered, &report)
+    }
+
+    #[test]
+    fn stale_rules() {
+        use Status::{Canceled, Filled, New, PartiallyFilled, PendingCancel, PendingNew, PendingReplace};
+        use Under::{Current, Other, Pending};
+        let table = [
+            // Done is final.
+            (Filled, New, Current, false, true),
+            // PendingNew only while the order is.
+            (PendingNew, PendingNew, Current, false, false),
+            (New, PendingNew, Current, false, true),
+            (PartiallyFilled, PendingNew, Current, false, true),
+            (PendingNew, New, Current, false, false),
+            // A pending state may follow New or PartiallyFilled.
+            (New, PendingCancel, Other, false, false),
+            (PartiallyFilled, PendingCancel, Other, false, false),
+            (PartiallyFilled, PendingReplace, Pending, false, false),
+            // New while a request is pending is a resend, unless it accepts the pending replace.
+            (PendingCancel, New, Current, false, true),
+            (PendingReplace, New, Current, false, true),
+            (PendingCancel, New, Other, false, true),
+            (PendingReplace, New, Pending, false, false),
+            (PendingCancel, New, Pending, false, false),
+            (PendingCancel, Canceled, Other, false, false),
+            // A settled request's reports, except on the order's current downstream.
+            (New, PendingReplace, Other, true, true),
+            (New, PendingCancel, Other, true, true),
+            (New, Canceled, Other, true, true),
+            (New, Canceled, Current, true, false),
+            (New, New, Current, true, false),
+            // On the current downstream, the accepted replace's own pending state is a resend.
+            (New, PendingReplace, Current, true, true),
+            // Unsolicited.
+            (New, Canceled, Current, false, false),
+            (PartiallyFilled, Canceled, Current, false, false),
+        ];
+        for (status, report, under, answered, expected) in table {
+            assert_eq!(
+                dropped(status, report, under, answered),
+                expected,
+                "{status:?} {report:?} {under:?} {answered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_pending_replace_after_acceptance_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report("1-1", Status::PendingReplace, 0, 0));
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+        assert!(run(&mut book, venue_report("1-1", Status::PendingReplace, 0, 0)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    #[test]
+    fn a_pending_cancel_after_a_partial_fill_is_applied() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        cancel(&mut book, "C2", "C1");
+        let out = run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 40));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.status, report.cl_ord_id.as_str()), (Status::PendingCancel, "C2"));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingCancel);
+    }
+
+    #[test]
+    fn an_unsolicited_cancel_on_the_current_downstream_is_applied() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+        let out = run(&mut book, venue_report("1-1", Status::Canceled, 0, 0));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.status, report.cl_ord_id.as_str(), &report.orig_cl_ord_id), (Status::Canceled, "C2", &None));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Canceled);
+    }
+
+    #[test]
+    fn a_late_new_while_a_cancel_is_pending_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 0));
+        assert!(run(&mut book, venue_report("1", Status::New, 0, 0)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingCancel);
+    }
+
+    #[test]
+    fn a_late_pending_cancel_after_the_cancel_is_rejected_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 0));
+        run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
+        assert!(run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 0)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    #[test]
+    fn a_late_pending_new_after_the_ack_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        assert!(run(&mut book, venue_report("1", Status::PendingNew, 0, 0)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
     }
 
     fn status_request(cl_ord_id: &str) -> Input {
