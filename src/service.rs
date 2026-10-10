@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
-use turbojet::Acceptor;
+use turbojet::{Acceptor, SessionHandle};
 use turbojet_config::{Initiators, SessionsFile};
 
 use crate::config::{self, Error};
@@ -66,6 +66,16 @@ impl Service {
     /// The gateway: the book and where its outputs go.
     pub fn gateway(&self) -> &Arc<Gateway> {
         &self.gateway
+    }
+
+    /// The session of the client whose CompID is `comp_id`, connected or not.
+    pub fn client_session(&self, comp_id: &str) -> SessionHandle {
+        self.acceptor.session(comp_id)
+    }
+
+    /// The session of venue `name` (its `[initiator.NAME]`), if its initiator is running.
+    pub fn venue_session(&self, name: &str) -> Option<SessionHandle> {
+        self.initiators.handle(name)
     }
 
     /// Rereads the sessions file and the routes, logging what changed. Either that doesn't load
