@@ -108,6 +108,8 @@ pub enum RejectReason {
     TooManyOrders,
     /// The venue's OrdRejReason, passed through.
     Venue(u32),
+    /// The venue's session couldn't take the order: not connected, or its queue full.
+    VenueUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +225,13 @@ pub enum Input {
         reason: Option<u32>,
         /// OrderID(37), the venue's.
         venue_order_id: Option<CompactString>,
+    },
+    /// The edge couldn't queue the request sent under `downstream` for the venue's session: it
+    /// isn't connected, or its queue is full. The order or request is refused with `text`.
+    SendFailed {
+        venue: VenueId,
+        downstream: CompactString,
+        text: CompactString,
     },
 }
 
@@ -392,6 +401,7 @@ impl Book {
                 let refused = Refused { status: Some(status), text, venue_order_id, reason };
                 self.venue_cancel_reject(&venue, &downstream, refused, out)
             }
+            Input::SendFailed { venue, downstream, text } => self.send_failed(&venue, &downstream, text, out),
         }
         #[cfg(debug_assertions)]
         self.check();
@@ -708,6 +718,33 @@ impl Book {
             return tracing::warn!(%venue, %downstream, "cancel reject for an unknown request");
         };
         self.refuse_request(venue, downstream, sent, refused, out);
+    }
+
+    /// The venue's session couldn't take what we sent under `downstream`. A cancel or replace is
+    /// refused as the venue would refuse it, leaving the order as it was; an original order is
+    /// rejected, since the venue never saw it.
+    fn send_failed(&mut self, venue: &VenueId, downstream: &CompactString, text: CompactString, out: &mut Vec<Output>) {
+        let Some(sent) = self.downstream.get(downstream).cloned() else {
+            return tracing::warn!(%venue, %downstream, "send failure for an unknown request");
+        };
+        if sent.kind.is_some() {
+            let refused = Refused { status: None, text: Some(text), venue_order_id: None, reason: None };
+            return self.refuse_request(venue, downstream, sent, refused, out);
+        }
+        let order = self.orders.get_mut(&sent.order).expect("downstream ClOrdIDs point at booked orders");
+        if order.venue != *venue {
+            return tracing::warn!(%venue, %downstream, "send failure for another venue's order");
+        }
+        // Done is final, as in `stale`: a venue's reject or fill means the send got there.
+        if sent.answered || order.status.is_done() {
+            return tracing::debug!(%venue, %downstream, "send failure for an answered request dropped");
+        }
+        self.downstream.get_mut(downstream).expect("looked up above").answered = true;
+        order.set_status(Status::Rejected);
+        let mut report = order.report(&order.request.cl_ord_id.clone(), ExecType::Rejected);
+        report.reject = Some(RejectReason::VenueUnavailable);
+        report.text = Some(text);
+        out.push(Output::Report { client: order.client.clone(), report });
     }
 
     /// The venue refused the cancel or replace `sent` under `downstream`, by OrderCancelReject or
@@ -2551,5 +2588,86 @@ mod tests {
         run(&mut book, to_market_ioc(replace_input("C2", "C1", 80, 0)));
         run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
         assert_eq!(book.order(OrderId(1)).unwrap().request, request("C1"));
+    }
+
+    fn send_failed(downstream: &str) -> Input {
+        Input::SendFailed {
+            venue: "NASDAQ".into(),
+            downstream: downstream.into(),
+            text: "session not connected".into(),
+        }
+    }
+
+    #[test]
+    fn a_new_order_the_venue_session_could_not_take_is_rejected() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, send_failed("1"));
+        let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((client.as_str(), report.cl_ord_id.as_str(), report.order_id), ("FUNDA", "C1", Some(OrderId(1))));
+        assert_eq!((report.exec_type, report.status), (ExecType::Rejected, Status::Rejected));
+        assert_eq!(
+            (report.reject, report.text.as_deref()),
+            (Some(RejectReason::VenueUnavailable), Some("session not connected"))
+        );
+        assert_eq!((report.exec_id.as_str(), report.leaves_qty), ("1.1", Decimal::ZERO));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
+        let out = cancel(&mut book, "C2", "C1");
+        assert_eq!(
+            cancel_reject(&out),
+            (Some(OrderId(1)), CancelKind::Cancel, Status::Rejected, CancelRejectReason::TooLate)
+        );
+    }
+
+    #[test]
+    fn a_cancel_the_venue_session_could_not_take_is_refused() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        cancel(&mut book, "C2", "C1");
+        let out = run(&mut book, send_failed("1-1"));
+        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
+        let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, text, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str(), text.as_str()), ("C2", "C1", "session not connected"));
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, &order.request, order.downstream.as_str()), (Status::New, &request("C1"), "1"));
+    }
+
+    #[test]
+    fn a_replace_the_venue_session_could_not_take_is_refused_and_another_goes_out() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        replace(&mut book, "C2", "C1", 80, 11);
+        let out = run(&mut book, send_failed("1-1"));
+        assert_eq!(
+            cancel_reject(&out),
+            (Some(OrderId(1)), CancelKind::Replace, Status::New, CancelRejectReason::Other)
+        );
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((&order.request, order.pending.is_none()), (&request("C1"), true));
+        assert!(matches!(replace(&mut book, "C3", "C1", 70, 11).as_slice(), [Output::Replace { .. }]));
+    }
+
+    #[test]
+    fn a_send_failure_for_an_unknown_request_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        assert!(run(&mut book, send_failed("9")).is_empty());
+        let other = Input::SendFailed { venue: "NYSE".into(), downstream: "1".into(), text: "queue full".into() };
+        assert!(run(&mut book, other).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingNew);
+    }
+
+    #[test]
+    fn a_second_send_failure_for_the_same_request_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, send_failed("1"));
+        assert!(run(&mut book, send_failed("1")).is_empty());
+        new_order(&mut book, "C2");
+        cancel(&mut book, "C3", "C2");
+        run(&mut book, send_failed("2-1"));
+        assert!(run(&mut book, send_failed("2-1")).is_empty());
     }
 }
