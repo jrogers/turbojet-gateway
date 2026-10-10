@@ -15,7 +15,7 @@ use turbojet_config::{Initiators, SessionsFile};
 
 use crate::book;
 use crate::config::{self, Error};
-use crate::edge::{ClientApp, Gateway, VenueApp};
+use crate::edge::{CANCEL_RETRY_INTERVAL, ClientApp, Gateway, VenueApp};
 use crate::fix::Version;
 
 /// The Text(58) of the Logouts sent at shutdown.
@@ -30,6 +30,14 @@ pub struct Service {
     acceptor: Acceptor,
     initiators: Initiators,
     local_addr: SocketAddr,
+    /// [`Gateway::retry_cancels`], aborted when the service is dropped.
+    retrying: JoinHandle<()>,
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        self.retrying.abort();
+    }
 }
 
 /// The acceptor's serving task; it ends only if accepting fails.
@@ -55,7 +63,8 @@ impl Service {
         let local_addr = listener.local_addr().map_err(|e| Error::new(format!("{listen}: {e}")))?;
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
-        let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr };
+        let retrying = tokio::spawn(gateway.clone().retry_cancels(CANCEL_RETRY_INTERVAL));
+        let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr, retrying };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
         let serving = match service.check_versions().and_then(|()| service.serve(listener)) {

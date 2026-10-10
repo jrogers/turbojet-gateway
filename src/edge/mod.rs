@@ -9,8 +9,10 @@
 
 pub mod outbox;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tracing::{error, warn};
 use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
@@ -36,6 +38,12 @@ const VENUE_BUSY: &str = "venue unavailable: its send queue is full";
 /// uses a few desks a CompID; 16 leaves room without letting one client cycle SubIDs unchecked.
 pub const MAX_SESSIONS_PER_COMP_ID: usize = 16;
 
+/// How often [`Gateway::retry_cancels`] looks for the gateway's cancels a connected venue's
+/// session refused (its queue full, say). A venue that's down gets them when it logs on; one
+/// that's up but was busy gets them within a second, which a kill switch can wait, without
+/// hammering a session that's already behind.
+pub const CANCEL_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The book, and where its outputs go.
 #[derive(Debug)]
 pub struct Gateway {
@@ -47,6 +55,9 @@ pub struct Gateway {
     client_version: Version,
     /// For TransactTime(60) on what the gateway sends.
     clock: Clock,
+    /// A venue request was refused since the last retry tick, so a gateway cancel may be waiting:
+    /// the tick looks at the book only then.
+    cancels_waiting: AtomicBool,
 }
 
 /// What a stop would lose until the book is persisted: see [`Gateway::unfinished`].
@@ -86,6 +97,7 @@ impl Gateway {
             clients: Mutex::default(),
             client_version,
             clock: Clock::system(),
+            cancels_waiting: AtomicBool::new(false),
         }
     }
 
@@ -236,6 +248,9 @@ impl Gateway {
         let mut outputs = Vec::new();
         while let Some(input) = inputs.pop_front() {
             let send_failed = matches!(input, Input::SendFailed { .. });
+            if send_failed {
+                self.cancels_waiting.store(true, Ordering::Release);
+            }
             state.book.handle(input, &mut outputs);
             for output in outputs.drain(..) {
                 if let Some(failed) = self.send(state, &output, now) {
@@ -243,6 +258,43 @@ impl Gateway {
                     inputs.push_back(failed);
                 }
             }
+        }
+    }
+
+    /// Every `every`, sends the gateway's cancels waiting for a venue whose session is connected:
+    /// those its session refused while up. Runs until its task is aborted; [`Service`] starts it
+    /// with [`CANCEL_RETRY_INTERVAL`].
+    ///
+    /// [`Service`]: crate::service::Service
+    pub async fn retry_cancels(self: Arc<Self>, every: Duration) {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            self.send_waiting_cancels();
+        }
+    }
+
+    /// One tick of [`retry_cancels`](Self::retry_cancels). Takes the book's lock only after a
+    /// refused send. A refusal during this one sets the flag again for the next tick.
+    fn send_waiting_cancels(self: &Arc<Self>) {
+        if !self.cancels_waiting.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let venues: BTreeSet<VenueId> = {
+            let state = self.lock();
+            // ponytail: walks every order after any refused send; a per-venue count if it shows.
+            state
+                .book
+                .cancelling()
+                .into_iter()
+                .filter(|(_, gateway)| gateway.unsent)
+                .filter_map(|(id, _)| state.book.order(id).map(|order| order.venue.clone()))
+                .filter(|venue| state.venues.get(venue).is_some_and(|to| to.session.is_connected()))
+                .collect()
+        };
+        if !venues.is_empty() {
+            self.handle_all(venues.into_iter().map(|venue| Input::VenueUp { venue }));
         }
     }
 
@@ -352,6 +404,14 @@ impl Application for VenueApp {
         }
     }
 
+    /// The gateway's cancels that couldn't be sent to the venue go now.
+    fn on_logon(&self, session: &SessionHandle) {
+        let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
+        if let Some(venue) = venue {
+            self.0.handle(Input::VenueUp { venue });
+        }
+    }
+
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
         let known = self.0.lock().venue_names.get(ctx.session_id()).cloned();
         // Only if a reload dropped the venue while its session was up.
@@ -383,6 +443,7 @@ mod tests {
     use turbojet_fix44 as v44;
 
     use super::*;
+    use crate::book::Scope;
     use crate::router::{Rule, Target};
 
     const VENUE: &str = "NASDAQ";
@@ -685,5 +746,92 @@ mod tests {
         assert!(rejected.text.as_deref().unwrap().starts_with(VENUE_UNAVAILABLE), "{:?}", rejected.text);
         let refused: v44::OrderCancelReject = answers[1].parse().unwrap();
         assert_eq!((refused.cl_ord_id.as_str(), refused.orig_cl_ord_id.as_str()), ("C2", "C1"));
+    }
+
+    /// Order 1 in the book, from FUNDA, as if sent to [`VENUE`]: what the book asked to send is
+    /// dropped.
+    fn book_order(gateway: &Gateway) {
+        let request = crate::book::OrderRequest {
+            cl_ord_id: "C1".into(),
+            account: None,
+            symbol: "AAPL".into(),
+            side: crate::book::Side::Buy,
+            ord_type: crate::book::OrdType::Limit,
+            qty: 100.into(),
+            price: Some(10.into()),
+            ex_destination: None,
+            time_in_force: None,
+        };
+        gateway
+            .lock()
+            .book
+            .handle(Input::NewOrder { client: "FUNDA".into(), request, redelivered: false }, &mut Vec::new());
+    }
+
+    fn unsent(gateway: &Gateway) -> Vec<bool> {
+        gateway.cancelling().into_iter().map(|(_, cancel)| cancel.unsent).collect()
+    }
+
+    /// The kill switch while the venue is down: the cancel waits, the retry tick leaves it (the
+    /// venue isn't connected), and it goes when the venue logs on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gateway_cancel_for_a_venue_that_is_down_goes_when_it_logs_on() {
+        let gateway = gateway();
+        let (venue_app, mut venue_events) = peer();
+        let venue_addr = serve("VENUE", venue_app).await;
+        let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        book_order(&gateway);
+        gateway.cancel_all(Scope::All);
+        gateway.send_waiting_cancels();
+        assert_eq!(unsent(&gateway), [true]);
+
+        tokio::spawn(venue.clone().run());
+        assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
+        let sent: v44::OrderCancelRequest = next_message(&mut venue_events).await.parse().unwrap();
+        assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), ("1-2", "1"));
+        assert_eq!(unsent(&gateway), [false]);
+    }
+
+    /// The gateway's venue application, saying when its `on_logon` has run.
+    struct LogonSignal(VenueApp, UnboundedSender<()>);
+
+    impl Application for LogonSignal {
+        fn verify_logon(&self, session: &SessionHandle, logon: &Message, info: &ConnectionInfo) -> Result<(), String> {
+            self.0.verify_logon(session, logon, info)
+        }
+
+        fn on_logon(&self, session: &SessionHandle) {
+            self.0.on_logon(session);
+            let _ = self.1.send(());
+        }
+    }
+
+    /// A cancel the connected venue's session refused (its queue full) goes on the next tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gateway_cancel_a_connected_venue_refused_goes_on_the_retry_tick() {
+        let gateway = gateway();
+        let (venue_app, mut venue_events) = peer();
+        let venue_addr = serve("VENUE", venue_app).await;
+        let (signal, mut logged_on) = unbounded_channel();
+        let app = Arc::new(LogonSignal(VenueApp(gateway.clone()), signal));
+        let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", app);
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        tokio::spawn(venue.clone().run());
+        // Past the logon's own VenueUp, so only the tick can send the cancel.
+        timeout(Duration::from_secs(5), logged_on.recv()).await.expect("no logon");
+        assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
+        book_order(&gateway);
+        // As `send` does when the session's queue is full.
+        gateway.lock().book.handle(Input::CancelAll { scope: Scope::All }, &mut Vec::new());
+        let text = VENUE_BUSY.into();
+        gateway.handle(Input::SendFailed { venue: VENUE.into(), downstream: "1-1".into(), text });
+        assert_eq!(unsent(&gateway), [true]);
+
+        tokio::spawn(gateway.clone().retry_cancels(Duration::from_millis(10)));
+        let sent: v44::OrderCancelRequest = next_message(&mut venue_events).await.parse().unwrap();
+        assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), ("1-2", "1"));
+        assert_eq!(unsent(&gateway), [false]);
+        assert!(!gateway.cancels_waiting.load(Ordering::Acquire));
     }
 }

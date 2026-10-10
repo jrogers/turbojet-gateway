@@ -133,7 +133,8 @@ everyone.
 - `cancel_all(scope)` blocks the scope and cancels its clients' live orders at their venues, in
   one step. Each client gets an unsolicited Canceled report for each order as its venue confirms
   it. A cancel the venue refuses is sent again, up to three times; `cancelling()` lists the
-  cancels still going and those given up.
+  cancels still going and those given up. A cancel for a venue that is down goes when it logs
+  back on; one its session couldn't queue is tried again within a second.
 - `block(scope)` only blocks: a blocked client's new orders are rejected ("blocked by an
   operator"). Its cancels pass, and so do replaces that don't raise the quantity.
 - `unblock(scope)` lifts the block of that scope exactly: unblocking a session leaves a block of
