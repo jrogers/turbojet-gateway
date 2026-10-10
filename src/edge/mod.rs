@@ -444,7 +444,7 @@ impl Gateway {
 
     /// Sends `output` where it's going. `Some` for a venue request its session refused. A venue
     /// request queued holds `ctx`'s message in flight until the venue's session has stored it,
-    /// so a stop before then has the client resend it rather than the order be lost.
+    /// so a stop before then has the client resend it rather than losing it.
     fn send(
         self: &Arc<Self>,
         state: &State,
@@ -487,12 +487,14 @@ impl Gateway {
 
     /// Waits for the venue's session to store a request, and if it drops it unsent, tells the
     /// book, so the client hears rather than waiting on an order the venue never saw. `hold`, the
-    /// client's message the request came from, is released once the receipt resolves.
+    /// client's message the request came from, is released once the receipt resolves and, if the
+    /// request was dropped, the book has heard.
     ///
     /// ponytail: one task per venue request; a per-venue drain like the outbox's if it measures.
     fn settle(self: &Arc<Self>, receipt: Receipt, venue: VenueId, downstream: CompactString, hold: Option<Hold>) {
         let gateway = self.clone();
         tokio::spawn(async move {
+            // Dropped at the end, after the book has handled a SendFailed, not before.
             let _hold = hold;
             let dropped = match receipt.await {
                 Ok(_) => return,
@@ -1226,6 +1228,18 @@ mod tests {
 
         fn reset(&mut self) -> std::io::Result<()> {
             self.inner.reset()
+        }
+
+        fn in_flight(&self) -> Option<u64> {
+            self.inner.in_flight()
+        }
+
+        fn set_in_flight(&mut self, seq: u64) -> std::io::Result<()> {
+            self.inner.set_in_flight(seq)
+        }
+
+        fn set_next_incoming_in_flight(&mut self, seq: u64, in_flight: u64) -> std::io::Result<()> {
+            self.inner.set_next_incoming_in_flight(seq, in_flight)
         }
 
         fn commit(&mut self) -> std::io::Result<Option<Commit>> {

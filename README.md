@@ -32,8 +32,8 @@ reports back, keeping each order's state as it goes.
 - **An order counts as received once its venue has it stored.** A client's order, cancel or
   replace stays in flight on the client's session until the venue's session has stored what it
   was forwarded as. If the client's connection drops first, the client sends it again when it's
-  back, and the ClOrdID dedupe answers with the order's state. With a `disk` store, the same
-  happens after a restart.
+  back, and the ClOrdID dedupe answers with the order's state. After a restart the book is
+  gone, so a resent order goes to the venue as a new one, possibly a second time (see CAVEATS).
 - **Reports held per client.** A report for a client that's disconnected, or reading slowly, waits
   in that client's queue and goes out, in order, once it can take it.
 - **Risk limits** per CompID, checked on each order and replace before it goes to a venue: order
