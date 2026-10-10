@@ -726,7 +726,7 @@ impl Book {
         out.push(Output::Report { client, report });
     }
 
-    fn venue_report(&mut self, venue: &VenueId, report: VenueReport, out: &mut Vec<Output>) {
+    fn venue_report(&mut self, venue: &VenueId, mut report: VenueReport, out: &mut Vec<Output>) {
         let Some(sent) = self.downstream.get(&report.downstream).cloned() else {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for an unknown order");
         };
@@ -771,18 +771,12 @@ impl Book {
         if report.cum_qty > qty {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, cum_qty = %report.cum_qty, "overfill");
         }
-        order.record_venue_order_id(report.venue_order_id, accepted);
+        order.record_venue_order_id(report.venue_order_id.take(), accepted);
         if accepted {
             // The downstream the replace supersedes is settled like any other: its late reports
             // without a fill are resends.
-            self.downstream.get_mut(&order.downstream).expect("an order's downstream is recorded").answered = true;
-            let pending = order.pending.take().expect("checked above");
-            order.request.cl_ord_id = pending.cl_ord_id;
-            order.request.qty = pending.qty;
-            order.request.price = pending.price;
-            order.request.ord_type = pending.ord_type;
-            order.request.time_in_force = pending.time_in_force;
-            order.downstream = pending.downstream;
+            let superseded = order.apply_replace();
+            self.downstream.get_mut(&superseded).expect("an order's downstream is recorded").answered = true;
         }
         if accepted || (kind == Some(CancelKind::Cancel) && report.status == Some(Status::Canceled)) {
             self.downstream.get_mut(&report.downstream).expect("looked up above").answered = true;
@@ -791,21 +785,8 @@ impl Book {
         order.avg_px = report.avg_px;
         // `None` keeps the status, through `set_status` so a fill makes a New order PartiallyFilled.
         order.set_status(report.status.unwrap_or(order.status));
-        // Clients count fills by ExecType (FIX 4.2 has nothing else), so every fill is a Trade.
-        let exec_type = if report.last_qty > Decimal::ZERO { ExecType::Trade } else { report.exec_type };
-        let mut client_report = if answers_request {
-            let mut client_report = order.report(&cl_ord_id, exec_type);
-            client_report.orig_cl_ord_id = orig_cl_ord_id;
-            client_report
-        } else {
-            order.report(&order.request.cl_ord_id.clone(), exec_type)
-        };
-        client_report.last_qty = report.last_qty;
-        client_report.last_px = report.last_px;
-        client_report.text = report.text;
-        if rejected {
-            client_report.reject = report.ord_rej_reason.map(RejectReason::Venue);
-        }
+        let answers = answers_request.then_some((cl_ord_id, orig_cl_ord_id));
+        let client_report = order.client_report(answers, report, rejected);
         out.push(Output::Report { client: order.client.clone(), report: client_report });
     }
 
@@ -1245,6 +1226,45 @@ impl Order {
             exec_id: format_compact!("{}.{}", self.name, self.exec_seq),
             text: None,
         }
+    }
+
+    /// The client's report of the venue's `report`: under the ClOrdIDs of the request it
+    /// `answers`, if any, else under the order's current ClOrdID.
+    fn client_report(
+        &mut self,
+        answers: Option<(CompactString, Option<CompactString>)>,
+        report: VenueReport,
+        rejected: bool,
+    ) -> ClientReport {
+        // Clients count fills by ExecType (FIX 4.2 has nothing else), so every fill is a Trade.
+        let exec_type = if report.last_qty > Decimal::ZERO { ExecType::Trade } else { report.exec_type };
+        let mut client_report = match answers {
+            Some((cl_ord_id, orig_cl_ord_id)) => {
+                let mut client_report = self.report(&cl_ord_id, exec_type);
+                client_report.orig_cl_ord_id = orig_cl_ord_id;
+                client_report
+            }
+            None => self.report(&self.request.cl_ord_id.clone(), exec_type),
+        };
+        client_report.last_qty = report.last_qty;
+        client_report.last_px = report.last_px;
+        client_report.text = report.text;
+        if rejected {
+            client_report.reject = report.ord_rej_reason.map(RejectReason::Venue);
+        }
+        client_report
+    }
+
+    /// Takes the pending replace's terms, the venue having accepted it, returning the downstream
+    /// ClOrdID it supersedes.
+    fn apply_replace(&mut self) -> CompactString {
+        let pending = self.pending.take().expect("a replace is pending");
+        self.request.cl_ord_id = pending.cl_ord_id;
+        self.request.qty = pending.qty;
+        self.request.price = pending.price;
+        self.request.ord_type = pending.ord_type;
+        self.request.time_in_force = pending.time_in_force;
+        std::mem::replace(&mut self.downstream, pending.downstream)
     }
 
     /// Where the order stands, answering a client asking by `asked`: a status request or a
