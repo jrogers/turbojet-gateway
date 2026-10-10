@@ -516,6 +516,7 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
         | RejectReason::RouteRejected
         | RejectReason::TooManyOrders
         | RejectReason::VenueUnavailable
+        | RejectReason::GatewayUnavailable
         | RejectReason::Blocked => fix::OrdRejReason::BrokerCredit,
         RejectReason::Risk(RiskReject::OrderQty | RiskReject::Notional | RiskReject::Credit) => {
             fix::OrdRejReason::OrderExceedsLimit
@@ -695,6 +696,7 @@ mod tests {
             (RejectReason::TooManyOrders, "0"),
             (RejectReason::VenueUnavailable, "0"),
             (RejectReason::Blocked, "0"),
+            (RejectReason::GatewayUnavailable, "0"),
             (RejectReason::Risk(RiskReject::OrderQty), "3"),
             (RejectReason::Risk(RiskReject::Notional), "3"),
             (RejectReason::Risk(RiskReject::Credit), "3"),

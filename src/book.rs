@@ -106,6 +106,10 @@ pub const MAX_GATEWAY_CANCEL_TRIES: u32 = 3;
 /// The start of the seconds [`start_prefix`] counts: 2026-01-01T00:00:00Z, in Unix seconds.
 pub const ID_EPOCH: u64 = 1_767_225_600;
 
+/// Text(58) of the reject for a new order while the gateway is unavailable: see
+/// [`Book::set_unavailable`].
+pub const GATEWAY_UNAVAILABLE: &str = "gateway unavailable";
+
 /// The book's key for an order. On the wire it's [`Order::name`], the book's prefix before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
@@ -197,6 +201,8 @@ pub enum RejectReason {
     VenueUnavailable,
     /// An operator blocked the client: see [`Input::Block`].
     Blocked,
+    /// The gateway's database is behind: see [`Book::set_unavailable`].
+    GatewayUnavailable,
     /// Over one of the client's risk limits.
     Risk(RiskReject),
 }
@@ -579,6 +585,8 @@ pub struct Book {
     touched: Touched,
     /// Changes copied before a roll, for the next `take_changes`.
     flushed: Changes,
+    /// New orders are rejected: see [`set_unavailable`](Self::set_unavailable).
+    unavailable: bool,
     /// Every change taken in the tests, as a store would hold them.
     #[cfg(test)]
     mirror: Snapshot,
@@ -604,6 +612,7 @@ impl Book {
             days: HashMap::new(),
             touched: Touched::default(),
             flushed: Changes::default(),
+            unavailable: false,
             #[cfg(test)]
             mirror: Snapshot::default(),
         }
@@ -625,6 +634,13 @@ impl Book {
     pub fn set_config(&mut self, router: Router, limits: risk::Config) {
         self.router = router;
         self.limits = limits;
+    }
+
+    /// While `unavailable`, new orders are rejected ([`RejectReason::GatewayUnavailable`]): the
+    /// gateway's database is too far behind to take more. Cancels, replaces and venue reports
+    /// pass, as they take orders off the market or record what a venue did.
+    pub fn set_unavailable(&mut self, unavailable: bool) {
+        self.unavailable = unavailable;
     }
 
     pub fn router(&self) -> &Router {
@@ -807,10 +823,13 @@ impl Book {
         }
     }
 
-    /// The venue a new order goes to, or why it's rejected: the client is blocked or has used its
-    /// ClOrdIDs, a route rejects it or none matches, or it's over a risk limit. Risk comes after
-    /// routing, since self-trade prevention is per venue.
+    /// The venue a new order goes to, or why it's rejected: the gateway is unavailable, the client
+    /// is blocked or has used its ClOrdIDs, a route rejects it or none matches, or it's over a
+    /// risk limit. Risk comes after routing, since self-trade prevention is per venue.
     fn admit(&self, client: &ClientId, request: &OrderRequest) -> Result<VenueId, (RejectReason, CompactString)> {
+        if self.unavailable {
+            return Err((RejectReason::GatewayUnavailable, GATEWAY_UNAVAILABLE.into()));
+        }
         if self.is_blocked(client) {
             return Err((RejectReason::Blocked, "blocked by an operator".into()));
         }

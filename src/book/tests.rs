@@ -55,6 +55,7 @@ fn restored(book: &Book) -> Book {
     restored.set_config(book.router.clone(), book.limits.clone());
     restored.max_cl_ord_ids = book.max_cl_ord_ids;
     restored.amend_reserve = book.amend_reserve;
+    restored.unavailable = book.unavailable;
     restored.set_prefix(book.prefix.clone());
     restored.restore(book.mirror.clone());
     // A restart numbers rejects afresh under a new prefix; this one keeps the live book's prefix
@@ -2313,6 +2314,27 @@ fn a_blocked_clients_new_orders_are_rejected_and_its_cancels_pass() {
     // Not booked, so not a duplicate later; other clients carry on.
     assert!(matches!(run(&mut book, order_from(&"FUNDB".into(), "C1")).as_slice(), [Output::NewOrder { .. }]));
     assert_eq!(cancels(&cancel(&mut book, "C3", "C1")), ["1-1"]);
+}
+
+/// While the database is behind, new orders are rejected and not booked; what takes orders off
+/// the market or records a venue's report passes: a cancel, a replace, a fill.
+#[test]
+fn an_unavailable_gateway_rejects_new_orders_and_passes_the_rest() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    new_order(&mut book, "C2");
+    book.set_unavailable(true);
+    let out = new_order(&mut book, "C3");
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.exec_type, report.order_id.as_deref()), (ExecType::Rejected, None));
+    assert_eq!(report.reject, Some(RejectReason::GatewayUnavailable));
+    assert_eq!(report.text.as_deref(), Some(GATEWAY_UNAVAILABLE));
+    assert_eq!(cancels(&cancel(&mut book, "C4", "C1")), ["1-1"]);
+    assert!(matches!(replace(&mut book, "C5", "C2", 50, 10).as_slice(), [Output::Replace { .. }]));
+    let fill = run(&mut book, venue_report("1", Status::PartiallyFilled, 10, 10));
+    assert!(matches!(fill.as_slice(), [Output::Report { .. }]), "{fill:?}");
+    book.set_unavailable(false);
+    assert!(matches!(new_order(&mut book, "C3").as_slice(), [Output::NewOrder { .. }]));
 }
 
 #[test]
