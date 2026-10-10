@@ -181,8 +181,9 @@ pub enum Input {
         side: Side,
         symbol: CompactString,
     },
-    /// As `Cancel`; `ord_type` and `time_in_force` are `None` to keep the order's. A replace to
-    /// Market drops the price.
+    /// As `Cancel`. `ord_type` and `time_in_force` are `None` to keep the order's: that's for
+    /// the book's own callers, since a FIX replace carries full terms and the edge always sets
+    /// both. The edge refuses a Limit replace without a price and a Market one with a price.
     Replace {
         client: ClientId,
         cl_ord_id: CompactString,
@@ -241,11 +242,13 @@ pub enum CancelKind {
     Replace,
 }
 
-/// CxlRejReason(102): 0, 1, 6 and 99, or the venue's; the FIX side maps it per version.
+/// CxlRejReason(102): 0, 1, 3, 6 and 99, or the venue's; the FIX side maps it per version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelRejectReason {
     TooLate,
     UnknownOrder,
+    /// 3: a replace is already pending for the order.
+    AlreadyPending,
     Duplicate,
     Other,
     /// The venue's CxlRejReason, passed through.
@@ -348,11 +351,12 @@ impl Book {
             Input::NewOrder { client, request, redelivered } => self.new_order(client, request, redelivered, out),
             Input::VenueReport { venue, report } => self.venue_report(&venue, report, out),
             Input::Cancel { client, cl_ord_id, orig_cl_ord_id, side, symbol } => {
-                self.cancel(Amend { client, cl_ord_id, orig_cl_ord_id, side, symbol, kind: CancelKind::Cancel }, out)
+                self.cancel(Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Cancel }, (side, symbol), out)
             }
             Input::Replace { client, cl_ord_id, orig_cl_ord_id, side, symbol, qty, price, ord_type, time_in_force } => {
-                let amend = Amend { client, cl_ord_id, orig_cl_ord_id, side, symbol, kind: CancelKind::Replace };
-                self.replace(amend, qty, price, ord_type, time_in_force, out)
+                let amend = Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Replace };
+                let terms = Terms { qty, price, ord_type, time_in_force };
+                self.replace(amend, (side, symbol), terms, out)
             }
             Input::VenueCancelReject { venue, downstream, status, text, reason, venue_order_id } => {
                 let refused = Refused { status: Some(status), text, venue_order_id, reason };
@@ -517,8 +521,8 @@ impl Book {
     }
 
     /// A cancel goes to the venue even while PendingNew, under the next numbered downstream ClOrdID.
-    fn cancel(&mut self, amend: Amend, out: &mut Vec<Output>) {
-        let Some((id, amend)) = self.amendable(amend, |_| None, out) else { return };
+    fn cancel(&mut self, amend: Amend, named: (Side, CompactString), out: &mut Vec<Output>) {
+        let Some((id, amend)) = self.amendable(amend, named, |_| None, out) else { return };
         let (downstream, order) = self.number(id, amend);
         out.push(Output::Cancel {
             venue: order.venue.clone(),
@@ -531,30 +535,27 @@ impl Book {
 
     /// A replace goes to the venue like a cancel, one at a time; the order keeps its terms until
     /// the venue accepts it (see `venue_report`).
-    fn replace(
-        &mut self,
-        amend: Amend,
-        qty: Decimal,
-        price: Option<Decimal>,
-        ord_type: Option<OrdType>,
-        time_in_force: Option<TimeInForce>,
-        out: &mut Vec<Output>,
-    ) {
+    fn replace(&mut self, amend: Amend, named: (Side, CompactString), terms: Terms, out: &mut Vec<Output>) {
+        let Terms { qty, price, ord_type, time_in_force } = terms;
         let refuse = |order: &Order| {
             if order.pending.is_some() {
-                Some("replace pending")
+                Some((CancelRejectReason::AlreadyPending, "replace pending"))
             } else if qty < order.cum_qty {
-                Some("quantity below filled quantity")
+                Some((CancelRejectReason::Other, "quantity below filled quantity"))
             } else {
                 None
             }
         };
-        let Some((id, amend)) = self.amendable(amend, refuse, out) else { return };
+        let Some((id, amend)) = self.amendable(amend, named, refuse, out) else { return };
         let cl_ord_id = amend.cl_ord_id.clone();
         let (downstream, order) = self.number(id, amend);
         let ord_type = ord_type.unwrap_or(order.request.ord_type);
         let time_in_force = time_in_force.or(order.request.time_in_force);
-        // A market order has no price; the edge refuses a Market replace that gives one.
+        debug_assert!(
+            (ord_type == OrdType::Limit) == price.is_some(),
+            "the edge refuses a Limit replace without a price and a Market one with a price"
+        );
+        // A market order has no price: the release fallback should the contract slip.
         let price = if ord_type == OrdType::Market { None } else { price };
         out.push(Output::Replace {
             venue: order.venue.clone(),
@@ -567,12 +568,13 @@ impl Book {
     }
 
     /// The live order a cancel or replace names, or `None` with an OrderCancelReject refusing it
-    /// pushed. `refuse` adds the request's own checks, as reason Other, after the shared ones,
-    /// the last of which is that the request names the order's side and symbol.
+    /// pushed. `refuse` adds the request's own checks after the shared ones, the last of which is
+    /// that the request `named` the order's side and symbol.
     fn amendable(
         &self,
         amend: Amend,
-        refuse: impl Fn(&Order) -> Option<&'static str>,
+        named: (Side, CompactString),
+        refuse: impl Fn(&Order) -> Option<(CancelRejectReason, &'static str)>,
         out: &mut Vec<Output>,
     ) -> Option<(OrderId, Amend)> {
         let id = self.index.get(&(amend.client.clone(), amend.orig_cl_ord_id.clone()));
@@ -591,10 +593,10 @@ impl Book {
             {
                 Some((CancelRejectReason::Other, "too many requests today"))
             }
-            Some(order) if order.request.side != amend.side || order.request.symbol != amend.symbol => {
+            Some(order) if (order.request.side, &order.request.symbol) != (named.0, &named.1) => {
                 Some((CancelRejectReason::Other, "side or symbol does not match"))
             }
-            Some(order) => refuse(order).map(|text| (CancelRejectReason::Other, text)),
+            Some(order) => refuse(order),
         };
         if let Some((reason, text)) = refusal {
             out.push(amend.refuse(order, reason, text.into()));
@@ -675,14 +677,8 @@ impl Book {
             }
             None => {}
         }
-        let amend = Amend {
-            client: order.client.clone(),
-            cl_ord_id: sent.cl_ord_id,
-            orig_cl_ord_id,
-            side: order.request.side,
-            symbol: order.request.symbol.clone(),
-            kind: response_to,
-        };
+        let amend =
+            Amend { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, kind: response_to };
         let text = text.unwrap_or_else(|| "rejected by the venue".into());
         let reason = reason.map_or(CancelRejectReason::Other, CancelRejectReason::Venue);
         out.push(amend.refuse(Some(&*order), reason, text));
@@ -803,10 +799,15 @@ struct Amend {
     client: ClientId,
     cl_ord_id: CompactString,
     orig_cl_ord_id: CompactString,
-    /// As the request names them; the order's must match.
-    side: Side,
-    symbol: CompactString,
     kind: CancelKind,
+}
+
+/// A replace's new terms, as `Input::Replace` gives them.
+struct Terms {
+    qty: Decimal,
+    price: Option<Decimal>,
+    ord_type: Option<OrdType>,
+    time_in_force: Option<TimeInForce>,
 }
 
 impl Amend {
@@ -1394,7 +1395,7 @@ mod tests {
         assert_eq!(text, "replace pending");
         assert_eq!(
             cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Replace, Status::PendingNew, CancelRejectReason::Other)
+            (Some(OrderId(1)), CancelKind::Replace, Status::PendingNew, CancelRejectReason::AlreadyPending)
         );
     }
 
@@ -2056,16 +2057,39 @@ mod tests {
     }
 
     #[test]
-    fn a_replace_to_market_drops_the_price() {
+    fn a_market_replace_without_a_price_goes_out_without_one() {
         let mut book = book();
         new_order(&mut book, "C1");
-        // A price on a Market replace is the edge's to refuse; the book doesn't send one.
-        let mut input = to_market_ioc(replace_input("C2", "C1", 80, 0));
-        let Input::Replace { price, .. } = &mut input else { unreachable!() };
-        *price = Some(Decimal::from(11));
+        let out = run(&mut book, to_market_ioc(replace_input("C2", "C1", 80, 0)));
+        let [Output::Replace { request, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((request.ord_type, request.price), (OrdType::Market, None));
+    }
+
+    #[test]
+    fn a_market_order_replaced_to_limit_reaches_the_venue_with_its_price() {
+        let mut book = book();
+        let market = OrderRequest { ord_type: OrdType::Market, price: None, ..request("C1") };
+        run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: market.clone(), redelivered: false });
+        let mut input = replace_input("C2", "C1", 80, 11);
+        let Input::Replace { ord_type, .. } = &mut input else { unreachable!() };
+        *ord_type = Some(OrdType::Limit);
         let out = run(&mut book, input);
         let [Output::Replace { request, .. }] = out.as_slice() else { panic!("{out:?}") };
-        assert_eq!(request.price, None);
+        assert_eq!(request, &replaced("C1", 80, 11));
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+        assert_eq!(book.order(OrderId(1)).unwrap().request, replaced("C2", 80, 11));
+    }
+
+    #[test]
+    fn a_replace_keeping_time_in_force_leaves_gtc() {
+        let mut book = book();
+        let gtc = OrderRequest { time_in_force: Some(TimeInForce::Gtc), ..request("C1") };
+        run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: gtc, redelivered: false });
+        let out = replace(&mut book, "C2", "C1", 80, 11);
+        let [Output::Replace { request, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(request.time_in_force, Some(TimeInForce::Gtc));
+        run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+        assert_eq!(book.order(OrderId(1)).unwrap().request.time_in_force, Some(TimeInForce::Gtc));
     }
 
     #[test]
