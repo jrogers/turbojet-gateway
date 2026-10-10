@@ -121,6 +121,8 @@ pub struct Order {
     pub avg_px: Decimal,
     /// A replace sent to the venue and not yet answered; `request` changes only when it's accepted.
     pub pending: Option<Pending>,
+    /// Client reports built for the order so far, numbering the next ExecID.
+    pub exec_seq: u32,
 }
 
 /// A replace awaiting the venue's answer.
@@ -144,6 +146,8 @@ pub struct VenueReport {
     pub last_px: Decimal,
     pub cum_qty: Decimal,
     pub avg_px: Decimal,
+    /// ExecID(17), for the logs: not a dedupe key, since `stale` goes by CumQty.
+    pub exec_id: CompactString,
     pub text: Option<CompactString>,
 }
 
@@ -198,6 +202,8 @@ pub struct ClientReport {
     pub cum_qty: Decimal,
     pub leaves_qty: Decimal,
     pub avg_px: Decimal,
+    /// ExecID(17): `<OrderID>.<n>` for a booked order, `R<n>` for a reject before booking.
+    pub exec_id: CompactString,
     pub text: Option<CompactString>,
 }
 
@@ -279,6 +285,8 @@ pub struct Book {
     /// Downstream ClOrdID -> what we sent under it.
     downstream: HashMap<CompactString, Sent>,
     next_id: u64,
+    /// Rejects before booking so far, numbering their ExecIDs.
+    rejects: u64,
     /// [`MAX_CL_ORD_IDS_PER_CLIENT`] and [`MAX_AMEND_RESERVE`]; fields so tests can reach them
     /// with real orders rather than a million.
     max_cl_ord_ids: usize,
@@ -294,6 +302,7 @@ impl Book {
             used: HashMap::new(),
             downstream: HashMap::new(),
             next_id: 1,
+            rejects: 0,
             max_cl_ord_ids: MAX_CL_ORD_IDS_PER_CLIENT,
             amend_reserve: MAX_AMEND_RESERVE,
         }
@@ -344,7 +353,7 @@ impl Book {
 
     fn new_order(&mut self, client: ClientId, request: OrderRequest, redelivered: bool, out: &mut Vec<Output>) {
         if let Some(&id) = self.index.get(&(client.clone(), request.cl_ord_id.clone())) {
-            let order = self.orders.get(&id).expect("indexed ClOrdIDs point at booked orders");
+            let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
             // A resend of an order we booked: answer with where it stands. Side, symbol and account,
             // not the whole request, since a replace may have changed quantity and price since.
             let resent = redelivered
@@ -354,22 +363,22 @@ impl Book {
             let output = if resent {
                 // Reports carry the order's latest ClOrdID; after a replace, OrigClOrdID names the
                 // one the client asked about.
-                let mut report = order.report(&order.request.cl_ord_id, ExecType::Status);
+                let mut report = order.report(&order.request.cl_ord_id.clone(), ExecType::Status);
                 if report.cl_ord_id != request.cl_ord_id {
                     report.orig_cl_ord_id = Some(request.cl_ord_id);
                 }
                 Output::Report { client, report }
             } else {
-                reject(client, request, RejectReason::Duplicate, "duplicate ClOrdID".into())
+                self.reject(client, request, RejectReason::Duplicate, "duplicate ClOrdID".into())
             };
             return out.push(output);
         }
         if self.used.get(&client).is_some_and(|&used| used >= self.max_cl_ord_ids) {
-            return out.push(reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
+            return out.push(self.reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
         }
         let venue = match self.router.route(&client, &request) {
             Target::Venue(venue) => venue,
-            Target::Reject(text) => return out.push(reject(client, request, RejectReason::NoRoute, text)),
+            Target::Reject(text) => return out.push(self.reject(client, request, RejectReason::NoRoute, text)),
         };
         let id = OrderId(self.next_id);
         self.next_id += 1;
@@ -391,6 +400,7 @@ impl Book {
             cum_qty: Decimal::ZERO,
             avg_px: Decimal::ZERO,
             pending: None,
+            exec_seq: 0,
         };
         let previous = self.orders.insert(id, order);
         debug_assert!(previous.is_none(), "order {id:?} booked twice");
@@ -398,7 +408,7 @@ impl Book {
 
     fn venue_report(&mut self, venue: &VenueId, report: VenueReport, out: &mut Vec<Output>) {
         let Some(sent) = self.downstream.get(&report.downstream).cloned() else {
-            return tracing::warn!(%venue, downstream = %report.downstream, "execution report for an unknown order");
+            return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for an unknown order");
         };
         // Rejected under a cancel's or replace's ClOrdID is about that request, not the order.
         // Some venues refuse an amendment with ExecType=8 and the order's live OrdStatus: that
@@ -411,10 +421,10 @@ impl Book {
         let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind, .. } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
-            return tracing::warn!(%venue, downstream = %report.downstream, "execution report for another venue's order");
+            return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");
         }
         if stale(order, &report) {
-            return tracing::debug!(%venue, downstream = %report.downstream, "stale execution report dropped");
+            return tracing::debug!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "stale execution report dropped");
         }
         let pending_here = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
         // Any answer under the replace's ClOrdID but these means the venue took it.
@@ -431,7 +441,7 @@ impl Book {
             _ => order.request.qty,
         };
         if report.cum_qty > qty {
-            return tracing::warn!(%venue, downstream = %report.downstream, cum_qty = %report.cum_qty, "overfill");
+            return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, cum_qty = %report.cum_qty, "overfill");
         }
         if accepted {
             let pending = order.pending.take().expect("checked above");
@@ -451,7 +461,7 @@ impl Book {
             client_report.orig_cl_ord_id = orig_cl_ord_id;
             client_report
         } else {
-            order.report(&order.request.cl_ord_id, report.exec_type)
+            order.report(&order.request.cl_ord_id.clone(), report.exec_type)
         };
         client_report.last_qty = report.last_qty;
         client_report.last_px = report.last_px;
@@ -606,6 +616,29 @@ impl Book {
         out.push(amend.refuse(Some(&*order), CancelRejectReason::Other, text));
     }
 
+    /// A reject for an order we didn't book, under the book's next `R` ExecID.
+    fn reject(&mut self, client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
+        // Saturating, as in `Order::report`; a u64 of rejects isn't reachable anyway.
+        self.rejects = self.rejects.saturating_add(1);
+        let report = ClientReport {
+            exec_type: ExecType::Rejected,
+            order_id: None,
+            cl_ord_id: request.cl_ord_id.clone(),
+            orig_cl_ord_id: None,
+            request,
+            status: Status::Rejected,
+            reject: Some(reason),
+            last_qty: Decimal::ZERO,
+            last_px: Decimal::ZERO,
+            cum_qty: Decimal::ZERO,
+            leaves_qty: Decimal::ZERO,
+            avg_px: Decimal::ZERO,
+            exec_id: format_compact!("R{}", self.rejects),
+            text: Some(text),
+        };
+        Output::Report { client, report }
+    }
+
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
         let previous = self.index.insert((client.clone(), cl_ord_id), id);
         debug_assert!(previous.is_none(), "ClOrdID reused by {client}");
@@ -614,8 +647,13 @@ impl Book {
 }
 
 impl Order {
-    /// A report of where the order stands, answering the client's `cl_ord_id`.
-    fn report(&self, cl_ord_id: &CompactString, exec_type: ExecType) -> ClientReport {
+    /// A report of where the order stands, answering the client's `cl_ord_id`, under the order's
+    /// next ExecID.
+    fn report(&mut self, cl_ord_id: &CompactString, exec_type: ExecType) -> ClientReport {
+        // Saturating: Status answers to redeliveries and pass-through venue reports aren't bounded
+        // by the ClOrdID limits, so a peer could in principle drive this to the top. Repeating the
+        // last ExecID there beats a peer being able to panic the book.
+        self.exec_seq = self.exec_seq.saturating_add(1);
         ClientReport {
             exec_type,
             order_id: Some(self.id),
@@ -629,6 +667,7 @@ impl Order {
             cum_qty: self.cum_qty,
             leaves_qty: self.leaves_qty(),
             avg_px: self.avg_px,
+            exec_id: format_compact!("{}.{}", self.id.0, self.exec_seq),
             text: None,
         }
     }
@@ -682,25 +721,6 @@ impl Amend {
             text,
         }
     }
-}
-
-fn reject(client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
-    let report = ClientReport {
-        exec_type: ExecType::Rejected,
-        order_id: None,
-        cl_ord_id: request.cl_ord_id.clone(),
-        orig_cl_ord_id: None,
-        request,
-        status: Status::Rejected,
-        reject: Some(reason),
-        last_qty: Decimal::ZERO,
-        last_px: Decimal::ZERO,
-        cum_qty: Decimal::ZERO,
-        leaves_qty: Decimal::ZERO,
-        avg_px: Decimal::ZERO,
-        text: Some(text),
-    };
-    Output::Report { client, report }
 }
 
 #[cfg(test)]
@@ -859,6 +879,7 @@ mod tests {
                 last_px: Decimal::from(10),
                 cum_qty: Decimal::from(cum_qty),
                 avg_px: Decimal::from(10),
+                exec_id: "V1".into(),
                 text: None,
             },
         }
@@ -1505,6 +1526,55 @@ mod tests {
         run(&mut book, venue_report("1-1", Status::New, 0, 0));
         assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New)).is_empty());
         assert_eq!(book.order(OrderId(1)).unwrap().request, replaced("C2", 80, 11));
+    }
+
+    fn exec_ids(out: &[Output]) -> Vec<&str> {
+        out.iter()
+            .map(|output| match output {
+                Output::Report { report, .. } => report.exec_id.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_orders_exec_ids_count_up_from_its_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        assert_eq!(exec_ids(&run(&mut book, venue_report("1", Status::New, 0, 0))), ["1.1"]);
+        assert_eq!(exec_ids(&run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40))), ["1.2"]);
+        cancel(&mut book, "C2", "C1");
+        assert_eq!(exec_ids(&run(&mut book, venue_report("1-1", Status::Canceled, 0, 40))), ["1.3"]);
+    }
+
+    #[test]
+    fn a_status_answer_takes_the_next_exec_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+        assert_eq!(exec_ids(&out), ["1.2"]);
+        assert_eq!(exec_ids(&run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40))), ["1.3"]);
+    }
+
+    #[test]
+    fn unbooked_rejects_number_their_exec_ids_across_the_book() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        assert_eq!(exec_ids(&new_order(&mut book, "C1")), ["R1"]);
+        let mut req = request("C2");
+        req.ex_destination = None;
+        let out = run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: req, redelivered: false });
+        assert_eq!(exec_ids(&out), ["R2"]);
+    }
+
+    #[test]
+    fn a_second_orders_exec_ids_start_from_its_own_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        new_order(&mut book, "C2");
+        assert_eq!(exec_ids(&run(&mut book, venue_report("2", Status::New, 0, 0))), ["2.1"]);
     }
 
     #[test]
