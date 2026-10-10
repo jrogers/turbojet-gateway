@@ -351,7 +351,7 @@ impl Book {
         if report.status == Status::Rejected && sent.kind.is_some() {
             return self.refuse_request(venue, &report.downstream, sent, None, report.text, out);
         }
-        let Sent { order: id, cl_ord_id, orig_cl_ord_id, .. } = sent;
+        let Sent { order: id, cl_ord_id, orig_cl_ord_id, kind } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
             return tracing::warn!(%venue, downstream = %report.downstream, "execution report for another venue's order");
@@ -359,9 +359,16 @@ impl Book {
         if stale(order, &report) {
             return tracing::debug!(%venue, downstream = %report.downstream, "stale execution report dropped");
         }
+        let pending_here = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream);
         // Any answer under the replace's ClOrdID but these means the venue took it.
-        let accepted = order.pending.as_ref().is_some_and(|pending| pending.downstream == report.downstream)
-            && !matches!(report.status, Status::PendingReplace | Status::Rejected);
+        let accepted = pending_here && !matches!(report.status, Status::PendingReplace | Status::Rejected);
+        // A cancel's reports and a pending replace's (up to the one accepting it) answer that
+        // request; any other report is about the order, under the client's latest ClOrdID.
+        let answers_request = match kind {
+            Some(CancelKind::Cancel) => true,
+            Some(CancelKind::Replace) => pending_here,
+            None => false,
+        };
         let qty = match &order.pending {
             Some(pending) if accepted => pending.qty,
             _ => order.request.qty,
@@ -376,11 +383,16 @@ impl Book {
             order.request.price = pending.price;
             order.downstream = pending.downstream;
         }
-        order.status = report.status;
+        order.set_status(report.status);
         order.cum_qty = report.cum_qty;
         order.avg_px = report.avg_px;
-        let mut client_report = order.report(&cl_ord_id, ReportKind::Event);
-        client_report.orig_cl_ord_id = orig_cl_ord_id;
+        let mut client_report = if answers_request {
+            let mut client_report = order.report(&cl_ord_id, ReportKind::Event);
+            client_report.orig_cl_ord_id = orig_cl_ord_id;
+            client_report
+        } else {
+            order.report(&order.request.cl_ord_id, ReportKind::Event)
+        };
         client_report.last_qty = report.last_qty;
         client_report.last_px = report.last_px;
         client_report.text = report.text;
@@ -522,11 +534,15 @@ impl Book {
         if order.pending.as_ref().is_some_and(|pending| pending.downstream == *downstream) {
             order.pending = None;
         }
-        // Done is final, as in `stale`.
-        if let Some(status) = status
-            && !order.status.is_done()
-        {
-            order.status = status;
+        match status {
+            // Done is final, as in `stale`.
+            _ if order.status.is_done() => {}
+            Some(status) => order.set_status(status),
+            // Without the venue's word, the refused request no longer holds the order pending.
+            None if matches!(order.status, Status::PendingCancel | Status::PendingReplace) => {
+                order.set_status(if order.cum_qty > Decimal::ZERO { Status::PartiallyFilled } else { Status::New });
+            }
+            None => {}
         }
         let refusal = Refusal { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, response_to };
         let text = text.unwrap_or_else(|| "rejected by the venue".into());
@@ -557,6 +573,14 @@ impl Order {
             leaves_qty: self.leaves_qty(),
             avg_px: self.avg_px,
             text: None,
+        }
+    }
+
+    /// A done order has nothing pending: a replace it still awaited can't happen now.
+    fn set_status(&mut self, status: Status) {
+        self.status = status;
+        if status.is_done() {
+            self.pending = None;
         }
     }
 
@@ -1091,15 +1115,36 @@ mod tests {
     }
 
     #[test]
-    fn a_fill_under_the_original_downstream_after_a_replace_still_maps() {
+    fn a_fill_under_the_original_downstream_after_a_replace_reports_the_latest_cl_ord_id() {
         let mut book = book();
         new_order(&mut book, "C1");
         replace(&mut book, "C2", "C1", 80, 11);
         run(&mut book, venue_report("1-1", Status::New, 0, 0));
         let out = run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
-        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C1", &None));
+        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C2", &None));
         assert_eq!(report.leaves_qty, Decimal::from(40));
+    }
+
+    #[test]
+    fn a_fill_under_the_original_downstream_before_the_replace_is_acked_reports_the_original() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        let out = run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C1", &None));
+    }
+
+    #[test]
+    fn a_fill_under_an_accepted_replace_reports_no_orig_cl_ord_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report("1-1", Status::New, 0, 0));
+        let out = run(&mut book, venue_report("1-1", Status::PartiallyFilled, 40, 40));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C2", &None));
     }
 
     #[test]
@@ -1218,5 +1263,59 @@ mod tests {
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!(report.status, Status::Rejected);
         assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
+    }
+
+    #[test]
+    fn a_rejected_replace_takes_the_order_out_of_pending_replace() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::New, 0, 0));
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, venue_report("1-1", Status::PendingReplace, 0, 0));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingReplace);
+        let out = run(&mut book, venue_report("1-1", Status::Rejected, 0, 0));
+        assert_eq!(cancel_reject(&out).2, Status::New);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    #[test]
+    fn a_rejected_cancel_after_a_fill_goes_back_to_partially_filled() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 40));
+        let out = run(&mut book, venue_report("1-1", Status::Rejected, 0, 40));
+        assert_eq!(cancel_reject(&out).2, Status::PartiallyFilled);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PartiallyFilled);
+    }
+
+    #[test]
+    fn a_done_order_has_no_pending_replace() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        cancel(&mut book, "C3", "C1");
+        run(&mut book, venue_report("1-2", Status::Canceled, 0, 0));
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!(order.status, Status::Canceled);
+        assert!(order.pending.is_none());
+    }
+
+    #[test]
+    fn a_cancel_while_a_replace_is_pending_names_the_last_accepted_downstream() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        let out = cancel(&mut book, "C3", "C1");
+        assert_eq!(
+            out,
+            [Output::Cancel {
+                venue: "NASDAQ".into(),
+                downstream: "1-2".into(),
+                orig_downstream: "1".into(),
+                request: request("C1")
+            }]
+        );
     }
 }
