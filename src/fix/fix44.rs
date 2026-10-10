@@ -467,7 +467,8 @@ fn exec_type_from_fix(exec_type: fix::ExecType) -> Option<ExecType> {
 }
 
 /// FIX 4.4 has codes for Duplicate (6) and, for the quantity, notional and credit limits, Order
-/// exceeds limit (3); the book's other reasons say Other (99) and the report's Text says why. A venue's code passes through if FIX 4.4 has it.
+/// exceeds limit (3); the book's other reasons say Other (99) and the report's Text says why. A
+/// venue's code passes through if FIX 4.4 has it.
 fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
     match reason {
         RejectReason::Duplicate => fix::OrdRejReason::DuplicateOrder,

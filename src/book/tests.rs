@@ -2487,3 +2487,40 @@ fn a_comp_ids_own_limits_apply_to_it_only() {
     assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Err(RiskReject::OrderQty));
     assert_eq!(risk_checked_from(&mut book, &"FUNDB".into(), limit_order("C1", Side::Buy, 100, "10")), Ok(()));
 }
+
+/// A replace that adds no risk (the same price, less or the same quantity) passes whatever the
+/// limits say now: here the reference has moved out of the band around the order's price.
+#[test]
+fn a_replace_cutting_the_quantity_at_the_same_price_skips_the_checks() {
+    let mut book = limited(risk::Limits { price_band: Some(5.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 100, "20")), Ok(()));
+    run(&mut book, fill_at("2", 10, 10, "20"));
+    assert!(matches!(replace(&mut book, "C3", "C1", 50, 10).as_slice(), [Output::Replace { .. }]));
+    let out = replace(&mut book, "C4", "C2", 100, 10);
+    let [Output::CancelReject { text, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(text, RiskReject::PriceBand.text());
+}
+
+/// While a replace is pending, the order rests at the more aggressive of its two prices, since
+/// the venue may have taken the replace already.
+#[test]
+fn self_trade_counts_a_pending_replaces_price() {
+    let mut book = limited(risk::Limits { self_trade: true, ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    assert!(matches!(replace(&mut book, "C2", "C1", 100, 12).as_slice(), [Output::Replace { .. }]));
+    assert_eq!(risk_checked(&mut book, limit_order("C3", Side::Sell, 100, "11")), Err(RiskReject::SelfTrade));
+    // Refused, the replace leaves the order at 10.
+    run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
+    assert_eq!(risk_checked(&mut book, limit_order("C4", Side::Sell, 100, "11")), Ok(()));
+}
+
+/// A fill without a usable price leaves the reference as it was.
+#[test]
+fn a_fill_at_zero_keeps_the_reference() {
+    let mut book = limited(risk::Limits { price_band: Some(5.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    run(&mut book, fill_at("1", 10, 10, "10"));
+    run(&mut book, fill_at("1", 10, 20, "0"));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 1, "10")), Ok(()));
+}

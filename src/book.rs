@@ -690,7 +690,7 @@ impl Book {
             let indexed = self.index.keys().filter(|(owner, _)| owner == client).count();
             assert_eq!(used, indexed, "{client}'s ClOrdID count");
         }
-        self.risk.check(self.orders.iter().filter_map(|(id, order)| Some((*id, order.exposure()?))));
+        self.risk.check(self.orders.iter().filter_map(|(id, order)| Some((*id, order.exposure()?))), self.orders.len());
     }
 
     fn new_order(&mut self, client: ClientId, request: OrderRequest, redelivered: bool, out: &mut Vec<Output>) {
@@ -958,8 +958,13 @@ impl Book {
         self.risk.track(id, order.exposure());
     }
 
-    /// A replace of `order` to `qty` at `price` (`None`: Market) against the client's limits.
+    /// A replace of `order` to `qty` at `price` (`None`: Market) against the client's limits. One
+    /// that adds no risk, at the same price (or Market again) and no more quantity, passes, so a
+    /// client can always cut an order the limits would refuse now.
     fn check_replace(&self, order: &Order, qty: Decimal, price: Option<Decimal>) -> Result<(), RiskReject> {
+        if price == limit_price(order.request.ord_type, order.request.price) && qty <= order.request.qty {
+            return Ok(());
+        }
         let proposed = Proposed {
             client: &order.client,
             symbol: &order.request.symbol,
@@ -1502,22 +1507,31 @@ impl Order {
     }
 
     /// What the order counts for in risk while it's live: its leaves at its risk price, or the
-    /// pending replace's, whichever is more, since the venue may accept the replace or not.
+    /// pending replace's, whichever is more, since the venue may accept the replace or not; it
+    /// rests at the more aggressive of the two prices, for the same reason.
     fn exposure(&self) -> Option<Exposure> {
         if self.status.is_done() {
             return None;
         }
         let leaves = |qty: Decimal| (qty - self.cum_qty).max(Decimal::ZERO);
         let mut notional = risk::notional(leaves(self.request.qty), self.risk_price);
+        let mut price = limit_price(self.request.ord_type, self.request.price);
         if let Some(pending) = &self.pending {
             notional = notional.max(risk::notional(leaves(pending.qty), pending.risk_price));
+            // The more aggressive price, as the venue may have taken the replace: a Market one
+            // crosses anything.
+            price = match (price, pending.price) {
+                (Some(current), Some(new)) if self.request.side == Side::Buy => Some(current.max(new)),
+                (Some(current), Some(new)) => Some(current.min(new)),
+                _ => None,
+            };
         }
         Some(Exposure {
             client: self.client.clone(),
             symbol: self.request.symbol.clone(),
             venue: self.venue.clone(),
             side: self.request.side,
-            price: limit_price(self.request.ord_type, self.request.price),
+            price,
             notional,
         })
     }

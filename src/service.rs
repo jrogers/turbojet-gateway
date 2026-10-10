@@ -112,8 +112,9 @@ impl Service {
     }
 
     /// Rereads the sessions file, and the routes and limits, logging what changed. Either file that
-    /// doesn't load is logged and stays as it was (routes and limits together); the routes are checked against the venues the gateway took
-    /// after the sessions reload, so a venue added to both files at once can be routed to.
+    /// doesn't load is logged and stays as it was (routes and limits together); the routes are
+    /// checked against the venues the gateway took after the sessions reload, so a venue added to
+    /// both files at once can be routed to.
     pub fn reload(&self) {
         match self.sessions.reload_all(Some(&self.acceptor), &self.initiators) {
             Ok(changes) => info!(

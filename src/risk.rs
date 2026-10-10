@@ -141,7 +141,8 @@ pub struct Exposure {
 /// session's open and filled notional and resting orders.
 #[derive(Debug, Default)]
 pub struct State {
-    /// The last fill's price per symbol, on any venue, for any client.
+    /// The last fill's price per symbol, on any venue, for any client. Bounded by the book's
+    /// orders: only a fill on a booked order inserts one, and the book keeps its orders.
     references: HashMap<CompactString, Decimal>,
     sessions: HashMap<ClientId, Session>,
     /// Each live order's exposure, as last tracked.
@@ -181,8 +182,14 @@ impl State {
 
     /// A fill of `qty` at `price` for the session `client`: the symbol's new reference, and to
     /// the session's filled notional.
+    /// A price of zero or less is no reference (a venue leaving LastPx(31) at 0, say): the
+    /// symbol keeps the one it has.
     pub fn fill(&mut self, client: &ClientId, symbol: &CompactString, qty: Decimal, price: Decimal) {
-        self.references.insert(symbol.clone(), price);
+        if price > Decimal::ZERO {
+            self.references.insert(symbol.clone(), price);
+        } else {
+            tracing::warn!(%client, %symbol, %price, "fill price not positive; the reference price stays");
+        }
         let session = self.sessions.entry(client.clone()).or_default();
         // Only ever added to, so saturating can't make the sum drift.
         session.filled = session.filled.checked_add(notional(qty, price)).unwrap_or(Decimal::MAX);
@@ -251,9 +258,11 @@ impl State {
 
     /// The state's invariants, given every live order's exposure as the book computes it now
     /// (`live`): what's tracked is exactly that, each session's open notional is their sum, and
-    /// its resting orders are those orders.
+    /// its resting orders are those orders. There are no more reference prices than the book has
+    /// `orders`.
     #[cfg(debug_assertions)]
-    pub fn check(&self, live: impl Iterator<Item = (OrderId, Exposure)>) {
+    pub fn check(&self, live: impl Iterator<Item = (OrderId, Exposure)>, orders: usize) {
+        assert!(self.references.len() <= orders, "a reference price per fill on a booked order");
         let mut count = 0;
         for (id, exposure) in live {
             assert_eq!(self.exposures.get(&id), Some(&exposure), "order {id:?}'s exposure");
@@ -358,8 +367,8 @@ mod tests {
         state.track(OrderId(2), Some(exposure("999999999999999999.9999", "2")));
         state.track(OrderId(2), Some(exposure("5", "2")));
         state.track(OrderId(2), None);
-        state.check([(OrderId(1), exposure("0.0001", "1"))].into_iter());
+        state.check([(OrderId(1), exposure("0.0001", "1"))].into_iter(), 2);
         state.track(OrderId(1), None);
-        state.check(std::iter::empty());
+        state.check(std::iter::empty(), 2);
     }
 }
