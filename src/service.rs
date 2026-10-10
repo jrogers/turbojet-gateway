@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use turbojet::{Acceptor, SessionHandle, SessionId};
 use turbojet_config::{Initiators, SessionsFile};
 
-use crate::book;
+use crate::book::{self, Snapshot};
 use crate::config::{self, Error};
 use crate::edge::{ClientApp, Gateway, Schedules, TICK_INTERVAL, VenueApp, Writer};
 use crate::fix::Version;
@@ -268,11 +268,17 @@ impl Service {
     }
 }
 
-/// Opens the database at `url` and starts the book's writer on it. Nothing is restored from it
-/// yet: recovery is task D1.
+/// Opens the database at `url` and starts the book's writer on it. A database with anything in
+/// it is refused: nothing is restored from it yet, and a new book would write over its rows.
 async fn start_writer(url: &str) -> Result<(Writer, JoinHandle<()>), Error> {
     let store = Store::open(url).await.map_err(|e| Error::new(e.to_string()))?;
     let snapshot = store.load().await.map_err(|e| Error::new(format!("cannot load the database: {e}")))?;
+    // ponytail: until recovery (task D1) restores the book from it.
+    if snapshot != (Snapshot { next_order_id: 1, ..Snapshot::default() }) {
+        return Err(Error::new(
+            "the database isn't empty, and restoring the book from it isn't built yet: start with a new database",
+        ));
+    }
     Ok(Writer::start(store, snapshot.next_undelivered_id()))
 }
 
@@ -434,5 +440,26 @@ mod tests {
         write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
         let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
         assert!(error.to_string().starts_with("cannot bind"), "{error}");
+    }
+
+    /// Until recovery is built, a database with rows in it is refused rather than written over;
+    /// a new one starts.
+    #[tokio::test]
+    async fn a_database_with_rows_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
+        let path = dir.path().join("jetbridge.toml");
+        let (service, serving) = Service::start(&path).await.unwrap();
+        service.shutdown().await;
+        serving.abort();
+        drop(service);
+
+        let store = Store::open(&url).await.unwrap();
+        let blocked = book::Changes { blocked: Some(vec![book::Scope::All]), ..book::Changes::default() };
+        store.write(&[blocked]).await.unwrap();
+        let error = Service::start(&path).await.unwrap_err();
+        assert!(error.to_string().contains("the database isn't empty"), "{error}");
     }
 }
