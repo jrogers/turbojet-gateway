@@ -63,6 +63,11 @@ impl Service {
         self.local_addr
     }
 
+    /// The gateway: the book and where its outputs go.
+    pub fn gateway(&self) -> &Arc<Gateway> {
+        &self.gateway
+    }
+
     /// Rereads the sessions file and the routes, logging what changed. Either that doesn't load
     /// is logged and stays as it was; the routes are checked against the venues the gateway took
     /// after the sessions reload, so a venue added to both files at once can be routed to.
