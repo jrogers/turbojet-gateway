@@ -43,34 +43,46 @@ pub struct Store {
 }
 
 /// Test hooks on [`Store::write`]: it waits while `gate` is shut, then fails while `failures` is
-/// above zero, counting it down.
+/// above zero, counting it down; past that, it runs its statements and then fails, rolling them
+/// back, while `failures_in_transaction` is above zero.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Hooks {
     pub(crate) gate: tokio::sync::watch::Sender<bool>,
     pub(crate) failures: std::sync::atomic::AtomicUsize,
+    pub(crate) failures_in_transaction: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
 impl Default for Hooks {
     fn default() -> Self {
-        Self { gate: tokio::sync::watch::Sender::new(true), failures: std::sync::atomic::AtomicUsize::new(0) }
+        Self {
+            gate: tokio::sync::watch::Sender::new(true),
+            failures: std::sync::atomic::AtomicUsize::new(0),
+            failures_in_transaction: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 }
 
 #[cfg(test)]
 impl Hooks {
     async fn before_write(&self) -> io::Result<()> {
-        use std::sync::atomic::Ordering;
         let mut open = self.gate.subscribe();
         open.wait_for(|open| *open).await.map_err(io::Error::other)?;
-        // One writer task writes, so nothing races the check and the count down.
-        if self.failures.load(Ordering::Acquire) == 0 {
-            return Ok(());
-        }
-        self.failures.fetch_sub(1, Ordering::AcqRel);
-        Err(io::Error::other("failing as the test asked"))
+        fail(&self.failures)
     }
+}
+
+/// Fails while `count` is above zero, counting it down. One writer task writes, so nothing races
+/// the check and the count down.
+#[cfg(test)]
+fn fail(count: &std::sync::atomic::AtomicUsize) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if count.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    count.fetch_sub(1, Ordering::AcqRel);
+    Err(io::Error::other("failing as the test asked"))
 }
 
 impl Store {
@@ -130,6 +142,9 @@ impl Store {
         for changes in changes {
             write_changes(&mut transaction, changes).await?;
         }
+        // Dropped uncommitted, the transaction rolls back.
+        #[cfg(test)]
+        fail(&self.hooks.failures_in_transaction)?;
         transaction.commit().await.map_err(database("committing a write"))
     }
 

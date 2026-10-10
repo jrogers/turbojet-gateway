@@ -1535,13 +1535,15 @@ mod tests {
     }
 
     /// A database that fails holds every message that changed the book, and once it's back each
-    /// change is written: the store then holds what the book does, and nothing undelivered.
+    /// change is written: the store then holds what the book does, and nothing undelivered. Some
+    /// writes fail before starting, some after their statements, rolled back.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failing_database_stalls_then_writes_every_change() {
         let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let mut sessions = connected(&gateway, true).await;
         store.hooks.gate.send_replace(false);
         store.hooks.failures.store(3, Ordering::Release);
+        store.hooks.failures_in_transaction.store(2, Ordering::Release);
 
         for cl_ord_id in ["C1", "C2", "C3"] {
             sessions.client.handle().send(order(cl_ord_id)).unwrap();
@@ -1556,6 +1558,7 @@ mod tests {
         wait_for(sessions.client_log.as_ref(), (5, Some(5))).await;
         wait_for(sessions.venue_log.as_ref(), (8, Some(8))).await;
         assert_eq!(store.hooks.failures.load(Ordering::Acquire), 0, "every failure was retried");
+        assert_eq!(store.hooks.failures_in_transaction.load(Ordering::Acquire), 0);
         delivered(&gateway).await;
         assert_eq!(uncommitted(&gateway), 0);
         let loaded = store.load().await.unwrap();

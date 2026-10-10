@@ -320,6 +320,19 @@ fn order_row(id: u64) -> OrderRow {
     OrderRow { order: order(id, &ClientId::from("FUNDB"), false), day: None }
 }
 
+/// A write that fails after its statements, before its commit, leaves nothing; the same write
+/// again writes it all.
+#[tokio::test]
+async fn a_write_failing_inside_its_transaction_leaves_nothing() {
+    let store = memory().await;
+    let changes = Changes { orders: every_order(&ClientId::from("FUNDA")), ..Changes::default() };
+    store.hooks.failures_in_transaction.store(1, std::sync::atomic::Ordering::Release);
+    assert!(store.write(std::slice::from_ref(&changes)).await.is_err());
+    assert_eq!(store.load().await.unwrap(), applied(&[]));
+    store.write(std::slice::from_ref(&changes)).await.unwrap();
+    assert_eq!(store.load().await.unwrap(), applied(&[changes]));
+}
+
 /// An empty store's next OrderId is 1.
 #[tokio::test]
 async fn an_empty_store_loads_an_empty_snapshot() {
