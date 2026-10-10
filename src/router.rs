@@ -13,7 +13,7 @@ pub enum Target {
 }
 
 /// Matches an order when every condition it sets holds; an unset one matches anything.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub client: Option<ClientId>,
     pub ex_destination: Option<CompactString>,
@@ -29,7 +29,7 @@ impl Rule {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Router {
     rules: Vec<Rule>,
 }

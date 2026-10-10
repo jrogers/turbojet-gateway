@@ -1,0 +1,12 @@
+# Jetbridge: the sessions file, and how orders are routed. First match wins; an order no route
+# matches is rejected.
+sessions = "sessions.toml"
+
+# FUNDA's orders for XNAS go to NASDAQ.
+[[route]]
+client = "FUNDA"
+ex_destination = "XNAS"
+venue = "NASDAQ"
+
+[[route]]
+reject = "no route for this order"
