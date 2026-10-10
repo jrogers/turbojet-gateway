@@ -2,14 +2,61 @@
 //! send onto `out`; the FIX side turns those into typed messages for each session's version.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use turbojet::SessionId;
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
 use crate::router::{Router, Target};
 
-/// A client session, by the client's SenderCompID.
-pub type ClientId = CompactString;
+/// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
+/// each with its own ClOrdIDs and reports. Shows as the session, as Turbojet shows it. Cheap to
+/// clone; the gateway makes one per session and reuses it, so a message doesn't format one.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientId(Arc<ClientName>);
+
+/// Compared by `session` first, which names the session whole; `comp_id` is part of it.
+#[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ClientName {
+    session: String,
+    comp_id: CompactString,
+}
+
+impl ClientId {
+    /// The client on the acceptor's session `id`, the client being its counterparty.
+    pub fn new(id: &SessionId) -> Self {
+        Self(Arc::new(ClientName { session: id.to_string(), comp_id: id.target_comp_id.as_str().into() }))
+    }
+
+    /// The client's CompID, which routes match on; its sessions share it.
+    pub fn comp_id(&self) -> &str {
+        &self.0.comp_id
+    }
+}
+
+/// The session, quoted: what the shutdown log's counts per client show.
+impl fmt::Debug for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0.session, f)
+    }
+}
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.session)
+    }
+}
+
+/// The FIX 4.4 session from JETBRIDGE to CompID `comp_id`, with no SubIDs: tests' usual client.
+#[cfg(test)]
+impl From<&str> for ClientId {
+    fn from(comp_id: &str) -> Self {
+        Self::new(&SessionId::new("FIX.4.4", "JETBRIDGE", comp_id))
+    }
+}
+
 /// A venue session, by its name in the sessions file.
 pub type VenueId = CompactString;
 
@@ -506,7 +553,7 @@ impl Book {
         if self.used.get(&client).is_some_and(|&used| used >= self.max_cl_ord_ids) {
             return out.push(self.reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
         }
-        let venue = match self.router.route(&client, &request) {
+        let venue = match self.router.route(client.comp_id(), &request) {
             Some(Target::Venue(venue)) => venue,
             Some(Target::Reject(text)) => {
                 return out.push(self.reject(client, request, RejectReason::RouteRejected, text));

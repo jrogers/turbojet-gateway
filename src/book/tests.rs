@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use turbojet::SessionId;
+
 use super::*;
 use crate::router::Rule;
 
@@ -120,6 +122,57 @@ fn the_same_cl_ord_id_from_another_client_is_a_new_order() {
     assert!(matches!(out.as_slice(), [Output::NewOrder { .. }]));
 }
 
+/// FUNDA's session with SubID `sub_id`.
+fn desk(sub_id: &str) -> ClientId {
+    ClientId::new(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA").with_target_sub_id(sub_id))
+}
+
+fn order_from(client: &ClientId, cl_ord_id: &str) -> Input {
+    Input::NewOrder { client: client.clone(), request: request(cl_ord_id), redelivered: false }
+}
+
+#[test]
+fn two_sessions_of_one_comp_id_have_their_own_cl_ord_ids_and_bounds() {
+    let mut book = book();
+    book.max_cl_ord_ids = 1;
+    let (one, two) = (desk("DESK1"), desk("DESK2"));
+    assert!(matches!(run(&mut book, order_from(&one, "C1")).as_slice(), [Output::NewOrder { .. }]));
+    assert!(matches!(run(&mut book, order_from(&two, "C1")).as_slice(), [Output::NewOrder { .. }]));
+    let out = run(&mut book, order_from(&one, "C2"));
+    let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((client, report.reject), (&one, Some(RejectReason::TooManyOrders)));
+}
+
+#[test]
+fn reports_go_to_the_session_that_sent_the_order() {
+    let mut book = book();
+    let (one, two) = (desk("DESK1"), desk("DESK2"));
+    run(&mut book, order_from(&one, "C1"));
+    run(&mut book, order_from(&two, "C1"));
+    for (downstream, sender) in [("1", &one), ("2", &two)] {
+        let out = run(&mut book, venue_report(downstream, Status::New, 0, 0));
+        let [Output::Report { client, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(client, sender);
+    }
+}
+
+#[test]
+fn a_route_rule_for_a_comp_id_matches_each_of_its_sessions() {
+    let rule = |client: Option<&str>, venue: &str| Rule {
+        client: client.map(Into::into),
+        ex_destination: None,
+        symbol: None,
+        target: Target::Venue(venue.into()),
+    };
+    let mut book = Book::new(Router::new(vec![rule(Some("FUNDA"), "NASDAQ"), rule(None, "OTHER")]));
+    for client in [desk("DESK1"), desk("DESK2"), "FUNDA".into()] {
+        let out = run(&mut book, order_from(&client, "C1"));
+        assert!(matches!(out.as_slice(), [Output::NewOrder { venue, .. }] if venue == "NASDAQ"), "{client}: {out:?}");
+    }
+    let out = run(&mut book, order_from(&"FUNDB".into(), "C1"));
+    assert!(matches!(out.as_slice(), [Output::NewOrder { venue, .. }] if venue == "OTHER"), "{out:?}");
+}
+
 #[test]
 fn a_client_just_under_its_cl_ord_id_bound_is_accepted() {
     let mut book = book();
@@ -180,7 +233,7 @@ fn a_fill_goes_back_under_the_clients_cl_ord_id() {
     new_order(&mut book, "C1");
     let out = run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
     let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
-    assert_eq!((client.as_str(), report.cl_ord_id.as_str()), ("FUNDA", "C1"));
+    assert_eq!((client, report.cl_ord_id.as_str()), (&ClientId::from("FUNDA"), "C1"));
     assert_eq!((report.last_qty, report.cum_qty, report.leaves_qty), (40.into(), 40.into(), 60.into()));
     assert_eq!(report.exec_type, ExecType::Trade);
     assert_eq!((report.last_px, report.avg_px, &report.orig_cl_ord_id), (10.into(), 10.into(), &None));
@@ -1578,7 +1631,7 @@ fn a_status_request_gets_the_orders_state() {
     run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
     let out = run(&mut book, status_request("C1"));
     let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
-    assert_eq!(client, "FUNDA");
+    assert_eq!(*client, ClientId::from("FUNDA"));
     assert_eq!((report.exec_type, report.status, report.reject), (ExecType::Status, Status::PartiallyFilled, None));
     assert_eq!((report.order_id.as_deref(), report.cum_qty, report.leaves_qty), (Some("1"), 40.into(), 60.into()));
     assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id, report.exec_id.as_str()), ("C1", &None, "1.2"));
@@ -1603,7 +1656,7 @@ fn a_status_request_for_an_unknown_order_is_answered_rejected() {
     new_order(&mut book, "C1");
     let out = run(&mut book, status_request("C9"));
     let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
-    assert_eq!(client, "FUNDA");
+    assert_eq!(*client, ClientId::from("FUNDA"));
     assert_eq!((report.exec_type, report.status, report.reject), (ExecType::Status, Status::Rejected, None));
     assert_eq!((report.order_id.as_deref(), report.cl_ord_id.as_str()), (None, "C9"));
     assert_eq!((report.text.as_deref(), report.exec_id.as_str()), (Some("unknown order"), "R2"));
@@ -1630,7 +1683,8 @@ fn a_new_order_the_venue_session_could_not_take_is_rejected() {
     new_order(&mut book, "C1");
     let out = run(&mut book, send_failed("1"));
     let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
-    assert_eq!((client.as_str(), report.cl_ord_id.as_str(), report.order_id.as_deref()), ("FUNDA", "C1", Some("1")));
+    let funda = ClientId::from("FUNDA");
+    assert_eq!((client, report.cl_ord_id.as_str(), report.order_id.as_deref()), (&funda, "C1", Some("1")));
     assert_eq!((report.exec_type, report.status), (ExecType::Rejected, Status::Rejected));
     assert_eq!(
         (report.reject, report.text.as_deref()),

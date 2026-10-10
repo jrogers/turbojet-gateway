@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use jetbridge::book::ClientId;
 use jetbridge::service::Service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -263,7 +264,7 @@ impl Setup {
         let serving = tokio::spawn(acceptor.clone().serve(listener));
         let (service, _serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         venue_events.logged_on().await;
-        let (client, mut events) = client(&service, options.client_version);
+        let (client, mut events) = client(&service, options.client_version, None);
         let running = tokio::spawn(client.clone().run());
         events.logged_on().await;
         let venue = Venue { acceptor, serving, events: venue_events };
@@ -306,10 +307,11 @@ impl Setup {
     }
 }
 
-/// A client of the gateway's, not yet running.
-fn client(service: &Service, version: &str) -> (Initiator, Events) {
+/// A client of the gateway's, not yet running, with SenderSubID `sub_id` if given.
+fn client(service: &Service, version: &str, sub_id: Option<&str>) -> (Initiator, Events) {
     let (app, events) = recorder(false);
     let mut config = InitiatorConfig::new(SessionConfig::new(version, CLIENT), GATEWAY);
+    config.sender_sub_id = sub_id.map(Into::into);
     config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
     let addr = service.local_addr().to_string();
     (Initiator::new(addr, config, Arc::new(MemoryStorage::new()), app).unwrap(), events)
@@ -519,7 +521,7 @@ async fn a_fill_for_a_disconnected_client_arrives_once_it_logs_back_on() {
     // The book has taken the fill when the order's done.
     let gateway = setup.service.gateway().clone();
     until(|| gateway.unfinished().open_orders.is_empty()).await;
-    assert_eq!(gateway.unfinished().undelivered, BTreeMap::from([(CLIENT.into(), 1)]));
+    assert_eq!(gateway.unfinished().undelivered, BTreeMap::from([(ClientId::new(client.id()), 1)]));
 
     // The same session, its sequence numbers kept.
     tokio::spawn(setup.client.clone().run());
@@ -617,6 +619,41 @@ async fn venue_resends_after_a_reconnect_reach_the_client_once() {
     setup.venue.send(acked(&setup.id("2")));
     let new: v44::ExecutionReport = setup.events.parse().await;
     assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C2"), v44::ExecType::New));
+}
+
+/// Two sessions of one CompID, told apart by SubID, are two clients: each may use the same
+/// ClOrdID, and each gets only its own orders' reports while the other (and the CompID's session
+/// without a SubID) is connected too.
+#[tokio::test]
+async fn sessions_of_one_comp_id_each_get_their_own_reports() {
+    let mut setup = Setup::new().await;
+    let mut desks = Vec::new();
+    for sub_id in ["DESK1", "DESK2"] {
+        let (desk, mut events) = client(&setup.service, "FIX.4.4", Some(sub_id));
+        tokio::spawn(desk.clone().run());
+        events.logged_on().await;
+        desks.push((desk, events));
+    }
+    for (desk, _) in &desks {
+        desk.handle().send(order("C1", "AAPL")).expect("the desk is logged on");
+        let sent: v44::NewOrderSingle = setup.venue.events.parse().await;
+        assert!(sent.cl_ord_id.starts_with(&setup.prefix), "{sent:?}");
+    }
+
+    // Acked the other way round, so a report sent to the wrong desk would come first.
+    setup.venue.send(acked(&setup.id("2")));
+    setup.venue.send(acked(&setup.id("1")));
+    for (n, (_, events)) in desks.iter_mut().enumerate() {
+        let new: v44::ExecutionReport = events.parse().await;
+        let order_id = setup.id(&(n + 1).to_string());
+        assert_eq!((new.cl_ord_id.as_deref(), new.order_id.as_str()), (Some("C1"), &*order_id));
+    }
+    setup.venue.send(fill(&setup.id("2"), "E-1", 100, 100));
+    let filled: v44::ExecutionReport = desks[1].1.parse().await;
+    assert_eq!((filled.order_id.as_str(), filled.exec_type), (&*setup.id("2"), v44::ExecType::Trade));
+    let gateway = setup.service.gateway().clone();
+    until(|| gateway.unfinished().undelivered.is_empty()).await;
+    assert!(desks[0].1.0.try_recv().is_err() && setup.events.0.try_recv().is_err());
 }
 
 #[tokio::test]

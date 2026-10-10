@@ -10,7 +10,7 @@
 pub mod outbox;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tracing::error;
 use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
@@ -35,6 +35,8 @@ const VENUE_BUSY: &str = "venue unavailable: its send queue is full";
 pub struct Gateway {
     state: Mutex<State>,
     outbox: Outbox,
+    /// Each client session seen since start, made once: see [`client`](Self::client).
+    clients: Mutex<HashMap<SessionId, ClientId>>,
     /// Every client's: the acceptor's BeginString.
     client_version: Version,
     /// For TransactTime(60) on what the gateway sends.
@@ -70,7 +72,13 @@ impl Gateway {
     /// [`set_venues`](Self::set_venues).
     pub fn new(router: Router, client_version: Version) -> Self {
         let state = State { book: Book::new(router), venues: HashMap::new(), venue_names: HashMap::new() };
-        Self { state: Mutex::new(state), outbox: Outbox::new(), client_version, clock: Clock::system() }
+        Self {
+            state: Mutex::new(state),
+            outbox: Outbox::new(),
+            clients: Mutex::default(),
+            client_version,
+            clock: Clock::system(),
+        }
     }
 
     /// Starts every ID the book issues with `prefix`, such as [`start_prefix`](crate::book::start_prefix)'s.
@@ -128,6 +136,20 @@ impl Gateway {
     /// Routes new orders by `router` from now on.
     pub fn set_router(&self, router: Router) {
         self.lock().book.set_router(router);
+    }
+
+    /// The client on the acceptor's session `id`. Made at the session's first logon or message
+    /// and kept, so a message costs a lookup and a clone rather than formatting the session. Kept
+    /// for every session seen since start, as the outbox and the book keep theirs.
+    fn client(&self, id: &SessionId) -> ClientId {
+        // Nothing is left half-changed under this lock, so a panic elsewhere doesn't spoil it.
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(client) = clients.get(id) {
+            return client.clone();
+        }
+        let client = ClientId::new(id);
+        clients.insert(id.clone(), client.clone());
+        client
     }
 
     /// Runs `input` through the book and sends what it answers, all under the lock. A venue
@@ -220,17 +242,17 @@ impl Gateway {
     }
 }
 
-/// The acceptor's application: clients, each named by its CompID (the session's TargetCompID).
+/// The acceptor's application: clients, each its own session (see [`ClientId`]).
 #[derive(Debug, Clone)]
 pub struct ClientApp(pub Arc<Gateway>);
 
 impl Application for ClientApp {
     fn on_logon(&self, session: &SessionHandle) {
-        self.0.outbox.logged_on(session);
+        self.0.outbox.logged_on(&self.0.client(session.id()), session);
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
-        let client = ClientId::from(ctx.session_id().target_comp_id.as_str());
+        let client = self.0.client(ctx.session_id());
         let redelivered = ctx.maybe_redelivered() || fix::possibly_resent(msg);
         let input = self.0.client_version.client_input(&client, msg, redelivered)?;
         self.0.handle(input);

@@ -48,11 +48,11 @@ const OVERFLOW_TEXT: &str = "too many undelivered reports";
 /// there; sending it again could duplicate it).
 ///
 /// **Limits.** Each client holds up to [`MAX_OUTBOX`] reports. Its queue and task are made on
-/// first use and kept, so there's one per client seen since start. The listed counterparties bound
-/// that, but not turbojet-config's `unknown = "admit"`: every distinct CompID that logs on over
-/// the process's life keeps a drain task here, and one that orders a `used` entry in the book,
-/// until a restart. Dropping the outbox aborts the drain tasks, and what they
-/// hold is lost.
+/// first use and kept, so there's one per client session seen since start: every distinct session
+/// that logs on over the process's life keeps a drain task here, and one that orders a `used`
+/// entry in the book, until a restart. Listing the counterparties bounds their CompIDs but not
+/// the SubIDs they log on with. Dropping the outbox aborts the drain tasks, and what they hold is
+/// lost.
 #[derive(Debug)]
 pub struct Outbox {
     limit: usize,
@@ -73,16 +73,15 @@ impl Outbox {
         Self { limit, clients: Mutex::default(), tasks: Mutex::default() }
     }
 
-    /// The client logged on, on `session`: its held reports start going out. Call it from the
-    /// acceptor's `Application::on_logon`; the client is the session's TargetCompID.
+    /// `client` logged on, on `session`: its held reports start going out. Call it from the
+    /// acceptor's `Application::on_logon`.
     ///
     /// # Panics
     ///
     /// Outside a tokio runtime, for a client not seen before (its drain task is spawned).
-    pub fn logged_on(&self, session: &SessionHandle) {
-        let id = ClientId::from(session.id().target_comp_id.as_str());
+    pub fn logged_on(&self, client: &ClientId, session: &SessionHandle) {
         let mut clients = lock(&self.clients);
-        let client = self.client(&mut clients, &id);
+        let client = self.client(&mut clients, client);
         *lock(&client.shared.session) = Some(session.clone());
         // Keeps a permit if the drain task isn't waiting yet: see `Drain::wait_for_logon`.
         client.shared.logon.notify_one();
@@ -158,7 +157,7 @@ impl Outbox {
     }
 
     #[cfg(test)]
-    fn held(&self, client: &str) -> usize {
+    fn held(&self, client: &ClientId) -> usize {
         lock(&self.clients).get(client).map_or(0, |c| c.shared.pending.load(Ordering::Acquire))
     }
 }
@@ -443,7 +442,7 @@ mod tests {
 
     impl Application for Gateway {
         fn on_logon(&self, session: &SessionHandle) {
-            self.outbox.logged_on(session);
+            self.outbox.logged_on(&ClientId::new(session.id()), session);
         }
 
         fn on_message(&self, _ctx: &mut Context<'_>, _msg: &Message) -> Result<(), MessageReject> {
@@ -576,16 +575,16 @@ mod tests {
         let (outbox, _app, _acceptor, addr) = gateway(MAX_OUTBOX).await;
         let (_initiator, _recorder, mut events) = start_client(&addr);
         assert_eq!(next(&mut events).await, Event::LoggedOn);
-        until(|| lock(&outbox.clients).get(CLIENT).is_some_and(|c| lock(&c.shared.session).is_some())).await;
+        until(|| lock(&outbox.clients).get(&client()).is_some_and(|c| lock(&c.shared.session).is_some())).await;
 
         assert!(outbox.deliver(&client(), report(0)));
         // Watched in flight until stored, so the next one queues behind it.
-        assert_eq!(outbox.held(CLIENT), 1);
+        assert_eq!(outbox.held(&client()), 1);
         assert_eq!(outbox.held_by_client(), BTreeMap::from([(client(), 1)]));
         assert!(outbox.deliver(&client(), report(1)));
         assert!(outbox.push(&client(), report(2)));
         assert_eq!(reports(&mut events, 3).await, numbered_reports(3));
-        until(|| outbox.held(CLIENT) == 0).await;
+        until(|| outbox.held(&client()) == 0).await;
         assert!(outbox.held_by_client().is_empty());
     }
 
@@ -599,7 +598,7 @@ mod tests {
         let (_initiator, _recorder, mut events) = start_client(&addr);
         assert_eq!(next(&mut events).await, Event::LoggedOn);
         assert_eq!(reports(&mut events, 2).await, numbered_reports(2));
-        until(|| outbox.held(CLIENT) == 0).await;
+        until(|| outbox.held(&client()) == 0).await;
         assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
     }
 
@@ -633,9 +632,9 @@ mod tests {
         assert_eq!(got, numbered(pushed));
         // The dropped ones never come.
         assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
-        assert_eq!(outbox.held(CLIENT), 0);
+        assert_eq!(outbox.held(&client()), 0);
         // Emptied, the outbox reported the drops and starts counting afresh.
-        assert_eq!(lock(&outbox.clients)[CLIENT].shared.dropped.load(Ordering::Acquire), 0);
+        assert_eq!(lock(&outbox.clients)[&client()].shared.dropped.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -656,7 +655,7 @@ mod tests {
         // Those the session stored come back as resends; the outbox sends the rest again.
         assert_eq!(reports(&mut events, REPORTS).await, numbered_reports(REPORTS));
         assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
-        assert_eq!(outbox.held(CLIENT), 0);
+        assert_eq!(outbox.held(&client()), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -665,7 +664,7 @@ mod tests {
         let mut sessions = acceptor.subscribe();
         let (_initiator, recorder, mut events) = start_client(&addr);
         assert_eq!(next(&mut events).await, Event::LoggedOn);
-        until(|| lock(&outbox.clients).get(CLIENT).is_some_and(|c| lock(&c.shared.session).is_some())).await;
+        until(|| lock(&outbox.clients).get(&client()).is_some_and(|c| lock(&c.shared.session).is_some())).await;
 
         // The client, held up, doesn't answer Jetbridge's Logout, so the session stays logging
         // out: it takes the report sent straight away, and its receipt says LoggingOut.
@@ -676,7 +675,7 @@ mod tests {
         let logging_out = async { while sessions.recv().await.unwrap().kind != SessionEventKind::LoggingOut {} };
         timeout(Duration::from_secs(5), logging_out).await.expect("never logging out");
         assert!(outbox.deliver(&client(), report(0)));
-        assert_eq!(outbox.held(CLIENT), 1);
+        assert_eq!(outbox.held(&client()), 1);
         assert!(outbox.push(&client(), report(1)));
         release.send(()).unwrap();
 
@@ -685,7 +684,7 @@ mod tests {
         assert_eq!(next(&mut events).await, Event::LoggedOn);
         assert_eq!(reports(&mut events, 2).await, numbered_reports(2));
         assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
-        until(|| outbox.held(CLIENT) == 0).await;
+        until(|| outbox.held(&client()) == 0).await;
     }
 
     /// Cuts the client's held-up connection, releases Jetbridge's session, and reconnects once

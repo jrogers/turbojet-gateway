@@ -85,7 +85,8 @@ impl Service {
         &self.gateway
     }
 
-    /// The session of the client whose CompID is `comp_id`, connected or not.
+    /// The session of the client whose CompID is `comp_id`, with no SubIDs or LocationIDs,
+    /// connected or not.
     pub fn client_session(&self, comp_id: &str) -> SessionHandle {
         self.acceptor.session(comp_id)
     }

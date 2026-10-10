@@ -720,7 +720,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!((client.as_str(), redelivered), ("FUNDA", true));
+        assert_eq!((client, redelivered), (ClientId::from("FUNDA"), true));
         let expected = OrderRequest { side: Side::Buy, time_in_force: Some(TimeInForce::Ioc), ..request() };
         assert_eq!(parsed, expected);
     }

@@ -3,7 +3,7 @@
 
 use turbojet::fields::CompactString;
 
-use crate::book::{ClientId, OrderRequest, VenueId};
+use crate::book::{OrderRequest, VenueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -15,15 +15,16 @@ pub enum Target {
 /// Matches an order when every condition it sets holds; an unset one matches anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
-    pub client: Option<ClientId>,
+    /// The client's CompID: matches each of its sessions.
+    pub client: Option<CompactString>,
     pub ex_destination: Option<CompactString>,
     pub symbol: Option<CompactString>,
     pub target: Target,
 }
 
 impl Rule {
-    fn matches(&self, client: &str, request: &OrderRequest) -> bool {
-        self.client.as_deref().is_none_or(|c| c == client)
+    fn matches(&self, comp_id: &str, request: &OrderRequest) -> bool {
+        self.client.as_deref().is_none_or(|c| c == comp_id)
             && self.ex_destination.as_deref().is_none_or(|d| request.ex_destination.as_deref() == Some(d))
             && self.symbol.as_deref().is_none_or(|s| s == request.symbol.as_str())
     }
@@ -45,9 +46,9 @@ impl Router {
     }
 
     /// The first rule that matches decides; `None` when none does, which the book rejects as no
-    /// route, telling it apart from a rule's own [`Target::Reject`].
-    pub fn route(&self, client: &str, request: &OrderRequest) -> Option<Target> {
-        self.rules.iter().find(|rule| rule.matches(client, request)).map(|rule| rule.target.clone())
+    /// route, telling it apart from a rule's own [`Target::Reject`]. `comp_id` is the client's CompID.
+    pub fn route(&self, comp_id: &str, request: &OrderRequest) -> Option<Target> {
+        self.rules.iter().find(|rule| rule.matches(comp_id, request)).map(|rule| rule.target.clone())
     }
 }
 

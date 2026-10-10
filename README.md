@@ -75,7 +75,7 @@ reject = "no route for this order"
   file it named then.
 - `[[route]]`, any number, tried in order for each new order; the first that matches decides. A
   route matches when every condition it sets holds, and one it leaves out matches anything:
-  - `client`: the client's CompID (its SenderCompID).
+  - `client`: the client's CompID (its SenderCompID). It matches every session of that CompID.
   - `ex_destination`: the order's ExDestination(100). A route that sets it doesn't match an order
     without one.
   - `symbol`: the order's Symbol(55).
@@ -114,7 +114,8 @@ Jetbridge:
 
 - `[acceptor]` is where clients log on. It's required, and its `begin_string`, `FIX.4.2` or
   `FIX.4.4`, is every client's version. Which CompIDs may log on is turbojet-config's: those listed
-  as `[counterparty.COMPID]`, or any under `unknown = "admit"`. A client is known by its CompID.
+  as `[counterparty.COMPID]`, or any under `unknown = "admit"`. A client is a session: sessions of
+  one CompID with different SubIDs or LocationIDs each have their own ClOrdIDs and reports.
 - Each `[initiator.NAME]` is a venue, and `NAME` is what routes call it. A venue speaks its own
   `begin_string` (the acceptor's by default), `FIX.4.2` or `FIX.4.4`, and logs on as the
   acceptor's `sender_comp_id` unless it sets its own. A venue with another version stops the
