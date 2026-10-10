@@ -64,6 +64,7 @@ mod tests {
             qty: Decimal::from(100),
             price: Some(Decimal::from(10)),
             ex_destination: ex_destination.map(Into::into),
+            time_in_force: None,
         }
     }
 

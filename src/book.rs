@@ -44,6 +44,15 @@ pub struct OrderRequest {
     pub qty: Decimal,
     pub price: Option<Decimal>,
     pub ex_destination: Option<CompactString>,
+    pub time_in_force: Option<TimeInForce>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeInForce {
+    Day,
+    Gtc,
+    Ioc,
+    Fok,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,12 +64,13 @@ pub enum Status {
     PendingCancel,
     PendingReplace,
     Canceled,
+    Expired,
     Rejected,
 }
 
 impl Status {
     fn is_done(self) -> bool {
-        matches!(self, Self::Filled | Self::Canceled | Self::Rejected)
+        matches!(self, Self::Filled | Self::Canceled | Self::Expired | Self::Rejected)
     }
 }
 
@@ -92,7 +102,7 @@ pub struct Order {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VenueReport {
     /// The downstream ClOrdID it answers.
-    pub cl_ord_id: CompactString,
+    pub downstream: CompactString,
     pub status: Status,
     pub last_qty: Decimal,
     pub last_px: Decimal,
@@ -120,7 +130,7 @@ pub enum Input {
     },
     VenueCancelReject {
         venue: VenueId,
-        cl_ord_id: CompactString,
+        downstream: CompactString,
         text: Option<CompactString>,
     },
 }
@@ -143,6 +153,22 @@ pub struct ClientReport {
     pub text: Option<CompactString>,
 }
 
+/// What an OrderCancelReject answers: ResponseTo(434).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelKind {
+    Cancel,
+    Replace,
+}
+
+/// CxlRejReason(102): 0, 1, 6 and 99; the FIX side maps it per version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelRejectReason {
+    TooLate,
+    UnknownOrder,
+    Duplicate,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
     Report {
@@ -154,17 +180,21 @@ pub enum Output {
         order_id: Option<OrderId>,
         cl_ord_id: CompactString,
         orig_cl_ord_id: CompactString,
+        response_to: CancelKind,
+        /// The order's status, `Rejected` when there is no order.
+        status: Status,
+        reason: CancelRejectReason,
         text: CompactString,
     },
     NewOrder {
         venue: VenueId,
-        cl_ord_id: CompactString,
+        downstream: CompactString,
         request: OrderRequest,
     },
     Cancel {
         venue: VenueId,
-        cl_ord_id: CompactString,
-        orig_cl_ord_id: CompactString,
+        downstream: CompactString,
+        orig_downstream: CompactString,
         request: OrderRequest,
     },
 }
