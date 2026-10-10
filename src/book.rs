@@ -465,7 +465,9 @@ impl Book {
         self.check();
     }
 
-    /// The book's invariants, after every input. Walks the whole book, so debug builds only.
+    /// The book's invariants, after every input. It walks every order and request sent, so a
+    /// debug build slows as the book grows, O(book) per message: don't load-test one. Release
+    /// builds leave it out.
     #[cfg(debug_assertions)]
     fn check(&self) {
         for (id, order) in &self.orders {
