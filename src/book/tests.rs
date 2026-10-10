@@ -1925,8 +1925,20 @@ fn cancels(out: &[Output]) -> Vec<&str> {
         .collect()
 }
 
-fn gateway_cancel(tries: u32, stuck: bool) -> GatewayCancel {
-    GatewayCancel { tries, stuck }
+/// What `cancelling` says, as (order, tries, unsent, stuck).
+fn cancelling(book: &Book) -> Vec<(u64, u32, bool, bool)> {
+    book.cancelling().into_iter().map(|(id, gateway)| (id.0, gateway.tries, gateway.unsent, gateway.stuck)).collect()
+}
+
+fn cancel_reject_because(downstream: &str, status: Status, reason: u32) -> Input {
+    let mut input = venue_cancel_reject("NASDAQ", downstream, status);
+    let Input::VenueCancelReject { reason: why, .. } = &mut input else { unreachable!() };
+    *why = Some(reason);
+    input
+}
+
+fn venue_up(venue: &str) -> Input {
+    Input::VenueUp { venue: venue.into() }
 }
 
 #[test]
@@ -1940,12 +1952,20 @@ fn cancel_all_covers_its_scope_only() {
     // The first is already being cancelled.
     assert_eq!(cancels(&cancel_all(&mut book, Scope::CompId("FUNDA".into()))), ["2-1"]);
     assert_eq!(cancels(&cancel_all(&mut book, Scope::All)), ["3-1"]);
-    let all = (1..=3).map(|id| (OrderId(id), gateway_cancel(1, false))).collect::<Vec<_>>();
-    assert_eq!(book.cancelling(), all);
+    assert_eq!(cancelling(&book), [(1, 1, false, false), (2, 1, false, false), (3, 1, false, false)]);
 }
 
 #[test]
-fn cancel_all_skips_done_orders_and_client_cancels_but_not_replaces() {
+fn cancel_all_again_leaves_a_cancel_in_flight_alone() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    cancel_all(&mut book, Scope::All);
+    assert!(cancel_all(&mut book, Scope::All).is_empty());
+    assert_eq!(cancelling(&book), [(1, 1, false, false)]);
+}
+
+#[test]
+fn cancel_all_skips_done_orders_and_waits_out_client_cancels_but_not_replaces() {
     let mut book = book();
     for cl_ord_id in ["C1", "C2", "C3", "C4"] {
         new_order(&mut book, cl_ord_id);
@@ -1958,6 +1978,31 @@ fn cancel_all_skips_done_orders_and_client_cancels_but_not_replaces() {
     // The replace isn't accepted: the venue knows the order by its original.
     let Output::Cancel { orig_downstream, request: sent, .. } = &out[1] else { unreachable!() };
     assert_eq!((orig_downstream.as_str(), sent), ("4", &request("C4")));
+    // The client's cancel may do it; the gateway's waits.
+    assert_eq!(cancelling(&book), [(2, 0, true, false), (3, 1, false, false), (4, 1, false, false)]);
+}
+
+#[test]
+fn a_gateway_cancel_waiting_on_a_client_cancel_goes_when_the_venue_refuses_that() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    cancel(&mut book, "C2", "C1");
+    assert!(cancel_all(&mut book, Scope::All).is_empty());
+    let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
+    let [Output::CancelReject { .. }, Output::Cancel { downstream, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(downstream, "1-2");
+    assert_eq!(cancelling(&book), [(1, 1, false, false)]);
+}
+
+#[test]
+fn a_gateway_cancel_waiting_on_a_client_cancel_that_failed_to_send_goes_when_the_venue_logs_on() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    cancel(&mut book, "C2", "C1");
+    cancel_all(&mut book, Scope::All);
+    let out = run(&mut book, send_failed("1-1"));
+    assert!(matches!(out.as_slice(), [Output::CancelReject { .. }]), "{out:?}");
+    assert_eq!(cancels(&run(&mut book, venue_up("NASDAQ"))), ["1-2"]);
 }
 
 #[test]
@@ -1977,6 +2022,31 @@ fn the_venues_cancel_reaches_the_client_unsolicited_under_its_current_cl_ord_id(
 }
 
 #[test]
+fn a_canceled_under_the_orders_own_downstream_ends_a_gateway_cancel() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    cancel_all(&mut book, Scope::All);
+    let out = run(&mut book, venue_report("1", Status::Canceled, 0, 0));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.cl_ord_id.as_str(), report.exec_type), ("C1", ExecType::Canceled));
+    assert!(book.cancelling().is_empty());
+    assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::Canceled)).is_empty());
+}
+
+#[test]
+fn only_fills_and_the_end_under_a_gateway_cancel_reach_the_client() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    cancel_all(&mut book, Scope::All);
+    // The client never asked; after a refusal it would be left showing PendingCancel.
+    assert!(run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 0)).is_empty());
+    let out = run(&mut book, venue_report("1-1", Status::PendingCancel, 40, 40));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.cl_ord_id.as_str(), report.exec_type, report.last_qty), ("C1", ExecType::Trade, 40.into()));
+}
+
+#[test]
 fn a_refused_gateway_cancel_is_retried_until_stuck_and_never_reaches_the_client() {
     let mut book = book();
     new_order(&mut book, "C1");
@@ -1987,20 +2057,13 @@ fn a_refused_gateway_cancel_is_retried_until_stuck_and_never_reaches_the_client(
     let rejected = venue_report_as("1-2", ExecType::Rejected, Status::New, 0, 0);
     assert_eq!(cancels(&run(&mut book, rejected)), ["1-3"]);
     assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-3", Status::New)).is_empty());
-    assert_eq!(book.cancelling(), [(OrderId(1), gateway_cancel(MAX_GATEWAY_CANCEL_TRIES, true))]);
+    assert_eq!(cancelling(&book), [(1, MAX_GATEWAY_CANCEL_TRIES, false, true)]);
     // Stuck, the gateway stands aside for the client's own cancel.
     assert_eq!(cancels(&cancel(&mut book, "C2", "C1")), ["1-4"]);
     // An operator asking again gets another round.
     run(&mut book, venue_cancel_reject("NASDAQ", "1-4", Status::New));
     assert_eq!(cancels(&cancel_all(&mut book, Scope::All)), ["1-5"]);
-    assert_eq!(book.cancelling(), [(OrderId(1), gateway_cancel(1, false))]);
-}
-
-fn cancel_reject_because(downstream: &str, status: Status, reason: u32) -> Input {
-    let mut input = venue_cancel_reject("NASDAQ", downstream, status);
-    let Input::VenueCancelReject { reason: why, .. } = &mut input else { unreachable!() };
-    *why = Some(reason);
-    input
+    assert_eq!(cancelling(&book), [(1, 1, false, false)]);
 }
 
 #[test]
@@ -2013,42 +2076,51 @@ fn too_late_or_unknown_ends_the_gateway_cancel_without_a_retry() {
     assert!(run(&mut book, cancel_reject_because("1-1", Status::Filled, 0)).is_empty());
     // Unknown to the venue but live here: stuck, for someone to look at.
     assert!(run(&mut book, cancel_reject_because("2-1", Status::New, 1)).is_empty());
-    assert_eq!(book.cancelling(), [(OrderId(2), gateway_cancel(1, true))]);
+    assert_eq!(cancelling(&book), [(2, 1, false, true)]);
 }
 
 #[test]
-fn a_gateway_cancel_that_failed_to_send_goes_when_the_venue_logs_on() {
+fn unknown_after_a_replace_was_accepted_meanwhile_is_retried_against_it() {
     let mut book = book();
     new_order(&mut book, "C1");
-    let up = |venue: &str| Input::VenueUp { venue: venue.into() };
-    let failed = |downstream: &str| Input::SendFailed {
-        venue: "NASDAQ".into(),
-        downstream: downstream.into(),
-        text: "not connected".into(),
-    };
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    replace(&mut book, "C2", "C1", 50, 10);
     cancel_all(&mut book, Scope::All);
-    assert!(run(&mut book, failed("1-1")).is_empty());
-    assert_eq!(book.cancelling(), [(OrderId(1), gateway_cancel(1, false))]);
-    assert!(run(&mut book, up("LSE")).is_empty());
-    assert_eq!(cancels(&run(&mut book, up("NASDAQ"))), ["1-2"]);
-    assert!(run(&mut book, up("NASDAQ")).is_empty(), "one in flight");
-    run(&mut book, failed("1-2"));
-    assert_eq!(cancels(&run(&mut book, up("NASDAQ"))), ["1-3"]);
-    run(&mut book, failed("1-3"));
-    assert!(run(&mut book, up("NASDAQ")).is_empty());
-    assert_eq!(book.cancelling(), [(OrderId(1), gateway_cancel(MAX_GATEWAY_CANCEL_TRIES, true))]);
+    run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    // The cancel named "1", which the replace superseded.
+    let out = run(&mut book, cancel_reject_because("1-2", Status::New, 1));
+    let [Output::Cancel { downstream, orig_downstream, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((downstream.as_str(), orig_downstream.as_str()), ("1-3", "1-1"));
+    assert_eq!(cancelling(&book), [(1, 2, false, false)]);
 }
 
 #[test]
-fn a_client_cancel_during_a_gateway_cancel_is_refused_as_pending() {
+fn a_flapping_venue_never_uses_up_the_gateways_tries() {
     let mut book = book();
     new_order(&mut book, "C1");
     cancel_all(&mut book, Scope::All);
-    let out = cancel(&mut book, "C2", "C1");
-    assert_eq!(
-        cancel_reject(&out),
-        (Some("1"), CancelKind::Cancel, Status::PendingNew, CancelRejectReason::AlreadyPending)
-    );
+    assert!(run(&mut book, send_failed("1-1")).is_empty());
+    assert_eq!(cancelling(&book), [(1, 0, true, false)]);
+    assert!(run(&mut book, venue_up("LSE")).is_empty());
+    for n in 2..=MAX_GATEWAY_CANCEL_TRIES + 2 {
+        let downstream = format!("1-{n}");
+        assert_eq!(cancels(&run(&mut book, venue_up("NASDAQ"))), [downstream.as_str()]);
+        assert!(run(&mut book, venue_up("NASDAQ")).is_empty(), "one in flight");
+        assert_eq!(cancelling(&book), [(1, 1, false, false)]);
+        run(&mut book, send_failed(&downstream));
+    }
+    assert_eq!(cancelling(&book), [(1, 0, true, false)]);
+}
+
+#[test]
+fn client_requests_during_a_gateway_cancel_are_refused_as_pending() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    cancel_all(&mut book, Scope::All);
+    let pending = (Some("1"), CancelKind::Cancel, Status::PendingNew, CancelRejectReason::AlreadyPending);
+    assert_eq!(cancel_reject(&cancel(&mut book, "C2", "C1")), pending);
+    let pending = (Some("1"), CancelKind::Replace, Status::PendingNew, CancelRejectReason::AlreadyPending);
+    assert_eq!(cancel_reject(&replace(&mut book, "C3", "C1", 50, 10)), pending);
 }
 
 #[test]
