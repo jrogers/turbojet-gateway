@@ -57,10 +57,9 @@ fn restored(book: &Book) -> Book {
     restored.amend_reserve = book.amend_reserve;
     restored.set_prefix(book.prefix.clone());
     restored.restore(book.mirror.clone());
-    // A restart numbers orders and rejects afresh under a new prefix; this one keeps the live
-    // book's prefix and numbering, so their answers compare.
-    assert!(restored.next_id <= book.next_id);
-    restored.next_id = book.next_id;
+    // A restart numbers rejects afresh under a new prefix; this one keeps the live book's prefix
+    // and count, so their answers compare. OrderIds carry on from the snapshot.
+    assert_eq!(restored.next_id, book.next_id);
     restored.rejects = book.rejects;
     restored
 }
@@ -2903,6 +2902,41 @@ fn changes_taken_across_a_roll_restore_the_same_book() {
     assert_eq!(restored.snapshot(), book.snapshot());
     assert_eq!(restored.used, book.used);
     assert_eq!(restored.next_id, book.next_id);
+}
+
+/// A restart, each with a new prefix as the gateway's, from every change taken so far.
+fn restart(snapshot: &mut Snapshot, book: &mut Book, prefix: &str) -> Book {
+    snapshot.apply(book.take_changes());
+    let mut restarted = Book::new(book.router.clone());
+    restarted.set_prefix(prefix.into());
+    restarted.restore(snapshot.clone());
+    restarted
+}
+
+/// A new order after a restart never takes the OrderId of one dropped at a roll before it, whose
+/// requests and ClOrdIDs the store still has: the next restart would give them to the new order.
+#[test]
+fn a_restart_numbers_orders_past_those_dropped_at_a_roll() {
+    let mut book = book();
+    let mut snapshot = Snapshot::default();
+    let handle = |book: &mut Book, input| {
+        let mut out = Vec::new();
+        book.handle(input, &mut out);
+        out
+    };
+    handle(&mut book, day_started("FUNDA", day(1)));
+    handle(&mut book, order_from(&"FUNDA".into(), "C1"));
+    handle(&mut book, order_from(&"FUNDA".into(), "C2"));
+    handle(&mut book, venue_report("2", Status::Filled, 100, 100));
+    handle(&mut book, day_started("FUNDA", day(2)));
+    let mut book = restart(&mut snapshot, &mut book, "B");
+    let out = handle(&mut book, order_from(&"FUNDB".into(), "C1"));
+    assert!(matches!(out.as_slice(), [Output::NewOrder { downstream, .. }] if downstream == "B3"), "{out:?}");
+    let mut book = restart(&mut snapshot, &mut book, "C");
+    assert_eq!(book.order(OrderId(3)).unwrap().client, ClientId::from("FUNDB"));
+    let out = handle(&mut book, cancel_input("C3", "C2"));
+    assert_eq!(cancel_reject(&out).3, CancelRejectReason::UnknownOrder);
+    assert_eq!(book.next_id, 4);
 }
 
 /// A done order from before its session's first day stays until the session's first roll.

@@ -57,13 +57,20 @@ pub struct Snapshot {
     pub blocked: Vec<Scope>,
     pub references: HashMap<CompactString, Decimal>,
     pub filled: HashMap<ClientId, Decimal>,
+    /// Past every OrderId the store has had, its history too: `MAX(id) + 1` over every order
+    /// row, not just those restored. OrderIds key the orders, requests sent and ClOrdIDs, so a
+    /// new order taking a dropped one's would inherit its rows at the next restart.
+    pub next_order_id: u64,
 }
 
 impl Snapshot {
     /// Writes `changes` over the records, as the store does.
     pub fn apply(&mut self, changes: Changes) {
         let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled } = changes;
-        self.orders.extend(orders.into_iter().map(|row| (row.order.id, row)));
+        for row in orders {
+            self.next_order_id = self.next_order_id.max(row.order.id.0 + 1);
+            self.orders.insert(row.order.id, row);
+        }
         self.sent.extend(sent);
         self.cl_ord_ids.extend(cl_ord_ids.into_iter().map(|row| ((row.client, row.day, row.cl_ord_id), row.order)));
         self.days.extend(days);
@@ -146,7 +153,10 @@ impl Book {
     /// live orders is worked out again from them.
     pub fn restore(&mut self, snapshot: Snapshot) {
         assert!(self.orders.is_empty() && self.next_id == 1 && self.days.is_empty(), "restore fills a new book");
-        let Snapshot { orders, sent, cl_ord_ids, days, blocked, references, filled } = snapshot;
+        let Snapshot { orders, sent, cl_ord_ids, days, blocked, references, filled, next_order_id } = snapshot;
+        for id in orders.keys() {
+            assert!(id.0 < next_order_id, "the snapshot's next OrderId is past {id:?}");
+        }
         self.days = days;
         let held: HashMap<OrderId, Order> = orders
             .into_values()
@@ -166,8 +176,7 @@ impl Book {
         for (id, order) in &self.orders {
             self.risk.track(*id, order.exposure());
         }
-        // Past every restored order, so a new one doesn't take an OrderId in use.
-        self.next_id = self.orders.keys().map(|id| id.0 + 1).max().unwrap_or(1);
+        self.next_id = next_order_id.max(1);
         self.touched = Touched::default();
         #[cfg(debug_assertions)]
         self.check();
@@ -193,6 +202,7 @@ impl Book {
             blocked: self.blocked.clone(),
             references: self.risk.references().clone(),
             filled: self.risk.filled_by_client().collect(),
+            next_order_id: self.next_id,
         }
     }
 }
