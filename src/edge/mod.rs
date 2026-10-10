@@ -215,6 +215,28 @@ impl Gateway {
         self.lock().book.cancels_settled()
     }
 
+    /// At shutdown, the clients gone: cancels the working orders of each client session whose
+    /// CompID `on` says has cancel on disconnect, whatever its trigger, without a block, as
+    /// [`ClientApp::on_cancel_on_disconnect`] does. Turbojet starts no countdown for a session our
+    /// side ends, and these orders would otherwise stay working with no gateway to report to.
+    /// Counted and cancelled under one lock; logged as one warning.
+    pub fn cancel_at_shutdown(self: &Arc<Self>, on: impl Fn(&str) -> bool) {
+        let sessions: Vec<ClientId> = {
+            let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+            clients.iter().filter(|(id, _)| on(&id.target_comp_id)).map(|(_, client)| client.clone()).collect()
+        };
+        let mut state = self.lock();
+        let working = state.book.working_by_client();
+        let orders: BTreeMap<ClientId, usize> =
+            sessions.into_iter().filter_map(|client| Some((client.clone(), *working.get(&client)?))).collect();
+        if orders.is_empty() {
+            return;
+        }
+        warn!(?orders, "shutting down: cancelling the orders of clients with cancel on disconnect");
+        let inputs = orders.into_keys().map(|client| Input::CancelAll { scope: Scope::Session(client) });
+        self.handle_locked(&mut state, inputs);
+    }
+
     /// Routes and checks new orders by `router` and `limits` from now on, both changed under one
     /// lock so no order sees one without the other.
     pub fn set_config(&self, router: Router, limits: risk::Config) {
@@ -270,10 +292,13 @@ impl Gateway {
 
     /// As [`handle`](Self::handle), each of `inputs` in turn under one lock.
     fn handle_all(self: &Arc<Self>, inputs: impl IntoIterator<Item = Input>) {
-        let mut state = self.lock();
+        self.handle_locked(&mut self.lock(), inputs);
+    }
+
+    /// As [`handle_all`](Self::handle_all), under the lock held as `state`.
+    fn handle_locked(self: &Arc<Self>, state: &mut State, inputs: impl IntoIterator<Item = Input>) {
         // After the lock, so TransactTimes rise in the order the book answers.
         let now = UtcTimestamp::from(self.clock.now());
-        let state = &mut *state;
         let mut inputs = VecDeque::from_iter(inputs);
         let mut outputs = Vec::new();
         while let Some(input) = inputs.pop_front() {

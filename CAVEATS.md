@@ -83,7 +83,10 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   error logged, and the client is logged out; later ones are dropped and counted until its queue
   empties.
 - Cancel on disconnect countdowns still pending when the gateway shuts down fire then, with the
-  clients logged out; the shutdown's own Logouts don't start any. Before logging the venues
+  clients logged out; the shutdown's own Logouts don't start any. Instead the gateway cancels the
+  working orders of every client session whose CompID has cancel on disconnect on, whatever its
+  trigger (a `disconnect` client's too), as the sessions file in use says now, not as it was at the
+  client's logon; other clients' orders stay working at their venues. Before logging the venues
   out, shutdown waits up to 5 s for them to answer all the gateway's cancels (the kill switch's
   too), and the clients don't receive those Canceled reports. A venue that's down with cancels
   waiting for it costs the full 5 s. A process that stops without shutting down loses its countdowns, as it

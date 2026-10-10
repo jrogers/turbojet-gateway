@@ -4,7 +4,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpListener;
@@ -14,7 +14,7 @@ use turbojet::{Acceptor, SessionHandle, SessionId};
 use turbojet_config::{Initiators, SessionsFile};
 
 use crate::book;
-use crate::config::{self, Error};
+use crate::config::{self, CancelOnDisconnect, Error};
 use crate::edge::{CANCEL_RETRY_INTERVAL, ClientApp, Gateway, VenueApp};
 use crate::fix::Version;
 
@@ -33,6 +33,9 @@ pub struct Service {
     path: PathBuf,
     gateway: Arc<Gateway>,
     sessions: SessionsFile,
+    sessions_path: PathBuf,
+    /// The sessions file's in use, reread when it reloads.
+    cancel_on_disconnect: Mutex<CancelOnDisconnect>,
     acceptor: Acceptor,
     initiators: Initiators,
     local_addr: SocketAddr,
@@ -71,7 +74,17 @@ impl Service {
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let retrying = tokio::spawn(gateway.clone().retry_cancels(CANCEL_RETRY_INTERVAL));
-        let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr, retrying };
+        let service = Self {
+            path: path.to_path_buf(),
+            gateway,
+            sessions,
+            sessions_path: loaded.sessions_path,
+            cancel_on_disconnect: Mutex::new(loaded.cancel_on_disconnect),
+            acceptor,
+            initiators,
+            local_addr,
+            retrying,
+        };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
         let serving = match service.check_versions().and_then(|()| service.serve(listener)) {
@@ -117,7 +130,12 @@ impl Service {
     /// both files at once can be routed to.
     pub fn reload(&self) {
         match self.sessions.reload_all(Some(&self.acceptor), &self.initiators) {
-            Ok(changes) => info!(
+            Ok(changes) => {
+                match CancelOnDisconnect::read(&self.sessions_path) {
+                    Ok(read) => *self.cancel_on_disconnect.lock().unwrap_or_else(PoisonError::into_inner) = read,
+                    Err(e) => warn!("keeping the clients' cancel on disconnect for shutdown as it was: {e}"),
+                }
+                info!(
                 added = ?changes.added,
                 changed = ?changes.changed,
                 removed = ?changes.removed,
@@ -125,8 +143,9 @@ impl Service {
                 started = ?changes.started,
                 reconfigured = ?changes.reconfigured,
                 stopped = ?changes.stopped,
-                "reloaded the sessions file"
-            ),
+                    "reloaded the sessions file"
+                );
+            }
             Err(e) => warn!("keeping the sessions file in use: {e}"),
         }
         let venues = self.set_venues();
@@ -143,11 +162,15 @@ impl Service {
         }
     }
 
-    /// Logs the clients' sessions out, waits for the venues to answer the gateway's cancels
-    /// (cancel on disconnect fires as the clients go), logs the venues' sessions out, returning
-    /// once all have closed, then logs what the stop loses.
+    /// Logs the clients' sessions out, cancels the working orders of those with cancel on
+    /// disconnect (pending countdowns fire as the clients go; the shutdown's own Logouts start
+    /// none), waits for the venues to answer the gateway's cancels, logs the venues' sessions out,
+    /// returning once all have closed, then logs what the stop loses.
     pub async fn shutdown(&self) {
         self.acceptor.shutdown(Some(SHUTTING_DOWN)).await;
+        let cancel_on_disconnect = self.cancel_on_disconnect.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let unknown = self.sessions.unknown();
+        self.gateway.cancel_at_shutdown(|comp_id| cancel_on_disconnect.is_on(comp_id, unknown));
         // The retry tick keeps running meanwhile, so cancels a venue's session couldn't take go.
         let settled = async {
             // ponytail: polled; a notify from the book if shutdown latency ever matters.

@@ -159,6 +159,10 @@ cancels its live orders at their venues, as `cancel_all` does for one session bu
 block: the client may log back on and trade. Each cancel is logged as a warning. The client gets
 an unsolicited Canceled report for each order as its venue confirms it, when it next logs on.
 
+At shutdown the gateway logs its clients out, which starts no countdown, so it cancels the working
+orders of every client session with cancel on disconnect on itself, whatever the trigger, logged
+as one warning with the count per session. Other clients' orders stay working at their venues.
+
 ## Signals
 
 - **SIGHUP** (Unix) reloads. The sessions file first, as turbojet-config reloads it: changed
@@ -168,7 +172,8 @@ an unsolicited Canceled report for each order as its venue confirms it, when it 
   sessions as they were, and a bad routes file keeps the routes. New routes apply to new orders;
   orders already working stay with their venue.
 - **Ctrl-C or SIGTERM** logs every client out ("gateway shutting down"), which fires any
-  cancel-on-disconnect countdowns under way; waits up to 5 seconds for the venues to answer the
+  cancel-on-disconnect countdowns under way, and cancels the working orders of clients with cancel
+  on disconnect (see above); waits up to 5 seconds for the venues to answer the
   gateway's cancels; then logs every venue out and exits once they've closed. A second signal
   exits at once. On the way out it logs how many orders are still
   open at each venue and how many reports weren't delivered to each client. Both are lost: the open

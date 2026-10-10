@@ -825,6 +825,36 @@ async fn shutdown_sends_pending_cancels_before_logging_the_venues_out() {
     assert_eq!(unfinished.undelivered.values().sum::<usize>(), 1);
 }
 
+/// Shutdown's own Logouts start no countdown, so the gateway cancels the working orders of a
+/// connected client with cancel on disconnect itself, before logging the venue out.
+#[tokio::test]
+async fn shutdown_cancels_the_orders_of_a_connected_client_with_cancel_on_disconnect() {
+    let mut setup =
+        Setup::with(Options { cancel_on_disconnect: Some(("disconnect", LONG_GRACE)), ..Options::default() }).await;
+    setup.working_order().await;
+    let order = setup.id("1");
+    let shutdown = setup.service.shutdown();
+    let answering = async {
+        let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
+        assert_eq!(sent.orig_cl_ord_id.as_str(), order);
+        setup.venue.send(canceled(&sent.cl_ord_id, &sent.orig_cl_ord_id));
+        setup.venue.events.logged_out().await;
+    };
+    timeout(WAIT, async { tokio::join!(shutdown, answering) }).await.expect("shutdown hung");
+    let unfinished = setup.service.gateway().unfinished();
+    assert!(unfinished.open_orders.is_empty() && unfinished.cancelling.is_empty(), "{unfinished:?}");
+}
+
+/// A client without cancel on disconnect keeps its order working at the venue.
+#[tokio::test]
+async fn shutdown_leaves_the_orders_of_a_client_without_cancel_on_disconnect() {
+    let mut setup = Setup::new().await;
+    setup.working_order().await;
+    timeout(WAIT, setup.service.shutdown()).await.expect("shutdown hung");
+    setup.venue.events.logged_out().await;
+    assert_eq!(setup.service.gateway().unfinished().open_orders.len(), 1);
+}
+
 #[tokio::test]
 async fn shutting_down_logs_the_client_and_the_venue_out() {
     let mut setup = Setup::new().await;

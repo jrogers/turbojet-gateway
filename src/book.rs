@@ -587,6 +587,15 @@ impl Book {
         open
     }
 
+    /// Orders not done and not being cancelled by the gateway already, per client holding any.
+    pub fn working_by_client(&self) -> BTreeMap<ClientId, usize> {
+        let mut working = BTreeMap::new();
+        for order in self.orders.values().filter(|order| !order.status.is_done() && order.gateway_cancel.is_none()) {
+            *working.entry(order.client.clone()).or_default() += 1;
+        }
+        working
+    }
+
     pub fn order(&self, id: OrderId) -> Option<&Order> {
         self.orders.get(&id)
     }
