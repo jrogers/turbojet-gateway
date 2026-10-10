@@ -299,9 +299,11 @@ impl Book {
         if order.venue != *venue {
             return tracing::warn!(%venue, downstream = %report.downstream, "execution report for another venue's order");
         }
-        // Fills are known by LastQty, not status: a fill on an order pending cancel says PendingCancel.
-        if report.last_qty > Decimal::ZERO && report.cum_qty <= order.cum_qty {
-            return tracing::debug!(%venue, downstream = %report.downstream, "resent fill dropped");
+        if stale(order, &report) {
+            return tracing::debug!(%venue, downstream = %report.downstream, "stale execution report dropped");
+        }
+        if report.cum_qty > order.request.qty {
+            return tracing::warn!(%venue, downstream = %report.downstream, cum_qty = %report.cum_qty, "overfill");
         }
         let orig_cl_ord_id = (cl_ord_id != order.request.cl_ord_id).then(|| order.request.cl_ord_id.clone());
         order.status = report.status;
@@ -345,6 +347,15 @@ impl Order {
     fn leaves_qty(&self) -> Decimal {
         if self.status.is_done() { Decimal::ZERO } else { self.request.qty - self.cum_qty }
     }
+}
+
+/// A report the book has already moved past, such as a venue resend after a reconnect: applying it
+/// would roll the order back. Done is final (busts and corrections come later). Fills are known by
+/// LastQty, not status, since a fill on an order pending cancel says PendingCancel.
+fn stale(order: &Order, report: &VenueReport) -> bool {
+    order.status.is_done()
+        || report.cum_qty < order.cum_qty
+        || (report.last_qty > Decimal::ZERO && report.cum_qty == order.cum_qty)
 }
 
 fn reject(client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
@@ -515,7 +526,59 @@ mod tests {
         assert_eq!((client.as_str(), report.cl_ord_id.as_str()), ("FUNDA", "C1"));
         assert_eq!((report.last_qty, report.cum_qty, report.leaves_qty), (40.into(), 40.into(), 60.into()));
         assert_eq!(report.kind, ReportKind::Event);
-        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PartiallyFilled);
+        assert_eq!((report.last_px, report.avg_px, &report.orig_cl_ord_id), (10.into(), 10.into(), &None));
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, order.cum_qty, order.avg_px), (Status::PartiallyFilled, 40.into(), 10.into()));
+    }
+
+    #[test]
+    fn a_resent_ack_after_a_fill_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        assert!(run(&mut book, venue_report("1", Status::New, 0, 0)).is_empty());
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, order.cum_qty), (Status::PartiallyFilled, 40.into()));
+    }
+
+    #[test]
+    fn a_done_order_takes_no_more_reports() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::Filled, 100, 100));
+        assert!(run(&mut book, venue_report("1", Status::New, 0, 0)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Filled);
+    }
+
+    #[test]
+    fn an_older_fill_after_a_newer_one_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        run(&mut book, venue_report("1", Status::Filled, 60, 100));
+        assert!(run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40)).is_empty());
+        let order = book.order(OrderId(1)).unwrap();
+        assert_eq!((order.status, order.cum_qty), (Status::Filled, 100.into()));
+    }
+
+    #[test]
+    fn a_report_without_a_fill_at_the_same_cum_qty_is_forwarded() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        let out = run(&mut book, venue_report("1", Status::PendingCancel, 0, 40));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.status, report.cum_qty), (Status::PendingCancel, 40.into()));
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingCancel);
+    }
+
+    #[test]
+    fn an_overfill_is_refused() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let before = book.order(OrderId(1)).unwrap().clone();
+        assert!(run(&mut book, venue_report("1", Status::Filled, 150, 150)).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap(), &before);
     }
 
     #[test]
@@ -539,5 +602,6 @@ mod tests {
         new_order(&mut book, "C1");
         let Input::VenueReport { report, .. } = venue_report("1", Status::New, 0, 0) else { unreachable!() };
         assert!(run(&mut book, Input::VenueReport { venue: "LSE".into(), report }).is_empty());
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingNew);
     }
 }
