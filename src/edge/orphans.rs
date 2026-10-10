@@ -32,7 +32,7 @@ use turbojet::codec::{self, Decoded};
 use turbojet::fields::{CompactString, UtcTimestamp, format_compact};
 use turbojet::message::tags;
 use turbojet::store::{Fetched, Opened, SentMessages, SessionLog};
-use turbojet::{Message, MsgType, SessionId, SessionStorage};
+use turbojet::{Message, MsgType, Receipt, SessionId, SessionStorage};
 
 use super::Gateway;
 use crate::book::{Changes, ClientId, Input, OrdType, OrphanedReplace, VenueId};
@@ -209,9 +209,10 @@ impl Gateway {
     }
 
     /// Sends the cancels of `venue`'s orphaned orders, its session having logged on, recording
-    /// each order's requests once its session has taken the cancel. One it refuses waits for the
-    /// next logon; one it takes isn't watched further.
-    pub(super) fn send_orphan_cancels(&self, venue: &VenueId) {
+    /// each order's requests once its session has stored the cancel: until then a stop leaves the
+    /// orphan to be found again. One the session refuses, or drops unsent, waits for the next
+    /// logon.
+    pub(super) fn send_orphan_cancels(self: &Arc<Self>, venue: &VenueId) {
         let mut state = self.lock();
         let Some(cancels) = state.orphan_cancels.remove(venue) else { return };
         let Some(to) = state.venues.get(venue) else {
@@ -223,9 +224,9 @@ impl Gateway {
         for orphan in cancels {
             let cl_ord_id = orphan.cancel.get(tags::CL_ORD_ID);
             match to.session.send(orphan.cancel.clone().with(tags::TRANSACT_TIME, now)) {
-                Ok(_) => {
+                Ok(receipt) => {
                     info!(%venue, cl_ord_id, chain = ?orphan.chain, "sent the cancel of an orphaned order");
-                    self.record_orphans(orphan.chain);
+                    self.settle_orphan_cancel(receipt, venue.clone(), orphan);
                 }
                 Err(e) => {
                     error!(%venue, cl_ord_id, "cancel of an orphaned order not sent; again at the next logon: {e}");
@@ -236,6 +237,26 @@ impl Gateway {
         if !unsent.is_empty() {
             state.orphan_cancels.insert(venue.clone(), unsent);
         }
+    }
+
+    /// Records `orphan`'s order once the venue's session has stored its cancel, or queues the
+    /// cancel again for the next logon if the session drops it (or may not have stored it: a
+    /// second cancel under the same ClOrdID is at worst refused as a duplicate). A drop racing
+    /// the next logon waits for the one after.
+    ///
+    /// ponytail: one task per orphan's cancel, a handful at a start.
+    fn settle_orphan_cancel(self: &Arc<Self>, receipt: Receipt, venue: VenueId, orphan: OrphanCancel) {
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            match receipt.await {
+                Ok(_) => gateway.record_orphans(orphan.chain),
+                Err(dropped) => {
+                    let cl_ord_id = orphan.cancel.get(tags::CL_ORD_ID);
+                    error!(%venue, cl_ord_id, "cancel of an orphaned order dropped unsent; again at the next logon: {dropped}");
+                    gateway.lock().orphan_cancels.entry(venue).or_default().push(orphan);
+                }
+            }
+        });
     }
 
     /// Whether `input` from `venue` is about an orphaned order or its cancel: logged at error

@@ -1955,7 +1955,8 @@ mod tests {
 
     /// Sessions the database had that must keep their identity (here, by a block of their own)
     /// count toward their CompID's [`MAX_SESSIONS_PER_COMP_ID`] before they log on, and one
-    /// logging on is the client it was, counted once; a session with only a day doesn't count.
+    /// logging on is the client it was, counted once; a session with only a day, or only done
+    /// orders, doesn't count.
     #[tokio::test]
     async fn restored_clients_count_toward_their_comp_ids_sessions() {
         let store = Store::open("sqlite::memory:").await.unwrap();
@@ -1968,11 +1969,19 @@ mod tests {
             ..Default::default()
         };
         store.write(&[changes]).await.unwrap();
+        // DONE's only order is done (rejected, no venue), and its report delivered.
+        let before = restarted(&store, "OLDOLD").await;
+        ClientApp(before.clone()).on_message(&mut Context::new(&desk("DONE")), &order("D1")).unwrap();
+        before.committed().await;
+        let rows = store.load().await.unwrap().undelivered.into_keys().collect();
+        store.write(&[crate::book::Changes { delivered: rows, ..Default::default() }]).await.unwrap();
+        assert!(!store.load().await.unwrap().orders.is_empty());
+        drop(before);
         let gateway = restarted(&store, "NEWNEW").await;
         let app = ClientApp(gateway.clone());
         assert_eq!(logon(&app, &desk("DESK3")), Ok(()));
         assert_eq!(gateway.client(desk("DESK3").id()), client("DESK3"));
-        // The 16th: DESK3 is counted once, and DAY-ONLY not at all.
+        // The 16th: DESK3 is counted once, and DAY-ONLY and DONE not at all.
         assert_eq!(logon(&app, &desk("NEW")), Ok(()));
         assert!(logon(&app, &desk("ONE-TOO-MANY")).is_err());
         assert!(logon(&app, &desk("DAY-ONLY")).is_err());
@@ -2119,8 +2128,17 @@ mod tests {
         assert!(gateway.orphan_answer(&VENUE.into(), &answer("OLDOLD1")));
         assert!(!gateway.orphan_answer(&VENUE.into(), &answer("OLDOLD2")));
 
-        // Recorded once sent: the next start doesn't cancel it again.
-        gateway.committed().await;
+        // Recorded once the session has stored it: the next start doesn't cancel it again.
+        let recorded = async {
+            loop {
+                gateway.committed().await;
+                if store.unknown_downstreams(&["OLDOLD1".into()]).await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(Duration::from_secs(5), recorded).await.expect("never recorded");
         let restarted = restarted(&store, "NEWER1").await;
         let again = restarted.cancel_orphans(&store, vec![(VENUE.into(), id(), venue_store)]).await.unwrap();
         assert_eq!((again.orders, again.amendments), (0, 0));
@@ -2164,6 +2182,38 @@ mod tests {
         assert_eq!(gateway.lock().orphan_cancels[VENUE].len(), 1);
         gateway.committed().await;
         assert_eq!(store.unknown_downstreams(&["OLDOLD1".into()]).await.unwrap(), ["OLDOLD1"], "recorded unsent");
+    }
+
+    /// An orphan's cancel the venue's session takes and then drops unsent (its logon refused) is
+    /// queued again for the next logon, and the orphan isn't recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphan_cancel_dropped_unsent_waits_for_the_next_logon() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let gateway = restarted(&store, "NEWNEW").await;
+        let venues = Arc::new(MemoryStorage::new());
+        store_sent(&venues, &id(), &[order("OLDOLD1")]);
+        gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues.clone())]).await.unwrap();
+        let (holding, mut held) = unbounded_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
+        let venue_addr = serve("VENUE", refuser).await;
+        let venue = initiator_with(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())), venues);
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        tokio::spawn(venue.clone().run());
+        timeout(Duration::from_secs(5), held.recv()).await.expect("logon not held");
+        // Taken by the session, queued behind the logon.
+        gateway.send_orphan_cancels(&VENUE.into());
+        assert!(gateway.lock().orphan_cancels.is_empty());
+        release.send(()).unwrap();
+        let requeued = async {
+            while gateway.lock().orphan_cancels.get(VENUE).is_none_or(Vec::is_empty) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(Duration::from_secs(5), requeued).await.expect("not queued again");
+        venue.shutdown(None).await;
+        gateway.committed().await;
+        assert_eq!(store.unknown_downstreams(&["OLDOLD1".into()]).await.unwrap(), ["OLDOLD1"]);
     }
 
     /// A venue holding a request under this start's prefix stops the start: its IDs would be
