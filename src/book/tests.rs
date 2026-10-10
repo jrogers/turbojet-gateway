@@ -2637,3 +2637,87 @@ fn a_missed_fills_implied_price_keeps_the_reference() {
     assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 1, "10.5")), Ok(()));
     assert_eq!(risk_checked(&mut book, limit_order("C3", Side::Buy, 1, "10.51")), Err(RiskReject::PriceBand));
 }
+
+/// The trading day ending `hour` o'clock on 2026-10-10.
+fn day(hour: u32) -> Day {
+    use chrono::TimeZone;
+    Day(Utc.with_ymd_and_hms(2026, 10, 10, hour, 0, 0).unwrap())
+}
+
+fn day_started(client: &str, day: Day) -> Input {
+    Input::DayStarted { client: client.into(), day }
+}
+
+/// What a new order from FUNDA was answered with: the venue's order, or the reject's reason.
+fn answer(out: &[Output]) -> Option<RejectReason> {
+    match out {
+        [Output::NewOrder { .. }] => None,
+        [Output::Report { report, .. }] => report.reject,
+        _ => panic!("{out:?}"),
+    }
+}
+
+/// A new day drops the session's done orders, whose ClOrdIDs it may use again, and keeps its
+/// live ones, whose ClOrdIDs stay taken; another session's orders stay whatever their state.
+#[test]
+fn a_new_day_drops_the_sessions_done_orders_and_keeps_its_live_ones() {
+    let mut book = book();
+    assert!(run(&mut book, day_started("FUNDA", day(1))).is_empty());
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::Filled, 100, 100));
+    new_order(&mut book, "C2");
+    run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: request("C1"), redelivered: false });
+    run(&mut book, venue_report("3", Status::Filled, 100, 100));
+
+    assert!(run(&mut book, day_started("FUNDA", day(2))).is_empty());
+    assert!(book.order(OrderId(1)).is_none());
+    assert_eq!(book.order(OrderId(2)).unwrap().status, Status::PendingNew);
+    assert_eq!(book.order(OrderId(3)).unwrap().status, Status::Filled);
+    assert_eq!(book.used[&ClientId::from("FUNDA")], 1);
+    assert_eq!(answer(&new_order(&mut book, "C2")), Some(RejectReason::Duplicate));
+    assert_eq!(answer(&new_order(&mut book, "C1")), None);
+    // The venue's late report on the dropped order is for an unknown one.
+    assert!(run(&mut book, venue_report("1", Status::Filled, 0, 100)).is_empty());
+}
+
+/// A new day's ClOrdID bound counts only the live orders carried into it.
+#[test]
+fn a_new_day_gives_back_the_cl_ord_ids_of_done_orders() {
+    let mut book = book();
+    book.max_cl_ord_ids = 2;
+    run(&mut book, day_started("FUNDA", day(1)));
+    new_order(&mut book, "C1");
+    new_order(&mut book, "C2");
+    run(&mut book, venue_report("1", Status::Canceled, 0, 0));
+    assert_eq!(answer(&new_order(&mut book, "C3")), Some(RejectReason::TooManyOrders));
+    run(&mut book, day_started("FUNDA", day(2)));
+    assert_eq!(answer(&new_order(&mut book, "C3")), None);
+    assert_eq!(answer(&new_order(&mut book, "C4")), Some(RejectReason::TooManyOrders));
+}
+
+/// What the session filled counts against its credit for its day only.
+#[test]
+fn a_new_day_starts_the_sessions_filled_notional_again() {
+    let mut book = limited(risk::Limits { credit: Some(1000.into()), ..Default::default() });
+    run(&mut book, day_started("FUNDA", day(1)));
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    run(&mut book, fill_at("1", 100, 100, "10"));
+    run(&mut book, venue_report("1", Status::Filled, 0, 100));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 1, "10")), Err(RiskReject::Credit));
+    run(&mut book, day_started("FUNDA", day(2)));
+    assert_eq!(risk_checked(&mut book, limit_order("C3", Side::Buy, 100, "10")), Ok(()));
+}
+
+/// A session's first day only records it, and a day no later than its own changes nothing.
+#[test]
+fn a_first_or_earlier_day_drops_nothing() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::Filled, 100, 100));
+    run(&mut book, day_started("FUNDA", day(2)));
+    run(&mut book, day_started("FUNDA", day(1)));
+    run(&mut book, day_started("FUNDA", day(2)));
+    assert_eq!(book.day(&"FUNDA".into()), Some(day(2)));
+    assert!(book.order(OrderId(1)).is_some());
+    assert_eq!(answer(&new_order(&mut book, "C1")), Some(RejectReason::Duplicate));
+}

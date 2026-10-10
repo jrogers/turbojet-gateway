@@ -1,11 +1,12 @@
 //! The order book: a sans-IO state machine. Each [`Input`] changes the book and pushes what to
 //! send onto `out`; the FIX side turns those into typed messages for each session's version.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use chrono::{DateTime, Utc};
 use turbojet::SessionId;
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
@@ -63,6 +64,11 @@ impl From<&str> for ClientId {
         Self::new(&SessionId::new("FIX.4.4", "JETBRIDGE", comp_id))
     }
 }
+
+/// A client session's trading day, known by when it ends: a later day is a later end. The gateway
+/// works it out from the session's schedule or `day_end`; the book only compares them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Day(pub DateTime<Utc>);
 
 /// A venue session, by its name in the sessions file.
 pub type VenueId = CompactString;
@@ -394,6 +400,16 @@ pub enum Input {
     Unblock {
         scope: Scope,
     },
+    /// The session `client` is in trading day `day`. For a session the book has a day for, a
+    /// later one rolls it over: its done orders go, with their ClOrdIDs, which it may use again;
+    /// its live orders stay (a GTC order, or one still working), their ClOrdIDs still in use, and
+    /// count against its new day's [`MAX_CL_ORD_IDS_PER_CLIENT`]; what it has filled starts again
+    /// at zero. Reference prices, being every client's, stay. A day no later than the session's
+    /// is ignored; the session's first just records it.
+    DayStarted {
+        client: ClientId,
+        day: Day,
+    },
 }
 
 /// An ExecutionReport for a client.
@@ -518,7 +534,8 @@ pub struct Book {
     /// Empty unless set by [`set_prefix`](Self::set_prefix).
     prefix: CompactString,
     orders: HashMap<OrderId, Order>,
-    /// (client, ClOrdID) -> order, for every ClOrdID each client used today.
+    /// (client, ClOrdID) -> order, for every ClOrdID each client used today, and its live orders'
+    /// from earlier days.
     index: HashMap<(ClientId, CompactString), OrderId>,
     /// ClOrdIDs in `index` per client, against [`MAX_CL_ORD_IDS_PER_CLIENT`].
     used: HashMap<ClientId, usize>,
@@ -535,6 +552,8 @@ pub struct Book {
     blocked: Vec<Scope>,
     /// A refused send left a gateway cancel waiting since [`take_cancel_unsent`](Self::take_cancel_unsent).
     cancel_unsent: bool,
+    /// Each client session's trading day: see [`Input::DayStarted`].
+    days: HashMap<ClientId, Day>,
 }
 
 impl Book {
@@ -554,6 +573,7 @@ impl Book {
             amend_reserve: MAX_AMEND_RESERVE,
             blocked: Vec::new(),
             cancel_unsent: false,
+            days: HashMap::new(),
         }
     }
 
@@ -646,6 +666,7 @@ impl Book {
                 }
             }
             Input::Unblock { scope } => self.blocked.retain(|blocked| *blocked != scope),
+            Input::DayStarted { client, day } => self.day_started(client, day),
         }
         #[cfg(debug_assertions)]
         self.check();
@@ -704,7 +725,11 @@ impl Book {
             let indexed = self.index.keys().filter(|(owner, _)| owner == client).count();
             assert_eq!(used, indexed, "{client}'s ClOrdID count");
         }
-        self.risk.check(self.orders.iter().filter_map(|(id, order)| Some((*id, order.exposure()?))), self.orders.len());
+        for ((client, cl_ord_id), id) in &self.index {
+            assert!(self.orders.contains_key(id), "{client}'s {cl_ord_id} names no order");
+            assert!(self.used.contains_key(client), "{client}'s ClOrdIDs aren't counted");
+        }
+        self.risk.check(self.orders.iter().filter_map(|(id, order)| Some((*id, order.exposure()?))));
     }
 
     fn new_order(&mut self, client: ClientId, request: OrderRequest, redelivered: bool, out: &mut Vec<Output>) {
@@ -868,6 +893,56 @@ impl Book {
             exec_id: format_compact!("{}R{}", self.prefix, self.rejects),
             text: Some(text),
         }
+    }
+
+    /// The session's trading day, if it has had one: see [`Input::DayStarted`].
+    pub fn day(&self, client: &ClientId) -> Option<Day> {
+        self.days.get(client).copied()
+    }
+
+    /// Every session's trading day.
+    pub fn days(&self) -> impl Iterator<Item = (&ClientId, Day)> {
+        self.days.iter().map(|(client, day)| (client, *day))
+    }
+
+    fn day_started(&mut self, client: ClientId, day: Day) {
+        let Some(current) = self.days.get_mut(&client) else {
+            self.days.insert(client, day);
+            return;
+        };
+        if *current >= day {
+            return;
+        }
+        *current = day;
+        self.roll(&client);
+    }
+
+    /// Starts a new trading day for `client`: see [`Input::DayStarted`].
+    ///
+    /// ponytail: walks the whole book per session rolled, so many sessions sharing an end of day
+    /// walk it many times; an order list per session if that shows.
+    fn roll(&mut self, client: &ClientId) {
+        let done: HashSet<OrderId> = self
+            .orders
+            .values()
+            .filter(|order| order.client == *client && order.status.is_done())
+            .map(|order| order.id)
+            .collect();
+        self.orders.retain(|id, _| !done.contains(id));
+        self.downstream.retain(|_, sent| !done.contains(&sent.order));
+        let mut used = 0;
+        self.index.retain(|(owner, _), id| {
+            let kept = owner != client || !done.contains(id);
+            used += usize::from(kept && owner == client);
+            kept
+        });
+        if used == 0 {
+            self.used.remove(client);
+        } else {
+            self.used.insert(client.clone(), used);
+        }
+        self.risk.new_day(client);
+        tracing::info!(%client, dropped = done.len(), cl_ord_ids_in_use = used, "new trading day");
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {

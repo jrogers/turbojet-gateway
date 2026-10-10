@@ -141,8 +141,8 @@ pub struct Exposure {
 /// session's open and filled notional and resting orders.
 #[derive(Debug, Default)]
 pub struct State {
-    /// The last fill's price per symbol, on any venue, for any client. Bounded by the book's
-    /// orders: only a fill on a booked order inserts one, and the book keeps its orders.
+    /// The last fill's price per symbol, on any venue, for any client. Only a fill on a booked
+    /// order inserts one, so they're bounded by the symbols the venues trade; kept across days.
     references: HashMap<CompactString, Decimal>,
     sessions: HashMap<ClientId, Session>,
     /// Each live order's exposure, as last tracked.
@@ -153,7 +153,7 @@ pub struct State {
 struct Session {
     /// The sum of the session's live orders' exposures.
     open: Decimal,
-    /// Filled since start: "today" until stage 4 keeps the book across restarts.
+    /// Filled since the session's trading day started (or the gateway did, if later).
     filled: Decimal,
     /// Live orders by (symbol, venue, buying), with their limit prices.
     // ponytail: a list per key, scanned per order; a price-ordered map if a session rests many
@@ -205,6 +205,16 @@ impl State {
         let session = self.sessions.entry(client.clone()).or_default();
         // Only ever added to, so saturating can't make the sum drift.
         session.filled = session.filled.checked_add(notional(qty, price)).unwrap_or(Decimal::MAX);
+    }
+
+    /// Starts a new trading day for `client`: nothing filled yet. A session with no live orders
+    /// is forgotten.
+    pub fn new_day(&mut self, client: &ClientId) {
+        let Some(session) = self.sessions.get_mut(client) else { return };
+        session.filled = Decimal::ZERO;
+        if session.resting.is_empty() {
+            self.sessions.remove(client);
+        }
     }
 
     /// Records what order `id` counts for now, `None` once it's done, replacing what it counted
@@ -270,11 +280,9 @@ impl State {
 
     /// The state's invariants, given every live order's exposure as the book computes it now
     /// (`live`): what's tracked is exactly that, each session's open notional is their sum, and
-    /// its resting orders are those orders. There are no more reference prices than the book has
-    /// `orders`.
+    /// its resting orders are those orders.
     #[cfg(debug_assertions)]
-    pub fn check(&self, live: impl Iterator<Item = (OrderId, Exposure)>, orders: usize) {
-        assert!(self.references.len() <= orders, "a reference price per fill on a booked order");
+    pub fn check(&self, live: impl Iterator<Item = (OrderId, Exposure)>) {
         let mut count = 0;
         for (id, exposure) in live {
             assert_eq!(self.exposures.get(&id), Some(&exposure), "order {id:?}'s exposure");
@@ -307,8 +315,8 @@ pub struct Limits {
     /// A Limit order's price within this percentage either side of the symbol's reference price
     /// (its last fill); no check without one.
     pub price_band: Option<Decimal>,
-    /// The session's open notional, plus what it has filled since start, plus the order's, at
-    /// most this.
+    /// The session's open notional, plus what it has filled in its trading day, plus the
+    /// order's, at most this.
     pub credit: Option<Decimal>,
     /// Refuse an order that would trade with the same session's resting order on the same symbol
     /// and venue.
@@ -379,8 +387,8 @@ mod tests {
         state.track(OrderId(2), Some(exposure("999999999999999999.9999", "2")));
         state.track(OrderId(2), Some(exposure("5", "2")));
         state.track(OrderId(2), None);
-        state.check([(OrderId(1), exposure("0.0001", "1"))].into_iter(), 2);
+        state.check([(OrderId(1), exposure("0.0001", "1"))].into_iter());
         state.track(OrderId(1), None);
-        state.check(std::iter::empty(), 2);
+        state.check(std::iter::empty());
     }
 }

@@ -15,7 +15,7 @@ use turbojet_config::{Initiators, SessionsFile};
 
 use crate::book;
 use crate::config::{self, Error};
-use crate::edge::{CANCEL_RETRY_INTERVAL, ClientApp, Gateway, VenueApp};
+use crate::edge::{ClientApp, Gateway, Schedules, TICK_INTERVAL, VenueApp};
 use crate::fix::Version;
 
 /// The Text(58) of the Logouts sent at shutdown.
@@ -32,11 +32,12 @@ const CANCELS_WAIT: Duration = Duration::from_secs(5);
 pub struct Service {
     path: PathBuf,
     gateway: Arc<Gateway>,
-    sessions: SessionsFile,
+    /// Shared with the gateway, which reads the clients' schedules from it.
+    sessions: Arc<SessionsFile>,
     acceptor: Acceptor,
     initiators: Initiators,
     local_addr: SocketAddr,
-    /// [`Gateway::retry_cancels`], aborted at shutdown, or when the service is dropped.
+    /// [`Gateway::run_ticks`], aborted at shutdown, or when the service is dropped.
     retrying: JoinHandle<()>,
 }
 
@@ -60,9 +61,16 @@ impl Service {
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
         let loaded = config::load(path)?;
         let prefix = book::start_prefix(SystemTime::now());
-        let gateway =
-            Arc::new(Gateway::new(loaded.router, loaded.version).with_id_prefix(prefix).with_limits(loaded.limits));
-        let sessions = loaded.sessions;
+        let sessions = Arc::new(loaded.sessions);
+        let schedules = {
+            let sessions = sessions.clone();
+            Schedules(Arc::new(move |comp_id| sessions.counterparty_config(comp_id)?.schedule))
+        };
+        let gateway = Gateway::new(loaded.router, loaded.version)
+            .with_id_prefix(prefix)
+            .with_limits(loaded.limits)
+            .with_days(loaded.day_end, schedules);
+        let gateway = Arc::new(gateway);
         let listen = sessions.listen().expect("load checked the file has [acceptor]");
         // Bound before the venues start, so a port in use stops nothing half-started.
         let listener =
@@ -70,7 +78,7 @@ impl Service {
         let local_addr = listener.local_addr().map_err(|e| Error::new(format!("{listen}: {e}")))?;
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
-        let retrying = tokio::spawn(gateway.clone().retry_cancels(CANCEL_RETRY_INTERVAL));
+        let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
         let service = Self { path: path.to_path_buf(), gateway, sessions, acceptor, initiators, local_addr, retrying };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
@@ -111,10 +119,11 @@ impl Service {
         self.initiators.handle(name)
     }
 
-    /// Rereads the sessions file, and the routes and limits, logging what changed. Either file that
-    /// doesn't load is logged and stays as it was (routes and limits together); the routes are
-    /// checked against the venues the gateway took after the sessions reload, so a venue added to
-    /// both files at once can be routed to.
+    /// Rereads the sessions file, and the routes, limits and `day_end`, logging what changed.
+    /// Either file that doesn't load is logged and stays as it was (routes, limits and `day_end`
+    /// together); the routes are checked against the venues the gateway took after the sessions
+    /// reload, so a venue added to both files at once can be routed to. A changed schedule or
+    /// `day_end` applies from each session's next trading day.
     pub fn reload(&self) {
         match self.sessions.reload_all(Some(&self.acceptor), &self.initiators) {
             Ok(changes) => {
@@ -133,15 +142,17 @@ impl Service {
         }
         let venues = self.set_venues();
         match config::reload(&self.path, &venues) {
-            Ok((router, limits)) => {
+            Ok((router, limits, day_end)) => {
                 info!(
                     routes = router.rules().len(),
                     clients = limits.by_comp_id.len(),
-                    "reloaded the routes and limits"
+                    %day_end,
+                    "reloaded the routes, limits and day_end"
                 );
                 self.gateway.set_config(router, limits);
+                self.gateway.set_day_end(day_end);
             }
-            Err(e) => warn!("keeping the routes and limits in use: {e}"),
+            Err(e) => warn!("keeping the routes, limits and day_end in use: {e}"),
         }
     }
 

@@ -2,6 +2,7 @@
 //!
 //! ```toml
 //! sessions = "sessions.toml"      # relative to this file
+//! day_end = "17:00 America/New_York"  # when a session with no schedule ends its trading day
 //!
 //! [[route]]                       # first match wins
 //! client = "FUNDA"                # SenderCompID; any, if left out
@@ -17,7 +18,7 @@
 //! max_notional = 1000000          # quantity x price at most this
 //! symbols = ["AAPL", "MSFT"]      # only these symbols
 //! price_band = 5.0                # Limit price within 5% of the last fill on the symbol
-//! credit = 5000000                # open + filled since start + this order's notional
+//! credit = 5000000                # open + filled today + this order's notional
 //! self_trade = true               # refuse an order crossing the session's own resting one
 //!
 //! [risk.client.FUNDA]             # a CompID's own: each key it sets replaces the default's
@@ -31,16 +32,25 @@
 //! The sessions file is Turbojet's (`turbojet-config`): its `[acceptor]` serves the clients, all
 //! speaking its `begin_string`, and each `[initiator.NAME]` logs on to venue `NAME`. The
 //! `sessions` key is read at start only: a reload rereads the routes and limits, and the sessions
-//! file in use. Turbojet-config's `validation` feature stays off: a dictionary on a venue initiator would
+//! file in use.
+//!
+//! A client session's trading day is its schedule's period, from the sessions file; a session
+//! with none ends its day at `day_end`: a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`, an
+//! offset (`+05:30`) or an IANA name, UTC if left out. Midnight UTC if `day_end` is left out.
+//!
+//! Turbojet-config's `validation` feature stays off: a dictionary on a venue initiator would
 //! reject venue reports with custom codes before the gateway sees them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveTime;
 use serde::Deserialize;
 use tracing::warn;
+use turbojet::SessionSchedule;
 use turbojet::fields::Decimal;
+use turbojet::schedule::ScheduleTimeZone;
 use turbojet_config::SessionsFile;
 
 use crate::fix::Version;
@@ -73,6 +83,8 @@ pub struct Loaded {
     pub sessions: SessionsFile,
     /// The clients' version: the acceptor's BeginString.
     pub version: Version,
+    /// When a session with no schedule ends its trading day: see [`day_end`].
+    pub day_end: SessionSchedule,
 }
 
 /// Reads the configuration file at `path` and the sessions file it names.
@@ -92,21 +104,43 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
     let router = file.router(path)?;
     check_venues(path, &router, &sessions.initiator_names())?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    Ok(Loaded { router, limits, sessions, version })
+    let day_end = file.day_end(path)?;
+    Ok(Loaded { router, limits, sessions, version, day_end })
 }
 
-/// Reads the routes and limits in the configuration file at `path` again, checking that each
-/// venue the routes name is one of `venues`.
+/// Reads the routes, limits and `day_end` in the configuration file at `path` again, checking
+/// that each venue the routes name is one of `venues`.
 ///
 /// # Errors
 ///
-/// As [`load`], for the routes and limits, or a route names a venue not in `venues`.
-pub fn reload(path: &Path, venues: &[String]) -> Result<(Router, risk::Config), Error> {
+/// As [`load`], for the routes, limits and `day_end`, or a route names a venue not in `venues`.
+pub fn reload(path: &Path, venues: &[String]) -> Result<(Router, risk::Config, SessionSchedule), Error> {
     let file = read(path)?;
     let router = file.router(path)?;
     check_venues(path, &router, venues)?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    Ok((router, limits))
+    let day_end = file.day_end(path)?;
+    Ok((router, limits, day_end))
+}
+
+/// `day_end` as written, `HH:MM[:SS] [ZONE]`, as a schedule whose periods run from one end of day
+/// to the next, so the period containing a time is its trading day, as for a session with a
+/// schedule. Turbojet's schedules read the time and zone, and handle daylight saving.
+///
+/// # Errors
+///
+/// The time or zone doesn't parse, or there's more.
+pub fn day_end(text: &str) -> Result<SessionSchedule, String> {
+    let mut words = text.split_whitespace();
+    let time = words.next().ok_or("empty; expected a time and a time zone, as \"17:00 America/New_York\"")?;
+    let time = NaiveTime::parse_from_str(time, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(time, "%H:%M"))
+        .map_err(|_| format!("invalid time {time:?} (expected HH:MM or HH:MM:SS)"))?;
+    let zone: ScheduleTimeZone = words.next().unwrap_or("UTC").parse()?;
+    if let Some(extra) = words.next() {
+        return Err(format!("unexpected {extra:?} after the time zone"));
+    }
+    Ok(SessionSchedule::daily(time, time).in_time_zone(zone))
 }
 
 /// Checks that each venue `router`, read from the file at `path`, routes to is one of `venues`:
@@ -149,6 +183,7 @@ pub fn warnings(router: &Router) -> Vec<String> {
 #[serde(deny_unknown_fields)]
 struct File {
     sessions: PathBuf,
+    day_end: Option<String>,
     #[serde(default)]
     route: Vec<Route>,
     #[serde(default)]
@@ -257,6 +292,12 @@ fn read(path: &Path) -> Result<File, Error> {
 }
 
 impl File {
+    /// [`day_end`], midnight UTC if the file leaves it out.
+    fn day_end(&self, path: &Path) -> Result<SessionSchedule, Error> {
+        day_end(self.day_end.as_deref().unwrap_or("00:00 UTC"))
+            .map_err(|e| Error(format!("{}: day_end: {e}", path.display())))
+    }
+
     /// The routes, read from `path`, with their [`warnings`] logged.
     fn router(&self, path: &Path) -> Result<Router, Error> {
         let mut rules = Vec::with_capacity(self.route.len());
@@ -402,7 +443,7 @@ reject = "no route"
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"")
             .unwrap();
         let venues = loaded.sessions.initiator_names();
-        let (router, _) = reload(&path, &venues).unwrap();
+        let (router, ..) = reload(&path, &venues).unwrap();
         assert_eq!(router, Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ")]));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"LSE\"").unwrap();
         assert!(reload(&path, &venues).is_err());
@@ -485,7 +526,7 @@ self_trade = false
         let path = dir.path().join("jetbridge.toml");
         let venues = load(&path).unwrap().sessions.initiator_names();
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = 5").unwrap();
-        let (_, limits) = reload(&path, &venues).unwrap();
+        let (_, limits, _) = reload(&path, &venues).unwrap();
         assert_eq!(limits.limits("FUNDA").max_order_qty, Some(decimal("5")));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = -5").unwrap();
         assert!(reload(&path, &venues).is_err());
@@ -501,6 +542,47 @@ self_trade = false
     }
 
     /// The example files the readme shows load.
+    /// When the trading day containing `time` (RFC 3339) ends, by `day_end`.
+    fn day_ends(day_end: &SessionSchedule, time: &str) -> String {
+        let time = time.parse().unwrap();
+        day_end.period_at(time).unwrap().end.to_rfc3339()
+    }
+
+    /// In the zone's local time, daylight saving or not; the day containing the end is the next.
+    #[test]
+    fn day_end_is_a_local_time_in_its_zone() {
+        let new_york = day_end("17:00 America/New_York").unwrap();
+        assert_eq!(day_ends(&new_york, "2026-10-10T20:59:59Z"), "2026-10-10T21:00:00+00:00");
+        assert_eq!(day_ends(&new_york, "2026-10-10T21:00:00Z"), "2026-10-11T21:00:00+00:00");
+        assert_eq!(day_ends(&new_york, "2026-11-10T12:00:00Z"), "2026-11-10T22:00:00+00:00");
+        let offset = day_end("08:30:15 +05:30").unwrap();
+        assert_eq!(day_ends(&offset, "2026-10-10T12:00:00Z"), "2026-10-11T03:00:15+00:00");
+        assert_eq!(day_end("17:00").unwrap(), day_end("17:00 UTC").unwrap());
+    }
+
+    #[test]
+    fn day_end_is_midnight_utc_unless_set_and_a_bad_one_is_an_error() {
+        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("jetbridge.toml")).unwrap();
+        assert_eq!(day_ends(&loaded.day_end, "2026-10-10T12:00:00Z"), "2026-10-11T00:00:00+00:00");
+        for (day_end, error) in [
+            ("", "empty"),
+            ("5pm UTC", "invalid time"),
+            ("17:00 Mars/Olympus", "unknown time zone"),
+            ("17:00 UTC mon-fri", "unexpected \"mon-fri\""),
+        ] {
+            let error_text = load_error(&format!("sessions = \"sessions.toml\"\nday_end = \"{day_end}\""));
+            assert!(error_text.contains("day_end: ") && error_text.contains(error), "{error_text}");
+        }
+    }
+
+    #[test]
+    fn reloading_reads_day_end() {
+        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
+        let (.., reloaded) = reload(&dir.path().join("jetbridge.toml"), &[]).unwrap();
+        assert_eq!(reloaded, day_end("17:00").unwrap());
+    }
+
     #[test]
     fn the_examples_load() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/jetbridge.toml");

@@ -13,9 +13,12 @@ tls = ["turbojet/tls", "turbojet-config/tls"]
 [dependencies]
 # By path while the engine API Jetbridge needs is still changing; crates.io once released.
 turbojet = { path = "../turbojet/crates/turbojet" }
-turbojet-config = { path = "../turbojet/crates/turbojet-config" }
+# `tz`: named time zones in session schedules and `day_end`.
+turbojet-config = { path = "../turbojet/crates/turbojet-config", features = ["tz"] }
 turbojet-fix42 = { path = "../turbojet/crates/turbojet-fix42" }
 turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
+# Turbojet's clock and schedules speak chrono's times.
+chrono = { version = "0.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
