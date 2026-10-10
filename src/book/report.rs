@@ -5,6 +5,9 @@ use super::{
     VenueReport,
 };
 
+/// Text(58) of the restatement telling a client the venue accepted an orphaned replace.
+const ORPHAN_REPLACED: &str = "replaced at the venue by a request sent before the gateway restarted";
+
 impl Book {
     pub(super) fn venue_report(&mut self, venue: &VenueId, mut report: VenueReport, out: &mut Vec<Output>) {
         let Some(sent) = self.downstream.get(&report.downstream).cloned() else {
@@ -45,14 +48,7 @@ impl Book {
         // Any answer under the replace's ClOrdID but these means the venue took it.
         let accepted =
             pending_here && !rejected && report.status.is_some_and(|status| status != Status::PendingReplace);
-        // A client's cancel's reports and a pending replace's (up to the one accepting it) answer
-        // that request; any other, the gateway's cancel's too, is about the order, unsolicited.
-        let answers_request = match kind {
-            Some(CancelKind::Cancel) => origin == Origin::Client,
-            // An orphaned replace's acks are the gateway's, as its cancel's are.
-            Some(CancelKind::Replace) => pending_here && origin == Origin::Client,
-            None => false,
-        };
+        let answers_request = answers_request(kind, origin, pending_here);
         let qty = match &order.pending {
             Some(pending) if accepted => pending.qty,
             _ => order.request.qty,
@@ -88,10 +84,16 @@ impl Book {
             self.touched.fill(order);
         }
         self.risk.track(id, order.exposure());
+        // The client never asked for an orphaned replace (see `Input::Orphan`), but its order
+        // changed: told as a restatement, under its current ClOrdID, with the new terms.
+        if accepted && origin == Origin::Gateway {
+            report.exec_type = ExecType::Restated;
+            report.text.get_or_insert_with(|| ORPHAN_REPLACED.into());
+        }
         // The gateway's cancel's acks aren't the client's: after a refusal it would be left
-        // showing PendingCancel. Fills and the end are.
-        if origin == Origin::Gateway && rise == Decimal::ZERO && !order.status.is_done() {
-            return tracing::debug!(%venue, downstream = %report.downstream, "gateway cancel's ack not forwarded");
+        // showing PendingCancel. Fills, the end and an orphaned replace accepted are.
+        if origin == Origin::Gateway && rise == Decimal::ZERO && !order.status.is_done() && !accepted {
+            return tracing::debug!(%venue, downstream = %report.downstream, "gateway request's ack not forwarded");
         }
         let answers = answers_request.then_some((cl_ord_id, orig_cl_ord_id));
         let client_report = order.client_report(answers, report, rejected, (rise, price));
@@ -165,6 +167,18 @@ impl Order {
             report.orig_cl_ord_id = Some(asked);
         }
         report
+    }
+}
+
+/// Whether a report under a request of `kind` from `origin` answers that request: a client's
+/// cancel's reports, and a pending replace's (up to the one accepting it), do. Any other, the
+/// gateway's requests' too (an orphaned replace's acks are the gateway's, as its cancel's are),
+/// is about the order, unsolicited.
+fn answers_request(kind: Option<CancelKind>, origin: Origin, pending_here: bool) -> bool {
+    match kind {
+        Some(CancelKind::Cancel) => origin == Origin::Client,
+        Some(CancelKind::Replace) => pending_here && origin == Origin::Client,
+        None => false,
     }
 }
 

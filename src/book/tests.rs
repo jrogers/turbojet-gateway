@@ -3067,14 +3067,15 @@ fn a_refused_orphan_leaves_the_gateway_cancel_going() {
 
 /// An orphaned replace the venue accepted applies its terms, so a fill past the old quantity
 /// counts; the gateway's cancel, naming the order's old ID, refused as unknown, goes again under
-/// the new one, and its Canceled ends the order. The replace's acks never reach the client.
+/// the new one, and its Canceled ends the order. The client hears the replace as a restatement.
 #[test]
 fn an_accepted_orphaned_replace_applies_and_the_gateway_cancel_follows_it() {
     let mut book = acked();
     run(&mut book, orphaned_replace("1-1", 200));
     assert_eq!(book.downstream["1-1"].kind, Some(CancelKind::Replace));
     assert_eq!(gateway_cancel_sent(&run(&mut book, venue_up("NASDAQ"))), ("1-2", "1"));
-    assert!(run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0)).is_empty());
+    let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    assert_eq!(report_of(&out).exec_type, ExecType::Restated);
     let order = book.order(OrderId(1)).unwrap();
     assert_eq!(
         (order.request.qty, order.downstream.as_str(), order.request.cl_ord_id.as_str()),
@@ -3123,4 +3124,128 @@ fn an_orphan_naming_no_order_here_changes_nothing() {
     }
     assert!(!book.downstream.contains_key("1-1"));
     assert!(book.cancelling().is_empty());
+}
+
+/// The client's replace C2, redelivered.
+fn redelivered_replace(qty: i64) -> Input {
+    let mut input = replace_input("C2", "C1", qty, 10);
+    if let Input::Replace { redelivered, ord_type, .. } = &mut input {
+        (*redelivered, *ord_type) = (true, Some(OrdType::Limit));
+    }
+    input
+}
+
+fn report_of(out: &[Output]) -> &ClientReport {
+    let [Output::Report { report, .. }] = out else { panic!("{out:?}") };
+    report
+}
+
+/// The client's replace, redelivered after a restart, is the orphaned replace it was sent as:
+/// the venue's Replaced answers it, and fills come under it.
+#[test]
+fn a_redelivered_replace_adopts_the_pending_orphaned_one() {
+    let mut book = acked();
+    run(&mut book, orphaned_replace("1-1", 200));
+    assert!(run(&mut book, redelivered_replace(200)).is_empty());
+    let sent = &book.downstream["1-1"];
+    assert_eq!(
+        (sent.origin, sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_deref()),
+        (Origin::Client, "C2", Some("C1"))
+    );
+    let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    let report = report_of(&out);
+    assert_eq!(
+        (report.exec_type, report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()),
+        (ExecType::Replaced, "C2", Some("C1"))
+    );
+    let out = run(&mut book, venue_report("1-1", Status::PartiallyFilled, 150, 150));
+    let report = report_of(&out);
+    assert_eq!(
+        (report.cl_ord_id.as_str(), report.request.qty, report.leaves_qty),
+        ("C2", Decimal::from(200), Decimal::from(50))
+    );
+    // Other terms aren't the orphan's: a replace of its own, refused while the gateway cancels.
+    let mut other = acked();
+    run(&mut other, orphaned_replace("1-1", 200));
+    let out = run(&mut other, redelivered_replace(300));
+    assert!(matches!(out.as_slice(), [Output::CancelReject { .. }]), "{out:?}");
+}
+
+/// An orphaned replace the venue accepted before the client's redelivered request arrived:
+/// the client hears a restatement under C1 with the new terms, then Replaced under C2.
+#[test]
+fn an_orphaned_replace_accepted_is_restated_then_adopted() {
+    let mut book = acked();
+    run(&mut book, orphaned_replace("1-1", 200));
+    let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    let report = report_of(&out);
+    assert_eq!((report.exec_type, report.cl_ord_id.as_str()), (ExecType::Restated, "C1"));
+    assert_eq!(
+        (report.request.qty, report.leaves_qty, report.request.price),
+        (Decimal::from(200), Decimal::from(200), Some(Decimal::from(10)))
+    );
+    assert!(report.text.is_some());
+
+    let out = run(&mut book, redelivered_replace(200));
+    let report = report_of(&out);
+    assert_eq!(
+        (report.exec_type, report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()),
+        (ExecType::Replaced, "C2", Some("C1"))
+    );
+    let out = run(&mut book, venue_report("1-1", Status::PartiallyFilled, 150, 150));
+    assert_eq!(report_of(&out).cl_ord_id, "C2");
+}
+
+/// Replaced and a fill in one report, for an orphaned replace nobody adopted: a Trade under
+/// the order's ClOrdID, never the gateway's empty one.
+#[test]
+fn an_orphaned_replace_accepted_with_a_fill_reports_under_the_orders_cl_ord_id() {
+    let mut book = acked();
+    run(&mut book, orphaned_replace("1-1", 200));
+    let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::PartiallyFilled, 150, 150));
+    let report = report_of(&out);
+    assert_eq!(
+        (report.exec_type, report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()),
+        (ExecType::Trade, "C1", None)
+    );
+}
+
+/// Handles `input` as `run` does, without restoring a book from the changes first: the orphaned
+/// replace waiting for a pending one isn't stored (a restart finds it again in the venue's store).
+fn run_live(book: &mut Book, input: Input) -> Vec<Output> {
+    let mut out = Vec::new();
+    book.handle(input, &mut out);
+    let changes = book.take_changes();
+    book.mirror.apply(changes);
+    out
+}
+
+/// An orphaned replace sent after the client's replace `1-1` was answered (the answer lost with
+/// it) waits for that answer: Replaced for `1-1` answers C2, then the orphan is pending, and its
+/// Replaced restates the order.
+#[test]
+fn an_orphaned_replace_waits_for_the_pending_replaces_answer() {
+    let mut book = acked();
+    replace(&mut book, "C2", "C1", 200, 10);
+    assert!(run(&mut book, orphaned_replace("1-2", 300)).is_empty());
+    assert_eq!(book.order(OrderId(1)).unwrap().pending.as_ref().unwrap().downstream, "1-1");
+    assert!(book.orphan_waiting("1-2"));
+    assert_eq!(gateway_cancel_sent(&run_live(&mut book, venue_up("NASDAQ"))), ("1-3", "1"));
+
+    let out = run_live(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    let report = report_of(&out);
+    assert_eq!(
+        (report.exec_type, report.cl_ord_id.as_str(), report.request.qty),
+        (ExecType::Replaced, "C2", Decimal::from(200))
+    );
+    assert_eq!(book.order(OrderId(1)).unwrap().pending.as_ref().unwrap().downstream, "1-2");
+    assert!(!book.orphan_waiting("1-2"));
+    let out = run_live(&mut book, venue_report_as("1-2", ExecType::Replaced, Status::New, 0, 0));
+    let report = report_of(&out);
+    assert_eq!(
+        (report.exec_type, report.cl_ord_id.as_str(), report.request.qty),
+        (ExecType::Restated, "C2", Decimal::from(300))
+    );
+    // What's stored from here restores the same book.
+    assert_eq!(restored(&book).snapshot(), book.snapshot());
 }

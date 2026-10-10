@@ -193,7 +193,8 @@ impl Gateway {
         let mut state = self.lock();
         let input = Input::Orphan { venue: venue.clone(), downstream: downstream.clone(), replace };
         self.handle_locked(&mut state, [input], None);
-        let taken = state.book.sent(&downstream).is_some();
+        // Waiting for the replace pending before it, it's found again after a restart until then.
+        let taken = state.book.sent(&downstream).is_some() || state.book.orphan_waiting(&downstream);
         if !taken {
             self.record_orphans(vec![downstream]);
         }

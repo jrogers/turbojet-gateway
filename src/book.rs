@@ -421,9 +421,10 @@ pub enum Input {
     /// sending it); `replace` holds a replace's terms. Recorded as the gateway's own request, so
     /// the venue's answers apply to the order (a replace pending, its terms applied if the venue
     /// accepts it), and the order gets the gateway's cancel, waiting for `VenueUp`: what the
-    /// client asked for is unknown. The client hears of neither request's acks, only of fills and
-    /// the order's end. One for an order the book doesn't hold (done, and dropped at a roll) is
-    /// logged.
+    /// client asked for is unknown. The client hears of fills and the order's end, and of an
+    /// orphaned replace accepted as a restatement; a replace waits for the one pending to be
+    /// answered, and a client's redelivered replace with its terms is taken as it. One for an
+    /// order the book doesn't hold (done, and dropped at a roll) is logged.
     Orphan {
         venue: VenueId,
         downstream: CompactString,
@@ -609,6 +610,10 @@ pub struct Book {
     flushed: Changes,
     /// New orders are rejected: see [`set_unavailable`](Self::set_unavailable).
     unavailable: bool,
+    /// Orphaned replaces (see [`Input::Orphan`]) of orders with a replace pending, by order, to be
+    /// made pending once that one is answered. Not stored: a restart before then finds the orphan
+    /// again in the venue's store.
+    orphaned_replaces: HashMap<OrderId, Pending>,
     /// Every change taken in the tests, as a store would hold them.
     #[cfg(test)]
     mirror: Snapshot,
@@ -635,6 +640,7 @@ impl Book {
             touched: Touched::default(),
             flushed: Changes::default(),
             unavailable: false,
+            orphaned_replaces: HashMap::new(),
             #[cfg(test)]
             mirror: Snapshot::default(),
         }
@@ -750,6 +756,7 @@ impl Book {
             }
             Input::DaysStarted { days } => self.days_started(days),
         }
+        self.promote_orphaned_replaces();
         #[cfg(debug_assertions)]
         self.check();
     }
@@ -802,6 +809,16 @@ impl Book {
                 );
                 assert!(gateway.tries > 0 || gateway.unsent, "{id:?}'s gateway cancel");
             }
+        }
+        for (id, waiting) in &self.orphaned_replaces {
+            assert!(
+                self.orders.get(id).is_some_and(|order| order.pending.is_some()),
+                "{id:?}'s orphaned replace waits on none"
+            );
+            assert!(
+                !self.downstream.contains_key(&waiting.downstream),
+                "a waiting orphaned replace isn't recorded yet"
+            );
         }
         for (client, &used) in &self.used {
             let indexed = self.index.keys().filter(|(owner, _)| owner == client).count();

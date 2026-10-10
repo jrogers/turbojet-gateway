@@ -122,7 +122,7 @@ impl Book {
         else {
             return tracing::error!(%venue, %downstream, "orphaned request isn't a cancel's or replace's");
         };
-        if self.downstream.contains_key(&downstream) {
+        if self.downstream.contains_key(&downstream) || self.orphan_waiting(&downstream) {
             return tracing::debug!(%venue, %downstream, "orphaned request already recorded");
         }
         // ponytail: a walk of every order per orphan, at a start only; a map by name if many.
@@ -139,32 +139,72 @@ impl Book {
         // A done order has no replace pending: its replace can only be refused.
         let replace = replace.filter(|_| !order.status.is_done());
         tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, ?replace, "venue holds a request the store lacks: cancelling its order");
-        let kind = if replace.is_some() { CancelKind::Replace } else { CancelKind::Cancel };
-        let sent = Sent {
-            order: id,
-            origin: Origin::Gateway,
-            cl_ord_id: CompactString::default(),
-            orig_cl_ord_id: None,
-            kind: Some(kind),
-            answered: false,
-        };
-        self.downstream.insert(downstream.clone(), sent);
-        self.touched.sent.insert(downstream.clone());
-        if let Some(OrphanedReplace { qty, price, ord_type, time_in_force }) = replace {
-            let price = limit_price(ord_type, price);
-            let risk_price = self.risk.risk_price(&order.request.symbol, price);
-            if let Some(pending) = &order.pending {
-                tracing::warn!(order = %order.name, superseded = %pending.downstream, "an orphaned replace takes the place of the one pending");
+        let waits = order.pending.is_some();
+        match replace {
+            None => {
+                self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Cancel));
+                self.touched.sent.insert(downstream);
             }
-            // Accepted, it leaves the order's ClOrdID as it is: the client never asked for it.
-            let cl_ord_id = order.request.cl_ord_id.clone();
-            order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price });
-            self.risk.track(id, order.exposure());
+            Some(OrphanedReplace { qty, price, ord_type, time_in_force }) => {
+                let price = limit_price(ord_type, price);
+                let risk_price = self.risk.risk_price(&order.request.symbol, price);
+                // Set when it's made pending.
+                let cl_ord_id = CompactString::default();
+                let pending = Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price };
+                if waits {
+                    // The book sent this replace only once the one pending was answered, so that
+                    // answer, lost with it, is redelivered first: see `orphaned_replaces`.
+                    tracing::info!(order = %order.name, pending = ?order.pending.as_ref().map(|p| &p.downstream), "orphaned replace waits for the pending one's answer");
+                    self.orphaned_replaces.insert(id, pending);
+                } else {
+                    self.make_orphan_pending(id, pending);
+                }
+            }
         }
         // Sent at `VenueUp`, or by the edge's retry tick if the venue is up already.
         if self.start_gateway_cancel(id).is_some() {
             self.cancel_unsent = true;
         }
+    }
+
+    /// Whether `downstream` is an orphaned replace waiting for the replace pending before it.
+    pub fn orphan_waiting(&self, downstream: &str) -> bool {
+        self.orphaned_replaces.values().any(|pending| pending.downstream == downstream)
+    }
+
+    /// Makes orphaned replaces pending whose orders' pending replaces have been answered: after
+    /// every input, and a walk of none but at a start.
+    pub(super) fn promote_orphaned_replaces(&mut self) {
+        if self.orphaned_replaces.is_empty() {
+            return;
+        }
+        let ready: Vec<OrderId> = self
+            .orphaned_replaces
+            .keys()
+            .filter(|id| self.orders.get(id).is_none_or(|order| order.pending.is_none()))
+            .copied()
+            .collect();
+        for id in ready {
+            let pending = self.orphaned_replaces.remove(&id).expect("listed above");
+            self.make_orphan_pending(id, pending);
+        }
+    }
+
+    /// Records orphaned replace `pending` as the gateway's, pending on its order unless that's
+    /// done (then only its answers map to the order).
+    fn make_orphan_pending(&mut self, id: OrderId, mut pending: Pending) {
+        let downstream = pending.downstream.clone();
+        self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Replace));
+        self.touched.sent.insert(downstream);
+        let Some(order) = self.orders.get_mut(&id).filter(|order| !order.status.is_done()) else {
+            return tracing::info!(order = id.0, downstream = %pending.downstream, "orphaned replace's order ended first");
+        };
+        self.touched.orders.insert(id);
+        // Accepted, it leaves the order's ClOrdID as it is, unless the client's request turns
+        // out to be it (see `adopt_orphaned_replace`).
+        pending.cl_ord_id = order.request.cl_ord_id.clone();
+        order.pending = Some(pending);
+        self.risk.track(id, order.exposure());
     }
 
     /// The gateway's cancel is waiting to be sent, and nothing stands in its way.
@@ -232,5 +272,17 @@ impl Book {
             return tracing::error!(order = %order.name, "gateway gave up cancelling an order the venue says is done or unknown");
         }
         self.retry_gateway_cancel(id, out);
+    }
+}
+
+/// A request the gateway itself sent for order `id`.
+fn gateway_sent(id: OrderId, kind: CancelKind) -> Sent {
+    Sent {
+        order: id,
+        origin: Origin::Gateway,
+        cl_ord_id: CompactString::default(),
+        orig_cl_ord_id: None,
+        kind: Some(kind),
+        answered: false,
     }
 }

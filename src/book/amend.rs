@@ -32,6 +32,9 @@ impl Book {
     /// cancel is in flight; for a blocked client, if it raises the quantity; and if its new terms
     /// break a risk limit (see [`risk::check`]).
     pub(super) fn replace(&mut self, amend: Amend, named: (Side, CompactString), terms: Terms, out: &mut Vec<Output>) {
+        if amend.redelivered && self.adopt_orphaned_replace(&amend, &named, &terms, out) {
+            return;
+        }
         let Terms { qty, price, ord_type, time_in_force } = terms;
         let refuse = |book: &Self, order: &Order| {
             if book.gateway_cancel_in_flight(order) {
@@ -71,6 +74,72 @@ impl Book {
         self.touched.orders.insert(id);
         order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price });
         self.risk.track(id, order.exposure());
+    }
+
+    /// Takes a client's redelivered replace as the orphaned replace (see `Input::Orphan`) it was
+    /// sent as before a restart, if the order's pending replace, or the one it last accepted, is
+    /// an orphan with the same terms: the request becomes the client's, so the venue's answers
+    /// answer it. Accepted already, it's answered as Replaced now. `false` if there's none.
+    fn adopt_orphaned_replace(
+        &mut self,
+        amend: &Amend,
+        named: &(Side, CompactString),
+        terms: &Terms,
+        out: &mut Vec<Output>,
+    ) -> bool {
+        let Some(&id) = self.index.get(&(amend.client.clone(), amend.orig_cl_ord_id.clone())) else { return false };
+        if self.index.contains_key(&(amend.client.clone(), amend.cl_ord_id.clone())) {
+            return false;
+        }
+        let order = &self.orders[&id];
+        if (order.request.side, &order.request.symbol) != (named.0, &named.1) {
+            return false;
+        }
+        let ord_type = terms.ord_type.unwrap_or(order.request.ord_type);
+        let wanted = (
+            terms.qty,
+            limit_price(ord_type, terms.price),
+            ord_type,
+            terms.time_in_force.or(order.request.time_in_force),
+        );
+        let orphan = |downstream: &CompactString| {
+            self.downstream
+                .get(downstream)
+                .is_some_and(|sent| sent.origin == Origin::Gateway && sent.kind == Some(CancelKind::Replace))
+        };
+        let accepted = match &order.pending {
+            Some(p) if orphan(&p.downstream) && (p.qty, p.price, p.ord_type, p.time_in_force) == wanted => false,
+            None if orphan(&order.downstream) => {
+                let r = &order.request;
+                if (r.qty, r.price, r.ord_type, r.time_in_force) != wanted {
+                    return false;
+                }
+                true
+            }
+            _ => return false,
+        };
+        let downstream = if accepted {
+            order.downstream.clone()
+        } else {
+            order.pending.as_ref().expect("matched above").downstream.clone()
+        };
+        tracing::info!(order = %order.name, %downstream, cl_ord_id = %amend.cl_ord_id, accepted, "a redelivered replace is the orphaned one");
+        self.remember(&amend.client, amend.cl_ord_id.clone(), id);
+        let sent = self.downstream.get_mut(&downstream).expect("matched above");
+        (sent.origin, sent.cl_ord_id, sent.orig_cl_ord_id) =
+            (Origin::Client, amend.cl_ord_id.clone(), Some(amend.orig_cl_ord_id.clone()));
+        self.touched.sent.insert(downstream);
+        let order = self.orders.get_mut(&id).expect("looked up above");
+        self.touched.orders.insert(id);
+        if !accepted {
+            order.pending.as_mut().expect("matched above").cl_ord_id = amend.cl_ord_id.clone();
+            return true;
+        }
+        order.request.cl_ord_id = amend.cl_ord_id.clone();
+        let mut report = order.report(&amend.cl_ord_id, ExecType::Replaced);
+        report.orig_cl_ord_id = Some(amend.orig_cl_ord_id.clone());
+        out.push(Output::Report { client: amend.client.clone(), report });
+        true
     }
 
     /// A replace of `order` to `qty` at `price` (`None`: Market) against the client's limits. One
