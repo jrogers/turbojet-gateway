@@ -94,7 +94,8 @@ impl CancelOnDisconnect {
     ///
     /// # Errors
     ///
-    /// The file can't be read or isn't TOML: changed since turbojet-config read it.
+    /// The file can't be read, isn't TOML, or has a `cancel_on_disconnect` turbojet-config doesn't
+    /// take: changed since turbojet-config read it.
     pub fn read(path: &Path) -> Result<Self, Error> {
         /// The keys read here; the rest are turbojet-config's.
         #[derive(Deserialize)]
@@ -106,11 +107,19 @@ impl CancelOnDisconnect {
         }
         #[derive(Default, Deserialize)]
         struct Table {
-            cancel_on_disconnect: Option<String>,
+            cancel_on_disconnect: Option<Trigger>,
+        }
+        /// turbojet-config's values, so one it doesn't take is an error here too.
+        #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Trigger {
+            Off,
+            Disconnect,
+            DisconnectOrLogout,
         }
         let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
         let file: File = toml::from_str(&text).map_err(|e| Error(format!("{}: {e}", path.display())))?;
-        let on = |table: &Table, default: bool| table.cancel_on_disconnect.as_deref().map_or(default, |t| t != "off");
+        let on = |table: &Table, default: bool| table.cancel_on_disconnect.map_or(default, |t| t != Trigger::Off);
         let defaults = on(&file.defaults, false);
         let listed = file.counterparty.iter().map(|(comp_id, table)| (comp_id.clone(), on(table, defaults))).collect();
         Ok(Self { defaults, listed })
@@ -385,6 +394,13 @@ store = "memory"
         assert_eq!(got, [(false, false), (true, true), (true, true), (true, false)]);
         let without = read("[counterparty.A]\n");
         assert!(!without.is_on("A", Unknown::Admit) && !without.is_on("B", Unknown::Admit));
+    }
+
+    #[test]
+    fn an_unknown_cancel_on_disconnect_is_an_error() {
+        let dir = dir(&[("sessions.toml", "[counterparty.A]\ncancel_on_disconnect = \"always\"\n")]);
+        let error = CancelOnDisconnect::read(&dir.path().join("sessions.toml")).unwrap_err().to_string();
+        assert!(error.contains("always"), "{error}");
     }
 
     fn load_error(jetbridge: &str) -> String {

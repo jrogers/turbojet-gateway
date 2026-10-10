@@ -845,6 +845,27 @@ async fn shutdown_cancels_the_orders_of_a_connected_client_with_cancel_on_discon
     assert!(unfinished.open_orders.is_empty() && unfinished.cancelling.is_empty(), "{unfinished:?}");
 }
 
+/// Under `disconnect`, a client that logged out keeps its orders working, but shutdown cancels
+/// them anyway: every client with cancel on disconnect, whatever its trigger.
+#[tokio::test]
+async fn shutdown_cancels_the_orders_of_a_disconnect_client_that_logged_out() {
+    let mut setup =
+        Setup::with(Options { cancel_on_disconnect: Some(("disconnect", GRACE)), ..Options::default() }).await;
+    setup.working_order().await;
+    setup.client.shutdown(None).await;
+    setup.events.logged_out().await;
+    let order = setup.id("1");
+    let shutdown = setup.service.shutdown();
+    let answering = async {
+        let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
+        assert_eq!(sent.orig_cl_ord_id.as_str(), order);
+        setup.venue.send(canceled(&sent.cl_ord_id, &sent.orig_cl_ord_id));
+        setup.venue.events.logged_out().await;
+    };
+    timeout(WAIT, async { tokio::join!(shutdown, answering) }).await.expect("shutdown hung");
+    assert!(setup.service.gateway().unfinished().open_orders.is_empty());
+}
+
 /// A client without cancel on disconnect keeps its order working at the venue.
 #[tokio::test]
 async fn shutdown_leaves_the_orders_of_a_client_without_cancel_on_disconnect() {

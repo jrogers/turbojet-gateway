@@ -219,7 +219,7 @@ impl Gateway {
     /// CompID `on` says has cancel on disconnect, whatever its trigger, without a block, as
     /// [`ClientApp::on_cancel_on_disconnect`] does. Turbojet starts no countdown for a session our
     /// side ends, and these orders would otherwise stay working with no gateway to report to.
-    /// Counted and cancelled under one lock; logged as one warning.
+    /// Logged as one warning with each session's working orders, counted under the same lock.
     pub fn cancel_at_shutdown(self: &Arc<Self>, on: impl Fn(&str) -> bool) {
         let sessions: Vec<ClientId> = {
             let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
@@ -232,7 +232,7 @@ impl Gateway {
         if orders.is_empty() {
             return;
         }
-        warn!(?orders, "shutting down: cancelling the orders of clients with cancel on disconnect");
+        warn!(working = ?orders, "shutting down: cancelling the working orders of clients with cancel on disconnect");
         let inputs = orders.into_keys().map(|client| Input::CancelAll { scope: Scope::Session(client) });
         self.handle_locked(&mut state, inputs);
     }
