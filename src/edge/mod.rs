@@ -1440,18 +1440,18 @@ mod tests {
         assert_eq!(again, 0, "the venue got the order again");
     }
 
-    /// [`gateway`], committing to an in-memory database, with new orders rejected past `limit`
-    /// uncommitted batches; and the database, whose writes the test can gate and fail.
-    async fn gateway_with_store(limit: usize) -> (Arc<Gateway>, Store) {
-        let (gateway, store, _writing) = gateway_with_writer(limit).await;
+    /// [`gateway`], committing to an in-memory database, with new orders rejected once a batch has
+    /// waited `max_wait`; and the database, whose writes the test can gate and fail.
+    async fn gateway_with_store(max_wait: Duration) -> (Arc<Gateway>, Store) {
+        let (gateway, store, _writing) = gateway_with_writer(max_wait).await;
         (gateway, store)
     }
 
     /// As [`gateway_with_store`], with the writer's task.
-    async fn gateway_with_writer(limit: usize) -> (Arc<Gateway>, Store, tokio::task::JoinHandle<()>) {
+    async fn gateway_with_writer(max_wait: Duration) -> (Arc<Gateway>, Store, tokio::task::JoinHandle<()>) {
         let store = Store::open("sqlite::memory:").await.unwrap();
         let (writer, writing) = Writer::start(store.clone(), 1);
-        let gateway = Arc::try_unwrap(gateway()).unwrap().with_writer(writer.with_limit(limit));
+        let gateway = Arc::try_unwrap(gateway()).unwrap().with_writer(writer.with_max_wait(max_wait));
         (Arc::new(gateway), store, writing)
     }
 
@@ -1513,7 +1513,7 @@ mod tests {
     /// to the venue and the reports to the client without waiting for it.
     #[tokio::test(flavor = "multi_thread")]
     async fn messages_stay_in_flight_until_their_changes_commit() {
-        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let mut sessions = connected(&gateway, true).await;
         store.hooks.gate.send_replace(false);
 
@@ -1538,7 +1538,7 @@ mod tests {
     /// change is written: the store then holds what the book does, and nothing undelivered.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failing_database_stalls_then_writes_every_change() {
-        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let mut sessions = connected(&gateway, true).await;
         store.hooks.gate.send_replace(false);
         store.hooks.failures.store(3, Ordering::Release);
@@ -1599,11 +1599,11 @@ mod tests {
             .collect()
     }
 
-    /// Past the limit of uncommitted batches, a new order is rejected as "gateway unavailable",
-    /// and isn't booked; a cancel goes to the venue and a fill is booked.
+    /// Once a batch has waited too long to commit, a new order is rejected as "gateway
+    /// unavailable", and isn't booked; a cancel goes to the venue and a fill is booked.
     #[tokio::test(flavor = "multi_thread")]
-    async fn past_the_uncommitted_limit_new_orders_are_rejected_and_the_rest_flow() {
-        let (gateway, store) = gateway_with_store(1).await;
+    async fn a_batch_waiting_too_long_rejects_new_orders_and_the_rest_flow() {
+        let (gateway, store) = gateway_with_store(Duration::from_millis(50)).await;
         let mut sessions = connected(&gateway, false).await;
         let venue = VenueApp(gateway.clone());
         let venue_message = |msg: &Message| venue.on_message(&mut Context::new(&sessions.venue.handle()), msg).unwrap();
@@ -1616,7 +1616,13 @@ mod tests {
         store.hooks.gate.send_replace(false);
         send_order(&gateway, "C2");
         let _: v44::NewOrderSingle = next_message(&mut sessions.venue_events).await.parse().unwrap();
-        assert_eq!(uncommitted(&gateway), 1);
+        let writer = gateway.writer.as_ref().unwrap();
+        let waited = async {
+            while !writer.unavailable() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(Duration::from_secs(5), waited).await.expect("never unavailable");
         send_order(&gateway, "C3");
         assert!(gateway.lock().book.order(OrderId(3)).is_none());
         let mut cancel = v44::OrderCancelRequest::new("C1", "C4", v44::Side::Buy, UtcTimestamp::now());
@@ -1645,7 +1651,7 @@ mod tests {
     /// stored the report.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reports_row_goes_once_the_clients_session_stores_it() {
-        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         // No venue: booked and rejected.
         send_order(&gateway, "C1");
         gateway.committed().await;
@@ -1668,7 +1674,7 @@ mod tests {
     /// An operator's call returns only once its change has committed.
     #[tokio::test]
     async fn an_operator_call_returns_once_its_change_has_committed() {
-        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         store.hooks.gate.send_replace(false);
         let mut blocking = tokio::spawn({
             let gateway = gateway.clone();
@@ -1696,7 +1702,7 @@ mod tests {
     /// rather than leave it pending with nothing to answer it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dropped_requests_order_stays_in_flight_until_its_reject_commits() {
-        let (gateway, store) = gateway_with_store(writer::MAX_UNCOMMITTED).await;
+        let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let (holding, mut held) = unbounded_channel();
         let (release, gate) = std::sync::mpsc::channel();
         let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
@@ -1733,7 +1739,7 @@ mod tests {
     /// restart, and nothing waiting for a commit is told it happened.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cancelled_writer_releases_nothing() {
-        let (gateway, _store, writing) = gateway_with_writer(writer::MAX_UNCOMMITTED).await;
+        let (gateway, _store, writing) = gateway_with_writer(writer::MAX_COMMIT_WAIT).await;
         let mut sessions = connected(&gateway, true).await;
         writing.abort();
         assert!(writing.await.unwrap_err().is_cancelled());

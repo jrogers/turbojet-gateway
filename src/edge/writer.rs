@@ -5,15 +5,16 @@
 //!
 //! Batches queue on one channel, unbounded in type but bounded in practice by the holds: a
 //! session stops reading 256 messages past its oldest held one, so a database that's down or slow
-//! slows the counterparties, not the gateway's memory. Past [`MAX_UNCOMMITTED`] batches the
-//! gateway rejects new orders (see [`Book::set_unavailable`](crate::book::Book::set_unavailable)).
+//! slows the counterparties, not the gateway's memory. While the oldest uncommitted batch has
+//! waited longer than [`MAX_COMMIT_WAIT`], the gateway rejects new orders (see
+//! [`Book::set_unavailable`](crate::book::Book::set_unavailable)).
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -28,18 +29,21 @@ use crate::store::Store;
 /// on it. A thousand inputs' rows is a few hundred kilobytes.
 pub const MAX_BATCHES_PER_WRITE: usize = 1_000;
 
-/// Uncommitted batches past which new orders are rejected as "gateway unavailable". A healthy
-/// writer is a transaction or two behind; ten writes' worth means the database is failing or far
-/// slower than the flow, and booking more would only grow what a crash makes clients resend.
-/// Cancels, replaces and fills keep flowing, each held until it commits.
-pub const MAX_UNCOMMITTED: usize = 10 * MAX_BATCHES_PER_WRITE;
+/// How long the oldest uncommitted batch may wait before new orders are rejected as "gateway
+/// unavailable". Age, not a count: a burst queues hundreds of batches that commit within
+/// milliseconds, and the holds stop each session at 256 messages, so a count can't tell a burst
+/// from a database that's failing or lagging. A healthy commit takes milliseconds; a second
+/// means the database is down or far behind, and booking more would only grow what a crash
+/// makes clients resend. Cancels, replaces and fills keep flowing, each held until it commits.
+pub const MAX_COMMIT_WAIT: Duration = Duration::from_secs(1);
 
 /// The writer's wait after a failed write, doubling to [`RETRY_MAX`]: soon enough for a blip,
 /// without hammering a database that's down.
 const RETRY_FIRST: Duration = Duration::from_millis(10);
 const RETRY_MAX: Duration = Duration::from_secs(1);
 
-const _: () = assert!(MAX_BATCHES_PER_WRITE <= MAX_UNCOMMITTED);
+// A database that keeps failing has the gateway unavailable between retries, too.
+const _: () = assert!(RETRY_MAX.as_millis() <= MAX_COMMIT_WAIT.as_millis());
 
 /// One input's changes, and what waits on their commit.
 #[derive(Debug)]
@@ -49,6 +53,7 @@ struct Batch {
     hold: Option<Hold>,
     /// Told once the changes have committed.
     done: Option<oneshot::Sender<()>>,
+    queued: Instant,
 }
 
 /// Queues batches for the writer task: see the [module documentation](self). Cloned, it queues on
@@ -61,7 +66,11 @@ pub struct Writer {
     next_row: Arc<AtomicU64>,
     /// Set once the writer task has been cancelled: see [`Supervised`].
     stopping: Arc<AtomicBool>,
-    limit: usize,
+    /// When the oldest batch not yet committed was queued, as nanoseconds after `start` plus
+    /// one; zero when there's none.
+    oldest: Arc<AtomicU64>,
+    start: Instant,
+    max_wait: Duration,
 }
 
 impl Writer {
@@ -74,25 +83,27 @@ impl Writer {
         let (queue, batches) = mpsc::unbounded_channel();
         let uncommitted = Arc::new(AtomicUsize::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
+        let (oldest, start) = (Arc::new(AtomicU64::new(0)), Instant::now());
         let task = Task { batches, waiting: Vec::with_capacity(MAX_BATCHES_PER_WRITE) };
-        let future = Box::pin(run(store, task, uncommitted.clone()));
+        let ages = Ages { oldest: oldest.clone(), start };
+        let future = Box::pin(run(store, task, uncommitted.clone(), ages));
         let writing = tokio::spawn(Supervised { future, polling: false, stopping: stopping.clone() });
         let next_row = Arc::new(AtomicU64::new(next_row));
-        let writer = Self { queue, uncommitted, next_row, stopping, limit: MAX_UNCOMMITTED };
+        let writer = Self { queue, uncommitted, next_row, stopping, oldest, start, max_wait: MAX_COMMIT_WAIT };
         (writer, writing)
     }
 
-    /// Rejects new orders past `limit` uncommitted batches rather than [`MAX_UNCOMMITTED`].
+    /// Rejects new orders once a batch has waited `max_wait` rather than [`MAX_COMMIT_WAIT`].
     #[cfg(test)]
-    pub(crate) fn with_limit(mut self, limit: usize) -> Self {
-        self.limit = limit;
+    pub(crate) fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
         self
     }
 
     /// Queues `changes` to commit after everything queued before them, holding `hold` until they
     /// have.
     pub(crate) fn queue(&self, changes: Changes, hold: Option<Hold>) {
-        self.send(Batch { changes, hold, done: None });
+        self.send(Batch { changes, hold, done: None, queued: Instant::now() });
     }
 
     /// Queues the deletion of undelivered row `row`: its report reached the client's session, or
@@ -104,7 +115,7 @@ impl Writer {
     /// Completes once everything queued so far has committed.
     pub(crate) async fn committed(&self) {
         let (done, committed) = oneshot::channel();
-        self.send(Batch { changes: Changes::default(), hold: None, done: Some(done) });
+        self.send(Batch { changes: Changes::default(), hold: None, done: Some(done), queued: Instant::now() });
         if committed.await.is_err() {
             self.gone(None);
             // Never as if committed.
@@ -117,9 +128,11 @@ impl Writer {
         self.next_row.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Whether the database is too far behind to take new orders.
+    /// Whether the database is too far behind to take new orders: the oldest batch not yet
+    /// committed has waited longer than the maximum.
     pub(crate) fn unavailable(&self) -> bool {
-        self.uncommitted() >= self.limit
+        let oldest = self.oldest.load(Ordering::Acquire);
+        oldest != 0 && self.start.elapsed() > Duration::from_nanos(oldest - 1) + self.max_wait
     }
 
     /// Batches queued and not yet committed.
@@ -182,6 +195,23 @@ impl<F> Drop for Supervised<F> {
     }
 }
 
+/// Where the writer task says how old its oldest batch is: see [`Writer::unavailable`].
+struct Ages {
+    oldest: Arc<AtomicU64>,
+    start: Instant,
+}
+
+impl Ages {
+    /// `queued` is the oldest batch's time; `None` once it's committed.
+    fn set(&self, queued: Option<Instant>) {
+        let nanos = queued.map_or(0, |queued| {
+            let since = queued.saturating_duration_since(self.start).as_nanos();
+            u64::try_from(since).unwrap_or(u64::MAX - 1) + 1
+        });
+        self.oldest.store(nanos, Ordering::Release);
+    }
+}
+
 /// What the writer task holds: its queue, and the holds and waiters of the batches it's writing.
 struct Task {
     batches: mpsc::UnboundedReceiver<Batch>,
@@ -201,17 +231,21 @@ impl Drop for Task {
 
 /// The writer task: takes what's queued, up to [`MAX_BATCHES_PER_WRITE`], writes it in one
 /// transaction, retrying until it commits, then lets go of its holds and says it's done.
-async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>) {
+async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>, ages: Ages) {
     // Reused from one write to the next.
     let mut changes = Vec::with_capacity(MAX_BATCHES_PER_WRITE);
     while let Some(first) = task.batches.recv().await {
+        // The oldest not committed: those queued behind it are younger. Between a commit and the
+        // next receive it reads as none, for as long as taking the next batch takes.
+        ages.set(Some(first.queued));
         let mut next = Some(first);
-        while let Some(Batch { changes: batch, hold, done }) = next {
+        while let Some(Batch { changes: batch, hold, done, queued: _ }) = next {
             changes.push(batch);
             task.waiting.push((hold, done));
             next = if changes.len() < MAX_BATCHES_PER_WRITE { task.batches.try_recv().ok() } else { None };
         }
         write(&store, &changes).await;
+        ages.set(None);
         let written = changes.len();
         changes.clear();
         for (hold, done) in task.waiting.drain(..) {
