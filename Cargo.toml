@@ -9,7 +9,14 @@ publish = false
 [dependencies]
 # By path while the engine API Jetbridge needs is still changing; crates.io once released.
 turbojet = { path = "../turbojet/crates/turbojet" }
+turbojet-config = { path = "../turbojet/crates/turbojet-config" }
+turbojet-fix42 = { path = "../turbojet/crates/turbojet-fix42" }
+turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]
 unsafe_code = "deny"
