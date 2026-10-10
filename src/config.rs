@@ -23,6 +23,9 @@
 //!
 //! [risk.client.FUNDA]             # a CompID's own: each key it sets replaces the default's
 //! max_notional = "250000.50"
+//!
+//! [database]                      # optional: without it, the book is kept in memory only
+//! url = "sqlite://jetbridge.db?mode=rwc"  # `mode=rwc` creates the file
 //! ```
 //!
 //! Amounts are TOML integers, floats or strings, read as decimals: a string keeps every digit
@@ -32,7 +35,7 @@
 //! The sessions file is Turbojet's (`turbojet-config`): its `[acceptor]` serves the clients, all
 //! speaking its `begin_string`, and each `[initiator.NAME]` logs on to venue `NAME`. The
 //! `sessions` key is read at start only: a reload rereads the routes and limits, and the sessions
-//! file in use.
+//! file in use. Nor does a reload read `[database]`: the gateway keeps the database it started with.
 //!
 //! A client session's trading day ends at `day_end`, or sooner when its schedule's period (from
 //! the sessions file) ends. `day_end` is a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`,
@@ -85,6 +88,8 @@ pub struct Loaded {
     pub version: Version,
     /// When a session with no schedule ends its trading day: see [`day_end`].
     pub day_end: SessionSchedule,
+    /// The `[database]` URL the book is kept in, if any: read at start only.
+    pub database: Option<String>,
 }
 
 /// Reads the configuration file at `path` and the sessions file it names.
@@ -105,7 +110,8 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
     check_venues(path, &router, &sessions.initiator_names())?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
-    Ok(Loaded { router, limits, sessions, version, day_end })
+    let database = file.database.map(|database| database.url);
+    Ok(Loaded { router, limits, sessions, version, day_end, database })
 }
 
 /// Reads the routes, limits and `day_end` in the configuration file at `path` again, checking
@@ -188,6 +194,13 @@ struct File {
     route: Vec<Route>,
     #[serde(default)]
     risk: Risk,
+    database: Option<Database>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Database {
+    url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -392,6 +405,19 @@ reject = "no route"
     fn an_unknown_key_is_an_error() {
         let error = load_error("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\nsymbl = \"X\"");
         assert!(error.contains("unknown field `symbl`"), "{error}");
+    }
+
+    #[test]
+    fn the_database_url_is_optional_and_its_table_takes_no_other_key() {
+        let load_database = |jetbridge: &str| {
+            let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("jetbridge.toml")).unwrap().database
+        };
+        assert_eq!(load_database("sessions = \"sessions.toml\""), None);
+        let with = "sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"";
+        assert_eq!(load_database(with).as_deref(), Some("sqlite://j.db?mode=rwc"));
+        let error = load_error("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db\"\npath = \"x\"");
+        assert!(error.contains("unknown field `path`"), "{error}");
     }
 
     #[test]
