@@ -18,13 +18,28 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   the client's session: a stop in between loses the report.
 - Operators' blocks (see the README's kill switch) are kept in memory: a restart lifts them.
 - So is what the risk limits count: a restart forgets each session's open and filled notional and
-  every symbol's last fill price. Credit counts fills since start, not since the start of a
-  trading day, and orders left working at the venues across a restart count for nothing.
+  every symbol's last fill price. Credit counts fills since the later of the trading day's start
+  and the gateway's, and orders left working at the venues across a restart count for nothing.
 - A gateway cancel (the kill switch's) that a venue's session can't queue is tried again once a
   second while the session is connected, without limit.
-- Nothing is cleared at the end of the day: orders, ClOrdIDs, requests sent, filled notional and
-  last fill prices stay in memory until a restart. The bound of 1,000,000 ClOrdIDs per client
-  (plus 10,000 for cancels and replaces once it's reached) counts from start, not per day.
+- At the end of a session's trading day its done orders, their ClOrdIDs and requests sent, and
+  its filled notional are dropped (see the README's trading day). Live orders carry over, GTC
+  ones for as long as they work, and so do last fill prices, one per symbol traded. The bound of
+  1,000,000 ClOrdIDs per client (plus 10,000 for cancels and replaces once it's reached) counts
+  per day, from the ClOrdIDs of the live orders carried over.
+
+## Trading day
+
+- A venue's report on an order done and dropped at the end of its client's day (a late
+  correction, a resend) is for an unknown order: it's dropped with a warning, and the client
+  doesn't hear of it. So is a cancel reject for one.
+- A day rolls over at the session's next message, or the next tick, once a second: a quiet
+  session's done orders and fills count up to a second past its end.
+- A changed `day_end` or schedule applies from each session's next day: the day under way ends
+  when it was going to, even if the new setting puts its end earlier or later. A schedule with no
+  period in the next 400 days (all holidays, say) leaves its sessions' day as it is.
+- The roll walks the whole book once per session rolled, under the book's lock: many sessions
+  ending their day at once with a large book hold it for a while.
 
 ## Orders and reports
 
@@ -86,8 +101,8 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   replace is checked against credit only when it raises the order's notional, so one that cuts the
   notional passes even over the credit limit; one at the same price (or Market again) with no more
   quantity skips every risk check.
-- The last fill prices are kept per symbol for the gateway's life: one entry for each symbol
-  traded, bounded by the orders booked.
+- The last fill prices are kept per symbol for the gateway's life, across trading days: one entry
+  for each symbol traded.
 - A reload's new limits apply to the next order or replace: orders already working aren't
   checked again or cancelled.
 
@@ -115,10 +130,10 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 - Every client speaks the acceptor's BeginString.
 - A CompID may log on with up to 16 sessions; a logon on a 17th is refused. A logon whose SubID
   or LocationID contains '/' is refused too, since it could print the same as another session.
-- Each session that logs on keeps a report queue and its task, and each that orders a count in
-  the book, until a restart. Listing the counterparties bounds the CompIDs, and so the sessions;
+- Each session that logs on keeps a report queue and its task, and each that orders its trading
+  day in the book, until a restart. Listing the counterparties bounds the CompIDs, and so the sessions;
   under `unknown = "admit"` they aren't bounded.
-- The ClOrdID budget (1,000,000 from start) is per session, so one CompID can use up to 16 times it.
+- The ClOrdID budget (1,000,000 a day) is per session, so one CompID can use up to 16 times it.
 - A client holds up to 100,000 undelivered reports. The first past that is dropped, with an
   error logged, and the client is logged out; later ones are dropped and counted until its queue
   empties.

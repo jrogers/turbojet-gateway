@@ -36,9 +36,11 @@ reports back, keeping each order's state as it goes.
   prevention.
 - **A kill switch**, as library calls: block a client session, a CompID or everyone, and cancel
   their orders at the venues.
+- **A trading day** per client session, from its schedule or a daily `day_end`: at its end, done
+  orders and their ClOrdIDs go, and the session's ClOrdID count and filled notional start again.
 - **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
   cancelled when its session drops and it doesn't log back on in time, and at shutdown.
-- **Reload on SIGHUP** of the routes, the risk limits and the sessions file, keeping connected
+- **Reload on SIGHUP** of the routes, the risk limits, `day_end` and the sessions file, keeping connected
   sessions the file still has.
 
 ## Building and running
@@ -68,6 +70,7 @@ Two files: `jetbridge.toml`, given with `--config`, and the sessions file it nam
 # Jetbridge: the sessions file, how orders are routed and the clients' risk limits. First match
 # wins; an order no route matches is rejected.
 sessions = "sessions.toml"
+day_end = "17:00 America/New_York"  # a session without a schedule's end of trading day
 
 # FUNDA's orders for XNAS go to NASDAQ.
 [[route]]
@@ -88,7 +91,7 @@ self_trade = true
 # FUNDA's own: the keys it sets replace the defaults', the rest are the defaults'.
 [risk.client.FUNDA]
 max_notional = "2500000.50"
-credit = 10000000                 # open + filled since start + this order
+credit = 10000000                 # open + filled today + this order
 ```
 
 - `sessions`: the sessions file, relative to this file. Read at start only; a reload rereads the
@@ -107,6 +110,8 @@ order is rejected, and routes after one with no conditions can never match; both
 warning logged. Unknown keys are errors, and so is a route to a venue the sessions file has no
 initiator for. Cancels and replaces go to the venue the order went to, whatever the routes say
 now.
+- `day_end`: when a client session without a schedule ends its trading day: see
+  [Trading day](#trading-day).
 - `[risk.defaults]` and `[risk.client.COMPID]`: see [Risk limits](#risk-limits).
 
 ### sessions.toml
@@ -157,7 +162,7 @@ optional, and one left out is no check:
 | `max_notional` | its quantity times its price is more than this |
 | `symbols` | its Symbol(55) isn't one of these, compared exactly |
 | `price_band` | it's a Limit order priced more than this percentage either side of the symbol's last fill; no check before the symbol's first fill |
-| `credit` | the session's open notional, plus what it has filled since start, plus this order's, is more than this |
+| `credit` | the session's open notional, plus what it has filled in its trading day, plus this order's, is more than this |
 | `self_trade` | `true`: it would trade with one of the same session's live orders on the other side, same symbol and venue (a buy at or above a resting sell's price, a sell at or below a resting buy's; a Market order on either side crosses) |
 
 Amounts are TOML integers, floats or strings, read as decimals (a string keeps every digit as
@@ -173,7 +178,7 @@ written), and must be positive; `symbols` can't be empty. Unknown keys are error
   `max_notional` or `credit` applies, and passes otherwise. An order's open notional is its
   unfilled quantity at that price, fixed when it's booked or replaced.
 - **Credit** counts the session's live orders (with a pending replace, the larger of the old and
-  new terms) and its fills, at their fill prices, since the gateway started.
+  new terms) and its fills, at their fill prices, in its [trading day](#trading-day).
 - **Replaces** are checked on their new terms, against credit only if they raise the order's
   notional. A replace that adds no risk, at the same price (or Market again) and no more quantity,
   always passes, so a client can cut an order the limits would refuse now.
@@ -185,6 +190,30 @@ written), and must be positive; `symbols` can't be empty. Unknown keys are error
   too many ClOrdIDs, the routes (a route's reject or no route), then the limits.
 - **Reloads.** A SIGHUP rereads the limits with the routes, both or neither. New limits apply from
   the next order or replace; orders already working stay, and what's been counted carries over.
+
+## Trading day
+
+Each client session has a trading day. When it ends, the session starts the next one:
+
+- its done orders (filled, cancelled, expired, rejected) are forgotten, and their ClOrdIDs can be
+  used again;
+- its live orders (GTC ones, or any still working) carry over, and their ClOrdIDs stay in use;
+- its count of ClOrdIDs against the 1,000,000 a day starts again from its live orders' ClOrdIDs;
+- what it has filled, for `credit`, starts again at zero.
+
+Symbols' last fill prices are every client's, and carry over.
+
+A session's day is its schedule's period, from the sessions file (`schedule = "daily
+08:00-17:00 America/New_York"`, say): it ends when the period ends, and between periods the
+session is in the next period's day. A session without a schedule ends its day at `day_end` in
+`jetbridge.toml`: a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`, an offset such as
+`+05:30` or an IANA name such as `America/New_York` (daylight saving followed). The zone is UTC if
+left out, and `day_end` is midnight UTC if left out.
+
+The day rolls over at a session's first message after its end, before that message is handled,
+or within a second by itself if the session is quiet. A SIGHUP rereads `day_end` with the routes
+and limits; a new `day_end`, or a changed schedule, applies from each session's next day: the day
+under way ends when it was going to.
 
 ## Kill switch
 
@@ -232,10 +261,11 @@ as one warning with the count per session. Other clients' orders stay working at
 
 - **SIGHUP** (Unix) reloads. The sessions file first, as turbojet-config reloads it: changed
   settings apply from each session's next logon, added venues start and removed ones are logged
-  out and stopped. Then the routes and risk limits, the routes checked against the venues running
-  after that. A file that doesn't load is logged as a warning and the one in use is kept: a bad
-  sessions file keeps the sessions as they were, and a bad `jetbridge.toml` keeps the routes and
-  limits. New routes and limits apply to new orders; orders already working stay with their venue.
+  out and stopped. Then the routes, risk limits and `day_end`, the routes checked against the
+  venues running after that. A file that doesn't load is logged as a warning and the one in use is
+  kept: a bad sessions file keeps the sessions as they were, and a bad `jetbridge.toml` keeps the
+  routes, limits and `day_end`. New routes and limits apply to new orders; orders already working
+  stay with their venue. A new `day_end` or schedule applies from each session's next trading day.
 - **Ctrl-C or SIGTERM** logs every client out ("gateway shutting down"), which fires any
   cancel-on-disconnect countdowns under way, and cancels the working orders of clients with cancel
   on disconnect (see above); waits up to 5 seconds for the venues to answer the

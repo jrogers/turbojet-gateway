@@ -25,9 +25,13 @@ Notable changes to Jetbridge.
   CompID.
 - Risk limits in `jetbridge.toml`, `[risk.defaults]` and `[risk.client.COMPID]`: maximum order
   quantity and notional, allowed symbols, a price band around the symbol's last fill, credit (open
-  plus filled since start) and self-trade prevention, checked per session on each order and
+  plus filled today) and self-trade prevention, checked per session on each order and
   replace after routing. A replace that adds no risk passes. Refused orders get OrdRejReason 3
   for quantity, notional and credit, and a Text naming the limit.
+- A trading day per client session: its schedule's period from the sessions file, or ending at
+  `day_end` in `jetbridge.toml` (a time and time zone; midnight UTC by default). When it ends, the
+  session's done orders and their ClOrdIDs are dropped, its ClOrdID count and filled notional start
+  again, and its live orders carry over.
 - Reports for a client that's disconnected or slow are held in a bounded queue per client and
   delivered in order once it can take them.
 - An order whose venue isn't connected, or whose session drops it unsent, is rejected as venue
@@ -40,6 +44,6 @@ Notable changes to Jetbridge.
 - Cancel on disconnect: a client session with `cancel_on_disconnect` in the sessions file has
   its orders cancelled at the venues when it doesn't log back on within its grace, and at
   shutdown, which waits up to 5 seconds for the venues to answer the gateway's cancels.
-- SIGHUP reloads the sessions file, the routes and the risk limits, keeping either file if it
+- SIGHUP reloads the sessions file, the routes, the risk limits and `day_end`, keeping either file if it
   doesn't load; Ctrl-C or SIGTERM logs every session out and says what the stop leaves open.
   Optional TLS (feature `tls`).
