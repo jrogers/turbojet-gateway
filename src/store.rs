@@ -1,6 +1,9 @@
 //! The book's database: [`Store::write`] commits the book's [`Changes`], and [`Store::load`] reads
 //! back the [`Snapshot`] a restart restores. SQLite through sqlx, in SQL PostgreSQL also speaks.
 //!
+//! It also keeps the reports queued for clients that their sessions haven't yet stored, as
+//! `undelivered` rows the gateway adds and deletes (see [`Changes::undelivered`]).
+//!
 //! Orders are never deleted: what the book drops at a day roll stays as history, and `load` reads
 //! only what [`Book::restore`](crate::book::Book::restore) keeps. Values are stored so they read
 //! back exactly: decimals as their text, which keeps the scale; times as RFC 3339 text in UTC with
@@ -22,7 +25,7 @@ use turbojet::fields::{CompactString, Decimal};
 
 use crate::book::{
     CancelKind, Changes, ClOrdIdRow, ClientId, Day, GatewayCancel, OrdType, Order, OrderId, OrderRequest, OrderRow,
-    Origin, Pending, Scope, Sent, Side, Snapshot, Status, TimeInForce, Today,
+    Origin, Pending, Scope, Sent, Side, Snapshot, Status, TimeInForce, Today, Undelivered,
 };
 
 /// The schema this build reads and writes. A database of another is refused, not migrated.
@@ -141,6 +144,12 @@ impl Store {
             snapshot.filled.insert(row.client()?, row.decimal("notional")?);
         }
         // Over every order, history too: see `Snapshot::next_order_id`.
+        for row in fetch(connection, "SELECT * FROM undelivered", "undelivered").await? {
+            let row = Columns(&row);
+            let message = row.0.try_get("message").map_err(|e| undecodable("message", e))?;
+            let id = unsigned("id", row.integer("id")?)?;
+            snapshot.undelivered.insert(id, Undelivered { client: row.client()?, message });
+        }
         let max: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM orders")
             .fetch_one(&mut *connection)
             .await
@@ -273,6 +282,13 @@ const TABLES: &[&str] = &[
         notional TEXT NOT NULL,
         PRIMARY KEY (client, client_comp_id)
     )",
+    // BYTEA, PostgreSQL's bytes; SQLite takes any type name, and stores a blob as it is.
+    "CREATE TABLE IF NOT EXISTS undelivered (
+        id BIGINT PRIMARY KEY,
+        client TEXT NOT NULL,
+        client_comp_id TEXT NOT NULL,
+        message BYTEA NOT NULL
+    )",
 ];
 
 /// Creates the tables a new database lacks, after checking the version of one that has them: a
@@ -362,6 +378,8 @@ static UPSERT_DAY: LazyLock<String> =
     LazyLock::new(|| upsert("days", &["client", "client_comp_id"], &["client", "client_comp_id", "day_end", "began"]));
 static UPSERT_REFERENCE: LazyLock<String> =
     LazyLock::new(|| upsert("risk_references", &["symbol"], &["symbol", "price"]));
+static UPSERT_UNDELIVERED: LazyLock<String> =
+    LazyLock::new(|| upsert("undelivered", &["id"], &["id", "client", "client_comp_id", "message"]));
 static UPSERT_FILLED: LazyLock<String> =
     LazyLock::new(|| upsert("risk_filled", &["client", "client_comp_id"], &["client", "client_comp_id", "notional"]));
 
@@ -384,7 +402,7 @@ fn upsert(table: &str, key: &[&str], columns: &[&str]) -> String {
 type Query<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>>;
 
 async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io::Result<()> {
-    let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled } = changes;
+    let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered } = changes;
     for row in orders {
         run(connection, bind_order(sqlx::query(&UPSERT_ORDER), row)?, "writing an order").await?;
     }
@@ -437,6 +455,14 @@ async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io:
     for (client, notional) in filled {
         let query = bind_client(sqlx::query(&UPSERT_FILLED), client).bind(notional.to_string());
         run(connection, query, "writing a client's filled notional").await?;
+    }
+    for (id, Undelivered { client, message }) in undelivered {
+        let query = bind_client(sqlx::query(&UPSERT_UNDELIVERED).bind(signed(*id)?), client).bind(message.as_slice());
+        run(connection, query, "writing an undelivered report").await?;
+    }
+    for id in delivered {
+        let query = sqlx::query("DELETE FROM undelivered WHERE id = $1").bind(signed(*id)?);
+        run(connection, query, "deleting a delivered report").await?;
     }
     Ok(())
 }

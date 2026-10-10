@@ -4,7 +4,7 @@
 //! prefix, and restored orders keep their names), what risk works out from live orders, and
 //! configuration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use turbojet::fields::{CompactString, Decimal};
 
@@ -26,6 +26,25 @@ pub struct Changes {
     pub references: Vec<(CompactString, Decimal)>,
     /// What each session has filled in its trading day: zero once a new day starts.
     pub filled: Vec<(ClientId, Decimal)>,
+    /// Reports queued for clients, by row ID: the gateway's outbox adds these to the changes of
+    /// the input that made them; the book never does.
+    pub undelivered: Vec<(u64, Undelivered)>,
+    /// Rows of `undelivered` to delete, their reports stored by the client's session or lost.
+    pub delivered: Vec<u64>,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A report queued for `client`, as the FIX message its session is sent, framed with the
+/// clients' BeginString, BodyLength and CheckSum so [`turbojet::codec::decode`] reads it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undelivered {
+    pub client: ClientId,
+    pub message: Vec<u8>,
 }
 
 /// An order, and its client's trading day when the row was written: a done order stays in the
@@ -59,6 +78,8 @@ pub struct Snapshot {
     pub blocked: Vec<Scope>,
     pub references: HashMap<CompactString, Decimal>,
     pub filled: HashMap<ClientId, Decimal>,
+    /// Reports not known to have reached their client, in the order they were queued.
+    pub undelivered: BTreeMap<u64, Undelivered>,
     /// Past every OrderId the store has had, its history too: `MAX(id) + 1` over every order
     /// row, not just those restored. OrderIds key the orders, requests sent and ClOrdIDs, so a
     /// new order taking a dropped one's would inherit its rows at the next restart.
@@ -68,7 +89,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// Writes `changes` over the records, as the store does.
     pub fn apply(&mut self, changes: Changes) {
-        let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled } = changes;
+        let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered } = changes;
         for row in orders {
             self.next_order_id = self.next_order_id.max(row.order.id.0 + 1);
             self.orders.insert(row.order.id, row);
@@ -81,6 +102,10 @@ impl Snapshot {
         }
         self.references.extend(references);
         self.filled.extend(filled);
+        self.undelivered.extend(undelivered);
+        for id in delivered {
+            self.undelivered.remove(&id);
+        }
     }
 }
 
@@ -157,7 +182,9 @@ impl Book {
         assert!(self.orders.is_empty(), "restore fills a new book");
         assert_eq!(self.next_id, 1, "restore fills a new book");
         assert!(self.days.is_empty(), "restore fills a new book");
-        let Snapshot { orders, sent, cl_ord_ids, days, blocked, references, filled, next_order_id } = snapshot;
+        // Undelivered reports are the gateway's to queue again, not the book's.
+        let Snapshot { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered: _, next_order_id } =
+            snapshot;
         for id in orders.keys() {
             assert!(id.0 < next_order_id, "the snapshot's next OrderId is past {id:?}");
         }
@@ -207,6 +234,7 @@ impl Book {
             blocked: self.blocked.clone(),
             references: self.risk.references().clone(),
             filled: self.risk.filled_by_client().collect(),
+            undelivered: BTreeMap::new(),
             next_order_id: self.next_id,
         }
     }

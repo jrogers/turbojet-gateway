@@ -20,7 +20,7 @@ mod report;
 
 use amend::{Amend, Refused, Terms};
 use persist::Touched;
-pub use persist::{Changes, ClOrdIdRow, OrderRow, Snapshot};
+pub use persist::{Changes, ClOrdIdRow, OrderRow, Snapshot, Undelivered};
 
 /// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
 /// each with its own ClOrdIDs and reports. Shows as the session, as Turbojet shows it. Cheap to

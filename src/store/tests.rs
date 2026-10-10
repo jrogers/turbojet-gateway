@@ -176,6 +176,12 @@ async fn every_row_reads_back_as_written() {
         blocked: Some(vec![Scope::Session(session.clone()), Scope::CompId("FUNDD".into()), Scope::All]),
         references: vec![("AAPL".into(), decimal("10.50")), ("MSFT".into(), decimal("0.0001"))],
         filled: vec![(funda.clone(), decimal("1000.00")), (fundb.clone(), Decimal::ZERO)],
+        undelivered: vec![
+            (1, Undelivered { client: session.clone(), message: b"8=FIX.4.4\x019=5\x0135=8\x0110=000\x01".to_vec() }),
+            // Any bytes, NUL and not UTF-8 too.
+            (2, Undelivered { client: fundb.clone(), message: vec![0xff, 0, 1] }),
+        ],
+        delivered: Vec::new(),
     };
     store.write(std::slice::from_ref(&changes)).await.unwrap();
     let loaded = store.load().await.unwrap();
@@ -243,6 +249,23 @@ async fn later_rows_win_and_blocks_are_replaced() {
     assert_eq!(loaded.blocked, [Scope::Session(funda)]);
     store.write(&[Changes { blocked: Some(Vec::new()), ..Changes::default() }]).await.unwrap();
     assert!(store.load().await.unwrap().blocked.is_empty());
+}
+
+/// A delivered report's row is deleted, in the same write as its insert or a later one; writing
+/// a batch again, as the writer retries one, changes nothing.
+#[tokio::test]
+async fn delivered_reports_are_deleted_and_a_rewrite_changes_nothing() {
+    let store = memory().await;
+    let row = |n: u8| Undelivered { client: ClientId::from("FUNDA"), message: vec![n] };
+    let first = Changes { undelivered: vec![(1, row(1)), (2, row(2)), (3, row(3))], ..Changes::default() };
+    let second = Changes { delivered: vec![1], ..Changes::default() };
+    store.write(&[first.clone(), second.clone()]).await.unwrap();
+    let third = Changes { delivered: vec![3], ..Changes::default() };
+    store.write(std::slice::from_ref(&third)).await.unwrap();
+    store.write(std::slice::from_ref(&third)).await.unwrap();
+    let loaded = store.load().await.unwrap();
+    assert_eq!(loaded.undelivered.into_iter().collect::<Vec<_>>(), [(2, row(2))]);
+    assert_eq!(store.load().await.unwrap(), applied(&[first, second, third]));
 }
 
 /// An empty store's next OrderId is 1.
