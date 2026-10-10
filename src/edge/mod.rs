@@ -13,9 +13,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tracing::error;
-use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp};
+use turbojet::fields::{BusinessRejectReason, CompactString, UtcTimestamp, format_compact};
 use turbojet::{
-    Application, Clock, ConnectionInfo, Context, Message, MessageReject, SendError, SessionHandle, SessionId,
+    Application, Clock, ConnectionInfo, Context, Dropped, Message, MessageReject, Receipt, SendError, SessionHandle,
+    SessionId,
 };
 
 use crate::book::{Book, ClientId, Input, Output, VenueId};
@@ -34,6 +35,8 @@ const VENUE_BUSY: &str = "venue unavailable: its send queue is full";
 pub struct Gateway {
     state: Mutex<State>,
     outbox: Outbox,
+    /// Every client's: the acceptor's BeginString.
+    client_version: Version,
     /// For TransactTime(60) on what the gateway sends.
     clock: Clock,
 }
@@ -42,11 +45,9 @@ pub struct Gateway {
 #[derive(Debug)]
 struct State {
     book: Book,
-    /// Each client's FIX version, recorded at logon, for the reports a venue's message makes.
-    clients: HashMap<ClientId, Version>,
     venues: HashMap<VenueId, Venue>,
     /// Which venue each initiator's session is.
-    venue_names: HashMap<SessionId, VenueId>,
+    venue_names: HashMap<SessionId, (VenueId, Version)>,
 }
 
 #[derive(Debug)]
@@ -56,15 +57,11 @@ struct Venue {
 }
 
 impl Gateway {
-    /// A gateway routing by `router`, with no venues until [`set_venues`](Self::set_venues).
-    pub fn new(router: Router) -> Self {
-        let state = State {
-            book: Book::new(router),
-            clients: HashMap::new(),
-            venues: HashMap::new(),
-            venue_names: HashMap::new(),
-        };
-        Self { state: Mutex::new(state), outbox: Outbox::new(), clock: Clock::system() }
+    /// A gateway routing by `router`, whose clients speak `client_version`, with no venues until
+    /// [`set_venues`](Self::set_venues).
+    pub fn new(router: Router, client_version: Version) -> Self {
+        let state = State { book: Book::new(router), venues: HashMap::new(), venue_names: HashMap::new() };
+        Self { state: Mutex::new(state), outbox: Outbox::new(), client_version, clock: Clock::system() }
     }
 
     /// Stamps TransactTime(60) from `clock` rather than the system's.
@@ -90,7 +87,7 @@ impl Gateway {
         let mut names = HashMap::new();
         for (name, session) in venues {
             let version = session.id().begin_string.parse()?;
-            names.insert(session.id().clone(), name.clone());
+            names.insert(session.id().clone(), (name.clone(), version));
             by_name.insert(name, Venue { version, session });
         }
         let mut state = self.lock();
@@ -107,9 +104,10 @@ impl Gateway {
     /// Runs `input` through the book and sends what it answers, all under the lock. A venue
     /// request that can't be queued goes back in as [`Input::SendFailed`], which never makes
     /// venue-bound output, so this ends after one more round per refused request.
-    fn handle(&self, input: Input) {
-        let now = UtcTimestamp::from(self.clock.now());
+    fn handle(self: &Arc<Self>, input: Input) {
         let mut state = self.lock();
+        // After the lock, so TransactTimes rise in the order the book answers.
+        let now = UtcTimestamp::from(self.clock.now());
         let state = &mut *state;
         let mut inputs = VecDeque::from([input]);
         let mut outputs = Vec::new();
@@ -126,19 +124,14 @@ impl Gateway {
     }
 
     /// Sends `output` where it's going. `Some` for a venue request its session refused.
-    fn send(&self, state: &State, output: &Output, now: UtcTimestamp) -> Option<Input> {
+    fn send(self: &Arc<Self>, state: &State, output: &Output, now: UtcTimestamp) -> Option<Input> {
         match output {
             Output::Report { client, .. } | Output::CancelReject { client, .. } => {
-                // Every client the book answers sent it a request, so logged on first.
-                let Some(version) = state.clients.get(client) else {
-                    error!(%client, "report for a client that never logged on; dropped");
-                    return None;
-                };
-                let msg = version.client_message(output, now).expect("a client-bound output");
+                let msg = self.client_version.client_message(output, now).expect("a client-bound output");
                 // Not `ctx.send`, even to the client whose request this answers: the outbox keeps
-                // each client's reports in the book's order. If the process stops before this is
-                // sent, at-least-once delivery covers it: the client's request comes again, and
-                // the book answers the redelivery.
+                // each client's reports in the book's order. The cost: the client's request can
+                // be committed before its report is stored, so a stop in between loses the
+                // report. Stage 4, persisting the book with undelivered reports, closes that.
                 self.outbox.deliver(client, msg);
                 None
             }
@@ -152,10 +145,11 @@ impl Gateway {
                 };
                 let Some(to) = state.venues.get(venue) else { return Some(failed(VENUE_UNAVAILABLE)) };
                 let msg = to.version.venue_message(output, now).expect("a venue-bound output");
-                // ponytail: the receipt is dropped, so a request the connection loses before
-                // storing it leaves the order pending; stage 4 holds the client's commit on it.
                 match to.session.send(msg) {
-                    Ok(_receipt) => None,
+                    Ok(receipt) => {
+                        self.settle(receipt, venue.clone(), downstream.clone());
+                        None
+                    }
                     Err(SendError::Full(_)) => Some(failed(VENUE_BUSY)),
                     // NotConnected.
                     Err(_) => Some(failed(VENUE_UNAVAILABLE)),
@@ -164,9 +158,36 @@ impl Gateway {
         }
     }
 
+    /// Waits for the venue's session to store a request, and if it drops it unsent, tells the
+    /// book, so the client hears rather than waiting on an order the venue never saw.
+    ///
+    /// ponytail: one task per venue request; a per-venue drain like the outbox's if it measures.
+    fn settle(self: &Arc<Self>, receipt: Receipt, venue: VenueId, downstream: CompactString) {
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            let dropped = match receipt.await {
+                Ok(_) => return,
+                Err(dropped @ (Dropped::Disconnected | Dropped::LoggingOut | Dropped::Rejected(_))) => dropped,
+                // Storage, or one Turbojet adds: it may have been stored, and then it's resent
+                // from there, so the order stays pending rather than be rejected while it works.
+                Err(dropped) => {
+                    return error!(%venue, %downstream, "venue request may not have been stored: {dropped}");
+                }
+            };
+            let text = format_compact!("{VENUE_UNAVAILABLE}: {dropped}");
+            gateway.handle(Input::SendFailed { venue, downstream, text });
+        });
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
-        // A panic inside the book may have left it half-updated: stop trading rather than go on.
-        self.state.lock().expect("the book panicked; no more orders")
+        self.state.lock().unwrap_or_else(|_| {
+            // A panic inside the book may have left it half-updated. Going on would be wrong, and
+            // so would panicking again: Turbojet answers a panicking callback with a
+            // BusinessMessageReject and carries on, so every venue fill would be consumed and
+            // lost. Stop the process, and let the venues resend to the next one.
+            error!("the book panicked while handling a message; stopping");
+            std::process::abort()
+        })
     }
 }
 
@@ -175,23 +196,14 @@ impl Gateway {
 pub struct ClientApp(pub Arc<Gateway>);
 
 impl Application for ClientApp {
-    fn verify_logon(&self, session: &SessionHandle, _logon: &Message, _: &ConnectionInfo) -> Result<(), String> {
-        session.id().begin_string.parse::<Version>().map(drop).map_err(|e| e.to_string())
-    }
-
     fn on_logon(&self, session: &SessionHandle) {
-        let id = session.id();
-        let version = id.begin_string.parse().expect("checked in verify_logon");
-        self.0.lock().clients.insert(ClientId::from(id.target_comp_id.as_str()), version);
         self.0.outbox.logged_on(session);
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
-        let id = ctx.session_id();
-        let version: Version = id.begin_string.parse().expect("checked in verify_logon");
-        let client = ClientId::from(id.target_comp_id.as_str());
+        let client = ClientId::from(ctx.session_id().target_comp_id.as_str());
         let redelivered = ctx.maybe_redelivered() || fix::possibly_resent(msg);
-        let input = version.client_input(&client, msg, redelivered)?;
+        let input = self.0.client_version.client_input(&client, msg, redelivered)?;
         self.0.handle(input);
         Ok(())
     }
@@ -214,11 +226,7 @@ impl Application for VenueApp {
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
-        let known = {
-            let state = self.0.lock();
-            let name = state.venue_names.get(ctx.session_id()).cloned();
-            name.and_then(|name| state.venues.get(&name).map(|venue| (name, venue.version)))
-        };
+        let known = self.0.lock().venue_names.get(ctx.session_id()).cloned();
         // Only if a reload dropped the venue while its session was up.
         let Some((venue, version)) = known else {
             error!(session = %ctx.session_id(), "message from a venue no longer configured; rejected");
@@ -255,7 +263,7 @@ mod tests {
     /// Every order to [`VENUE`].
     fn gateway() -> Arc<Gateway> {
         let rule = Rule { client: None, ex_destination: None, symbol: None, target: Target::Venue(VENUE.into()) };
-        Arc::new(Gateway::new(Router::new(vec![rule])))
+        Arc::new(Gateway::new(Router::new(vec![rule]), Version::Fix44))
     }
 
     fn session(begin_string: &str, target: &str) -> SessionHandle {
@@ -266,13 +274,15 @@ mod tests {
         app.verify_logon(session, &Message::new(MsgType::Logon), &ConnectionInfo::new(None, Vec::new()))
     }
 
+    /// Clients' requests are read in the version the gateway was made for: FIX 4.2 requires
+    /// HandlInst(21) on an order, which FIX 4.4 dropped.
     #[test]
-    fn a_client_logs_on_only_with_a_version_the_gateway_converts() {
-        let app = ClientApp(gateway());
-        assert_eq!(logon(&app, &session("FIX.4.2", "FUNDA")), Ok(()));
-        assert_eq!(logon(&app, &session("FIX.4.4", "FUNDA")), Ok(()));
-        let refused = logon(&app, &session("FIX.4.3", "FUNDA")).unwrap_err();
-        assert!(refused.contains("FIX.4.3"), "{refused}");
+    fn clients_speak_the_version_the_gateway_was_made_for() {
+        let rule = Rule { client: None, ex_destination: None, symbol: None, target: Target::Venue(VENUE.into()) };
+        let app = ClientApp(Arc::new(Gateway::new(Router::new(vec![rule]), Version::Fix42)));
+        let client = session("FIX.4.2", "FUNDA");
+        let reject = app.on_message(&mut Context::new(&client), &order("C1")).unwrap_err();
+        assert_eq!(reject, MessageReject::required_tag_missing(tags::HANDL_INST));
     }
 
     #[test]
@@ -309,6 +319,7 @@ mod tests {
     #[derive(Debug)]
     enum Event {
         LoggedOn,
+        LoggedOut,
         Message(Message),
     }
 
@@ -321,6 +332,10 @@ mod tests {
     impl Application for Peer {
         fn on_logon(&self, _session: &SessionHandle) {
             let _ = self.events.send(Event::LoggedOn);
+        }
+
+        fn on_logout(&self, _session: &SessionHandle, _ended: turbojet::Disconnect) {
+            let _ = self.events.send(Event::LoggedOut);
         }
 
         fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
@@ -437,5 +452,79 @@ mod tests {
         let rejected = report(&mut events).await;
         assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
         assert_eq!(rejected.text.as_deref(), Some(VENUE_UNAVAILABLE));
+    }
+
+    /// A venue's initiator started before the gateway knows it, as `turbojet-config` starts
+    /// them: its first logon is refused, and once the gateway is told, the retry gets through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_venue_started_before_the_gateway_knows_it_logs_on_once_told() {
+        let gateway = gateway();
+        let (venue_app, mut venue_events) = peer();
+        let venue_addr = serve("VENUE", venue_app).await;
+        let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        tokio::spawn(venue.clone().run());
+        // The venue's side completes the logon, and then ours refuses it.
+        assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
+        assert!(matches!(next(&mut venue_events).await, Event::LoggedOut));
+        gateway.set_venues([(VENUE.into(), venue.handle())]).unwrap();
+        assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
+        let (client, _client_events) = client(&gateway).await;
+        client.handle().send(order("C1")).unwrap();
+        let sent: v44::NewOrderSingle = next_message(&mut venue_events).await.parse().unwrap();
+        assert_eq!(sent.cl_ord_id, "1");
+    }
+
+    /// A venue that holds our first Logon until released, then refuses it, and every later one.
+    struct Refuser {
+        holding: UnboundedSender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl Application for Refuser {
+        fn verify_logon(&self, _: &SessionHandle, _: &Message, _: &ConnectionInfo) -> Result<(), String> {
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = self.holding.send(());
+                tokio::task::block_in_place(|| release.recv()).ok();
+            }
+            Err("not today".into())
+        }
+    }
+
+    /// An order and its cancel, queued for the venue while our logon to it is under way, are
+    /// dropped unsent when the logon fails: the client hears of both rather than wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_dropped_unsent_by_the_venue_session_are_answered() {
+        let gateway = gateway();
+        let (holding, mut held) = unbounded_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
+        let venue_addr = serve("VENUE", refuser).await;
+        let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        gateway.set_venues([(VENUE.into(), venue.handle())]).unwrap();
+        tokio::spawn(venue.clone().run());
+        timeout(Duration::from_secs(5), held.recv()).await.expect("logon not held");
+        let (client, mut events) = client(&gateway).await;
+
+        client.handle().send(order("C1")).unwrap();
+        let mut cancel = v44::OrderCancelRequest::new("C1", "C2", v44::Side::Buy, UtcTimestamp::now());
+        cancel.symbol = Some("AAPL".into());
+        client.handle().send(cancel.to_message()).unwrap();
+        // Neither refused straight away: both are queued on the session.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(events.try_recv().is_err(), "answered before the logon failed");
+        release.send(()).unwrap();
+
+        // In either order: each failure is settled on its own task.
+        let mut answers = Vec::new();
+        for _ in 0..2 {
+            answers.push(next_message(&mut events).await);
+        }
+        answers.sort_by_key(|msg| msg.msg_type().code().to_owned());
+        let rejected: v44::ExecutionReport = answers[0].parse().unwrap();
+        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        assert!(rejected.text.as_deref().unwrap().starts_with(VENUE_UNAVAILABLE), "{:?}", rejected.text);
+        let refused: v44::OrderCancelReject = answers[1].parse().unwrap();
+        assert_eq!((refused.cl_ord_id.as_str(), refused.orig_cl_ord_id.as_str()), ("C2", "C1"));
     }
 }
