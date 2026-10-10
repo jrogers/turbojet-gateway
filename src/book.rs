@@ -209,6 +209,17 @@ pub enum Output {
     },
 }
 
+/// A request we sent a venue, by its downstream ClOrdID: what the venue's answers map back to.
+#[derive(Debug, Clone)]
+struct Sent {
+    order: OrderId,
+    /// The client's ClOrdID for the request, and its OrigClOrdID for a cancel or replace.
+    cl_ord_id: CompactString,
+    orig_cl_ord_id: Option<CompactString>,
+    /// `None` for the original order.
+    kind: Option<CancelKind>,
+}
+
 #[derive(Debug)]
 pub struct Book {
     router: Router,
@@ -217,8 +228,8 @@ pub struct Book {
     index: HashMap<(ClientId, CompactString), OrderId>,
     /// ClOrdIDs in `index` per client, against [`MAX_CL_ORD_IDS_PER_CLIENT`].
     used: HashMap<ClientId, usize>,
-    /// Downstream ClOrdID -> the order, and the client's ClOrdID for that request.
-    downstream: HashMap<CompactString, (OrderId, CompactString)>,
+    /// Downstream ClOrdID -> what we sent under it.
+    downstream: HashMap<CompactString, Sent>,
     next_id: u64,
 }
 
@@ -276,7 +287,8 @@ impl Book {
         self.next_id += 1;
         let downstream = format_compact!("{}", id.0);
         self.remember(&client, request.cl_ord_id.clone(), id);
-        let previous = self.downstream.insert(downstream.clone(), (id, request.cl_ord_id.clone()));
+        let sent = Sent { order: id, cl_ord_id: request.cl_ord_id.clone(), orig_cl_ord_id: None, kind: None };
+        let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
         out.push(Output::NewOrder { venue: venue.clone(), downstream: downstream.clone(), request: request.clone() });
         let order = Order {
@@ -295,7 +307,8 @@ impl Book {
     }
 
     fn venue_report(&mut self, venue: &VenueId, report: VenueReport, out: &mut Vec<Output>) {
-        let Some((id, cl_ord_id)) = self.downstream.get(&report.downstream).cloned() else {
+        let Some(Sent { order: id, cl_ord_id, orig_cl_ord_id, .. }) = self.downstream.get(&report.downstream).cloned()
+        else {
             return tracing::warn!(%venue, downstream = %report.downstream, "execution report for an unknown order");
         };
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
@@ -308,7 +321,6 @@ impl Book {
         if report.cum_qty > order.request.qty {
             return tracing::warn!(%venue, downstream = %report.downstream, cum_qty = %report.cum_qty, "overfill");
         }
-        let orig_cl_ord_id = (cl_ord_id != order.request.cl_ord_id).then(|| order.request.cl_ord_id.clone());
         order.status = report.status;
         order.cum_qty = report.cum_qty;
         order.avg_px = report.avg_px;
@@ -330,27 +342,22 @@ impl Book {
         orig_cl_ord_id: CompactString,
         out: &mut Vec<Output>,
     ) {
-        let refuse = |order_id, status, reason, text: &str| Output::CancelReject {
-            client: client.clone(),
-            order_id,
-            cl_ord_id: cl_ord_id.clone(),
-            orig_cl_ord_id: orig_cl_ord_id.clone(),
-            response_to: CancelKind::Cancel,
-            status,
-            reason,
-            text: text.into(),
-        };
+        let id = self.index.get(&(client.clone(), orig_cl_ord_id.clone())).copied();
+        let order = id.map(|id| self.orders.get(&id).expect("indexed ClOrdIDs point at booked orders"));
         // Before `remember`, which asserts the ClOrdID is new.
-        if self.index.contains_key(&(client.clone(), cl_ord_id.clone())) {
-            return out.push(refuse(None, Status::Rejected, CancelRejectReason::Duplicate, "duplicate ClOrdID"));
-        }
-        let Some(&id) = self.index.get(&(client.clone(), orig_cl_ord_id.clone())) else {
-            return out.push(refuse(None, Status::Rejected, CancelRejectReason::UnknownOrder, "unknown order"));
+        let duplicate = self.index.contains_key(&(client.clone(), cl_ord_id.clone()));
+        let refusal = match order {
+            _ if duplicate => Some((CancelRejectReason::Duplicate, "duplicate ClOrdID")),
+            None => Some((CancelRejectReason::UnknownOrder, "unknown order")),
+            Some(order) if order.status.is_done() => Some((CancelRejectReason::TooLate, "order is done")),
+            Some(_) => None,
         };
-        let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
-        if order.status.is_done() {
-            return out.push(refuse(Some(id), order.status, CancelRejectReason::TooLate, "order is done"));
+        if let Some((reason, text)) = refusal {
+            let refusal = Refusal { client, cl_ord_id, orig_cl_ord_id, response_to: CancelKind::Cancel };
+            return out.push(refusal.output(order, reason, text.into()));
         }
+        let id = id.expect("checked above");
+        let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
         order.amendments += 1;
         let downstream = format_compact!("{}-{}", id.0, order.amendments);
         out.push(Output::Cancel {
@@ -359,11 +366,19 @@ impl Book {
             orig_downstream: order.downstream.clone(),
             request: order.request.clone(),
         });
-        let previous = self.downstream.insert(downstream.clone(), (id, cl_ord_id.clone()));
+        let sent = Sent {
+            order: id,
+            cl_ord_id: cl_ord_id.clone(),
+            orig_cl_ord_id: Some(orig_cl_ord_id),
+            kind: Some(CancelKind::Cancel),
+        };
+        let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
         self.remember(&client, cl_ord_id, id);
     }
 
+    /// The venue refused a cancel or replace we sent under `downstream`: tell the client, under
+    /// the ClOrdIDs of its own request. Anything that doesn't name such a request is dropped.
     fn venue_cancel_reject(
         &mut self,
         venue: &VenueId,
@@ -371,23 +386,19 @@ impl Book {
         text: Option<CompactString>,
         out: &mut Vec<Output>,
     ) {
-        let Some((id, cl_ord_id)) = self.downstream.get(downstream).cloned() else {
+        let Some(sent) = self.downstream.get(downstream).cloned() else {
             return tracing::warn!(%venue, %downstream, "cancel reject for an unknown request");
         };
-        let order = self.orders.get(&id).expect("downstream ClOrdIDs point at booked orders");
+        let (Some(response_to), Some(orig_cl_ord_id)) = (sent.kind, sent.orig_cl_ord_id) else {
+            return tracing::warn!(%venue, %downstream, "cancel reject naming an order, not a cancel or replace");
+        };
+        let order = self.orders.get(&sent.order).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
             return tracing::warn!(%venue, %downstream, "cancel reject for another venue's order");
         }
-        out.push(Output::CancelReject {
-            client: order.client.clone(),
-            order_id: Some(id),
-            cl_ord_id,
-            orig_cl_ord_id: order.request.cl_ord_id.clone(),
-            response_to: CancelKind::Cancel,
-            status: order.status,
-            reason: CancelRejectReason::Other,
-            text: text.unwrap_or_else(|| "rejected by the venue".into()),
-        });
+        let refusal = Refusal { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, response_to };
+        let text = text.unwrap_or_else(|| "rejected by the venue".into());
+        out.push(refusal.output(Some(order), CancelRejectReason::Other, text));
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
@@ -429,6 +440,30 @@ fn stale(order: &Order, report: &VenueReport) -> bool {
     order.status.is_done()
         || report.cum_qty < order.cum_qty
         || (report.last_qty > Decimal::ZERO && report.cum_qty == order.cum_qty)
+}
+
+/// A client's cancel or replace request, refused.
+struct Refusal {
+    client: ClientId,
+    cl_ord_id: CompactString,
+    orig_cl_ord_id: CompactString,
+    response_to: CancelKind,
+}
+
+impl Refusal {
+    /// An OrderCancelReject, naming the order when there is one.
+    fn output(self, order: Option<&Order>, reason: CancelRejectReason, text: CompactString) -> Output {
+        Output::CancelReject {
+            client: self.client,
+            order_id: order.map(|order| order.id),
+            cl_ord_id: self.cl_ord_id,
+            orig_cl_ord_id: self.orig_cl_ord_id,
+            response_to: self.response_to,
+            status: order.map_or(Status::Rejected, |order| order.status),
+            reason,
+            text,
+        }
+    }
 }
 
 fn reject(client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
@@ -714,6 +749,7 @@ mod tests {
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref()), ("C2", Some("C1")));
         assert_eq!(report.leaves_qty, Decimal::ZERO);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Canceled);
     }
 
     #[test]
@@ -740,8 +776,10 @@ mod tests {
         let mut book = book();
         new_order(&mut book, "C1");
         let out = cancel(&mut book, "C1", "C1");
-        assert_eq!(cancel_reject(&out).1, CancelKind::Cancel);
-        assert_eq!(cancel_reject(&out).3, CancelRejectReason::Duplicate);
+        assert_eq!(
+            cancel_reject(&out),
+            (Some(OrderId(1)), CancelKind::Cancel, Status::PendingNew, CancelRejectReason::Duplicate)
+        );
     }
 
     #[test]
@@ -749,8 +787,7 @@ mod tests {
         let mut book = book();
         new_order(&mut book, "C1");
         cancel(&mut book, "C2", "C1");
-        let out =
-            run(&mut book, Input::VenueCancelReject { venue: "NASDAQ".into(), downstream: "1-1".into(), text: None });
+        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1"));
         let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, text, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str()), ("C2", "C1"));
         assert_eq!(text, "rejected by the venue");
@@ -758,5 +795,49 @@ mod tests {
             cancel_reject(&out),
             (Some(OrderId(1)), CancelKind::Cancel, Status::PendingNew, CancelRejectReason::Other)
         );
+    }
+
+    fn venue_cancel_reject(venue: &str, downstream: &str) -> Input {
+        Input::VenueCancelReject { venue: venue.into(), downstream: downstream.into(), text: None }
+    }
+
+    #[test]
+    fn a_cancel_can_name_an_earlier_cancel() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        let out = cancel(&mut book, "C3", "C2");
+        assert_eq!(
+            out,
+            [Output::Cancel {
+                venue: "NASDAQ".into(),
+                downstream: "1-2".into(),
+                orig_downstream: "1".into(),
+                request: request("C1")
+            }]
+        );
+        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-2"));
+        let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str()), ("C3", "C2"));
+    }
+
+    #[test]
+    fn a_venue_cancel_reject_for_no_cancel_of_ours_is_dropped() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        assert!(run(&mut book, venue_cancel_reject("LSE", "1-1")).is_empty());
+        assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-9")).is_empty());
+        assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1")).is_empty());
+    }
+
+    #[test]
+    fn a_fill_on_the_original_after_a_cancel_reports_the_original_cl_ord_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        let out = run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C1", &None));
     }
 }
