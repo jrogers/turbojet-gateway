@@ -235,7 +235,22 @@ impl Book {
         }
     }
 
-    fn new_order(&mut self, client: ClientId, request: OrderRequest, _redelivered: bool, out: &mut Vec<Output>) {
+    fn new_order(&mut self, client: ClientId, request: OrderRequest, redelivered: bool, out: &mut Vec<Output>) {
+        if let Some(&id) = self.index.get(&(client.clone(), request.cl_ord_id.clone())) {
+            let order = &self.orders[&id];
+            // A resend of an order we booked: answer with where it stands. Side and symbol, not the
+            // whole request, since a replace may have changed quantity and price since.
+            let resent = redelivered && order.request.side == request.side && order.request.symbol == request.symbol;
+            let output = if resent {
+                Output::Report { client, report: order.report(&request.cl_ord_id) }
+            } else {
+                reject(client, request, RejectReason::Duplicate, "duplicate ClOrdID".into())
+            };
+            return out.push(output);
+        }
+        if self.used.get(&client).is_some_and(|&used| used >= MAX_CL_ORD_IDS_PER_CLIENT) {
+            return out.push(reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
+        }
         let venue = match self.router.route(&client, &request) {
             Target::Venue(venue) => venue,
             Target::Reject(text) => return out.push(reject(client, request, RejectReason::NoRoute, text)),
@@ -244,7 +259,8 @@ impl Book {
         self.next_id += 1;
         let downstream = format_compact!("{}", id.0);
         self.remember(&client, request.cl_ord_id.clone(), id);
-        self.downstream.insert(downstream.clone(), (id, request.cl_ord_id.clone()));
+        let previous = self.downstream.insert(downstream.clone(), (id, request.cl_ord_id.clone()));
+        debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
         out.push(Output::NewOrder { venue: venue.clone(), downstream: downstream.clone(), request: request.clone() });
         let order = Order {
             id,
@@ -257,12 +273,38 @@ impl Book {
             cum_qty: Decimal::ZERO,
             avg_px: Decimal::ZERO,
         };
-        self.orders.insert(id, order);
+        let previous = self.orders.insert(id, order);
+        debug_assert!(previous.is_none(), "order {id:?} booked twice");
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
-        self.index.insert((client.clone(), cl_ord_id), id);
+        let previous = self.index.insert((client.clone(), cl_ord_id), id);
+        debug_assert!(previous.is_none(), "ClOrdID reused by {client}");
         *self.used.entry(client.clone()).or_default() += 1;
+    }
+}
+
+impl Order {
+    /// A report of where the order stands, answering the client's `cl_ord_id`.
+    fn report(&self, cl_ord_id: &CompactString) -> ClientReport {
+        ClientReport {
+            order_id: Some(self.id),
+            cl_ord_id: cl_ord_id.clone(),
+            orig_cl_ord_id: None,
+            request: self.request.clone(),
+            status: self.status,
+            reject: None,
+            last_qty: Decimal::ZERO,
+            last_px: Decimal::ZERO,
+            cum_qty: self.cum_qty,
+            leaves_qty: self.leaves_qty(),
+            avg_px: self.avg_px,
+            text: None,
+        }
+    }
+
+    fn leaves_qty(&self) -> Decimal {
+        if self.status.is_done() { Decimal::ZERO } else { self.request.qty - self.cum_qty }
     }
 }
 
@@ -342,5 +384,52 @@ mod tests {
             (Status::Rejected, Some(RejectReason::NoRoute), None)
         );
         assert!(book.order(OrderId(1)).is_none());
+    }
+
+    #[test]
+    fn a_reused_cl_ord_id_is_rejected_as_a_duplicate() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = new_order(&mut book, "C1");
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.reject, Some(RejectReason::Duplicate));
+    }
+
+    #[test]
+    fn a_redelivered_order_gets_its_state_not_a_second_order() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!((report.order_id, report.status, report.reject), (Some(OrderId(1)), Status::PendingNew, None));
+    }
+
+    #[test]
+    fn a_redelivery_for_a_different_order_is_still_a_duplicate() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let mut other = request("C1");
+        other.side = Side::Sell;
+        let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: other, redelivered: true });
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.reject, Some(RejectReason::Duplicate));
+    }
+
+    #[test]
+    fn the_same_cl_ord_id_from_another_client_is_a_new_order() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        let out =
+            run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: request("C1"), redelivered: false });
+        assert!(matches!(out.as_slice(), [Output::NewOrder { .. }]));
+    }
+
+    #[test]
+    fn a_client_over_its_cl_ord_id_bound_is_rejected() {
+        let mut book = book();
+        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT);
+        let out = new_order(&mut book, "C1");
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(report.reject, Some(RejectReason::TooManyOrders));
     }
 }
