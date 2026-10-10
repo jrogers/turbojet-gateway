@@ -50,6 +50,7 @@ impl Book {
             return tracing::debug!(order = %order.name, "gateway cancel already in flight");
         }
         let order = self.orders.get_mut(&id).expect("looked up above");
+        self.touched.orders.insert(id);
         let orig_downstream = order.downstream.clone();
         order.gateway_cancel =
             Some(GatewayCancel { tries: 0, unsent: true, stuck: false, orig_downstream, refused_sends: 0 });
@@ -71,6 +72,7 @@ impl Book {
         };
         let downstream = self.next_downstream(sent);
         let order = self.orders.get_mut(&id).expect("requests are for booked orders");
+        self.touched.orders.insert(id);
         let gateway = order.gateway_cancel.as_mut().expect("the caller started the gateway's cancel");
         debug_assert!(gateway.tries < MAX_GATEWAY_CANCEL_TRIES && !gateway.stuck);
         gateway.tries += 1;
@@ -116,6 +118,7 @@ impl Book {
     /// Sends the gateway's cancel again, or marks the order stuck once it has had its tries.
     fn retry_gateway_cancel(&mut self, id: OrderId, out: &mut Vec<Output>) {
         let order = self.orders.get_mut(&id).expect("requests are for booked orders");
+        self.touched.orders.insert(id);
         let gateway = order.gateway_cancel.as_mut().expect("the caller checked for the gateway's cancel");
         if gateway.tries >= MAX_GATEWAY_CANCEL_TRIES {
             gateway.stuck = true;
@@ -150,6 +153,7 @@ impl Book {
         out: &mut Vec<Output>,
     ) {
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
+        self.touched.orders.insert(id);
         let text = text.unwrap_or_default();
         // The refusal's status made the order done, which ends the gateway's cancel.
         let Some(gateway) = order.gateway_cancel.as_mut() else {

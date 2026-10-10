@@ -15,9 +15,12 @@ use crate::router::{Router, Target};
 
 mod amend;
 mod gateway_cancel;
+mod persist;
 mod report;
 
 use amend::{Amend, Refused, Terms};
+use persist::Touched;
+pub use persist::{Changes, ClOrdIdRow, OrderRow, Snapshot};
 
 /// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
 /// each with its own ClOrdIDs and reports. Shows as the session, as Turbojet shows it. Cheap to
@@ -67,15 +70,15 @@ impl From<&str> for ClientId {
 
 /// A client session's trading day, known by when it ends: a later day is a later end. The gateway
 /// works it out from the session's schedule or `day_end`; the book only compares them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Day(pub DateTime<Utc>);
 
 /// A session's trading day, and when it began: its previous day's end, `None` for the first the
 /// book has seen.
-#[derive(Debug, Clone, Copy)]
-struct Today {
-    day: Day,
-    began: Option<DateTime<Utc>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Today {
+    pub day: Day,
+    pub began: Option<DateTime<Utc>>,
 }
 
 /// A venue session, by its name in the sessions file.
@@ -510,26 +513,26 @@ pub enum Output {
 
 /// Who asked for a request we sent a venue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Origin {
+pub enum Origin {
     Client,
     /// The gateway's own cancel: it spends none of the client's ClOrdIDs.
     Gateway,
 }
 
 /// A request we sent a venue, by its downstream ClOrdID: what the venue's answers map back to.
-#[derive(Debug, Clone)]
-struct Sent {
-    order: OrderId,
-    origin: Origin,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sent {
+    pub order: OrderId,
+    pub origin: Origin,
     /// The client's ClOrdID for the request, and its OrigClOrdID for a cancel or replace. Empty
     /// and `None` for the gateway's own cancel, whose answers go under the order's current one.
-    cl_ord_id: CompactString,
-    orig_cl_ord_id: Option<CompactString>,
+    pub cl_ord_id: CompactString,
+    pub orig_cl_ord_id: Option<CompactString>,
     /// `None` for the original order.
-    kind: Option<CancelKind>,
+    pub kind: Option<CancelKind>,
     /// The venue has rejected or accepted it (a cancel's Canceled, a replace's acceptance): a
     /// later reject is a resend.
-    answered: bool,
+    pub answered: bool,
 }
 
 /// Every ID the book issues starts with its prefix: OrderIDs, the ExecIDs `<OrderID>.<n>` and
@@ -566,6 +569,14 @@ pub struct Book {
     cancel_unsent: bool,
     /// Each client session's trading day: see [`Input::DaysStarted`].
     days: HashMap<ClientId, Today>,
+    /// What changed since [`take_changes`](Self::take_changes): every change to the records
+    /// above that survive a restart marks its key here.
+    touched: Touched,
+    /// Changes copied before a roll, for the next `take_changes`.
+    flushed: Changes,
+    /// Every change taken in the tests, as a store would hold them.
+    #[cfg(test)]
+    mirror: Snapshot,
 }
 
 impl Book {
@@ -586,6 +597,10 @@ impl Book {
             blocked: Vec::new(),
             cancel_unsent: false,
             days: HashMap::new(),
+            touched: Touched::default(),
+            flushed: Changes::default(),
+            #[cfg(test)]
+            mirror: Snapshot::default(),
         }
     }
 
@@ -677,9 +692,13 @@ impl Book {
             Input::Block { scope } => {
                 if !self.blocked.contains(&scope) {
                     self.blocked.push(scope);
+                    self.touched.blocked = true;
                 }
             }
-            Input::Unblock { scope } => self.blocked.retain(|blocked| *blocked != scope),
+            Input::Unblock { scope } => {
+                self.touched.blocked |= self.blocked.contains(&scope);
+                self.blocked.retain(|blocked| *blocked != scope);
+            }
             Input::DaysStarted { days } => self.days_started(days),
         }
         #[cfg(debug_assertions)]
@@ -756,6 +775,8 @@ impl Book {
     ) {
         if let Some(&id) = self.index.get(&(client.clone(), request.cl_ord_id.clone())) {
             let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
+            // Its next ExecID, if it's answered.
+            self.touched.orders.insert(id);
             // A resend of an order we booked: answer with where it stands. Side, symbol and account,
             // not the whole request, since a replace may have changed quantity and price since.
             let resent = redelivered.is_some()
@@ -830,6 +851,7 @@ impl Book {
         };
         let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
+        self.touched.sent.insert(downstream.clone());
         out.push(Output::NewOrder { venue: venue.clone(), downstream: downstream.clone(), request: request.clone() });
         let risk_price = self.risk.risk_price(&request.symbol, limit_price(request.ord_type, request.price));
         let order = Order {
@@ -853,6 +875,7 @@ impl Book {
         self.risk.track(id, order.exposure());
         let previous = self.orders.insert(id, order);
         debug_assert!(previous.is_none(), "order {id:?} booked twice");
+        self.touched.orders.insert(id);
     }
 
     /// The order's state, or for a ClOrdID the client never used, a Rejected report saying so:
@@ -865,8 +888,9 @@ impl Book {
         symbol: CompactString,
         out: &mut Vec<Output>,
     ) {
-        if let Some(id) = self.index.get(&(client.clone(), cl_ord_id.clone())) {
-            let order = self.orders.get_mut(id).expect("indexed ClOrdIDs point at booked orders");
+        if let Some(&id) = self.index.get(&(client.clone(), cl_ord_id.clone())) {
+            let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
+            self.touched.orders.insert(id);
             return out.push(Output::Report { client, report: order.status_report(cl_ord_id) });
         }
         // The client named only the ClOrdID, side and symbol; the rest says nothing is there.
@@ -934,15 +958,19 @@ impl Book {
     }
 
     fn days_started(&mut self, days: Vec<(ClientId, Day)>) {
+        // Written in the days they were made in, before a roll drops what they name.
+        self.flush_changes();
         let mut rolling = HashSet::new();
         for (client, day) in days {
             match self.days.get_mut(&client) {
                 None => {
+                    self.touched.days.insert(client.clone());
                     self.days.insert(client, Today { day, began: None });
                 }
                 Some(today) if today.day >= day => {}
                 Some(today) => {
                     *today = Today { day, began: Some(today.day.0) };
+                    self.touched.days.insert(client.clone());
                     rolling.insert(client);
                 }
             }
@@ -980,11 +1008,13 @@ impl Book {
                 None => self.used.remove(client),
             };
             self.risk.new_day(client);
+            self.touched.filled.insert(client.clone());
         }
         tracing::info!(sessions = ?rolling, dropped = done.len(), "new trading day");
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
+        self.touched.cl_ord_ids.insert((client.clone(), cl_ord_id.clone()));
         let previous = self.index.insert((client.clone(), cl_ord_id), id);
         debug_assert!(previous.is_none(), "ClOrdID reused by {client}");
         *self.used.entry(client.clone()).or_default() += 1;

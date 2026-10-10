@@ -68,6 +68,7 @@ impl Book {
         let symbol = order.request.symbol.clone();
         let risk_price = self.risk.risk_price(&symbol, price);
         let order = self.orders.get_mut(&id).expect("looked up above");
+        self.touched.orders.insert(id);
         order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price });
         self.risk.track(id, order.exposure());
     }
@@ -109,6 +110,7 @@ impl Book {
         if let Some(id) = id.filter(|&id| amend.redelivered && used_for == Some(id)) {
             // Side and symbol aren't checked again: the ClOrdID already maps to this order.
             let order = self.orders.get_mut(&id).expect("indexed ClOrdIDs point at booked orders");
+            self.touched.orders.insert(id);
             // It answers that request, under its own ClOrdIDs, as the venue's reports for it do.
             let mut report = order.report(&amend.cl_ord_id, ExecType::Status);
             report.orig_cl_ord_id = Some(amend.orig_cl_ord_id);
@@ -159,6 +161,7 @@ impl Book {
     /// The order's next numbered downstream ClOrdID, recording `sent` under it.
     pub(super) fn next_downstream(&mut self, sent: Sent) -> CompactString {
         let order = self.orders.get_mut(&sent.order).expect("requests are for booked orders");
+        self.touched.orders.insert(sent.order);
         order.amendments += 1;
         let downstream = format_compact!("{}-{}", order.name, order.amendments);
         if sent.kind == Some(CancelKind::Cancel) {
@@ -166,6 +169,7 @@ impl Book {
         }
         let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
+        self.touched.sent.insert(downstream.clone());
         downstream
     }
 
@@ -200,6 +204,7 @@ impl Book {
             return tracing::warn!(%venue, %downstream, "send failed for an unknown request");
         };
         let order = self.orders.get_mut(&sent.order).expect("downstream ClOrdIDs point at booked orders");
+        self.touched.orders.insert(sent.order);
         debug_assert_eq!(order.venue, *venue, "the edge reports a failed send to the order's venue");
         if order.venue != *venue {
             return tracing::warn!(%venue, %downstream, "send failed for another venue's order");
@@ -211,6 +216,7 @@ impl Book {
                 return tracing::debug!(%venue, %downstream, "send failed for an answered request; dropped");
             }
             self.downstream.get_mut(downstream).expect("looked up above").answered = true;
+            self.touched.sent.insert(downstream.clone());
             // Done since, the order needs no more cancelling.
             let Some(gateway) = &mut order.gateway_cancel else {
                 return tracing::debug!(%venue, %downstream, "send failed for a gateway cancel of a done order");
@@ -236,6 +242,7 @@ impl Book {
             return tracing::debug!(%venue, %downstream, "send failed for an answered order; dropped");
         }
         self.downstream.get_mut(downstream).expect("looked up above").answered = true;
+        self.touched.sent.insert(downstream.clone());
         order.set_status(Status::Rejected);
         self.risk.track(order.id, order.exposure());
         let mut report = order.report(&order.request.cl_ord_id.clone(), ExecType::Rejected);
@@ -260,6 +267,7 @@ impl Book {
             return tracing::warn!(%venue, %downstream, "request rejected naming an order, not a cancel or replace");
         };
         let order = self.orders.get_mut(&sent.order).expect("downstream ClOrdIDs point at booked orders");
+        self.touched.orders.insert(sent.order);
         if order.venue != *venue {
             return tracing::warn!(%venue, %downstream, "request rejected for another venue's order");
         }
@@ -267,6 +275,7 @@ impl Book {
             return tracing::debug!(%venue, %downstream, "rejection of an answered request dropped");
         }
         self.downstream.get_mut(downstream).expect("looked up by the caller").answered = true;
+        self.touched.sent.insert(downstream.clone());
         // The venue named its order while refusing the request: as good as any report's.
         order.record_venue_order_id(venue_order_id, false);
         // Only the replace it names: an older one's late reject leaves a newer one pending.

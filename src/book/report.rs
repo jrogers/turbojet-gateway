@@ -59,15 +59,18 @@ impl Book {
         if report.cum_qty > qty {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, cum_qty = %report.cum_qty, "overfill");
         }
+        self.touched.orders.insert(id);
         order.record_venue_order_id(report.venue_order_id.take(), accepted);
         if accepted {
             // The downstream the replace supersedes is settled like any other: its late reports
             // without a fill are resends.
             let superseded = order.apply_replace();
             self.downstream.get_mut(&superseded).expect("an order's downstream is recorded").answered = true;
+            self.touched.sent.insert(superseded);
         }
         if accepted || (kind == Some(CancelKind::Cancel) && report.status == Some(Status::Canceled)) {
             self.downstream.get_mut(&report.downstream).expect("looked up above").answered = true;
+            self.touched.sent.insert(report.downstream.clone());
         }
         // What the report filled: more than its LastQty when it carries a fill the gateway
         // missed (a Status report without one, or a fill after a gap).
@@ -81,6 +84,7 @@ impl Book {
         if rise > Decimal::ZERO {
             let reference = (report.last_qty > Decimal::ZERO).then_some(report.last_px);
             self.risk.fill(&order.client, &order.request.symbol, rise, price, reference);
+            self.touched.fill(order);
         }
         self.risk.track(id, order.exposure());
         // The gateway's cancel's acks aren't the client's: after a refusal it would be left

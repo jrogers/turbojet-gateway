@@ -207,6 +207,36 @@ impl State {
         session.filled = session.filled.checked_add(notional(qty, price)).unwrap_or(Decimal::MAX);
     }
 
+    /// What the session has filled in its trading day.
+    pub fn filled(&self, client: &ClientId) -> Decimal {
+        self.sessions.get(client).map_or(Decimal::ZERO, |session| session.filled)
+    }
+
+    /// Sets the reference prices and what sessions have filled in a new state, from a snapshot,
+    /// before the book tracks its live orders again.
+    pub fn restore(&mut self, references: HashMap<CompactString, Decimal>, filled: HashMap<ClientId, Decimal>) {
+        assert!(self.references.is_empty() && self.sessions.is_empty(), "restore fills a new state");
+        self.references = references;
+        // A session with nothing filled and no orders has no entry, as after `new_day`.
+        for (client, filled) in filled.into_iter().filter(|(_, filled)| *filled != Decimal::ZERO) {
+            self.sessions.entry(client).or_default().filled = filled;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn references(&self) -> &HashMap<CompactString, Decimal> {
+        &self.references
+    }
+
+    /// Sessions that have filled anything in their trading day, and how much.
+    #[cfg(test)]
+    pub fn filled_by_client(&self) -> impl Iterator<Item = (ClientId, Decimal)> {
+        self.sessions
+            .iter()
+            .filter(|(_, session)| session.filled != Decimal::ZERO)
+            .map(|(client, session)| (client.clone(), session.filled))
+    }
+
     /// Starts a new trading day for `client`: nothing filled yet. A session with no live orders
     /// is forgotten.
     pub fn new_day(&mut self, client: &ClientId) {

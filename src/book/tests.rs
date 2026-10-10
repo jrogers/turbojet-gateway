@@ -30,10 +30,39 @@ fn request(cl_ord_id: &str) -> OrderRequest {
     }
 }
 
+/// Every test's inputs go through here, so each checks the book's persistence too: a book
+/// restored from the changes taken before the input answers it as the live one does, and one
+/// restored from the changes taken after it holds what the live one holds.
 fn run(book: &mut Book, input: Input) -> Vec<Output> {
+    let mut before = restored(book);
     let mut out = Vec::new();
-    book.handle(input, &mut out);
+    book.handle(input.clone(), &mut out);
+    let mut again = Vec::new();
+    before.handle(input, &mut again);
+    assert_eq!(again, out, "the restored book's answer");
+    assert_eq!(before.snapshot(), book.snapshot(), "what the restored book holds after the input");
+    let changes = book.take_changes();
+    book.mirror.apply(changes);
+    let after = restored(book);
+    assert_eq!(after.snapshot(), book.snapshot(), "what the restored book holds");
+    assert_eq!(after.used, book.used);
     out
+}
+
+/// A new book restored from what `book` has had taken, set up as `book` is.
+fn restored(book: &Book) -> Book {
+    let mut restored = Book::new(book.router.clone());
+    restored.set_config(book.router.clone(), book.limits.clone());
+    restored.max_cl_ord_ids = book.max_cl_ord_ids;
+    restored.amend_reserve = book.amend_reserve;
+    restored.set_prefix(book.prefix.clone());
+    restored.restore(book.mirror.clone());
+    // A restart numbers orders and rejects afresh under a new prefix; this one keeps the live
+    // book's prefix and numbering, so their answers compare.
+    assert!(restored.next_id <= book.next_id);
+    restored.next_id = book.next_id;
+    restored.rejects = book.rejects;
+    restored
 }
 
 fn new_order(book: &mut Book, cl_ord_id: &str) -> Vec<Output> {
@@ -2842,4 +2871,71 @@ fn a_live_order_with_a_replace_and_a_cancel_crosses_the_roll() {
     run(&mut book, day_started("FUNDA", day(3)));
     assert!(book.order(OrderId(1)).is_none());
     assert_eq!(answer(&new_order(&mut book, "C1")), None);
+}
+
+/// Changes taken once, after several inputs and a roll between them, restore the same book: the
+/// roll copies what it drops first, in the day it was written in. The store keeps the dropped
+/// order as history, and the restored book leaves it out as the live one did.
+#[test]
+fn changes_taken_across_a_roll_restore_the_same_book() {
+    let mut book = book();
+    let inputs = [
+        day_started("FUNDA", day(1)),
+        order_from(&"FUNDA".into(), "C1"),
+        venue_report("1", Status::Filled, 100, 100),
+        order_from(&"FUNDA".into(), "C2"),
+        venue_report("2", Status::PartiallyFilled, 40, 40),
+        Input::Block { scope: Scope::CompId("FUNDB".into()) },
+        day_started("FUNDA", day(2)),
+        order_from(&"FUNDA".into(), "C1"),
+        Input::CancelAll { scope: Scope::All },
+    ];
+    for input in inputs {
+        book.handle(input, &mut Vec::new());
+    }
+    let mut snapshot = Snapshot::default();
+    snapshot.apply(book.take_changes());
+    assert_eq!(snapshot.orders[&OrderId(1)].order.status, Status::Filled);
+    assert_eq!(snapshot.orders[&OrderId(1)].day, Some(day(1)));
+    let mut restored = Book::new(book.router.clone());
+    restored.restore(snapshot);
+    assert!(restored.order(OrderId(1)).is_none());
+    assert_eq!(restored.snapshot(), book.snapshot());
+    assert_eq!(restored.used, book.used);
+    assert_eq!(restored.next_id, book.next_id);
+}
+
+/// A done order from before its session's first day stays until the session's first roll.
+#[test]
+fn a_done_order_from_before_the_first_day_goes_at_the_first_roll() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::Filled, 100, 100));
+    run(&mut book, day_started("FUNDA", day(1)));
+    assert!(restored(&book).order(OrderId(1)).is_some());
+    run(&mut book, day_started("FUNDA", day(2)));
+    assert!(restored(&book).order(OrderId(1)).is_none());
+}
+
+/// Inputs that change nothing that survives a restart leave no changes; answering a known
+/// order's status takes one of its ExecIDs, which does.
+#[test]
+fn only_inputs_changing_what_survives_leave_changes() {
+    let mut book = book();
+    run(&mut book, status_request("C1"));
+    let mut unroutable = request("C2");
+    unroutable.ex_destination = None;
+    run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: unroutable, redelivered: false, sent: None });
+    run(&mut book, Input::Unblock { scope: Scope::All });
+    run(&mut book, day_started("FUNDA", day(1)));
+    run(&mut book, day_started("FUNDA", day(1)));
+    for input in [status_request("C1"), Input::Unblock { scope: Scope::All }, day_started("FUNDA", day(1))] {
+        book.handle(input, &mut Vec::new());
+        assert_eq!(book.take_changes(), Changes::default());
+    }
+    new_order(&mut book, "C1");
+    book.handle(status_request("C1"), &mut Vec::new());
+    let changes = book.take_changes();
+    assert_eq!(changes.orders.iter().map(|row| row.order.exec_seq).collect::<Vec<_>>(), [1]);
+    assert_eq!(changes, Changes { orders: changes.orders.clone(), ..Changes::default() });
 }
