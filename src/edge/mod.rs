@@ -601,7 +601,16 @@ impl Gateway {
     /// Queued first, under the book's lock: a later change never commits before an earlier one,
     /// and a report's row is queued before the outbox can queue its deletion. Without a writer,
     /// the changes are dropped, so the book's tracking holds nothing.
-    fn commit(&self, book: &mut Book, reports: Vec<(ClientId, Message)>, ctx: Option<&mut Context<'_>>) {
+    ///
+    /// Reports made from a message that may have been handled before a restart are marked
+    /// PossResend(97): the database may have lost what handling it changed while the reports went
+    /// out, and then the same reports, under the same ExecIDs, go again.
+    fn commit(&self, book: &mut Book, mut reports: Vec<(ClientId, Message)>, ctx: Option<&mut Context<'_>>) {
+        if ctx.as_ref().is_some_and(|ctx| ctx.maybe_redelivered()) {
+            for (_, msg) in &mut reports {
+                msg.set(tags::POSS_RESEND, true);
+            }
+        }
         let Some(writer) = &self.writer else {
             book.discard_changes();
             for (client, msg) in reports {

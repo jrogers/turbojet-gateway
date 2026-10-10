@@ -268,6 +268,12 @@ impl Setup {
         self.venue.session(GATEWAY).send(msg).expect("the gateway is logged on to the venue");
     }
 
+    /// Sends `msg` from the venue, once its session has stored it.
+    async fn venue_send_stored(&self, msg: Message) {
+        let receipt = self.venue.session(GATEWAY).send(msg).expect("the gateway is logged on to the venue");
+        timeout(WAIT, receipt).await.expect("timed out").expect("stored");
+    }
+
     /// Order `cl_ord_id`, booked as the start's order `n`, acked by the venue, its ack seen.
     async fn working_order(&mut self, cl_ord_id: &str, n: usize) -> String {
         self.send(order(cl_ord_id));
@@ -760,4 +766,34 @@ async fn a_clean_shutdown_and_restart_carries_on() {
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::Filled, 100.into())]);
     assert!(database.undelivered.is_empty(), "{:?}", database.undelivered);
+}
+
+/// Crash after a fill reached the gateway, and its report the client, before it committed: the
+/// venue redelivers the fill after the restart, and the client gets the same report again, marked
+/// PossResend, so it can tell it's had it; its cumulative quantity stays right.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_lost_in_a_crash_is_redelivered_and_reported_again_as_possibly_resent() {
+    let mut setup = Setup::new().await;
+    let downstream = setup.working_order("C1", 1).await;
+    setup.gateway().committed().await;
+    setup.gateway().store().hooks.gate.send_replace(false);
+    setup.venue_send_stored(fill(&downstream, "E-1", 40, 40)).await;
+    let mut fills = vec![fill_seen(&setup.events.report().await)];
+
+    setup.crash_and_restart().await;
+    setup.venue_send(fill(&downstream, "E-2", 60, 100));
+    while fills.last().is_none_or(|(.., cum, _)| *cum != Decimal::from(100)) {
+        fills.push(fill_seen(&setup.events.report().await));
+    }
+    let partial = (setup.id(0, "1.2"), Some(40.into()), 40.into(), None);
+    let again = (setup.id(0, "1.2"), Some(40.into()), 40.into(), Some("Y".into()));
+    // Turbojet marks the new fill too if it arrives while the gateway's ResendRequest for the
+    // first is outstanding, within the window that may have been handled: it can't tell them
+    // apart then. Either way the client has a new ExecID to take.
+    fills[2].3 = None;
+    let filled = (setup.id(0, "1.3"), Some(60.into()), 100.into(), None);
+    assert_eq!(fills, [partial, again, filled]);
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::Filled, 100.into())]);
 }
