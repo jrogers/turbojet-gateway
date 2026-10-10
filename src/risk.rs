@@ -180,15 +180,27 @@ impl State {
         price.or_else(|| self.reference(symbol)).unwrap_or(Decimal::ZERO)
     }
 
-    /// A fill of `qty` at `price` for the session `client`: the symbol's new reference, and to
-    /// the session's filled notional.
-    /// A price of zero or less is no reference (a venue leaving LastPx(31) at 0, say): the
-    /// symbol keeps the one it has.
-    pub fn fill(&mut self, client: &ClientId, symbol: &CompactString, qty: Decimal, price: Decimal) {
-        if price > Decimal::ZERO {
-            self.references.insert(symbol.clone(), price);
-        } else {
-            tracing::warn!(%client, %symbol, %price, "fill price not positive; the reference price stays");
+    /// A fill of `qty` at `price` for the session `client`, added to its filled notional.
+    /// `reference` is the venue's LastPx(31), if the report had a fill of its own: the symbol's
+    /// new reference. A price derived from AvgPx for a fill the gateway missed is none. A
+    /// LastPx of zero or less is no reference either (a venue leaving it at 0, say): the symbol
+    /// keeps the one it has.
+    pub fn fill(
+        &mut self,
+        client: &ClientId,
+        symbol: &CompactString,
+        qty: Decimal,
+        price: Decimal,
+        reference: Option<Decimal>,
+    ) {
+        match reference {
+            Some(reference) if reference > Decimal::ZERO => {
+                self.references.insert(symbol.clone(), reference);
+            }
+            Some(reference) => {
+                tracing::warn!(%client, %symbol, %reference, "fill price not positive; the reference price stays");
+            }
+            None => {}
         }
         let session = self.sessions.entry(client.clone()).or_default();
         // Only ever added to, so saturating can't make the sum drift.

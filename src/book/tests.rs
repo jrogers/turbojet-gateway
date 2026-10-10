@@ -575,6 +575,49 @@ fn a_status_report_with_a_fill_reaches_the_client_as_a_trade() {
     assert_eq!((report.exec_type, report.last_qty, report.cum_qty), (ExecType::Trade, 40.into(), 40.into()));
 }
 
+/// `input`, a venue report, with LastPx `last_px` and AvgPx `avg_px`.
+fn priced(mut input: Input, last_px: &str, avg_px: &str) -> Input {
+    let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+    report.last_px = last_px.parse().unwrap();
+    report.avg_px = avg_px.parse().unwrap();
+    input
+}
+
+/// A Status report raising CumQty without a LastQty carries a fill the gateway missed: the client
+/// gets it as a Trade, priced from the change in AvgPx (40 at 10, then 60 at 10.5: 20 at 11.5).
+#[test]
+fn a_fill_the_gateway_missed_reaches_the_client_as_a_trade_at_the_implied_price() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    let missed = venue_report_as("1", ExecType::Status, Status::PartiallyFilled, 0, 60);
+    let out = run(&mut book, priced(missed, "0", "10.5"));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(
+        (report.exec_type, report.last_qty, report.last_px),
+        (ExecType::Trade, 20.into(), "11.5".parse().unwrap())
+    );
+    assert_eq!((report.cum_qty, report.avg_px), (60.into(), "10.5".parse().unwrap()));
+    // A resend of the missed fill, or of part of it, is behind the order's CumQty.
+    assert!(run(&mut book, venue_report("1", Status::PartiallyFilled, 20, 60)).is_empty());
+    assert!(run(&mut book, venue_report("1", Status::PartiallyFilled, 10, 50)).is_empty());
+}
+
+/// A fill report raising CumQty by more than its LastQty carries the gap too: the client gets the
+/// whole rise, priced from AvgPx (40 at 10, then 70 at 11.2: 30 at 12.8).
+#[test]
+fn a_fill_after_a_gap_reaches_the_client_as_the_whole_rise() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    let out = run(&mut book, priced(venue_report("1", Status::PartiallyFilled, 10, 70), "12", "11.2"));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(
+        (report.exec_type, report.last_qty, report.last_px),
+        (ExecType::Trade, 30.into(), "12.8".parse().unwrap())
+    );
+}
+
 #[test]
 fn a_replace_ack_with_a_fill_reaches_the_client_as_a_trade() {
     let mut book = book();
@@ -2049,6 +2092,21 @@ fn only_fills_and_the_end_under_a_gateway_cancel_reach_the_client() {
     assert_eq!((report.cl_ord_id.as_str(), report.exec_type, report.last_qty), ("C1", ExecType::Trade, 40.into()));
 }
 
+/// A gateway cancel's ack that raises CumQty carries a fill the gateway missed: it reaches the
+/// client as a Trade.
+#[test]
+fn a_missed_fill_under_a_gateway_cancel_reaches_the_client() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    cancel_all(&mut book, Scope::All);
+    assert!(run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 40)).is_empty());
+    let out = run(&mut book, priced(venue_report("1-1", Status::PendingCancel, 0, 60), "0", "10.5"));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.cl_ord_id.as_str(), report.exec_type), ("C1", ExecType::Trade));
+    assert_eq!((report.last_qty, report.last_px), (20.into(), "11.5".parse().unwrap()));
+}
+
 #[test]
 fn a_refused_gateway_cancel_is_retried_until_stuck_and_never_reaches_the_client() {
     let mut book = book();
@@ -2523,4 +2581,27 @@ fn a_fill_at_zero_keeps_the_reference() {
     run(&mut book, fill_at("1", 10, 10, "10"));
     run(&mut book, fill_at("1", 10, 20, "0"));
     assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 1, "10")), Ok(()));
+}
+
+/// A fill the gateway missed counts in filled notional at the price AvgPx implies: 400 filled,
+/// then 230 more (20 at 11.5), and 400 open, so 970 more fits a credit of 2000 and no more.
+#[test]
+fn a_missed_fill_counts_in_filled_notional() {
+    let mut book = limited(risk::Limits { credit: Some(2000.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    run(&mut book, fill_at("1", 40, 40, "10"));
+    run(&mut book, priced(venue_report_as("1", ExecType::Status, Status::PartiallyFilled, 0, 60), "0", "10.5"));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 97, "10")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C3", Side::Buy, 1, "10")), Err(RiskReject::Credit));
+}
+
+/// The reference is the last LastPx: a price implied by AvgPx for a missed fill isn't one.
+#[test]
+fn a_missed_fills_implied_price_keeps_the_reference() {
+    let mut book = limited(risk::Limits { price_band: Some(5.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    run(&mut book, fill_at("1", 40, 40, "10"));
+    run(&mut book, priced(venue_report_as("1", ExecType::Status, Status::PartiallyFilled, 0, 60), "0", "10.5"));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 1, "10.5")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C3", Side::Buy, 1, "10.51")), Err(RiskReject::PriceBand));
 }

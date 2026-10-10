@@ -34,8 +34,10 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 - A venue fill without LastPx(31) is refused with a session-level Reject and logged as an error;
   the book doesn't see it.
 - A report that takes CumQty past the order's quantity is logged as a warning and dropped.
-- A venue Status report carrying a fill the gateway missed updates CumQty without a Trade to the
-  client: the client sees the new CumQty on a non-fill report.
+- A fill the gateway missed (a Status report raising CumQty without LastQty(32), or a fill
+  raising it by more than its LastQty) reaches the client as a Trade for the missing quantity,
+  priced from the change in AvgPx when the venue gave no LastPx for it: approximate, by the
+  venue's AvgPx rounding.
 - After a replace is accepted, reports without a fill under a ClOrdID it superseded are dropped
   (fills and done statuses still apply), so a venue that keeps reporting under the original
   ClOrdID loses its restatements. A dropped restatement is logged as a warning.
@@ -78,9 +80,8 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 - Each order's and each fill's notional counts at most 10^18 and is rounded to 4 decimal places,
   so a session's open and filled notional add up exactly.
 - Filled notional counts the fills the book takes. An overfill it drops isn't counted; a trade
-  bust or correction, also dropped, leaves the busted fill counted. A Status report carrying a
-  fill the gateway missed (no LastQty(32)) takes the order's open notional down without adding to
-  its filled notional, so credit counts that fill for nothing.
+  bust or correction, also dropped, leaves the busted fill counted. A fill the gateway missed
+  counts at the price the change in AvgPx implies, and doesn't move the reference price.
 - A replace counts as the larger of the order's old and new terms until the venue answers it. A
   replace is checked against credit only when it raises the order's notional, so one that cuts the
   notional passes even over the credit limit; one at the same price (or Market again) with no more

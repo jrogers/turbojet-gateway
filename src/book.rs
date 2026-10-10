@@ -268,9 +268,8 @@ pub struct Pending {
 pub struct VenueReport {
     /// The downstream ClOrdID it answers.
     pub downstream: CompactString,
-    /// Passed to the client as it is, except that a report with a fill (`last_qty` > 0) goes to
-    /// the client as `Trade`, whatever the venue said: the book knows fills by `last_qty`, and
-    /// clients by ExecType.
+    /// Passed to the client as it is, except that a report raising CumQty goes to the client as
+    /// `Trade`, whatever the venue said: clients know fills by ExecType.
     pub exec_type: ExecType,
     /// OrdStatus(39); `None` keeps the order's, for reports whose status the book doesn't model
     /// (DoneForDay, Stopped, Suspended, Calculated). Such a report never rejects anything or
@@ -884,21 +883,27 @@ impl Book {
         if accepted || (kind == Some(CancelKind::Cancel) && report.status == Some(Status::Canceled)) {
             self.downstream.get_mut(&report.downstream).expect("looked up above").answered = true;
         }
+        // What the report filled: more than its LastQty when it carries a fill the gateway
+        // missed (a Status report without one, or a fill after a gap).
+        let rise = report.cum_qty - order.cum_qty;
+        debug_assert!(rise >= Decimal::ZERO, "stale drops a lower CumQty");
+        let price = fill_price(order, &report, rise);
         order.cum_qty = report.cum_qty;
         order.avg_px = report.avg_px;
         // `None` keeps the status, through `set_status` so a fill makes a New order PartiallyFilled.
         order.set_status(report.status.unwrap_or(order.status));
-        if report.last_qty > Decimal::ZERO {
-            self.risk.fill(&order.client, &order.request.symbol, report.last_qty, report.last_px);
+        if rise > Decimal::ZERO {
+            let reference = (report.last_qty > Decimal::ZERO).then_some(report.last_px);
+            self.risk.fill(&order.client, &order.request.symbol, rise, price, reference);
         }
         self.risk.track(id, order.exposure());
         // The gateway's cancel's acks aren't the client's: after a refusal it would be left
         // showing PendingCancel. Fills and the end are.
-        if origin == Origin::Gateway && report.last_qty == Decimal::ZERO && !order.status.is_done() {
+        if origin == Origin::Gateway && rise == Decimal::ZERO && !order.status.is_done() {
             return tracing::debug!(%venue, downstream = %report.downstream, "gateway cancel's ack not forwarded");
         }
         let answers = answers_request.then_some((cl_ord_id, orig_cl_ord_id));
-        let client_report = order.client_report(answers, report, rejected);
+        let client_report = order.client_report(answers, report, rejected, (rise, price));
         out.push(Output::Report { client: order.client.clone(), report: client_report });
     }
 
@@ -1433,16 +1438,20 @@ impl Order {
         }
     }
 
-    /// The client's report of the venue's `report`: under the ClOrdIDs of the request it
-    /// `answers`, if any, else under the order's current ClOrdID.
+    /// The client's report of the venue's `report`, which `filled` the order's CumQty up by a
+    /// quantity at a price: under the ClOrdIDs of the request it `answers`, if any, else under
+    /// the order's current ClOrdID.
     fn client_report(
         &mut self,
         answers: Option<(CompactString, Option<CompactString>)>,
         report: VenueReport,
         rejected: bool,
+        filled: (Decimal, Decimal),
     ) -> ClientReport {
-        // Clients count fills by ExecType (FIX 4.2 has nothing else), so every fill is a Trade.
-        let exec_type = if report.last_qty > Decimal::ZERO { ExecType::Trade } else { report.exec_type };
+        let (last_qty, last_px) = filled;
+        // Clients count fills by ExecType (FIX 4.2 has nothing else), so every fill is a Trade,
+        // and its LastQty is the whole rise in CumQty, so a client's LastQtys add up to it.
+        let exec_type = if last_qty > Decimal::ZERO { ExecType::Trade } else { report.exec_type };
         let mut client_report = match answers {
             Some((cl_ord_id, orig_cl_ord_id)) => {
                 let mut client_report = self.report(&cl_ord_id, exec_type);
@@ -1451,8 +1460,8 @@ impl Order {
             }
             None => self.report(&self.request.cl_ord_id.clone(), exec_type),
         };
-        client_report.last_qty = report.last_qty;
-        client_report.last_px = report.last_px;
+        client_report.last_qty = last_qty;
+        client_report.last_px = last_px;
         client_report.text = report.text;
         if rejected {
             client_report.reject = report.ord_rej_reason.map(RejectReason::Venue);
@@ -1591,6 +1600,23 @@ fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool {
         && matches!(order.status, Status::PendingCancel | Status::PendingReplace)
         && !accepts_pending;
     settled || behind_new || behind_pending
+}
+
+/// The price of `rise`, what `report` takes the order's CumQty up by: its LastPx when that's
+/// the report's own fill, else what the change in AvgPx implies for the rise (a fill the gateway
+/// missed, approximate by the venue's AvgPx rounding), or AvgPx itself where that can't be
+/// worked out or isn't positive.
+fn fill_price(order: &Order, report: &VenueReport, rise: Decimal) -> Decimal {
+    if rise == report.last_qty && report.last_px > Decimal::ZERO {
+        return report.last_px;
+    }
+    let old = order.cum_qty.checked_mul(order.avg_px);
+    let new = report.cum_qty.checked_mul(report.avg_px);
+    new.zip(old)
+        .and_then(|(new, old)| new.checked_sub(old))
+        .and_then(|missed| missed.checked_div(rise))
+        .filter(|&price| price > Decimal::ZERO)
+        .unwrap_or(report.avg_px)
 }
 
 /// A Limit order's price; a Market order has none, whatever `price` says.
