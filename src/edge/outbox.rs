@@ -14,7 +14,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinSet;
 use tracing::{error, warn};
-use turbojet::{Dropped, Message, Receipt, SessionHandle};
+use turbojet::{Dropped, Message, Receipt, SendError, SessionHandle};
 
 use crate::book::ClientId;
 
@@ -27,7 +27,9 @@ pub const MAX_OUTBOX: usize = 100_000;
 /// Reports a client's drain task has queued on the session without yet hearing they're stored,
 /// each with a copy kept to send again if the connection ends first. Waiting for each one's
 /// receipt before queueing the next would cost a store commit per report; a window lets the
-/// session commit them in groups. 256 is plenty for that, and bounds the copies.
+/// session commit them in groups. 256 is plenty for that, and bounds the copies. The copy costs
+/// a clone (allocations) per report sent, the price of resending without Turbojet handing a
+/// dropped message back.
 const IN_FLIGHT: usize = 256;
 
 /// Text(58) of the Logout sent to a client whose outbox is full.
@@ -77,6 +79,10 @@ impl Outbox {
 
     /// The client logged on, on `session`: its held reports start going out. Call it from the
     /// acceptor's `Application::on_logon`; the client is the session's TargetCompID.
+    ///
+    /// # Panics
+    ///
+    /// Outside a tokio runtime, for a client not seen before (its drain task is spawned).
     pub fn logged_on(&self, session: &SessionHandle) {
         let id = ClientId::from(session.id().target_comp_id.as_str());
         let mut clients = lock(&self.clients);
@@ -87,12 +93,18 @@ impl Outbox {
     }
 
     /// Queues `msg` for `client`, to go out once everything held for it ahead of it has. Never
-    /// waits. `false` if it was dropped: the client's outbox was full, so it's also logged out.
+    /// waits. `false` if it was dropped: the client's outbox was full. The first report dropped
+    /// logs an error and logs the client out; the rest are counted, and the count logged once the
+    /// outbox empties.
+    ///
+    /// # Panics
+    ///
+    /// Outside a tokio runtime, for a client not seen before (its drain task is spawned).
     pub fn push(&self, client: &ClientId, msg: Message) -> bool {
         let mut clients = lock(&self.clients);
         let held = self.client(&mut clients, client);
         if !held.reserve(self.limit) {
-            overflow(client, &held.shared, self.limit, &msg);
+            overflow(&held.shared, self.limit);
             return false;
         }
         held.enqueue(Entry { msg, receipt: None })
@@ -101,13 +113,18 @@ impl Outbox {
     /// Sends `msg` to `client` straight away if nothing is held for it and its session takes it;
     /// otherwise [`push`](Self::push)es it, so order holds. Either way, if the connection drops
     /// it before it's stored, it's sent again after the client logs back on. Never waits.
+    ///
+    /// # Panics
+    ///
+    /// Outside a tokio runtime, for a client not seen before (its drain task is spawned).
     pub fn deliver(&self, client: &ClientId, msg: Message) -> bool {
         let mut clients = lock(&self.clients);
         let held = self.client(&mut clients, client);
-        // Nothing held: count this one, so the next queues behind it until it's stored.
+        // Something already held: queue behind it. Otherwise this one is now counted, so the next
+        // queues behind it until its receipt is settled.
         if held.shared.pending.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             if !held.reserve(self.limit) {
-                overflow(client, &held.shared, self.limit, &msg);
+                overflow(&held.shared, self.limit);
                 return false;
             }
             return held.enqueue(Entry { msg, receipt: None });
@@ -133,15 +150,8 @@ impl Outbox {
     fn start(&self, id: &ClientId) -> Client {
         // Holds at most `limit`, since `pending` counts what it holds and stops at `limit`.
         let (queue, receiver) = mpsc::channel(self.limit);
-        let shared = Arc::new(Shared::default());
-        let drain = Drain {
-            client: id.clone(),
-            shared: shared.clone(),
-            queue: receiver,
-            session: None,
-            flight: VecDeque::new(),
-            retry: VecDeque::new(),
-        };
+        let shared = Arc::new(Shared::new(id.clone()));
+        let drain = Drain { shared: shared.clone(), queue: receiver, flight: VecDeque::new(), retry: VecDeque::new() };
         lock(&self.tasks).spawn(drain.run());
         Client { queue, shared }
     }
@@ -157,8 +167,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn overflow(client: &ClientId, shared: &Shared, limit: usize, msg: &Message) {
-    error!(%client, limit, report = ?msg, "outbox full: report dropped, logging the client out");
+/// Drops a report for a full outbox. Only the first since the outbox was last empty logs an error
+/// and logs the client out; the rest are counted, for [`Shared::settle`] to report.
+fn overflow(shared: &Shared, limit: usize) {
+    if shared.dropped.fetch_add(1, Ordering::AcqRel) > 0 {
+        return;
+    }
+    error!(client = %shared.client, limit, "outbox full: dropping reports, logging the client out");
     if let Some(session) = lock(&shared.session).as_ref() {
         // Not connected: nothing to log out. Control queue full: a logout is already queued.
         let _ = session.logout(Some(OVERFLOW_TEXT));
@@ -197,21 +212,40 @@ impl Client {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Shared {
-    /// The client's session, from its first logon.
+    client: ClientId,
+    /// The client's session, from its latest logon.
     session: Mutex<Option<SessionHandle>>,
     /// Signalled at each logon.
     logon: Notify,
     /// Reports pushed and not yet stored by the session or dropped: queued, held by the drain
     /// task, or in flight.
     pending: AtomicUsize,
+    /// Reports dropped since the outbox was last empty, because it was full.
+    dropped: AtomicUsize,
 }
 
 impl Shared {
+    fn new(client: ClientId) -> Self {
+        Self {
+            client,
+            session: Mutex::default(),
+            logon: Notify::new(),
+            pending: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+        }
+    }
+
     fn settle(&self) {
         let before = self.pending.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(before > 0, "settled a report that wasn't counted");
+        if before == 1 {
+            let dropped = self.dropped.swap(0, Ordering::AcqRel);
+            if dropped > 0 {
+                warn!(client = %self.client, dropped, "outbox emptied; reports were dropped while it was full");
+            }
+        }
     }
 }
 
@@ -231,11 +265,8 @@ enum Step {
 
 /// Delivers one client's reports in order, on a task of its own.
 struct Drain {
-    client: ClientId,
     shared: Arc<Shared>,
     queue: mpsc::Receiver<Entry>,
-    /// Our copy of the client's session handle, taken at each logon.
-    session: Option<SessionHandle>,
     /// Queued on the session, oldest first, each with a copy to send again if it's dropped.
     flight: VecDeque<(Message, Receipt)>,
     /// To send before anything in `queue`, oldest first: dropped by a connection that ended. At
@@ -269,23 +300,28 @@ impl Drain {
         if let Some(msg) = self.retry.pop_front() {
             return Step::Send(Entry { msg, receipt: None });
         }
+        // Settled first: a report dropped by a connection that ended must go back in `retry`
+        // before anything newer is sent, perhaps on the next connection.
         tokio::select! {
-            entry = self.queue.recv() => entry.map_or(Step::Closed, Step::Send),
+            biased;
             outcome = oldest(&mut self.flight) => Step::Settled(outcome),
+            entry = self.queue.recv() => entry.map_or(Step::Closed, Step::Send),
         }
     }
 
     async fn send(&mut self, msg: Message) {
-        let Some(session) = &self.session else {
-            self.retry.push_front(msg);
-            return self.wait_for_logon().await;
-        };
+        // Read at each send, not kept: always the latest logon's handle.
+        let session = lock(&self.shared.session).clone();
         let copy = msg.clone();
-        match session.send_when_ready(msg).await {
+        let sent = match &session {
+            Some(session) => session.send_when_ready(msg).await,
+            None => Err(SendError::NotConnected(msg)),
+        };
+        match sent {
             Ok(receipt) => self.flight.push_back((copy, receipt)),
             Err(refused) => {
-                // Not connected, or the connection ended while waiting for room: what's in
-                // flight went on that connection, ahead of this.
+                // Not connected (or never logged on), or the connection ended while waiting for
+                // room: what's in flight went on that connection, ahead of this.
                 self.retry.push_front(refused.into_message());
                 self.requeue_flight().await;
                 self.wait_for_logon().await;
@@ -297,10 +333,15 @@ impl Drain {
         let (msg, _) = self.flight.pop_front().expect("settled the oldest in flight");
         match outcome {
             Ok(_) => self.shared.settle(),
-            Err(Dropped::Disconnected | Dropped::LoggingOut) => {
+            Err(dropped @ (Dropped::Disconnected | Dropped::LoggingOut)) => {
                 self.requeue_flight().await;
                 self.retry.push_front(msg);
-                self.wait_for_logon().await;
+                // Disconnected: the next send says whether there's a new connection yet. Logging
+                // out, the session is still connected and would drop each send at once until it
+                // disconnects; wait for the next logon rather than spin.
+                if dropped == Dropped::LoggingOut {
+                    self.wait_for_logon().await;
+                }
             }
             Err(reason) => self.lost(&msg, &reason),
         }
@@ -314,9 +355,10 @@ impl Drain {
         while let Some((msg, receipt)) = self.flight.pop_front() {
             match receipt.await {
                 Ok(_) => {
-                    // Possible only if a new connection took it before the old one's receipts
-                    // resolved: delivered, but after reports it's now behind.
-                    warn!(client = %self.client, "a report went out ahead of one dropped before it");
+                    // A guard: receipts settle oldest first, so this means a connection stored a
+                    // report after dropping an earlier one. Seen, it's a Turbojet change or bug:
+                    // this report reached the client ahead of the ones now being resent.
+                    warn!(client = %self.shared.client, "a report went out ahead of one dropped before it");
                     self.shared.settle();
                 }
                 Err(Dropped::Disconnected | Dropped::LoggingOut) => dropped.push(msg),
@@ -329,17 +371,14 @@ impl Drain {
     }
 
     fn lost(&self, msg: &Message, reason: &Dropped) {
-        error!(client = %self.client, %reason, report = ?msg, "report not delivered");
+        error!(client = %self.shared.client, %reason, report = ?msg, "report not delivered");
         self.shared.settle();
     }
 
     /// Waits for the client's next logon. `notify_one` keeps a permit when no one is waiting, so a
-    /// logon between a failed send and this wait still wakes it. A permit left from an earlier
-    /// logon wakes it at once instead; then the next send fails and brings it back here, to wait
-    /// with none left.
-    async fn wait_for_logon(&mut self) {
+    /// logon between a failed send and this wait still wakes it.
+    async fn wait_for_logon(&self) {
         self.shared.logon.notified().await;
-        self.session = lock(&self.shared.session).clone();
     }
 }
 
@@ -361,17 +400,44 @@ mod tests {
     use turbojet::message::tags;
     use turbojet::{
         Acceptor, Application, Context, Disconnect, Initiator, InitiatorConfig, MemoryStorage, MessageReject, MsgType,
-        ReconnectPolicy, SessionConfig,
+        ReconnectPolicy, SessionConfig, SessionEventKind,
     };
 
     use super::*;
 
-    /// Jetbridge's side: tells the outbox of each logon, and when `hold` is set, holds up its
-    /// session in the next message from the client until released, signalling `holding`.
+    /// Holds up a session in its next application message until released.
+    #[derive(Default)]
+    struct Hold {
+        gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        holding: Notify,
+    }
+
+    impl Hold {
+        /// Holds the next message; the returned sender releases it, sent to or dropped.
+        fn arm(&self) -> std::sync::mpsc::Sender<()> {
+            let (release, gate) = std::sync::mpsc::channel();
+            *lock(&self.gate) = Some(gate);
+            release
+        }
+
+        fn wait_if_armed(&self) {
+            let gate = lock(&self.gate).take();
+            if let Some(release) = gate {
+                self.holding.notify_one();
+                // Hands the worker's other duties, timers among them, to another thread.
+                tokio::task::block_in_place(|| release.recv()).ok();
+            }
+        }
+
+        async fn held(&self) {
+            timeout(Duration::from_secs(5), self.holding.notified()).await.expect("not held");
+        }
+    }
+
+    /// Jetbridge's side: tells the outbox of each logon.
     struct Gateway {
         outbox: Arc<Outbox>,
-        hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-        holding: Notify,
+        hold: Hold,
     }
 
     impl Application for Gateway {
@@ -380,12 +446,7 @@ mod tests {
         }
 
         fn on_message(&self, _ctx: &mut Context<'_>, _msg: &Message) -> Result<(), MessageReject> {
-            let held = lock(&self.hold).take();
-            if let Some(release) = held {
-                self.holding.notify_one();
-                // Hands the worker's other duties, timers among them, to another thread.
-                tokio::task::block_in_place(|| release.recv()).ok();
-            }
+            self.hold.wait_if_armed();
             Ok(())
         }
     }
@@ -397,19 +458,24 @@ mod tests {
         Report(String),
     }
 
-    struct Recorder(UnboundedSender<Event>);
+    /// The client's side: records what it sees.
+    struct Recorder {
+        events: UnboundedSender<Event>,
+        hold: Hold,
+    }
 
     impl Application for Recorder {
         fn on_logon(&self, _session: &SessionHandle) {
-            let _ = self.0.send(Event::LoggedOn);
+            let _ = self.events.send(Event::LoggedOn);
         }
 
         fn on_logout(&self, _session: &SessionHandle, _ended: Disconnect) {
-            let _ = self.0.send(Event::LoggedOut);
+            let _ = self.events.send(Event::LoggedOut);
         }
 
         fn on_message(&self, _ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
-            let _ = self.0.send(Event::Report(msg.get(tags::TEXT).unwrap_or_default().to_owned()));
+            self.hold.wait_if_armed();
+            let _ = self.events.send(Event::Report(msg.get(tags::TEXT).unwrap_or_default().to_owned()));
             Ok(())
         }
     }
@@ -427,7 +493,7 @@ mod tests {
     /// Jetbridge's acceptor, serving on loopback, with an outbox holding `limit` per client.
     async fn gateway(limit: usize) -> (Arc<Outbox>, Arc<Gateway>, Acceptor, String) {
         let outbox = Arc::new(Outbox::with_limit(limit));
-        let app = Arc::new(Gateway { outbox: outbox.clone(), hold: Mutex::default(), holding: Notify::new() });
+        let app = Arc::new(Gateway { outbox: outbox.clone(), hold: Hold::default() });
         let mut config = SessionConfig::new("FIX.4.4", "JETBRIDGE");
         // Small, so a held-up session fills it quickly.
         config.send_queue = 4;
@@ -439,20 +505,20 @@ mod tests {
     }
 
     /// The client, a Turbojet initiator, not yet connected.
-    fn client_session(addr: &str) -> (Initiator, UnboundedReceiver<Event>) {
+    fn client_session(addr: &str) -> (Initiator, Arc<Recorder>, UnboundedReceiver<Event>) {
         let (events, rx) = unbounded_channel();
+        let recorder = Arc::new(Recorder { events, hold: Hold::default() });
         let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", CLIENT), "JETBRIDGE");
         config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
-        let initiator =
-            Initiator::new(addr, config, Arc::new(MemoryStorage::new()), Arc::new(Recorder(events))).unwrap();
-        (initiator, rx)
+        let initiator = Initiator::new(addr, config, Arc::new(MemoryStorage::new()), recorder.clone()).unwrap();
+        (initiator, recorder, rx)
     }
 
     /// The client, running, reconnecting on its own.
-    fn start_client(addr: &str) -> (Initiator, UnboundedReceiver<Event>) {
-        let (initiator, rx) = client_session(addr);
+    fn start_client(addr: &str) -> (Initiator, Arc<Recorder>, UnboundedReceiver<Event>) {
+        let (initiator, recorder, rx) = client_session(addr);
         tokio::spawn(initiator.clone().run());
-        (initiator, rx)
+        (initiator, recorder, rx)
     }
 
     /// One connection of the client's, over a stream the test can cut by aborting the task.
@@ -487,10 +553,9 @@ mod tests {
     /// Holds up Jetbridge's session with the client, by having the client send a message that
     /// waits in `on_message` until the returned sender is dropped or sent to.
     async fn hold(app: &Gateway, initiator: &Initiator) -> std::sync::mpsc::Sender<()> {
-        let (release, held) = std::sync::mpsc::channel();
-        *lock(&app.hold) = Some(held);
+        let release = app.hold.arm();
         initiator.handle().send(Message::new(MsgType::NewOrderSingle).with(tags::CL_ORD_ID, "hold")).unwrap();
-        timeout(Duration::from_secs(5), app.holding.notified()).await.expect("not held");
+        app.hold.held().await;
         release
     }
 
@@ -500,7 +565,7 @@ mod tests {
         for i in 0..3 {
             assert!(outbox.push(&client(), report(i)));
         }
-        let (_initiator, mut events) = start_client(&addr);
+        let (_initiator, _recorder, mut events) = start_client(&addr);
         assert_eq!(next(&mut events).await, Event::LoggedOn);
         assert_eq!(reports(&mut events, 3).await, numbered_reports(3));
     }
@@ -508,11 +573,9 @@ mod tests {
     #[tokio::test]
     async fn deliver_sends_straight_away_when_connected_and_keeps_order() {
         let (outbox, _app, _acceptor, addr) = gateway(MAX_OUTBOX).await;
-        let (_initiator, mut events) = start_client(&addr);
+        let (_initiator, _recorder, mut events) = start_client(&addr);
         assert_eq!(next(&mut events).await, Event::LoggedOn);
-        while lock(&outbox.clients).get(CLIENT).is_none_or(|c| lock(&c.shared.session).is_none()) {
-            tokio::task::yield_now().await;
-        }
+        until(|| lock(&outbox.clients).get(CLIENT).is_some_and(|c| lock(&c.shared.session).is_some())).await;
 
         assert!(outbox.deliver(&client(), report(0)));
         // Watched in flight until stored, so the next one queues behind it.
@@ -520,16 +583,28 @@ mod tests {
         assert!(outbox.deliver(&client(), report(1)));
         assert!(outbox.push(&client(), report(2)));
         assert_eq!(reports(&mut events, 3).await, numbered_reports(3));
-        while outbox.held(CLIENT) > 0 {
-            tokio::task::yield_now().await;
-        }
+        until(|| outbox.held(CLIENT) == 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_report_the_session_refuses_is_dropped_and_the_rest_go() {
+        let (outbox, _app, _acceptor, addr) = gateway(MAX_OUTBOX).await;
+        assert!(outbox.push(&client(), report(0)));
+        // SOH inside a value: the session refuses it for good (Dropped::Rejected).
+        assert!(outbox.push(&client(), report("bad\u{1}58=x")));
+        assert!(outbox.push(&client(), report(1)));
+        let (_initiator, _recorder, mut events) = start_client(&addr);
+        assert_eq!(next(&mut events).await, Event::LoggedOn);
+        assert_eq!(reports(&mut events, 2).await, numbered_reports(2));
+        until(|| outbox.held(CLIENT) == 0).await;
+        assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
     }
 
     // Multi-threaded: the held-up session blocks a worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_full_outbox_logs_the_client_out_and_drops_the_report() {
         let (outbox, app, _acceptor, addr) = gateway(2).await;
-        let (initiator, mut events) = start_client(&addr);
+        let (initiator, _recorder, mut events) = start_client(&addr);
         assert_eq!(next(&mut events).await, Event::LoggedOn);
         let release = hold(&app, &initiator).await;
 
@@ -539,6 +614,8 @@ mod tests {
             assert!(outbox.push(&client(), report(i)));
         }
         assert!(!outbox.push(&client(), report(pushed)));
+        // Dropped too; counted, not logged or logged out again.
+        assert!(!outbox.push(&client(), report(pushed + 1)));
         release.send(()).unwrap();
 
         // Everything before the dropped one arrives, some perhaps after the client logs back on.
@@ -551,16 +628,18 @@ mod tests {
             }
         }
         assert_eq!(got, numbered(pushed));
-        // The dropped one never comes.
+        // The dropped ones never come.
         assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
         assert_eq!(outbox.held(CLIENT), 0);
+        // Emptied, the outbox reported the drops and starts counting afresh.
+        assert_eq!(lock(&outbox.clients)[CLIENT].shared.dropped.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn nothing_is_lost_when_the_connection_drops_while_draining() {
         const REPORTS: usize = 200;
         let (outbox, app, acceptor, addr) = gateway(MAX_OUTBOX).await;
-        let (initiator, mut events) = client_session(&addr);
+        let (initiator, _recorder, mut events) = client_session(&addr);
         let connection = connect(&initiator, &addr).await;
         assert_eq!(next(&mut events).await, Event::LoggedOn);
 
@@ -570,25 +649,70 @@ mod tests {
         for i in 0..REPORTS {
             assert!(outbox.push(&client(), report(i)));
         }
-        connection.abort();
-        let _ = connection.await;
-        release.send(()).unwrap();
-        // The client saw none of them before the cut.
-        assert_eq!(next(&mut events).await, Event::LoggedOut);
-        assert!(events.try_recv().is_err());
-
-        // Jetbridge refuses a Logon until it has noticed the old connection end.
-        let ended = async {
-            while acceptor.session(CLIENT).is_connected() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        };
-        timeout(Duration::from_secs(5), ended).await.expect("old connection never ended");
+        let _connection = cut_and_reconnect(connection, release, &acceptor, &initiator, &addr, &mut events).await;
         // Those the session stored come back as resends; the outbox sends the rest again.
-        let _connection = connect(&initiator, &addr).await;
-        assert_eq!(next(&mut events).await, Event::LoggedOn);
         assert_eq!(reports(&mut events, REPORTS).await, numbered_reports(REPORTS));
         assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
         assert_eq!(outbox.held(CLIENT), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_report_delivered_straight_away_and_then_dropped_is_sent_again_in_order() {
+        let (outbox, _app, acceptor, addr) = gateway(MAX_OUTBOX).await;
+        let mut sessions = acceptor.subscribe();
+        let (_initiator, recorder, mut events) = start_client(&addr);
+        assert_eq!(next(&mut events).await, Event::LoggedOn);
+        until(|| lock(&outbox.clients).get(CLIENT).is_some_and(|c| lock(&c.shared.session).is_some())).await;
+
+        // The client, held up, doesn't answer Jetbridge's Logout, so the session stays logging
+        // out: it takes the report sent straight away, and its receipt says LoggingOut.
+        let release = recorder.hold.arm();
+        acceptor.session(CLIENT).send(report("before")).unwrap();
+        recorder.hold.held().await;
+        acceptor.session(CLIENT).logout(Some("bye")).unwrap();
+        let logging_out = async { while sessions.recv().await.unwrap().kind != SessionEventKind::LoggingOut {} };
+        timeout(Duration::from_secs(5), logging_out).await.expect("never logging out");
+        assert!(outbox.deliver(&client(), report(0)));
+        assert_eq!(outbox.held(CLIENT), 1);
+        assert!(outbox.push(&client(), report(1)));
+        release.send(()).unwrap();
+
+        assert_eq!(next(&mut events).await, Event::Report("before".into()));
+        assert_eq!(next(&mut events).await, Event::LoggedOut);
+        assert_eq!(next(&mut events).await, Event::LoggedOn);
+        assert_eq!(reports(&mut events, 2).await, numbered_reports(2));
+        assert!(timeout(Duration::from_millis(200), events.recv()).await.is_err());
+        until(|| outbox.held(CLIENT) == 0).await;
+    }
+
+    /// Cuts the client's held-up connection, releases Jetbridge's session, and reconnects once
+    /// Jetbridge has noticed (it refuses a Logon until then). The client sees nothing in between.
+    async fn cut_and_reconnect(
+        connection: tokio::task::JoinHandle<std::io::Result<()>>,
+        release: std::sync::mpsc::Sender<()>,
+        acceptor: &Acceptor,
+        initiator: &Initiator,
+        addr: &str,
+        events: &mut UnboundedReceiver<Event>,
+    ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+        connection.abort();
+        let _ = connection.await;
+        release.send(()).unwrap();
+        assert_eq!(next(events).await, Event::LoggedOut);
+        assert!(events.try_recv().is_err());
+        until(|| !acceptor.session(CLIENT).is_connected()).await;
+        let connection = connect(initiator, addr).await;
+        assert_eq!(next(events).await, Event::LoggedOn);
+        connection
+    }
+
+    /// Waits for `done`, for up to five seconds.
+    async fn until(done: impl Fn() -> bool) {
+        let wait = async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        timeout(Duration::from_secs(5), wait).await.expect("timed out waiting");
     }
 }
