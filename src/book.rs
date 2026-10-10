@@ -123,7 +123,8 @@ pub struct Order {
     pub pending: Option<Pending>,
     /// Client reports built for the order so far, numbering the next ExecID.
     pub exec_seq: u64,
-    /// The venue's OrderID(37), from the first report the book took that had one.
+    /// The venue's OrderID(37): from the first report the book took that had one, then from the
+    /// report accepting each replace. "NONE" and empty ones don't count.
     pub venue_order_id: Option<CompactString>,
 }
 
@@ -451,7 +452,7 @@ impl Book {
         if report.cum_qty > qty {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, cum_qty = %report.cum_qty, "overfill");
         }
-        order.record_venue_order_id(report.venue_order_id);
+        order.record_venue_order_id(report.venue_order_id, accepted);
         if accepted {
             let pending = order.pending.take().expect("checked above");
             order.request.cl_ord_id = pending.cl_ord_id;
@@ -607,7 +608,7 @@ impl Book {
         }
         self.downstream.get_mut(downstream).expect("looked up by the caller").answered = true;
         // The venue named its order while refusing the request: as good as any report's.
-        order.record_venue_order_id(venue_order_id);
+        order.record_venue_order_id(venue_order_id, false);
         // Only the replace it names: an older one's late reject leaves a newer one pending.
         if order.pending.as_ref().is_some_and(|pending| pending.downstream == *downstream) {
             order.pending = None;
@@ -697,12 +698,16 @@ impl Order {
         }
     }
 
-    /// Keeps the first OrderID the venue gives; venues don't change it, so a different one is
-    /// logged and ignored.
-    fn record_venue_order_id(&mut self, venue_order_id: Option<CompactString>) {
+    /// Keeps the first OrderID the venue gives, or the one from the report accepting a replace
+    /// (`replaced`), since some venues give the replacing order a new one. Any other different
+    /// one is logged and ignored. "NONE" and empty are FIX's placeholders for no order, as when a
+    /// venue refuses a request for an order it doesn't know yet.
+    fn record_venue_order_id(&mut self, venue_order_id: Option<CompactString>, replaced: bool) {
+        let venue_order_id = venue_order_id.filter(|id| !id.is_empty() && id != "NONE");
         match (&self.venue_order_id, venue_order_id) {
             (_, None) => {}
             (None, Some(new)) => self.venue_order_id = Some(new),
+            (Some(_), Some(new)) if replaced => self.venue_order_id = Some(new),
             (Some(kept), Some(new)) if *kept != new => {
                 tracing::warn!(order = self.id.0, %kept, %new, "venue changed its OrderID; keeping the first");
             }
@@ -1739,5 +1744,48 @@ mod tests {
         let out = run(&mut book, with_venue_order_id(venue_report("1-1", Status::Rejected, 0, 0), "V-1"));
         assert_eq!(cancel_reject(&out).1, CancelKind::Replace);
         assert_eq!(venue_order_id(&book), Some("V-1"));
+    }
+
+    #[test]
+    fn none_and_empty_venue_order_ids_count_as_absent() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        replace(&mut book, "C2", "C1", 80, 11);
+        // FIX's placeholder from a venue refusing a request for an order it doesn't know yet.
+        let rejected = venue_report_as("1-1", ExecType::Rejected, Status::Rejected, 0, 0);
+        let out = run(&mut book, with_venue_order_id(rejected, "NONE"));
+        assert_eq!(cancel_reject(&out).1, CancelKind::Replace);
+        assert_eq!(venue_order_id(&book), None);
+        run(&mut book, with_venue_order_id(venue_report("1", Status::PendingNew, 0, 0), ""));
+        assert_eq!(venue_order_id(&book), None);
+        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        assert_eq!(venue_order_id(&book), Some("V-1"));
+    }
+
+    #[test]
+    fn an_accepted_replace_takes_the_venues_new_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        replace(&mut book, "C2", "C1", 80, 11);
+        run(&mut book, with_venue_order_id(venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0), "V-2"));
+        assert_eq!(venue_order_id(&book), Some("V-2"));
+        // A late report from before the replace doesn't roll it back.
+        run(&mut book, with_venue_order_id(venue_report("1", Status::New, 0, 0), "V-1"));
+        assert_eq!(venue_order_id(&book), Some("V-2"));
+        let out = cancel(&mut book, "C3", "C2");
+        let [Output::Cancel { venue_order_id, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(venue_order_id.as_deref(), Some("V-2"));
+    }
+
+    #[test]
+    fn a_refusal_of_an_answered_request_records_no_venue_order_id() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        assert_eq!(run(&mut book, venue_report("1-1", Status::Rejected, 0, 0)).len(), 1);
+        let resent = with_venue_order_id(venue_report("1-1", Status::Rejected, 0, 0), "V-1");
+        assert!(run(&mut book, resent).is_empty());
+        assert_eq!(venue_order_id(&book), None);
     }
 }
