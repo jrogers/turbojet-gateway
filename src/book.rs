@@ -131,6 +131,8 @@ pub enum Input {
     VenueCancelReject {
         venue: VenueId,
         downstream: CompactString,
+        /// OrdStatus(39), required on OrderCancelReject.
+        status: Status,
         text: Option<CompactString>,
     },
 }
@@ -254,8 +256,8 @@ impl Book {
             Input::NewOrder { client, request, redelivered } => self.new_order(client, request, redelivered, out),
             Input::VenueReport { venue, report } => self.venue_report(&venue, report, out),
             Input::Cancel { client, cl_ord_id, orig_cl_ord_id } => self.cancel(client, cl_ord_id, orig_cl_ord_id, out),
-            Input::VenueCancelReject { venue, downstream, text } => {
-                self.venue_cancel_reject(&venue, &downstream, text, out)
+            Input::VenueCancelReject { venue, downstream, status, text } => {
+                self.venue_cancel_reject(&venue, &downstream, status, text, out)
             }
         }
     }
@@ -378,11 +380,13 @@ impl Book {
     }
 
     /// The venue refused a cancel or replace we sent under `downstream`: tell the client, under
-    /// the ClOrdIDs of its own request. Anything that doesn't name such a request is dropped.
+    /// the ClOrdIDs of its own request, with the order's status as the venue now gives it. Anything
+    /// that doesn't name such a request is dropped.
     fn venue_cancel_reject(
         &mut self,
         venue: &VenueId,
         downstream: &CompactString,
+        status: Status,
         text: Option<CompactString>,
         out: &mut Vec<Output>,
     ) {
@@ -392,13 +396,17 @@ impl Book {
         let (Some(response_to), Some(orig_cl_ord_id)) = (sent.kind, sent.orig_cl_ord_id) else {
             return tracing::warn!(%venue, %downstream, "cancel reject naming an order, not a cancel or replace");
         };
-        let order = self.orders.get(&sent.order).expect("downstream ClOrdIDs point at booked orders");
+        let order = self.orders.get_mut(&sent.order).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
             return tracing::warn!(%venue, %downstream, "cancel reject for another venue's order");
         }
+        // Done is final, as in `stale`.
+        if !order.status.is_done() {
+            order.status = status;
+        }
         let refusal = Refusal { client: order.client.clone(), cl_ord_id: sent.cl_ord_id, orig_cl_ord_id, response_to };
         let text = text.unwrap_or_else(|| "rejected by the venue".into());
-        out.push(refusal.output(Some(order), CancelRejectReason::Other, text));
+        out.push(refusal.output(Some(&*order), CancelRejectReason::Other, text));
     }
 
     fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
@@ -787,18 +795,15 @@ mod tests {
         let mut book = book();
         new_order(&mut book, "C1");
         cancel(&mut book, "C2", "C1");
-        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1"));
+        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
         let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, text, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str()), ("C2", "C1"));
         assert_eq!(text, "rejected by the venue");
-        assert_eq!(
-            cancel_reject(&out),
-            (Some(OrderId(1)), CancelKind::Cancel, Status::PendingNew, CancelRejectReason::Other)
-        );
+        assert_eq!(cancel_reject(&out), (Some(OrderId(1)), CancelKind::Cancel, Status::New, CancelRejectReason::Other));
     }
 
-    fn venue_cancel_reject(venue: &str, downstream: &str) -> Input {
-        Input::VenueCancelReject { venue: venue.into(), downstream: downstream.into(), text: None }
+    fn venue_cancel_reject(venue: &str, downstream: &str, status: Status) -> Input {
+        Input::VenueCancelReject { venue: venue.into(), downstream: downstream.into(), status, text: None }
     }
 
     #[test]
@@ -816,7 +821,7 @@ mod tests {
                 request: request("C1")
             }]
         );
-        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-2"));
+        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-2", Status::New));
         let [Output::CancelReject { cl_ord_id, orig_cl_ord_id, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((cl_ord_id.as_str(), orig_cl_ord_id.as_str()), ("C3", "C2"));
     }
@@ -826,9 +831,9 @@ mod tests {
         let mut book = book();
         new_order(&mut book, "C1");
         cancel(&mut book, "C2", "C1");
-        assert!(run(&mut book, venue_cancel_reject("LSE", "1-1")).is_empty());
-        assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-9")).is_empty());
-        assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1")).is_empty());
+        assert!(run(&mut book, venue_cancel_reject("LSE", "1-1", Status::New)).is_empty());
+        assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-9", Status::New)).is_empty());
+        assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1", Status::New)).is_empty());
     }
 
     #[test]
@@ -839,5 +844,27 @@ mod tests {
         let out = run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.cl_ord_id.as_str(), &report.orig_cl_ord_id), ("C1", &None));
+    }
+
+    #[test]
+    fn a_venue_cancel_reject_sets_the_orders_status() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 0));
+        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
+        assert_eq!(cancel_reject(&out).2, Status::New);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::New);
+    }
+
+    #[test]
+    fn a_venue_cancel_reject_leaves_a_done_order_done() {
+        let mut book = book();
+        new_order(&mut book, "C1");
+        cancel(&mut book, "C2", "C1");
+        run(&mut book, venue_report("1", Status::Filled, 100, 100));
+        let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
+        assert_eq!(cancel_reject(&out).2, Status::Filled);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Filled);
     }
 }
