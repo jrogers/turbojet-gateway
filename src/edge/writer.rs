@@ -244,10 +244,12 @@ async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>, ages: 
             task.waiting.push((hold, done));
             next = if changes.len() < MAX_BATCHES_PER_WRITE { task.batches.try_recv().ok() } else { None };
         }
-        write(&store, &changes).await;
-        ages.set(None);
         let written = changes.len();
-        changes.clear();
+        // Rows changed by many batches are written once: statements, not the commit, are most of
+        // a large write's time.
+        let merged = Changes::merge(changes.drain(..));
+        write(&store, std::slice::from_ref(&merged), written).await;
+        ages.set(None);
         for (hold, done) in task.waiting.drain(..) {
             drop(hold);
             if let Some(done) = done {
@@ -261,15 +263,15 @@ async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>, ages: 
     info!("the book's writer stopped: nothing left to write");
 }
 
-/// Writes `changes` in one transaction, retrying until it commits. Every row is an upsert or a
+/// Writes `changes`, merged from `batches` batches, in one transaction, retrying until it commits. Every row is an upsert or a
 /// delete by key, so writing them again after a failure writes each once.
-async fn write(store: &Store, changes: &[Changes]) {
+async fn write(store: &Store, changes: &[Changes], batches: usize) {
     let mut wait = RETRY_FIRST;
     let mut failures: u32 = 0;
     while let Err(e) = store.write(changes).await {
         failures = failures.saturating_add(1);
         error!(
-            batches = changes.len(),
+            batches,
             failures,
             retry_in = ?wait,
             "cannot commit the book's changes; their messages stay held: {e}"
@@ -278,6 +280,6 @@ async fn write(store: &Store, changes: &[Changes]) {
         wait = (wait * 2).min(RETRY_MAX);
     }
     if failures > 0 {
-        info!(batches = changes.len(), failures, "committed the book's changes after failing");
+        info!(batches, failures, "committed the book's changes after failing");
     }
 }

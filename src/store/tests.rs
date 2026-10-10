@@ -268,6 +268,56 @@ async fn delivered_reports_are_deleted_and_a_rewrite_changes_nothing() {
     assert_eq!(store.load().await.unwrap(), applied(&[first, second, third]));
 }
 
+/// Merged, changes leave the store as writing each in turn does, with each row once: an order
+/// changed twice is one row, and a report delivered within them is neither inserted nor deleted.
+#[tokio::test]
+async fn merged_changes_write_what_the_changes_do() {
+    let funda = ClientId::from("FUNDA");
+    let row = |status| {
+        let mut order = order(1, &funda, true);
+        order.status = status;
+        OrderRow { order, day: None }
+    };
+    let report = |n: u8| Undelivered { client: funda.clone(), message: vec![n] };
+    let cl_ord_id = |order| ClOrdIdRow { client: funda.clone(), day: None, cl_ord_id: "C1".into(), order };
+    let written = [
+        Changes {
+            orders: vec![row(Status::New), order_row(2)],
+            cl_ord_ids: vec![cl_ord_id(OrderId(1))],
+            blocked: Some(vec![Scope::All]),
+            references: vec![("AAPL".into(), decimal("10"))],
+            undelivered: vec![(1, report(1)), (2, report(2))],
+            ..Changes::default()
+        },
+        Changes {
+            orders: vec![row(Status::Filled)],
+            cl_ord_ids: vec![cl_ord_id(OrderId(2))],
+            references: vec![("AAPL".into(), decimal("11"))],
+            undelivered: vec![(3, report(3))],
+            delivered: vec![1, 9],
+            ..Changes::default()
+        },
+        Changes { delivered: vec![3], ..Changes::default() },
+    ];
+    let merged = Changes::merge(written.clone());
+    assert_eq!(merged.orders.len(), 2);
+    assert_eq!(merged.cl_ord_ids, [cl_ord_id(OrderId(2))]);
+    assert_eq!(merged.references, [("AAPL".into(), decimal("11"))]);
+    assert_eq!(merged.blocked, Some(vec![Scope::All]));
+    assert_eq!(merged.undelivered, [(2, report(2))]);
+    assert_eq!(merged.delivered, [9]);
+    assert_eq!(applied(std::slice::from_ref(&merged)), applied(&written));
+
+    let (one, each) = (memory().await, memory().await);
+    one.write(std::slice::from_ref(&merged)).await.unwrap();
+    each.write(&written).await.unwrap();
+    assert_eq!(one.load().await.unwrap(), each.load().await.unwrap());
+}
+
+fn order_row(id: u64) -> OrderRow {
+    OrderRow { order: order(id, &ClientId::from("FUNDB"), false), day: None }
+}
+
 /// An empty store's next OrderId is 1.
 #[tokio::test]
 async fn an_empty_store_loads_an_empty_snapshot() {

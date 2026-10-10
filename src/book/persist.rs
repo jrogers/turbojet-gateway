@@ -37,6 +37,46 @@ impl Changes {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// `changes` as one, which [`Snapshot::apply`] leaves as applying each in turn would: each
+    /// key's last row wins, and an undelivered row inserted and deleted among them is in neither
+    /// list. The writer coalesces a transaction's batches so, writing each row once.
+    pub fn merge(changes: impl IntoIterator<Item = Changes>) -> Self {
+        let mut orders = HashMap::new();
+        let mut sent = HashMap::new();
+        let mut cl_ord_ids = HashMap::new();
+        let mut days = HashMap::new();
+        let mut blocked = None;
+        let mut references = HashMap::new();
+        let mut filled = HashMap::new();
+        let mut undelivered = BTreeMap::new();
+        let mut delivered = Vec::new();
+        for changes in changes {
+            orders.extend(changes.orders.into_iter().map(|row| (row.order.id, row)));
+            sent.extend(changes.sent);
+            let key = |row: &ClOrdIdRow| (row.client.clone(), row.day, row.cl_ord_id.clone());
+            cl_ord_ids.extend(changes.cl_ord_ids.into_iter().map(|row| (key(&row), row)));
+            days.extend(changes.days);
+            blocked = changes.blocked.or(blocked);
+            references.extend(changes.references);
+            filled.extend(changes.filled);
+            undelivered.extend(changes.undelivered);
+            // A row inserted earlier in these changes is never written; one from an earlier write
+            // is deleted.
+            delivered.extend(changes.delivered.into_iter().filter(|id| undelivered.remove(id).is_none()));
+        }
+        Self {
+            orders: orders.into_values().collect(),
+            sent: sent.into_iter().collect(),
+            cl_ord_ids: cl_ord_ids.into_values().collect(),
+            days: days.into_iter().collect(),
+            blocked,
+            references: references.into_iter().collect(),
+            filled: filled.into_iter().collect(),
+            undelivered: undelivered.into_iter().collect(),
+            delivered,
+        }
+    }
 }
 
 /// A report queued for `client`, as the FIX message its session is sent, framed with the
