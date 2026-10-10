@@ -4,7 +4,7 @@
 //! prefix, and restored orders keep their names), what risk works out from live orders, and
 //! configuration.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use turbojet::fields::{CompactString, Decimal};
 
@@ -50,7 +50,7 @@ impl Changes {
         let mut references = HashMap::new();
         let mut filled = HashMap::new();
         let mut undelivered = BTreeMap::new();
-        let mut delivered = Vec::new();
+        let mut delivered = BTreeSet::new();
         for changes in changes {
             orders.extend(changes.orders.into_iter().map(|row| (row.order.id, row)));
             sent.extend(changes.sent);
@@ -60,10 +60,18 @@ impl Changes {
             blocked = changes.blocked.or(blocked);
             references.extend(changes.references);
             filled.extend(changes.filled);
-            undelivered.extend(changes.undelivered);
-            // A row inserted earlier in these changes is never written; one from an earlier write
-            // is deleted.
-            delivered.extend(changes.delivered.into_iter().filter(|id| undelivered.remove(id).is_none()));
+            // Within one Changes, inserts before deletes, as `Snapshot::apply` and the store take
+            // them. An insert after a delete of the same row leaves it; a delete after an insert
+            // in these changes means neither is written.
+            for (id, row) in changes.undelivered {
+                delivered.remove(&id);
+                undelivered.insert(id, row);
+            }
+            for id in changes.delivered {
+                if undelivered.remove(&id).is_none() {
+                    delivered.insert(id);
+                }
+            }
         }
         Self {
             orders: orders.into_values().collect(),
@@ -74,7 +82,7 @@ impl Changes {
             references: references.into_iter().collect(),
             filled: filled.into_iter().collect(),
             undelivered: undelivered.into_iter().collect(),
-            delivered,
+            delivered: delivered.into_iter().collect(),
         }
     }
 }

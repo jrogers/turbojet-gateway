@@ -297,14 +297,16 @@ async fn merged_changes_write_what_the_changes_do() {
             delivered: vec![1, 9],
             ..Changes::default()
         },
-        Changes { delivered: vec![3], ..Changes::default() },
+        Changes { delivered: vec![3, 4], ..Changes::default() },
+        // Inserted after its delete, as a mis-ordered queue would: it stays.
+        Changes { undelivered: vec![(4, report(4))], ..Changes::default() },
     ];
     let merged = Changes::merge(written.clone());
     assert_eq!(merged.orders.len(), 2);
     assert_eq!(merged.cl_ord_ids, [cl_ord_id(OrderId(2))]);
     assert_eq!(merged.references, [("AAPL".into(), decimal("11"))]);
     assert_eq!(merged.blocked, Some(vec![Scope::All]));
-    assert_eq!(merged.undelivered, [(2, report(2))]);
+    assert_eq!(merged.undelivered, [(2, report(2)), (4, report(4))]);
     assert_eq!(merged.delivered, [9]);
     assert_eq!(applied(std::slice::from_ref(&merged)), applied(&written));
 
