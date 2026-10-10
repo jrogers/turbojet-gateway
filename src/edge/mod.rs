@@ -275,6 +275,8 @@ impl Gateway {
     fn client(&self, id: &SessionId) -> ClientId {
         // Nothing is left half-changed under this lock, so a panic elsewhere doesn't spoil it.
         let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        // `admit` (at verify_logon, before any logon or message) has added a live session already,
+        // under its per-CompID cap: the insert below is for unit tests that skip the logon.
         if let Some(client) = clients.get(id) {
             return client.clone();
         }
