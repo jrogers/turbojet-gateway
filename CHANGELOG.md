@@ -20,16 +20,26 @@ Notable changes to Jetbridge.
   passed through in the client's version.
 - Routing rules in `jetbridge.toml`, `[[route]]`s matching on client, ExDestination and Symbol,
   first match wins, to a venue or rejected with a text.
+- A client is a session: sessions of one CompID with different SubIDs or LocationIDs each keep
+  their own ClOrdIDs, reports and risk counts, up to 16 per CompID. Routes and limits match the
+  CompID.
+- Risk limits in `jetbridge.toml`, `[risk.defaults]` and `[risk.client.COMPID]`: maximum order
+  quantity and notional, allowed symbols, a price band around the symbol's last fill, credit (open
+  plus filled since start) and self-trade prevention, checked per session on each order and
+  replace after routing. A replace that adds no risk passes. Refused orders get OrdRejReason 3
+  for quantity, notional and credit, and a Text naming the limit.
 - Reports for a client that's disconnected or slow are held in a bounded queue per client and
   delivered in order once it can take them.
 - An order whose venue isn't connected, or whose session drops it unsent, is rejected as venue
   unavailable.
 - A kill switch, as library calls on the gateway: block a client session, a CompID or everyone
   (new orders rejected; cancels and replaces that don't raise the quantity pass), cancel their
-  orders at the venues, and unblock.
+  orders at the venues, and unblock. The gateway's own cancels are retried when a venue refuses
+  them (three tries in all), sent when a down venue logs back on, and listed while they're going;
+  clients get an unsolicited Canceled report per order.
 - Cancel on disconnect: a client session with `cancel_on_disconnect` in the sessions file has
   its orders cancelled at the venues when it doesn't log back on within its grace, and at
-  shutdown.
-- SIGHUP reloads the sessions file and the routes, keeping either if it doesn't load; Ctrl-C or
-  SIGTERM logs every session out and says what the stop leaves open. Optional TLS (feature
-  `tls`).
+  shutdown, which waits up to 5 seconds for the venues to answer the gateway's cancels.
+- SIGHUP reloads the sessions file, the routes and the risk limits, keeping either file if it
+  doesn't load; Ctrl-C or SIGTERM logs every session out and says what the stop leaves open.
+  Optional TLS (feature `tls`).

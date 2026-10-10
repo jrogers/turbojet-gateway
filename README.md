@@ -5,10 +5,11 @@ on to it, it logs on to venues, and it routes the clients' orders to the venues 
 reports back, keeping each order's state as it goes.
 
 > [!WARNING]
-> **Early work.** Orders are kept in memory only: a restart forgets every order and every report
-> not yet delivered. It hasn't been run against a real venue or client. Read
-> [CAVEATS.md](CAVEATS.md) before relying on it, and don't use it to trade real money without
-> testing it thoroughly yourself. It is provided as is, without warranty of any kind.
+> **Early work.** Everything is kept in memory only: a restart forgets every order, every report
+> not yet delivered, operators' blocks and what the risk limits have counted. It hasn't been run
+> against a real venue or client. Read [CAVEATS.md](CAVEATS.md) before relying on it, and don't
+> use it to trade real money without testing it thoroughly yourself. It is provided as is,
+> without warranty of any kind.
 
 ## What it does
 
@@ -30,8 +31,15 @@ reports back, keeping each order's state as it goes.
   Trade; Partial fill or Fill on FIX 4.2), whatever the venue called it.
 - **Reports held per client.** A report for a client that's disconnected, or reading slowly, waits
   in that client's queue and goes out, in order, once it can take it.
-- **Reload on SIGHUP** of the routes and the sessions file, keeping connected sessions the file
-  still has.
+- **Risk limits** per CompID, checked on each order and replace before it goes to a venue: order
+  quantity, notional, allowed symbols, a price band around the last fill, credit and self-trade
+  prevention.
+- **A kill switch**, as library calls: block a client session, a CompID or everyone, and cancel
+  their orders at the venues.
+- **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
+  cancelled when its session drops and it doesn't log back on in time, and at shutdown.
+- **Reload on SIGHUP** of the routes, the risk limits and the sessions file, keeping connected
+  sessions the file still has.
 
 ## Building and running
 
@@ -57,8 +65,8 @@ Two files: `jetbridge.toml`, given with `--config`, and the sessions file it nam
 ### jetbridge.toml
 
 ```toml
-# Jetbridge: the sessions file, and how orders are routed. First match wins; an order no route
-# matches is rejected.
+# Jetbridge: the sessions file, how orders are routed and the clients' risk limits. First match
+# wins; an order no route matches is rejected.
 sessions = "sessions.toml"
 
 # FUNDA's orders for XNAS go to NASDAQ.
@@ -69,6 +77,18 @@ venue = "NASDAQ"
 
 [[route]]
 reject = "no route for this order"
+
+# Every client's limits. A key left out is no check.
+[risk.defaults]
+max_order_qty = 10000             # OrderQty(38)
+max_notional = 1000000            # quantity x price
+price_band = 5                    # percent either side of the symbol's last fill
+self_trade = true
+
+# FUNDA's own: the keys it sets replace the defaults', the rest are the defaults'.
+[risk.client.FUNDA]
+max_notional = "2500000.50"
+credit = 10000000                 # open + filled since start + this order
 ```
 
 - `sessions`: the sessions file, relative to this file. Read at start only; a reload rereads the
@@ -87,6 +107,7 @@ order is rejected, and routes after one with no conditions can never match; both
 warning logged. Unknown keys are errors, and so is a route to a venue the sessions file has no
 initiator for. Cancels and replaces go to the venue the order went to, whatever the routes say
 now.
+- `[risk.defaults]` and `[risk.client.COMPID]`: see [Risk limits](#risk-limits).
 
 ### sessions.toml
 
@@ -115,13 +136,55 @@ Jetbridge:
 - `[acceptor]` is where clients log on. It's required, and its `begin_string`, `FIX.4.2` or
   `FIX.4.4`, is every client's version. Which CompIDs may log on is turbojet-config's: those listed
   as `[counterparty.COMPID]`, or any under `unknown = "admit"`. A client is a session: sessions of
-  one CompID with different SubIDs or LocationIDs each have their own ClOrdIDs and reports.
+  one CompID with different SubIDs or LocationIDs each have their own ClOrdIDs, reports and risk
+  counts.
 - Each `[initiator.NAME]` is a venue, and `NAME` is what routes call it. A venue speaks its own
   `begin_string` (the acceptor's by default), `FIX.4.2` or `FIX.4.4`, and logs on as the
   acceptor's `sender_comp_id` unless it sets its own. A venue with another version stops the
   gateway at start; a reload that adds one skips it, with an error logged.
 - Sessions are kept in the `memory` store unless the file says otherwise, so sequence numbers
   start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them.
+
+## Risk limits
+
+Each new order a route sends to a venue, and each replace, is checked against its client's limits
+first. `[risk.defaults]` sets every client's; `[risk.client.COMPID]` sets one CompID's. Every key is
+optional, and one left out is no check:
+
+| Key | Refuses an order when |
+| --- | --- |
+| `max_order_qty` | its OrderQty(38) is more than this |
+| `max_notional` | its quantity times its price is more than this |
+| `symbols` | its Symbol(55) isn't one of these, compared exactly |
+| `price_band` | it's a Limit order priced more than this percentage either side of the symbol's last fill; no check before the symbol's first fill |
+| `credit` | the session's open notional, plus what it has filled since start, plus this order's, is more than this |
+| `self_trade` | `true`: it would trade with one of the same session's live orders on the other side, same symbol and venue (a buy at or above a resting sell's price, a sell at or below a resting buy's; a Market order on either side crosses) |
+
+Amounts are TOML integers, floats or strings, read as decimals (a string keeps every digit as
+written), and must be positive; `symbols` can't be empty. Unknown keys are errors.
+
+- **Per CompID, each session separately.** A `[risk.client.COMPID]` key replaces the defaults'
+  one key by key; the keys it leaves out are the defaults'. It can't remove a numeric default or
+  the defaults' `symbols`: set a large number, or list the symbols. `self_trade = false` does turn
+  off the defaults'. The limits apply to each of the CompID's sessions on its own: two sessions of
+  one CompID each have the full credit.
+- **Prices.** A Limit order counts at its limit price. A Market order counts at the symbol's last
+  fill price, on any venue and for any client. Without one, a Market order is rejected where
+  `max_notional` or `credit` applies, and passes otherwise. An order's open notional is its
+  unfilled quantity at that price, fixed when it's booked or replaced.
+- **Credit** counts the session's live orders (with a pending replace, the larger of the old and
+  new terms) and its fills, at their fill prices, since the gateway started.
+- **Replaces** are checked on their new terms, against credit only if they raise the order's
+  notional. A replace that adds no risk, at the same price (or Market again) and no more quantity,
+  always passes, so a client can cut an order the limits would refuse now.
+- **What the client sees.** A refused order gets a Rejected ExecutionReport whose Text(58) names
+  the limit, such as "notional over the limit (risk max_notional)". Its OrdRejReason(103) is 3
+  (exceeds limit) for `max_order_qty`, `max_notional` and `credit`, and 0 (broker option) on FIX
+  4.2 or 99 (other) on FIX 4.4 for the rest. A refused replace gets an OrderCancelReject with the
+  same text. New orders are checked in this order: a duplicate ClOrdID, blocked by an operator,
+  too many ClOrdIDs, the routes (a route's reject or no route), then the limits.
+- **Reloads.** A SIGHUP rereads the limits with the routes, both or neither. New limits apply from
+  the next order or replace; orders already working stay, and what's been counted carries over.
 
 ## Kill switch
 
@@ -131,7 +194,7 @@ including ones that log on later), or everyone.
 
 - `cancel_all(scope)` blocks the scope and cancels its clients' live orders at their venues, in
   one step. Each client gets an unsolicited Canceled report for each order as its venue confirms
-  it. A cancel the venue refuses is sent again, up to three times; `cancelling()` lists the
+  it. A cancel the venue refuses is sent again, three tries in all; `cancelling()` lists the
   cancels still going and those given up. A cancel for a venue that is down goes when it logs
   back on; one its session couldn't queue is tried again every second while its session is
   connected.
@@ -142,7 +205,8 @@ including ones that log on later), or everyone.
   unblocking a session leaves a block of its CompID in force. `blocked()` lists the blocked
   scopes.
 
-Each call is logged as a warning naming its scope.
+Each call that changes something is logged as a warning naming its scope. A blocked client's
+replaces are still checked against its risk limits.
 
 ## Cancel on disconnect
 
@@ -156,8 +220,9 @@ cancel_grace = "5s"                   # how long it has to log back on; 0s by de
 
 When such a session's connection ends and it doesn't log back on within the grace, the gateway
 cancels its live orders at their venues, as `cancel_all` does for one session but without a
-block: the client may log back on and trade. Each cancel is logged as a warning. The client gets
-an unsolicited Canceled report for each order as its venue confirms it, when it next logs on.
+block: the client may log back on and trade. It's logged as a warning naming the session. The
+client gets an unsolicited Canceled report for each order as its venue confirms it, when it next
+logs on.
 
 At shutdown the gateway logs its clients out, which starts no countdown, so it cancels the working
 orders of every client session with cancel on disconnect on itself, whatever the trigger, logged
@@ -167,10 +232,10 @@ as one warning with the count per session. Other clients' orders stay working at
 
 - **SIGHUP** (Unix) reloads. The sessions file first, as turbojet-config reloads it: changed
   settings apply from each session's next logon, added venues start and removed ones are logged
-  out and stopped. Then the routes, checked against the venues running after that. A file that
-  doesn't load is logged as a warning and the one in use is kept: a bad sessions file keeps the
-  sessions as they were, and a bad routes file keeps the routes. New routes apply to new orders;
-  orders already working stay with their venue.
+  out and stopped. Then the routes and risk limits, the routes checked against the venues running
+  after that. A file that doesn't load is logged as a warning and the one in use is kept: a bad
+  sessions file keeps the sessions as they were, and a bad `jetbridge.toml` keeps the routes and
+  limits. New routes and limits apply to new orders; orders already working stay with their venue.
 - **Ctrl-C or SIGTERM** logs every client out ("gateway shutting down"), which fires any
   cancel-on-disconnect countdowns under way, and cancels the working orders of clients with cancel
   on disconnect (see above); waits up to 5 seconds for the venues to answer the

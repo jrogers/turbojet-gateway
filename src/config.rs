@@ -599,5 +599,9 @@ self_trade = false
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.version, Version::Fix44);
         assert_eq!(loaded.sessions.initiator_names(), ["NASDAQ"]);
+        let funda = loaded.limits.limits("FUNDA");
+        assert_eq!(funda.max_notional, Some(decimal("2500000.50")));
+        assert_eq!((funda.max_order_qty, funda.price_band), (Some(decimal("10000")), Some(decimal("5"))));
+        assert_eq!(loaded.limits.limits("FUNDB").credit, None);
     }
 }

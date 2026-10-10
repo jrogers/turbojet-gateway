@@ -13,7 +13,7 @@ usage: jetbridge --config FILE
 
 A FIX gateway: clients log on to its acceptor, and it routes their orders to venues.
 
-  --config FILE   jetbridge.toml: the sessions file and the routes
+  --config FILE   jetbridge.toml: the sessions file, the routes and the risk limits
   --help          print this
 
 On Unix, SIGHUP reloads both files; a file that doesn't load keeps the one in use. Ctrl-C or
