@@ -198,3 +198,149 @@ pub enum Output {
         request: OrderRequest,
     },
 }
+
+#[derive(Debug)]
+pub struct Book {
+    router: Router,
+    orders: HashMap<OrderId, Order>,
+    /// (client, ClOrdID) -> order, for every ClOrdID each client used today.
+    index: HashMap<(ClientId, CompactString), OrderId>,
+    /// ClOrdIDs in `index` per client, against [`MAX_CL_ORD_IDS_PER_CLIENT`].
+    used: HashMap<ClientId, usize>,
+    /// Downstream ClOrdID -> the order, and the client's ClOrdID for that request.
+    downstream: HashMap<CompactString, (OrderId, CompactString)>,
+    next_id: u64,
+}
+
+impl Book {
+    pub fn new(router: Router) -> Self {
+        Self {
+            router,
+            orders: HashMap::new(),
+            index: HashMap::new(),
+            used: HashMap::new(),
+            downstream: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    pub fn order(&self, id: OrderId) -> Option<&Order> {
+        self.orders.get(&id)
+    }
+
+    pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
+        match input {
+            Input::NewOrder { client, request, redelivered } => self.new_order(client, request, redelivered, out),
+            Input::Cancel { .. } | Input::VenueReport { .. } | Input::VenueCancelReject { .. } => todo!(),
+        }
+    }
+
+    fn new_order(&mut self, client: ClientId, request: OrderRequest, _redelivered: bool, out: &mut Vec<Output>) {
+        let venue = match self.router.route(&client, &request) {
+            Target::Venue(venue) => venue,
+            Target::Reject(text) => return out.push(reject(client, request, RejectReason::NoRoute, text)),
+        };
+        let id = OrderId(self.next_id);
+        self.next_id += 1;
+        let downstream = format_compact!("{}", id.0);
+        self.remember(&client, request.cl_ord_id.clone(), id);
+        self.downstream.insert(downstream.clone(), (id, request.cl_ord_id.clone()));
+        out.push(Output::NewOrder { venue: venue.clone(), downstream: downstream.clone(), request: request.clone() });
+        let order = Order {
+            id,
+            client,
+            venue,
+            request,
+            downstream,
+            amendments: 0,
+            status: Status::PendingNew,
+            cum_qty: Decimal::ZERO,
+            avg_px: Decimal::ZERO,
+        };
+        self.orders.insert(id, order);
+    }
+
+    fn remember(&mut self, client: &ClientId, cl_ord_id: CompactString, id: OrderId) {
+        self.index.insert((client.clone(), cl_ord_id), id);
+        *self.used.entry(client.clone()).or_default() += 1;
+    }
+}
+
+fn reject(client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
+    let report = ClientReport {
+        order_id: None,
+        cl_ord_id: request.cl_ord_id.clone(),
+        orig_cl_ord_id: None,
+        request,
+        status: Status::Rejected,
+        reject: Some(reason),
+        last_qty: Decimal::ZERO,
+        last_px: Decimal::ZERO,
+        cum_qty: Decimal::ZERO,
+        leaves_qty: Decimal::ZERO,
+        avg_px: Decimal::ZERO,
+        text: Some(text),
+    };
+    Output::Report { client, report }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::Rule;
+
+    fn book() -> Book {
+        Book::new(Router::new(vec![Rule {
+            client: None,
+            ex_destination: Some("XNAS".into()),
+            symbol: None,
+            target: Target::Venue("NASDAQ".into()),
+        }]))
+    }
+
+    fn request(cl_ord_id: &str) -> OrderRequest {
+        OrderRequest {
+            cl_ord_id: cl_ord_id.into(),
+            account: None,
+            symbol: "AAPL".into(),
+            side: Side::Buy,
+            ord_type: OrdType::Limit,
+            qty: Decimal::from(100),
+            price: Some(Decimal::from(10)),
+            ex_destination: Some("XNAS".into()),
+            time_in_force: None,
+        }
+    }
+
+    fn run(book: &mut Book, input: Input) -> Vec<Output> {
+        let mut out = Vec::new();
+        book.handle(input, &mut out);
+        out
+    }
+
+    fn new_order(book: &mut Book, cl_ord_id: &str) -> Vec<Output> {
+        run(book, Input::NewOrder { client: "FUNDA".into(), request: request(cl_ord_id), redelivered: false })
+    }
+
+    #[test]
+    fn a_new_order_goes_to_its_venue_under_our_order_id() {
+        let mut book = book();
+        let out = new_order(&mut book, "C1");
+        assert_eq!(out, [Output::NewOrder { venue: "NASDAQ".into(), downstream: "1".into(), request: request("C1") }]);
+        assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PendingNew);
+    }
+
+    #[test]
+    fn an_unroutable_order_is_rejected_and_not_booked() {
+        let mut book = book();
+        let mut req = request("C1");
+        req.ex_destination = None;
+        let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: req, redelivered: false });
+        let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+        assert_eq!(
+            (report.status, report.reject, report.order_id),
+            (Status::Rejected, Some(RejectReason::NoRoute), None)
+        );
+        assert!(book.order(OrderId(1)).is_none());
+    }
+}
