@@ -37,8 +37,8 @@ const OVERFLOW_TEXT: &str = "too many undelivered reports";
 
 /// Holds reports per client, and delivers them as each client can take them.
 ///
-/// **Order.** A client receives its reports in the order [`push`](Self::push) and
-/// [`deliver`](Self::deliver) were called for it (calls racing on different threads have no order
+/// **Order.** A client receives its reports in the order [`deliver`](Self::deliver) was called
+/// for it (calls racing on different threads have no order
 /// to keep). A report the connection drops before storing it is sent again after the client logs
 /// back on, ahead of anything later; one that was stored is resent by the session as usual.
 ///
@@ -59,20 +59,14 @@ pub struct Outbox {
     tasks: Mutex<JoinSet<()>>,
 }
 
-impl Default for Outbox {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Outbox {
     /// An outbox holding up to [`MAX_OUTBOX`] reports per client.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_limit(MAX_OUTBOX)
     }
 
     /// An outbox holding up to `limit` reports per client.
-    pub fn with_limit(limit: usize) -> Self {
+    fn with_limit(limit: usize) -> Self {
         assert!(limit > 0, "an outbox must hold at least one report");
         Self { limit, clients: Mutex::default(), tasks: Mutex::default() }
     }
@@ -92,15 +86,10 @@ impl Outbox {
         client.shared.logon.notify_one();
     }
 
-    /// Queues `msg` for `client`, to go out once everything held for it ahead of it has. Never
-    /// waits. `false` if it was dropped: the client's outbox was full. The first report dropped
-    /// logs an error and logs the client out; the rest are counted, and the count logged once the
-    /// outbox empties.
-    ///
-    /// # Panics
-    ///
-    /// Outside a tokio runtime, for a client not seen before (its drain task is spawned).
-    pub fn push(&self, client: &ClientId, msg: Message) -> bool {
+    /// Queues `msg` for `client` as [`deliver`](Self::deliver) does when something is already
+    /// held: never sent straight away, so tests can hold reports up.
+    #[cfg(test)]
+    fn push(&self, client: &ClientId, msg: Message) -> bool {
         let mut clients = lock(&self.clients);
         let held = self.client(&mut clients, client);
         if !held.reserve(self.limit) {
@@ -111,8 +100,11 @@ impl Outbox {
     }
 
     /// Sends `msg` to `client` straight away if nothing is held for it and its session takes it;
-    /// otherwise [`push`](Self::push)es it, so order holds. Either way, if the connection drops
-    /// it before it's stored, it's sent again after the client logs back on. Never waits.
+    /// otherwise queues it, to go out once everything held for it ahead of it has. Either way, if
+    /// the connection drops it before it's stored, it's sent again after the client logs back on.
+    /// Never waits. `false` if it was dropped: the client's outbox was full. The first report
+    /// dropped logs an error and logs the client out; the rest are counted, and the count logged
+    /// once the outbox empties.
     ///
     /// # Panics
     ///

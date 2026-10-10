@@ -128,13 +128,13 @@ impl Service {
         tokio::join!(self.initiators.shutdown(Some(SHUTTING_DOWN)), self.acceptor.shutdown(Some(SHUTTING_DOWN)));
         // Lost at exit until stage 4 persists the book and the undelivered reports: open orders
         // stay open at their venues with no client to report to.
-        let (open_orders, undelivered) = self.gateway.unfinished();
-        if open_orders.is_empty() && undelivered.is_empty() {
+        let unfinished = self.gateway.unfinished();
+        if unfinished.open_orders.is_empty() && unfinished.undelivered.is_empty() {
             info!("no open orders or undelivered reports");
         } else {
             warn!(
-                ?open_orders,
-                ?undelivered,
+                open_orders = ?unfinished.open_orders,
+                undelivered = ?unfinished.undelivered,
                 "stopping with open orders (per venue) and undelivered reports (per client)"
             );
         }

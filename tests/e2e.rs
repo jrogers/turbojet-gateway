@@ -518,8 +518,8 @@ async fn a_fill_for_a_disconnected_client_arrives_once_it_logs_back_on() {
     setup.venue.send(fill(&setup.id("1"), "E-1", 100, 100));
     // The book has taken the fill when the order's done.
     let gateway = setup.service.gateway().clone();
-    until(|| gateway.unfinished().0.is_empty()).await;
-    assert_eq!(gateway.unfinished().1, BTreeMap::from([(CLIENT.into(), 1)]));
+    until(|| gateway.unfinished().open_orders.is_empty()).await;
+    assert_eq!(gateway.unfinished().undelivered, BTreeMap::from([(CLIENT.into(), 1)]));
 
     // The same session, its sequence numbers kept.
     tokio::spawn(setup.client.clone().run());
@@ -527,7 +527,7 @@ async fn a_fill_for_a_disconnected_client_arrives_once_it_logs_back_on() {
     let msg = setup.events.message().await;
     assert_eq!(msg.get(tags::POSS_DUP_FLAG), None);
     assert_eq!(seen(&msg.parse().unwrap()), setup.c1("1.2", v44::ExecType::Trade, Some(100), 100));
-    until(|| gateway.unfinished().1.is_empty()).await;
+    until(|| gateway.unfinished().undelivered.is_empty()).await;
 }
 
 #[tokio::test]
@@ -597,7 +597,7 @@ async fn venue_resends_after_a_reconnect_reach_the_client_once() {
     let last = setup.venue.send_stored(fill(&setup.id("1"), "E-2", 60, 100)).await;
     relay.cut();
     // Stored at the venue, but lost on the way.
-    assert_eq!(setup.service.gateway().unfinished().0, BTreeMap::from([(VENUE.into(), 1)]));
+    assert_eq!(setup.service.gateway().unfinished().open_orders, BTreeMap::from([(VENUE.into(), 1)]));
     setup.venue.events.logged_out().await;
     setup.venue.events.logged_on().await;
     // The gateway saw the venue's Logon run ahead, and asked for the fill it missed.

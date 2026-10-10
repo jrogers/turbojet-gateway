@@ -41,6 +41,15 @@ pub struct Gateway {
     clock: Clock,
 }
 
+/// What a stop would lose until the book is persisted: see [`Gateway::unfinished`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfinished {
+    /// Open orders, per venue holding any.
+    pub open_orders: BTreeMap<VenueId, usize>,
+    /// Reports not yet delivered, per client holding any.
+    pub undelivered: BTreeMap<ClientId, usize>,
+}
+
 /// Everything sending needs, under one lock so reports leave in the book's order.
 #[derive(Debug)]
 struct State {
@@ -62,13 +71,6 @@ impl Gateway {
     pub fn new(router: Router, client_version: Version) -> Self {
         let state = State { book: Book::new(router), venues: HashMap::new(), venue_names: HashMap::new() };
         Self { state: Mutex::new(state), outbox: Outbox::new(), client_version, clock: Clock::system() }
-    }
-
-    /// Stamps TransactTime(60) from `clock` rather than the system's.
-    #[must_use]
-    pub fn with_clock(mut self, clock: Clock) -> Self {
-        self.clock = clock;
-        self
     }
 
     /// Starts every ID the book issues with `prefix`, such as [`start_prefix`](crate::book::start_prefix)'s.
@@ -118,10 +120,9 @@ impl Gateway {
         self.lock().book.router().clone()
     }
 
-    /// What a stop would lose until the book is persisted: the open orders per venue, and the
-    /// reports not yet delivered per client.
-    pub fn unfinished(&self) -> (BTreeMap<VenueId, usize>, BTreeMap<ClientId, usize>) {
-        (self.lock().book.open_orders_by_venue(), self.outbox.held_by_client())
+    /// What a stop would lose until the book is persisted.
+    pub fn unfinished(&self) -> Unfinished {
+        Unfinished { open_orders: self.lock().book.open_orders_by_venue(), undelivered: self.outbox.held_by_client() }
     }
 
     /// Routes new orders by `router` from now on.
