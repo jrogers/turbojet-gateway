@@ -874,3 +874,22 @@ async fn until(done: impl Fn() -> bool) {
     };
     timeout(WAIT, wait).await.expect("timed out waiting");
 }
+
+/// Limits from the reloaded file apply: an order over max_order_qty is rejected with the limit's
+/// text and Order exceeds limit, and never reaches the venue; one within it does.
+#[tokio::test]
+async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
+    let mut setup = Setup::new().await;
+    let risk = "[risk.defaults]\nmax_order_qty = 99\n";
+    std::fs::write(setup.dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + risk).unwrap();
+    setup.service.reload();
+
+    setup.send(order("C1", "AAPL"));
+    let rejected: v44::ExecutionReport = setup.events.parse().await;
+    assert_unbooked_reject(&rejected, "C1", &setup.id("R1"));
+    assert_eq!(rejected.text.as_deref(), Some("quantity over the limit (risk max_order_qty)"));
+    assert_eq!(rejected.ord_rej_reason, Some(v44::OrdRejReason::OrderExceedsLimit));
+    std::fs::write(setup.dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT)).unwrap();
+    setup.service.reload();
+    assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("1"));
+}

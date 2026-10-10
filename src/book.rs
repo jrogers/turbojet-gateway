@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use turbojet::SessionId;
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
-use crate::risk;
+use crate::risk::{self, Exposure, Proposed, RiskReject};
 use crate::router::{Router, Target};
 
 /// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
@@ -169,6 +169,8 @@ pub enum RejectReason {
     VenueUnavailable,
     /// An operator blocked the client: see [`Input::Block`].
     Blocked,
+    /// Over one of the client's risk limits.
+    Risk(RiskReject),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +190,9 @@ pub struct Order {
     pub status: Status,
     pub cum_qty: Decimal,
     pub avg_px: Decimal,
+    /// The price risk counts the order at: its limit, or a Market order's reference price when
+    /// it was booked (zero without one). Fixed, so its exposure doesn't move with the reference.
+    pub risk_price: Decimal,
     /// A replace sent to the venue and not yet answered; `request` changes only when it's accepted.
     pub pending: Option<Pending>,
     /// Client reports built for the order so far, numbering the next ExecID.
@@ -254,6 +259,8 @@ pub struct Pending {
     pub price: Option<Decimal>,
     pub ord_type: OrdType,
     pub time_in_force: Option<TimeInForce>,
+    /// As [`Order::risk_price`], for the new terms.
+    pub risk_price: Decimal,
 }
 
 /// An ExecutionReport from a venue, parsed.
@@ -502,6 +509,7 @@ struct Sent {
 pub struct Book {
     router: Router,
     limits: risk::Config,
+    risk: risk::State,
     /// Empty unless set by [`set_prefix`](Self::set_prefix).
     prefix: CompactString,
     orders: HashMap<OrderId, Order>,
@@ -529,6 +537,7 @@ impl Book {
         Self {
             router,
             limits: risk::Config::default(),
+            risk: risk::State::default(),
             prefix: CompactString::default(),
             orders: HashMap::new(),
             index: HashMap::new(),
@@ -681,6 +690,7 @@ impl Book {
             let indexed = self.index.keys().filter(|(owner, _)| owner == client).count();
             assert_eq!(used, indexed, "{client}'s ClOrdID count");
         }
+        self.risk.check(self.orders.iter().filter_map(|(id, order)| Some((*id, order.exposure()?))));
     }
 
     fn new_order(&mut self, client: ClientId, request: OrderRequest, redelivered: bool, out: &mut Vec<Output>) {
@@ -699,22 +709,45 @@ impl Book {
             };
             return out.push(output);
         }
-        if self.is_blocked(&client) {
-            return out.push(self.reject(client, request, RejectReason::Blocked, "blocked by an operator".into()));
+        match self.admit(&client, &request) {
+            Ok(venue) => self.book_order(client, request, venue, out),
+            Err((reason, text)) => out.push(self.reject(client, request, reason, text)),
         }
-        if self.used.get(&client).is_some_and(|&used| used >= self.max_cl_ord_ids) {
-            return out.push(self.reject(client, request, RejectReason::TooManyOrders, "too many orders today".into()));
+    }
+
+    /// The venue a new order goes to, or why it's rejected: the client is blocked or has used its
+    /// ClOrdIDs, a route rejects it or none matches, or it's over a risk limit. Risk comes after
+    /// routing, since self-trade prevention is per venue.
+    fn admit(&self, client: &ClientId, request: &OrderRequest) -> Result<VenueId, (RejectReason, CompactString)> {
+        if self.is_blocked(client) {
+            return Err((RejectReason::Blocked, "blocked by an operator".into()));
         }
-        let venue = match self.router.route(client.comp_id(), &request) {
+        if self.used.get(client).is_some_and(|&used| used >= self.max_cl_ord_ids) {
+            return Err((RejectReason::TooManyOrders, "too many orders today".into()));
+        }
+        let venue = match self.router.route(client.comp_id(), request) {
             Some(Target::Venue(venue)) => venue,
-            Some(Target::Reject(text)) => {
-                return out.push(self.reject(client, request, RejectReason::RouteRejected, text));
-            }
-            None => {
-                let text = "no route for this order".into();
-                return out.push(self.reject(client, request, RejectReason::NoRoute, text));
-            }
+            Some(Target::Reject(text)) => return Err((RejectReason::RouteRejected, text)),
+            None => return Err((RejectReason::NoRoute, "no route for this order".into())),
         };
+        let proposed = Proposed {
+            client,
+            symbol: &request.symbol,
+            venue: &venue,
+            side: request.side,
+            qty: request.qty,
+            leaves: request.qty,
+            price: limit_price(request.ord_type, request.price),
+            replaces: None,
+        };
+        let limits = self.limits.limits(client.comp_id());
+        risk::check(limits, &proposed, &self.risk)
+            .map_err(|reject| (RejectReason::Risk(reject), reject.text().into()))?;
+        Ok(venue)
+    }
+
+    /// Books an order `admit` let through and sends it to `venue`.
+    fn book_order(&mut self, client: ClientId, request: OrderRequest, venue: VenueId, out: &mut Vec<Output>) {
         let id = OrderId(self.next_id);
         self.next_id += 1;
         let name = format_compact!("{}{}", self.prefix, id.0);
@@ -731,6 +764,7 @@ impl Book {
         let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");
         out.push(Output::NewOrder { venue: venue.clone(), downstream: downstream.clone(), request: request.clone() });
+        let risk_price = self.risk.risk_price(&request.symbol, limit_price(request.ord_type, request.price));
         let order = Order {
             id,
             name,
@@ -742,12 +776,14 @@ impl Book {
             status: Status::PendingNew,
             cum_qty: Decimal::ZERO,
             avg_px: Decimal::ZERO,
+            risk_price,
             pending: None,
             exec_seq: 0,
             venue_order_id: None,
             cancel: None,
             gateway_cancel: None,
         };
+        self.risk.track(id, order.exposure());
         let previous = self.orders.insert(id, order);
         debug_assert!(previous.is_none(), "order {id:?} booked twice");
     }
@@ -843,6 +879,10 @@ impl Book {
         order.avg_px = report.avg_px;
         // `None` keeps the status, through `set_status` so a fill makes a New order PartiallyFilled.
         order.set_status(report.status.unwrap_or(order.status));
+        if report.last_qty > Decimal::ZERO {
+            self.risk.fill(&order.client, &order.request.symbol, report.last_qty, report.last_px);
+        }
+        self.risk.track(id, order.exposure());
         // The gateway's cancel's acks aren't the client's: after a refusal it would be left
         // showing PendingCancel. Fills and the end are.
         if origin == Origin::Gateway && report.last_qty == Decimal::ZERO && !order.status.is_done() {
@@ -875,7 +915,8 @@ impl Book {
 
     /// A replace goes to the venue like a cancel, one at a time; the order keeps its terms until
     /// the venue accepts it (see `venue_report`). Refused, like a cancel, while the gateway's own
-    /// cancel is in flight, and for a blocked client, if it raises the quantity.
+    /// cancel is in flight; for a blocked client, if it raises the quantity; and if its new terms
+    /// break a risk limit (see [`risk::check`]).
     fn replace(&mut self, amend: Amend, named: (Side, CompactString), terms: Terms, out: &mut Vec<Output>) {
         let Terms { qty, price, ord_type, time_in_force } = terms;
         let refuse = |book: &Self, order: &Order| {
@@ -888,7 +929,8 @@ impl Book {
             } else if qty > order.request.qty && book.is_blocked(&order.client) {
                 Some((CancelRejectReason::Other, "blocked: a replace may not raise the quantity"))
             } else {
-                None
+                let price = limit_price(ord_type.unwrap_or(order.request.ord_type), price);
+                book.check_replace(order, qty, price).err().map(|reject| (CancelRejectReason::Other, reject.text()))
             }
         };
         let Some((id, amend)) = self.amendable(amend, named, refuse, out) else { return };
@@ -901,7 +943,7 @@ impl Book {
             "the edge refuses a Limit replace without a price and a Market one with a price"
         );
         // A market order has no price: the release fallback should the contract slip.
-        let price = if ord_type == OrdType::Market { None } else { price };
+        let price = limit_price(ord_type, price);
         out.push(Output::Replace {
             venue: order.venue.clone(),
             downstream: downstream.clone(),
@@ -909,7 +951,26 @@ impl Book {
             request: OrderRequest { qty, price, ord_type, time_in_force, ..order.request.clone() },
             venue_order_id: order.venue_order_id.clone(),
         });
-        order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force });
+        let symbol = order.request.symbol.clone();
+        let risk_price = self.risk.risk_price(&symbol, price);
+        let order = self.orders.get_mut(&id).expect("looked up above");
+        order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price });
+        self.risk.track(id, order.exposure());
+    }
+
+    /// A replace of `order` to `qty` at `price` (`None`: Market) against the client's limits.
+    fn check_replace(&self, order: &Order, qty: Decimal, price: Option<Decimal>) -> Result<(), RiskReject> {
+        let proposed = Proposed {
+            client: &order.client,
+            symbol: &order.request.symbol,
+            venue: &order.venue,
+            side: order.request.side,
+            qty,
+            leaves: qty - order.cum_qty,
+            price,
+            replaces: Some(order.id),
+        };
+        risk::check(self.limits.limits(order.client.comp_id()), &proposed, &self.risk)
     }
 
     /// Whether a refused send has left a gateway cancel waiting since the last call: the edge's
@@ -1193,6 +1254,7 @@ impl Book {
         }
         self.downstream.get_mut(downstream).expect("looked up above").answered = true;
         order.set_status(Status::Rejected);
+        self.risk.track(order.id, order.exposure());
         let mut report = order.report(&order.request.cl_ord_id.clone(), ExecType::Rejected);
         report.reject = Some(RejectReason::VenueUnavailable);
         report.text = Some(text);
@@ -1238,6 +1300,7 @@ impl Book {
             }
             None => {}
         }
+        self.risk.track(order.id, order.exposure());
         if sent.origin == Origin::Gateway {
             return self.gateway_cancel_refused(sent.order, downstream, reason, text, out);
         }
@@ -1392,6 +1455,7 @@ impl Order {
         self.request.price = pending.price;
         self.request.ord_type = pending.ord_type;
         self.request.time_in_force = pending.time_in_force;
+        self.risk_price = pending.risk_price;
         std::mem::replace(&mut self.downstream, pending.downstream)
     }
 
@@ -1435,6 +1499,27 @@ impl Order {
             }
             (Some(_), Some(_)) => {}
         }
+    }
+
+    /// What the order counts for in risk while it's live: its leaves at its risk price, or the
+    /// pending replace's, whichever is more, since the venue may accept the replace or not.
+    fn exposure(&self) -> Option<Exposure> {
+        if self.status.is_done() {
+            return None;
+        }
+        let leaves = |qty: Decimal| (qty - self.cum_qty).max(Decimal::ZERO);
+        let mut notional = risk::notional(leaves(self.request.qty), self.risk_price);
+        if let Some(pending) = &self.pending {
+            notional = notional.max(risk::notional(leaves(pending.qty), pending.risk_price));
+        }
+        Some(Exposure {
+            client: self.client.clone(),
+            symbol: self.request.symbol.clone(),
+            venue: self.venue.clone(),
+            side: self.request.side,
+            price: limit_price(self.request.ord_type, self.request.price),
+            notional,
+        })
     }
 
     fn leaves_qty(&self) -> Decimal {
@@ -1483,6 +1568,11 @@ fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool {
         && matches!(order.status, Status::PendingCancel | Status::PendingReplace)
         && !accepts_pending;
     settled || behind_new || behind_pending
+}
+
+/// A Limit order's price; a Market order has none, whatever `price` says.
+fn limit_price(ord_type: OrdType, price: Option<Decimal>) -> Option<Decimal> {
+    if ord_type == OrdType::Market { None } else { price }
 }
 
 /// A venue's refusal of a cancel or replace. `status` is the order's status as the venue gives

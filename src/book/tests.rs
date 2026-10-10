@@ -1370,6 +1370,7 @@ fn dropped(status: Status, report: Status, under: Under, answered: bool, pending
         status,
         cum_qty: Decimal::ZERO,
         avg_px: Decimal::ZERO,
+        risk_price: Decimal::from(10),
         pending: pending.then(|| Pending {
             downstream: "1-2".into(),
             cl_ord_id: "C3".into(),
@@ -1377,6 +1378,7 @@ fn dropped(status: Status, report: Status, under: Under, answered: bool, pending
             price: Some(Decimal::from(11)),
             ord_type: OrdType::Limit,
             time_in_force: None,
+            risk_price: Decimal::from(11),
         }),
         exec_seq: 0,
         venue_order_id: None,
@@ -2263,4 +2265,225 @@ fn a_gateway_cancels_refused_sends_are_counted_for_the_logs() {
     run(&mut book, venue_up("NASDAQ"));
     run(&mut book, send_failed("1-2"));
     assert_eq!(book.cancelling()[0].1.refused_sends, 2);
+}
+
+/// A book whose clients all have `limits`, routing XNAS to NASDAQ and XNYS to NYSE.
+fn limited(limits: risk::Limits) -> Book {
+    let venue = |ex_destination: &str, venue: &str| Rule {
+        client: None,
+        ex_destination: Some(ex_destination.into()),
+        symbol: None,
+        target: Target::Venue(venue.into()),
+    };
+    let mut book = Book::new(Router::new(Vec::new()));
+    let router = Router::new(vec![venue("XNAS", "NASDAQ"), venue("XNYS", "NYSE")]);
+    book.set_config(router, risk::Config { defaults: limits, by_comp_id: HashMap::new() });
+    book
+}
+
+fn limit_order(cl_ord_id: &str, side: Side, qty: i64, price: &str) -> OrderRequest {
+    OrderRequest { side, qty: Decimal::from(qty), price: Some(price.parse().unwrap()), ..request(cl_ord_id) }
+}
+
+fn market_order(cl_ord_id: &str, side: Side, qty: i64) -> OrderRequest {
+    OrderRequest { side, ord_type: OrdType::Market, price: None, ..limit_order(cl_ord_id, side, qty, "0") }
+}
+
+/// Sends `request` from FUNDA: `Ok` if it went to a venue, else the risk check it failed, whose
+/// text the reject carries.
+fn risk_checked(book: &mut Book, request: OrderRequest) -> Result<(), RiskReject> {
+    risk_checked_from(book, &"FUNDA".into(), request)
+}
+
+fn risk_checked_from(book: &mut Book, client: &ClientId, request: OrderRequest) -> Result<(), RiskReject> {
+    let out = run(book, Input::NewOrder { client: client.clone(), request, redelivered: false });
+    match out.as_slice() {
+        [Output::NewOrder { .. }] => Ok(()),
+        [Output::Report { report, .. }] => {
+            let Some(RejectReason::Risk(reject)) = report.reject else { panic!("{out:?}") };
+            assert_eq!(report.text.as_deref(), Some(reject.text()));
+            assert_eq!((report.exec_type, report.order_id.as_ref()), (ExecType::Rejected, None));
+            Err(reject)
+        }
+        _ => panic!("{out:?}"),
+    }
+}
+
+/// A fill of `last_qty` at `price` on order `downstream`, taking it to `cum_qty`: the symbol's
+/// reference price becomes `price`.
+fn fill_at(downstream: &str, last_qty: i64, cum_qty: i64, price: &str) -> Input {
+    let mut input = venue_report(downstream, Status::PartiallyFilled, last_qty, cum_qty);
+    let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+    report.last_px = price.parse().unwrap();
+    input
+}
+
+#[test]
+fn max_order_qty_refuses_a_larger_order() {
+    let mut book = limited(risk::Limits { max_order_qty: Some(100.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 101, "10")), Err(RiskReject::OrderQty));
+}
+
+#[test]
+fn max_notional_refuses_quantity_times_price_over_it() {
+    let mut book = limited(risk::Limits { max_notional: Some(1000.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Sell, 100, "10.01")), Err(RiskReject::Notional));
+}
+
+#[test]
+fn symbols_refuses_any_other_symbol() {
+    let mut book = limited(risk::Limits { symbols: Some(vec!["AAPL".into()]), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    let msft = OrderRequest { symbol: "MSFT".into(), ..limit_order("C2", Side::Buy, 100, "10") };
+    assert_eq!(risk_checked(&mut book, msft), Err(RiskReject::Symbol));
+}
+
+/// The band is around the last fill on the symbol; with none, any price passes.
+#[test]
+fn price_band_refuses_a_price_too_far_from_the_last_fill_and_is_skipped_without_one() {
+    let mut book = limited(risk::Limits { price_band: Some(5.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "1000")), Ok(()));
+    run(&mut book, fill_at("1", 10, 10, "10"));
+    for (price, expected) in [("10.5", Ok(())), ("10.51", Err(RiskReject::PriceBand)), ("9.5", Ok(()))] {
+        assert_eq!(risk_checked(&mut book, limit_order(price, Side::Buy, 1, price)), expected, "{price}");
+    }
+    assert_eq!(risk_checked(&mut book, limit_order("C9", Side::Sell, 1, "9.49")), Err(RiskReject::PriceBand));
+}
+
+/// A Market order's notional is at the symbol's last fill; with none, it's refused where a
+/// notional or credit limit needs one, and passes where none does.
+#[test]
+fn a_market_orders_notional_is_at_the_reference_price() {
+    let mut book = limited(risk::Limits { max_notional: Some(1000.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, market_order("C1", Side::Buy, 10)), Err(RiskReject::NoReferencePrice));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 10, "10")), Ok(()));
+    run(&mut book, fill_at("1", 10, 10, "10"));
+    assert_eq!(risk_checked(&mut book, market_order("C3", Side::Buy, 100)), Ok(()));
+    assert_eq!(risk_checked(&mut book, market_order("C4", Side::Buy, 101)), Err(RiskReject::Notional));
+
+    let mut credit = limited(risk::Limits { credit: Some(1000.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut credit, market_order("C1", Side::Buy, 10)), Err(RiskReject::NoReferencePrice));
+    let mut unlimited = limited(risk::Limits { max_order_qty: Some(100.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut unlimited, market_order("C1", Side::Buy, 10)), Ok(()));
+}
+
+/// Credit counts open orders' leaves and fills; a done order's leaves come off it.
+#[test]
+fn credit_counts_open_and_filled_and_frees_what_is_done() {
+    let mut book = limited(risk::Limits { credit: Some(2000.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    run(&mut book, fill_at("1", 100, 100, "10"));
+    assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PartiallyFilled);
+    run(&mut book, venue_report("1", Status::Filled, 0, 100));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 100, "10")), Ok(()));
+    // 1000 filled and 1000 open: full.
+    assert_eq!(risk_checked(&mut book, limit_order("C3", Side::Sell, 1, "10")), Err(RiskReject::Credit));
+    cancel(&mut book, "C4", "C2");
+    run(&mut book, venue_report("2-1", Status::Canceled, 0, 0));
+    assert_eq!(risk_checked(&mut book, limit_order("C5", Side::Buy, 100, "10")), Ok(()));
+    // The venue rejecting it frees it too.
+    run(&mut book, venue_report("3", Status::Rejected, 0, 0));
+    assert_eq!(risk_checked(&mut book, limit_order("C6", Side::Buy, 100, "10")), Ok(()));
+    run(&mut book, send_failed("4"));
+    assert_eq!(risk_checked(&mut book, limit_order("C7", Side::Buy, 100, "10")), Ok(()));
+}
+
+/// Self-trade prevention looks at the session's own resting orders on the other side, same
+/// symbol and venue: another venue's, or another session's, don't count.
+#[test]
+fn self_trade_refuses_crossing_the_sessions_own_order_on_the_same_venue() {
+    let mut book = limited(risk::Limits { self_trade: true, ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Sell, 100, "10")), Err(RiskReject::SelfTrade));
+    assert_eq!(risk_checked(&mut book, limit_order("C3", Side::SellShort, 100, "9")), Err(RiskReject::SelfTrade));
+    assert_eq!(risk_checked(&mut book, market_order("C4", Side::Sell, 100)), Err(RiskReject::SelfTrade));
+    assert_eq!(risk_checked(&mut book, limit_order("C5", Side::Sell, 100, "10.01")), Ok(()));
+    // Resting at 10.01, it's crossed by a buy at that price.
+    assert_eq!(risk_checked(&mut book, limit_order("C6", Side::Buy, 100, "10.01")), Err(RiskReject::SelfTrade));
+    let nyse = OrderRequest { ex_destination: Some("XNYS".into()), ..limit_order("C7", Side::Sell, 100, "10") };
+    assert_eq!(risk_checked(&mut book, nyse), Ok(()));
+    let other = limit_order("C1", Side::Sell, 100, "10");
+    assert_eq!(risk_checked_from(&mut book, &desk("DESK2"), other), Ok(()));
+    // Once the buy is done, nothing rests against a sell at 10.
+    cancel(&mut book, "C8", "C1");
+    run(&mut book, venue_report("1-1", Status::Canceled, 0, 0));
+    assert_eq!(risk_checked(&mut book, limit_order("C9", Side::Sell, 100, "10")), Ok(()));
+}
+
+#[test]
+fn self_trade_off_lets_crossing_orders_through() {
+    let mut book = limited(risk::Limits::default());
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Sell, 100, "10")), Ok(()));
+}
+
+/// A replace is checked on its new terms: one raising the quantity past the limit is refused with
+/// the limit's text, and the order keeps its terms.
+#[test]
+fn a_replace_raising_the_quantity_past_a_limit_is_refused() {
+    let mut book = limited(risk::Limits { max_order_qty: Some(100.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    let out = replace(&mut book, "C2", "C1", 101, 10);
+    assert_eq!(cancel_reject(&out), (Some("1"), CancelKind::Replace, Status::PendingNew, CancelRejectReason::Other));
+    let [Output::CancelReject { text, .. }] = out.as_slice() else { unreachable!() };
+    assert_eq!(text, RiskReject::OrderQty.text());
+    assert!(book.order(OrderId(1)).unwrap().pending.is_none());
+    assert!(matches!(replace(&mut book, "C3", "C1", 80, 10).as_slice(), [Output::Replace { .. }]));
+}
+
+/// Credit is checked on a replace only when it raises the order's notional, so a client over its
+/// credit can still take risk off. A pending replace counts at its terms or the order's, the more.
+#[test]
+fn a_replace_is_checked_against_credit_only_if_it_adds_to_it() {
+    let mut book = limited(risk::Limits { credit: Some(1000.into()), ..Default::default() });
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    let out = replace(&mut book, "C2", "C1", 100, 11);
+    let [Output::CancelReject { text, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(text, RiskReject::Credit.text());
+    assert!(matches!(replace(&mut book, "C3", "C1", 50, 10).as_slice(), [Output::Replace { .. }]));
+    // Pending, the order still counts at 1000: the venue may refuse the replace.
+    assert_eq!(risk_checked(&mut book, limit_order("C4", Side::Buy, 1, "10")), Err(RiskReject::Credit));
+    run(&mut book, venue_report("1-1", Status::New, 0, 0));
+    assert_eq!(risk_checked(&mut book, limit_order("C5", Side::Buy, 50, "10")), Ok(()));
+}
+
+/// New limits apply to the next order; an order booked before keeps going.
+#[test]
+fn replaced_limits_apply_to_the_next_order_only() {
+    let mut book = limited(risk::Limits::default());
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    let router = book.router().clone();
+    let limits = risk::Limits { max_order_qty: Some(50.into()), ..Default::default() };
+    book.set_config(router, risk::Config { defaults: limits, by_comp_id: HashMap::new() });
+    assert_eq!(risk_checked(&mut book, limit_order("C2", Side::Buy, 100, "10")), Err(RiskReject::OrderQty));
+    let out = run(&mut book, fill_at("1", 100, 100, "10"));
+    assert!(matches!(out.as_slice(), [Output::Report { .. }]), "{out:?}");
+    assert_eq!(book.order(OrderId(1)).unwrap().cum_qty, Decimal::from(100));
+}
+
+/// A CompID's limits apply to each of its sessions separately.
+#[test]
+fn each_session_of_a_comp_id_has_its_own_credit() {
+    let mut book = limited(risk::Limits { credit: Some(1000.into()), ..Default::default() });
+    let (one, two) = (desk("DESK1"), desk("DESK2"));
+    assert_eq!(risk_checked_from(&mut book, &one, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+    let more = limit_order("C2", Side::Buy, 1, "10");
+    assert_eq!(risk_checked_from(&mut book, &one, more), Err(RiskReject::Credit));
+    assert_eq!(risk_checked_from(&mut book, &two, limit_order("C1", Side::Buy, 100, "10")), Ok(()));
+}
+
+/// The CompID's own limits apply to it, the defaults to every other.
+#[test]
+fn a_comp_ids_own_limits_apply_to_it_only() {
+    let mut book = limited(risk::Limits::default());
+    let router = book.router().clone();
+    let funda = risk::Limits { max_order_qty: Some(10.into()), ..Default::default() };
+    book.set_config(
+        router,
+        risk::Config { defaults: risk::Limits::default(), by_comp_id: HashMap::from([("FUNDA".into(), funda)]) },
+    );
+    assert_eq!(risk_checked(&mut book, limit_order("C1", Side::Buy, 100, "10")), Err(RiskReject::OrderQty));
+    assert_eq!(risk_checked_from(&mut book, &"FUNDB".into(), limit_order("C1", Side::Buy, 100, "10")), Ok(()));
 }

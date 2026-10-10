@@ -18,6 +18,7 @@ use crate::book::{
     CancelKind, CancelRejectReason, ClientId, ClientReport, ExecType, Input, OrdType, OrderRequest, Output,
     RejectReason, Side, Status, TimeInForce, VenueId, VenueReport,
 };
+use crate::risk::RiskReject;
 
 /// A client's NewOrderSingle(D), OrderCancelRequest(F), OrderCancelReplaceRequest(G) or
 /// OrderStatusRequest(H) as the book's input. `redelivered` is the caller's: Turbojet's
@@ -465,8 +466,8 @@ fn exec_type_from_fix(exec_type: fix::ExecType) -> Option<ExecType> {
     }
 }
 
-/// The book's reasons have no FIX 4.4 code of their own but Duplicate; the rest say Other (99)
-/// and the report's Text says why. A venue's code passes through if FIX 4.4 has it.
+/// FIX 4.4 has codes for Duplicate (6) and, for the quantity, notional and credit limits, Order
+/// exceeds limit (3); the book's other reasons say Other (99) and the report's Text says why. A venue's code passes through if FIX 4.4 has it.
 fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
     match reason {
         RejectReason::Duplicate => fix::OrdRejReason::DuplicateOrder,
@@ -475,6 +476,12 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
         | RejectReason::TooManyOrders
         | RejectReason::VenueUnavailable
         | RejectReason::Blocked => fix::OrdRejReason::Other,
+        RejectReason::Risk(RiskReject::OrderQty | RiskReject::Notional | RiskReject::Credit) => {
+            fix::OrdRejReason::OrderExceedsLimit
+        }
+        RejectReason::Risk(
+            RiskReject::Symbol | RiskReject::NoReferencePrice | RiskReject::PriceBand | RiskReject::SelfTrade,
+        ) => fix::OrdRejReason::Other,
         RejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::OrdRejReason::Other),
     }
 }
@@ -618,6 +625,13 @@ mod tests {
             (RejectReason::TooManyOrders, "99"),
             (RejectReason::VenueUnavailable, "99"),
             (RejectReason::Blocked, "99"),
+            (RejectReason::Risk(RiskReject::OrderQty), "3"),
+            (RejectReason::Risk(RiskReject::Notional), "3"),
+            (RejectReason::Risk(RiskReject::Credit), "3"),
+            (RejectReason::Risk(RiskReject::Symbol), "99"),
+            (RejectReason::Risk(RiskReject::NoReferencePrice), "99"),
+            (RejectReason::Risk(RiskReject::PriceBand), "99"),
+            (RejectReason::Risk(RiskReject::SelfTrade), "99"),
             (RejectReason::Venue(3), "3"),
             (RejectReason::Venue(15), "15"),
             // FIX 5.0 added 16 onwards; a 4.4 client gets Other and the Text.

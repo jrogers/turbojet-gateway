@@ -25,6 +25,7 @@ use crate::book::{
     CancelKind, CancelRejectReason, ClientId, ClientReport, ExecType, Input, OrdType, OrderRequest, Output,
     RejectReason, Side, Status, TimeInForce, VenueId, VenueReport,
 };
+use crate::risk::RiskReject;
 
 /// HandlInst(21) on orders and replaces sent to venues: automated execution, no broker
 /// intervention. The same for every venue until one needs otherwise.
@@ -505,8 +506,9 @@ fn exec_type_from_fix(trans: fix::ExecTransType, exec_type: fix::ExecType) -> Op
     })
 }
 
-/// FIX 4.2 has a code for Duplicate (6) but none for the book's other reasons: they say Broker
-/// option (0) and the report's Text says why. A venue's code passes through if FIX 4.2 has it.
+/// FIX 4.2 has codes for Duplicate (6) and, for the quantity, notional and credit limits, Order
+/// exceeds limit (3); the book's other reasons say Broker option (0) and the report's Text says
+/// why. A venue's code passes through if FIX 4.2 has it.
 fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
     match reason {
         RejectReason::Duplicate => fix::OrdRejReason::DuplicateOrder,
@@ -515,6 +517,12 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
         | RejectReason::TooManyOrders
         | RejectReason::VenueUnavailable
         | RejectReason::Blocked => fix::OrdRejReason::BrokerCredit,
+        RejectReason::Risk(RiskReject::OrderQty | RiskReject::Notional | RiskReject::Credit) => {
+            fix::OrdRejReason::OrderExceedsLimit
+        }
+        RejectReason::Risk(
+            RiskReject::Symbol | RiskReject::NoReferencePrice | RiskReject::PriceBand | RiskReject::SelfTrade,
+        ) => fix::OrdRejReason::BrokerCredit,
         RejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::OrdRejReason::BrokerCredit),
     }
 }
@@ -687,6 +695,13 @@ mod tests {
             (RejectReason::TooManyOrders, "0"),
             (RejectReason::VenueUnavailable, "0"),
             (RejectReason::Blocked, "0"),
+            (RejectReason::Risk(RiskReject::OrderQty), "3"),
+            (RejectReason::Risk(RiskReject::Notional), "3"),
+            (RejectReason::Risk(RiskReject::Credit), "3"),
+            (RejectReason::Risk(RiskReject::Symbol), "0"),
+            (RejectReason::Risk(RiskReject::NoReferencePrice), "0"),
+            (RejectReason::Risk(RiskReject::PriceBand), "0"),
+            (RejectReason::Risk(RiskReject::SelfTrade), "0"),
             (RejectReason::Venue(3), "3"),
             (RejectReason::Venue(8), "8"),
             // FIX 4.3 added 9 onwards; a 4.2 client gets Broker option and the Text.
