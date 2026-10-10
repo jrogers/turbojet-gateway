@@ -135,9 +135,19 @@ pub enum Input {
     },
 }
 
+/// What a [`ClientReport`] tells the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportKind {
+    /// Something happened to the order: an ack, a fill, a cancel, a reject.
+    Event,
+    /// An answer to a redelivery, nothing new: sent as ExecType=I (4.3+) or ExecTransType=3 (4.2).
+    Status,
+}
+
 /// An ExecutionReport for a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientReport {
+    pub kind: ReportKind,
     /// `None` for an order rejected before it was booked.
     pub order_id: Option<OrderId>,
     pub cl_ord_id: CompactString,
@@ -237,12 +247,15 @@ impl Book {
 
     fn new_order(&mut self, client: ClientId, request: OrderRequest, redelivered: bool, out: &mut Vec<Output>) {
         if let Some(&id) = self.index.get(&(client.clone(), request.cl_ord_id.clone())) {
-            let order = &self.orders[&id];
-            // A resend of an order we booked: answer with where it stands. Side and symbol, not the
-            // whole request, since a replace may have changed quantity and price since.
-            let resent = redelivered && order.request.side == request.side && order.request.symbol == request.symbol;
+            let order = self.orders.get(&id).expect("indexed ClOrdIDs point at booked orders");
+            // A resend of an order we booked: answer with where it stands. Side, symbol and account,
+            // not the whole request, since a replace may have changed quantity and price since.
+            let resent = redelivered
+                && order.request.side == request.side
+                && order.request.symbol == request.symbol
+                && order.request.account == request.account;
             let output = if resent {
-                Output::Report { client, report: order.report(&request.cl_ord_id) }
+                Output::Report { client, report: order.report(&request.cl_ord_id, ReportKind::Status) }
             } else {
                 reject(client, request, RejectReason::Duplicate, "duplicate ClOrdID".into())
             };
@@ -286,8 +299,9 @@ impl Book {
 
 impl Order {
     /// A report of where the order stands, answering the client's `cl_ord_id`.
-    fn report(&self, cl_ord_id: &CompactString) -> ClientReport {
+    fn report(&self, cl_ord_id: &CompactString, kind: ReportKind) -> ClientReport {
         ClientReport {
+            kind,
             order_id: Some(self.id),
             cl_ord_id: cl_ord_id.clone(),
             orig_cl_ord_id: None,
@@ -310,6 +324,7 @@ impl Order {
 
 fn reject(client: ClientId, request: OrderRequest, reason: RejectReason, text: CompactString) -> Output {
     let report = ClientReport {
+        kind: ReportKind::Event,
         order_id: None,
         cl_ord_id: request.cl_ord_id.clone(),
         orig_cl_ord_id: None,
@@ -402,6 +417,16 @@ mod tests {
         let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
         let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
         assert_eq!((report.order_id, report.status, report.reject), (Some(OrderId(1)), Status::PendingNew, None));
+        assert_eq!(report.kind, ReportKind::Status);
+        assert_eq!(report.leaves_qty, Decimal::from(100));
+        assert_eq!(report.cl_ord_id, "C1");
+    }
+
+    #[test]
+    fn a_redelivered_order_we_never_saw_is_booked() {
+        let mut book = book();
+        let out = run(&mut book, Input::NewOrder { client: "FUNDA".into(), request: request("C1"), redelivered: true });
+        assert!(matches!(out.as_slice(), [Output::NewOrder { .. }]));
     }
 
     #[test]
@@ -425,7 +450,15 @@ mod tests {
     }
 
     #[test]
-    fn a_client_over_its_cl_ord_id_bound_is_rejected() {
+    fn a_client_just_under_its_cl_ord_id_bound_is_accepted() {
+        let mut book = book();
+        book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT - 1);
+        let out = new_order(&mut book, "C1");
+        assert!(matches!(out.as_slice(), [Output::NewOrder { .. }]));
+    }
+
+    #[test]
+    fn a_client_at_its_cl_ord_id_bound_is_rejected() {
         let mut book = book();
         book.used.insert("FUNDA".into(), MAX_CL_ORD_IDS_PER_CLIENT);
         let out = new_order(&mut book, "C1");
