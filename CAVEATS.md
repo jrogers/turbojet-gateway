@@ -1,0 +1,78 @@
+# Known caveats
+
+Behaviour that is deliberate or documented, but worth knowing about before you rely on Jetbridge.
+Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/main/CAVEATS.md).
+
+## Kept in memory
+
+- The book (orders, the ClOrdIDs each client has used, what was sent to each venue) and the
+  reports held for clients live in memory. A stop loses them; shutting down logs how many open
+  orders and undelivered reports it leaves. Open orders stay working at their venues.
+- After a restart, numbering starts again at 1: OrderIDs and ExecIDs repeat on the same day, so
+  a client deduping on ExecID drops the repeats, and so do the ClOrdIDs sent to venues, which a
+  venue may refuse as duplicates. A late report from a venue on an order from before the restart
+  is taken as about the new order with the same number.
+- A client's request is committed by its session before the report answering it is stored by
+  the client's session: a stop in between loses the report.
+- Nothing is cleared at the end of the day: orders, ClOrdIDs and requests sent stay in memory
+  until a restart. The bound of 1,000,000 ClOrdIDs per client (plus 10,000 for cancels and
+  replaces once it's reached) counts from start, not per day.
+
+## Orders and reports
+
+- Trade busts and corrections (ExecType TradeCancel or TradeCorrect, and ExecTransType Cancel or
+  Correct on FIX 4.2) are logged as errors and dropped: the client doesn't hear of them, and the
+  order's CumQty stays as it was.
+- A venue fill without LastPx(31) is refused with a session-level Reject and logged as an error;
+  the book doesn't see it.
+- A report that takes CumQty past the order's quantity is logged as a warning and dropped.
+- A venue Status report carrying a fill the gateway missed updates CumQty without a Trade to the
+  client: the client sees the new CumQty on a non-fill report.
+- After a replace is accepted, reports without a fill under a ClOrdID it superseded are dropped
+  (fills and done statuses still apply), so a venue that keeps reporting under the original
+  ClOrdID loses its restatements. A dropped restatement is logged as a warning.
+- A cancel sent while a replace is pending names the last ClOrdID the venue accepted. A strict
+  venue that has just accepted the replace may reject the cancel as for an unknown order; the
+  client gets the reject and can cancel again.
+- OrigClOrdID is resolved loosely: any ClOrdID the client has used for an order (the original, a
+  superseded one, a cancel's) names that order.
+- A replace changes quantity, price, OrdType and TimeInForce; the rest stays the original's. A
+  replace without TimeInForce makes the order Day.
+- Rejected orders' ClOrdIDs aren't remembered, so a client can reuse one and the order is booked.
+  A routes reload between an order and its resend could book an order the client saw rejected.
+- ExecTypes the gateway doesn't model (Suspended, Calculated, Stopped, a venue's own codes)
+  reach the client as Restated, and OrdStatuses it doesn't model leave the order's status as it
+  was, each with a warning logged. DoneForDay passes through and leaves the order open.
+- A client receives its own reports in the order the gateway made them. Reports to different
+  clients aren't ordered with each other.
+
+## Venues
+
+- FIX 4.2 venues get HandlInst(21) 1 (automated, private) on every order and replace, whatever
+  the client sent; FIX 4.4 venues get none.
+- Only Account, ExDestination, Symbol, Side, OrderQty, Price, OrdType and TimeInForce reach the
+  venue, Account and ExDestination as the client sent them: nothing is mapped per venue, and
+  other fields the client sent are dropped.
+- A venue's logon is refused until the gateway knows the venue: at start, and after a reload adds
+  one, its initiator can log on before then, and its reconnect policy retries.
+- A venue request its session's store fails on may or may not have been stored: it's logged as
+  an error and the order or request stays pending, with nothing sent to the client.
+- A venue a reload removes leaves its open orders in the book: cancels and replaces for them are
+  refused as venue unavailable, and its reports, should its session still be up, are rejected.
+- Jetbridge is built without Turbojet's `validation` feature, so a `dictionary` in the sessions
+  file doesn't load. On a venue initiator, one would refuse reports with a venue's own codes
+  before the gateway saw them.
+
+## Clients
+
+- Clients are known by CompID. Sessions from one CompID told apart by SubID, LocationID or
+  qualifier are one client to the gateway, and its reports go to the session that logged on last.
+- Every client speaks the acceptor's BeginString.
+- A client holds up to 100,000 undelivered reports. The first past that is dropped, with an
+  error logged, and the client is logged out; later ones are dropped and counted until its queue
+  empties.
+- Cancel on disconnect isn't implemented: `cancel_on_disconnect` in the sessions file cancels
+  nothing.
+- There are no risk checks: every order a route sends to a venue goes there.
+- A panic in the book stops the process rather than carry on with a book that may be half
+  changed.
