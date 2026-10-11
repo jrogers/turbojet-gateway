@@ -308,10 +308,20 @@ impl Setup {
     /// Starts the gateway again once the client (if connected) and venue have seen it go,
     /// waiting for both to log on.
     async fn restart(&mut self) {
+        self.gone().await;
+        self.start_again().await;
+    }
+
+    /// Waits for the client (if connected) and the venue to see the gateway go.
+    async fn gone(&mut self) {
         if self.running.is_some() {
             self.events.logged_out().await;
         }
         self.venue_events.logged_out().await;
+    }
+
+    /// Starts the gateway again, waiting for the venue and the client (if running) to log on.
+    async fn start_again(&mut self) {
         let last = self.prefixes.last().expect("a start").clone();
         while book::start_prefix(SystemTime::now()) == last {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -326,6 +336,20 @@ impl Setup {
         if self.running.is_some() {
             self.events.logged_on().await;
         }
+    }
+
+    /// Resets the venue's session at the gateway, as a schedule would, and the venue's side of
+    /// it, while the gateway is down: its store starts empty, created now.
+    async fn reset_venue_session(&self) {
+        let disk = DiskStorage::new(self.dir.path().join("venue-store"), true).unwrap();
+        let mut log = disk.open(&turbojet::SessionId::new("FIX.4.4", GATEWAY, VENUE)).unwrap();
+        log.reset().unwrap();
+        log.set_created_at(UtcTimestamp::now()).unwrap();
+        if let Some(commit) = log.commit().unwrap() {
+            commit.run().unwrap();
+        }
+        drop(log);
+        self.venue.session(GATEWAY).reset_sequence_numbers().await.unwrap();
     }
 
     /// Drops the client's connection, without a Logout, and waits for the gateway to see it go.
@@ -848,4 +872,27 @@ async fn a_replace_the_venue_never_got_before_a_crash_goes_after_it() {
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C2"), [(Status::Filled, 150.into())]);
+}
+
+/// An order the venue's session stored and sent, unanswered, then the session reset (as a
+/// schedule resets it) while the gateway is down: the order is missing from the store, but it
+/// was sent before the store was created, so the venue had it. It isn't sent again, and stays
+/// pending: the venue's ack, when it comes, reaches the client.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_lost_to_a_store_reset_is_not_sent_again() {
+    let mut setup = Setup::new().await;
+    setup.send(order("C1"));
+    let sent: v44::NewOrderSingle = setup.venue_events.parse().await;
+    setup.until_stored(|database| !stored(database, "C1").is_empty()).await;
+
+    setup.gateway.take().expect("the gateway is running").crash();
+    setup.gone().await;
+    setup.reset_venue_session().await;
+    setup.start_again().await;
+    setup.assert_quiet().await;
+    setup.venue_send(acked(&sent.cl_ord_id, 100));
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
 }

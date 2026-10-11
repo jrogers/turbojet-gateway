@@ -402,8 +402,10 @@ pub enum Input {
     },
     /// At a start: a request the database recorded as sent to `venue` under `downstream` that the
     /// venue's session never stored, so never sent (the gateway stopped after its change committed,
-    /// before the session stored it). Sent again as it was, unless it's been answered or its order
-    /// is done, when it's handled as `SendFailed`.
+    /// before the session stored it). Sent again as it was, its send time now, unless it's been
+    /// answered or its order is done, when it's handled as `SendFailed`. The edge passes only
+    /// requests sent since the venue's store was created or last reset: one missing from before
+    /// then was lost to the reset, not the stop.
     Unsent {
         venue: VenueId,
         downstream: CompactString,
@@ -575,6 +577,9 @@ pub struct Sent {
     /// The venue has rejected or accepted it (a cancel's Canceled, a replace's acceptance): a
     /// later reject is a resend.
     pub answered: bool,
+    /// When the book last sent it: a request missing from the venue's store was lost to a stop
+    /// only if it was sent since the store was created or last reset (see [`Input::Unsent`]).
+    pub sent_at: DateTime<Utc>,
 }
 
 /// Every ID the book issues starts with its prefix: OrderIDs, the ExecIDs `<OrderID>.<n>` and
@@ -622,6 +627,8 @@ pub struct Book {
     /// made pending once that one is answered. Not stored: a restart before then finds the orphan
     /// again in the venue's store.
     orphaned_replaces: HashMap<OrderId, Pending>,
+    /// The time of the inputs being handled: see [`set_now`](Self::set_now).
+    now: DateTime<Utc>,
     /// Every change taken in the tests, as a store would hold them.
     #[cfg(test)]
     mirror: Snapshot,
@@ -649,6 +656,7 @@ impl Book {
             flushed: Changes::default(),
             unavailable: false,
             orphaned_replaces: HashMap::new(),
+            now: DateTime::UNIX_EPOCH,
             #[cfg(test)]
             mirror: Snapshot::default(),
         }
@@ -659,6 +667,12 @@ impl Book {
     pub fn set_prefix(&mut self, prefix: CompactString) {
         debug_assert!(self.next_id == 1 && self.rejects == 0, "the prefix changed after the book issued IDs");
         self.prefix = prefix;
+    }
+
+    /// The time of the inputs handled from now on, stamped on the requests they send: the edge
+    /// sets it from its clock before each batch.
+    pub fn set_now(&mut self, now: DateTime<Utc>) {
+        self.now = now;
     }
 
     pub fn prefix(&self) -> &CompactString {
@@ -715,10 +729,10 @@ impl Book {
     }
 
     /// The downstream ClOrdIDs of requests sent to `venue` for live orders that it hasn't
-    /// answered (an original order, while it's PendingNew), in the order they were sent: those
-    /// [`Input::Unsent`] can send again.
-    pub fn unanswered(&self, venue: &VenueId) -> Vec<CompactString> {
-        let mut unanswered: Vec<(OrderId, &CompactString)> = self
+    /// answered (an original order, while it's PendingNew), with when each was sent, in the order
+    /// they were sent: those [`Input::Unsent`] can send again.
+    pub fn unanswered(&self, venue: &VenueId) -> Vec<(CompactString, DateTime<Utc>)> {
+        let mut unanswered: Vec<(OrderId, &CompactString, DateTime<Utc>)> = self
             .downstream
             .iter()
             .filter(|(_, sent)| !sent.answered)
@@ -728,11 +742,11 @@ impl Book {
                     && !order.status.is_done()
                     && (sent.kind.is_some() || order.status == Status::PendingNew)
             })
-            .map(|(downstream, sent)| (sent.order, downstream))
+            .map(|(downstream, sent)| (sent.order, downstream, sent.sent_at))
             .collect();
         // `<name>` before `<name>-1`, and `<name>-9` before `<name>-10`.
-        unanswered.sort_unstable_by_key(|&(order, downstream)| (order.0, downstream.len(), downstream));
-        unanswered.into_iter().map(|(_, downstream)| downstream.clone()).collect()
+        unanswered.sort_unstable_by_key(|&(order, downstream, _)| (order.0, downstream.len(), downstream));
+        unanswered.into_iter().map(|(_, downstream, sent_at)| (downstream.clone(), sent_at)).collect()
     }
 
     pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
@@ -947,6 +961,7 @@ impl Book {
             orig_cl_ord_id: None,
             kind: None,
             answered: false,
+            sent_at: self.now,
         };
         let previous = self.downstream.insert(downstream.clone(), sent);
         debug_assert!(previous.is_none(), "downstream ClOrdID {downstream} reused");

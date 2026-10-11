@@ -56,6 +56,7 @@ fn restored(book: &Book) -> Book {
     restored.max_cl_ord_ids = book.max_cl_ord_ids;
     restored.amend_reserve = book.amend_reserve;
     restored.unavailable = book.unavailable;
+    restored.now = book.now;
     restored.set_prefix(book.prefix.clone());
     restored.restore(book.mirror.clone());
     // A restart numbers rejects afresh under a new prefix; this one keeps the live book's prefix
@@ -3247,19 +3248,28 @@ fn unsent(downstream: &str) -> Input {
     Input::Unsent { venue: "NASDAQ".into(), downstream: downstream.into() }
 }
 
+fn unanswered(book: &Book) -> Vec<String> {
+    book.unanswered(&"NASDAQ".into()).into_iter().map(|(downstream, _)| downstream.to_string()).collect()
+}
+
 /// What a request was sent as, `Unsent` sends again: an order, a cancel and a replace, listed by
-/// `unanswered` in the order they went.
+/// `unanswered` in the order they went, each with when it was sent, which a send again moves on.
 #[test]
 fn an_unsent_request_goes_again_as_it_was_sent() {
     let mut book = book();
+    let (then, now) = (DateTime::UNIX_EPOCH + Duration::from_secs(1), DateTime::UNIX_EPOCH + Duration::from_secs(2));
+    book.set_now(then);
     let order = new_order(&mut book, "C1");
     let cancel = cancel(&mut book, "C2", "C1");
     new_order(&mut book, "C3");
     run(&mut book, venue_report("2", Status::New, 0, 0));
     let replace = replace(&mut book, "C4", "C3", 80, 11);
-    assert_eq!(book.unanswered(&"NASDAQ".into()), ["1", "1-1", "2-1"]);
+    assert_eq!(unanswered(&book), ["1", "1-1", "2-1"]);
+    assert!(book.unanswered(&"NASDAQ".into()).iter().all(|(_, sent_at)| *sent_at == then));
+    book.set_now(now);
     for (downstream, sent) in [("1", order), ("1-1", cancel), ("2-1", replace)] {
         assert_eq!(run(&mut book, unsent(downstream)), sent, "{downstream}");
+        assert_eq!(book.sent(downstream).unwrap().sent_at, now);
     }
 }
 
@@ -3271,10 +3281,10 @@ fn an_unsent_request_answered_since_is_not_sent_again() {
     new_order(&mut book, "C1");
     cancel(&mut book, "C2", "C1");
     run(&mut book, venue_report("1", Status::New, 0, 0));
-    assert_eq!(book.unanswered(&"NASDAQ".into()), ["1-1"]);
+    assert_eq!(unanswered(&book), ["1-1"]);
     assert!(run(&mut book, unsent("1")).is_empty());
     run(&mut book, venue_report("1", Status::Filled, 100, 100));
-    assert!(book.unanswered(&"NASDAQ".into()).is_empty());
+    assert!(unanswered(&book).is_empty());
     let out = run(&mut book, unsent("1-1"));
     assert_eq!(cancel_reject(&out).1, CancelKind::Cancel);
     assert_eq!(cancel_reject(&out).2, Status::Filled);

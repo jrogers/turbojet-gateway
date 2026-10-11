@@ -21,9 +21,11 @@
 //! The scan also finds the converse: requests the database has as sent, unanswered, that the
 //! venue's session never stored, so never sent (the gateway stopped after their change committed,
 //! before the session stored them). They go at the venue's next logon as they were
-//! ([`Input::Unsent`]). A request gone from the store for another reason (a sequence reset, or
-//! evicted from a full store) looks the same, and goes again too: the venue may refuse it as a
-//! duplicate.
+//! ([`Input::Unsent`]). Only those sent since the store was created or last reset: one missing
+//! from before then was lost to a reset (a schedule's, or an operator's), and the venue had it, so
+//! it's left pending, logged; a store that doesn't record when it was created sends none. One
+//! evicted from a store past its size budget since its last reset looks unsent, and goes again:
+//! the venue may refuse it as a duplicate.
 //!
 //! ponytail: the whole of each venue's store is read and decoded, every start, in windows of
 //! [`SCAN_WINDOW`], and its requests looked up: a million stored NewOrderSingles, all ours, took
@@ -32,6 +34,8 @@
 //! database has seen, if starts show it.
 
 use std::collections::{BTreeMap, HashSet};
+
+use chrono::{DateTime, Utc};
 use std::io;
 use std::sync::Arc;
 
@@ -116,7 +120,8 @@ impl Gateway {
             let requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
             self.check_prefix(&venue, &requests)?;
             let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
-            found.unsent += self.find_unsent(&venue, &ids);
+            let created = log.created_at().map(DateTime::<Utc>::from);
+            found.unsent += self.find_unsent(&venue, &ids, created);
             let chains = chains(requests);
             ids.extend(chains.keys().cloned());
             let unknown: HashSet<CompactString> = store.unknown_downstreams(&ids).await?.into_iter().collect();
@@ -142,12 +147,24 @@ impl Gateway {
     }
 
     /// Keeps for `venue`'s next logon the requests the book has as sent to it, unanswered, that
-    /// aren't among those its session `stored`, returning how many.
-    fn find_unsent(&self, venue: &VenueId, stored: &[CompactString]) -> usize {
+    /// aren't among those its session `stored`, returning how many. Only those sent since the
+    /// store was `created` (or last reset): one missing from before then was lost to a reset, and
+    /// the venue had it, so it's left pending, as is everything if the store doesn't say.
+    fn find_unsent(&self, venue: &VenueId, stored: &[CompactString], created: Option<DateTime<Utc>>) -> usize {
         let stored: HashSet<&CompactString> = stored.iter().collect();
         let mut state = self.lock();
-        let unsent: Vec<CompactString> =
-            state.book.unanswered(venue).into_iter().filter(|downstream| !stored.contains(downstream)).collect();
+        let missing = state.book.unanswered(venue).into_iter().filter(|(downstream, _)| !stored.contains(downstream));
+        let (unsent, reset): (Vec<_>, Vec<_>) =
+            missing.partition(|(_, sent_at)| created.is_some_and(|c| *sent_at >= c));
+        if !reset.is_empty() {
+            let reset: Vec<_> = reset.into_iter().map(|(downstream, _)| downstream).collect();
+            if created.is_none() {
+                warn!(%venue, ?reset, "venue's store doesn't say when it was created: unanswered requests it lacks are left pending, not sent again");
+            } else {
+                warn!(%venue, ?reset, ?created, "unanswered requests sent before the venue's store was last reset: the venue had them; left pending");
+            }
+        }
+        let unsent: Vec<CompactString> = unsent.into_iter().map(|(downstream, _)| downstream).collect();
         if unsent.is_empty() {
             return 0;
         }

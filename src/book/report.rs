@@ -26,7 +26,7 @@ impl Book {
             self.refuse_request(venue, &report.downstream, sent, refused, out);
             return self.resume_gateway_cancel(id, out);
         }
-        let Sent { order: id, origin, cl_ord_id, orig_cl_ord_id, kind, answered } = sent;
+        let Sent { order: id, origin, cl_ord_id, orig_cl_ord_id, kind, answered, sent_at: _ } = sent;
         let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
         if order.venue != *venue {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");

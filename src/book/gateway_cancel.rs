@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use turbojet::fields::CompactString;
 
 use super::{
@@ -82,6 +83,7 @@ impl Book {
             orig_cl_ord_id: None,
             kind: Some(CancelKind::Cancel),
             answered: false,
+            sent_at: self.now,
         };
         let downstream = self.next_downstream(sent);
         let order = self.orders.get_mut(&id).expect("requests are for booked orders");
@@ -142,7 +144,7 @@ impl Book {
         match replace {
             None => {
                 tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, "venue holds a cancel the store lacks: cancelling its order");
-                self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Cancel));
+                self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Cancel, self.now));
                 self.touched.sent.insert(downstream);
                 // Sent at `VenueUp`, or by the edge's retry tick if the venue is up already.
                 if self.start_gateway_cancel(id).is_some() {
@@ -195,7 +197,7 @@ impl Book {
     /// done (then only its answers map to the order).
     fn make_orphan_pending(&mut self, id: OrderId, mut pending: Pending) {
         let downstream = pending.downstream.clone();
-        self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Replace));
+        self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Replace, self.now));
         self.touched.sent.insert(downstream);
         let Some(order) = self.orders.get_mut(&id).filter(|order| !order.status.is_done()) else {
             return tracing::info!(order = id.0, downstream = %pending.downstream, "orphaned replace's order ended first");
@@ -277,7 +279,7 @@ impl Book {
 }
 
 /// A request the gateway itself sent for order `id`.
-fn gateway_sent(id: OrderId, kind: CancelKind) -> Sent {
+fn gateway_sent(id: OrderId, kind: CancelKind, sent_at: DateTime<Utc>) -> Sent {
     Sent {
         order: id,
         origin: Origin::Gateway,
@@ -285,5 +287,6 @@ fn gateway_sent(id: OrderId, kind: CancelKind) -> Sent {
         orig_cl_ord_id: None,
         kind: Some(kind),
         answered: false,
+        sent_at,
     }
 }

@@ -132,6 +132,7 @@ fn every_sent() -> Vec<(CompactString, Sent)> {
         orig_cl_ord_id: None,
         kind: None,
         answered: false,
+        sent_at: DateTime::UNIX_EPOCH,
     };
     let replace = Sent {
         order: OrderId(2),
@@ -140,6 +141,7 @@ fn every_sent() -> Vec<(CompactString, Sent)> {
         orig_cl_ord_id: Some("C2".into()),
         kind: Some(CancelKind::Replace),
         answered: true,
+        sent_at: "2026-10-10T12:00:00.123456789Z".parse().unwrap(),
     };
     let cancel = Sent {
         order: OrderId(2),
@@ -148,6 +150,7 @@ fn every_sent() -> Vec<(CompactString, Sent)> {
         orig_cl_ord_id: None,
         kind: Some(CancelKind::Cancel),
         answered: false,
+        sent_at: "2026-10-10T12:00:01Z".parse().unwrap(),
     };
     vec![("1".into(), original), ("2-1".into(), replace), ("2-2".into(), cancel)]
 }

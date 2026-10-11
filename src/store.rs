@@ -334,7 +334,8 @@ const TABLES: &[&str] = &[
         cl_ord_id TEXT NOT NULL,
         orig_cl_ord_id TEXT,
         kind TEXT,
-        answered BIGINT NOT NULL
+        answered BIGINT NOT NULL,
+        sent_at TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS sent_order_id ON sent (order_id)",
     // Orphaned venue requests handled: see `Changes::orphans`.
@@ -456,7 +457,7 @@ const ORDER_COLUMNS: &[&str] = &[
 
 static UPSERT_ORDER: LazyLock<String> = LazyLock::new(|| upsert("orders", &["id"], ORDER_COLUMNS));
 static UPSERT_SENT: LazyLock<String> = LazyLock::new(|| {
-    let columns = ["downstream", "order_id", "origin", "cl_ord_id", "orig_cl_ord_id", "kind", "answered"];
+    let columns = ["downstream", "order_id", "origin", "cl_ord_id", "orig_cl_ord_id", "kind", "answered", "sent_at"];
     upsert("sent", &["downstream"], &columns)
 });
 static UPSERT_CL_ORD_ID: LazyLock<String> = LazyLock::new(|| {
@@ -505,7 +506,8 @@ async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io:
             .bind(sent.cl_ord_id.as_str())
             .bind(sent.orig_cl_ord_id.as_deref())
             .bind(sent.kind.map(Code::code))
-            .bind(i64::from(sent.answered));
+            .bind(i64::from(sent.answered))
+            .bind(time_text(sent.sent_at));
         run(connection, query, "writing a request sent").await?;
     }
     for ClOrdIdRow { client, day, cl_ord_id, order } in cl_ord_ids {
@@ -686,6 +688,7 @@ fn sent(row: &Columns<'_>) -> io::Result<Sent> {
         orig_cl_ord_id: row.optional_compact("orig_cl_ord_id")?,
         kind: row.optional_code("kind")?,
         answered: row.flag("answered")?,
+        sent_at: row.time("sent_at")?,
     })
 }
 

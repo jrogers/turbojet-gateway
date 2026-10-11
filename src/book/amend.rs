@@ -221,6 +221,7 @@ impl Book {
             orig_cl_ord_id: Some(amend.orig_cl_ord_id),
             kind: Some(amend.kind),
             answered: false,
+            sent_at: self.now,
         };
         let downstream = self.next_downstream(sent);
         self.remember(&amend.client, amend.cl_ord_id, id);
@@ -361,6 +362,8 @@ impl Book {
         match output {
             Some(output) => {
                 tracing::warn!(%venue, %downstream, "sending again a request the venue's session never stored");
+                self.downstream.get_mut(&downstream).expect("looked up above").sent_at = self.now;
+                self.touched.sent.insert(downstream);
                 out.push(output);
             }
             None => self.send_failed(venue, &downstream, "not sent before the gateway restarted".into(), out),

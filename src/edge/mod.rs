@@ -494,7 +494,9 @@ impl Gateway {
             state.book.set_unavailable(writer.unavailable());
         }
         // After the lock, so TransactTimes rise in the order the book answers.
-        let now = UtcTimestamp::from(self.clock.now());
+        let clock_now = self.clock.now();
+        state.book.set_now(clock_now);
+        let now = UtcTimestamp::from(clock_now);
         let mut inputs = VecDeque::from_iter(inputs);
         let mut outputs = Vec::new();
         let mut reports = Vec::new();
@@ -2121,6 +2123,7 @@ pub(crate) mod tests {
             orig_cl_ord_id: None,
             kind: None,
             answered: false,
+            sent_at: chrono::DateTime::UNIX_EPOCH,
         };
         store
             .write(&[crate::book::Changes { sent: vec![("OLDOLD2".into(), known)], ..Default::default() }])
