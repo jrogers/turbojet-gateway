@@ -163,8 +163,9 @@ impl Service {
         &self.gateway
     }
 
-    /// The book's database, if there is one.
-    pub fn store(&self) -> Option<&Store> {
+    /// The book's database, if there is one: the tests' way to its hooks.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the tests' way to the store's hooks"))]
+    pub(crate) fn store(&self) -> Option<&Store> {
         self.store.as_ref()
     }
 
