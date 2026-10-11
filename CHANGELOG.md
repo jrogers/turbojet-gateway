@@ -43,7 +43,8 @@ Notable changes to Jetbridge.
 - An optional database, `[database] url = "sqlite://...?mode=rwc"` in `jetbridge.toml` (SQLite;
   a missing file is an error unless the URL asks for it to be created; read at start only). The
   book's orders, ClOrdIDs and requests sent, operators' blocks, risk counts and the reports not
-  yet delivered are committed behind the hot path, and restored at the next start. Every
+  yet delivered are committed in the background, without delaying orders or reports, and
+  restored at the next start. Every
   message that changed the book is held in flight until its change has committed. Without a
   `[database]` everything stays in memory, as before.
 - Recovery at start: before the venues log on, each venue's session store is read and compared
@@ -56,14 +57,15 @@ Notable changes to Jetbridge.
   clients again, marked PossResend.
 - New orders are rejected as "gateway unavailable" while the oldest change not yet committed has
   waited over a second; cancels, replaces and venue reports keep flowing.
-- With a database, a venue's session must be kept in a durable store: a start that finds a
-  venue's store with no record of its session while the database has orders for the venue stops.
+- With a database, client and venue sessions must be kept in a durable store. A start that
+  finds a venue's store with no record of its session while the database has live orders, or
+  orders of a client's current day, for that venue stops; client stores aren't checked.
 - Each start waits for the next second before taking its ID prefix, so two starts never share
   one unless the clock goes back.
 - Reports made from a message that may have been handled before a restart are marked
   PossResend.
 - A venue report that changes nothing (a repeated ack) is dropped rather than forwarded under a
-  new ExecID. DoneForDay is still forwarded.
+  new ExecID (restatements, replaces and DoneForDay still go).
 - A kill switch, as async library calls on the gateway, which with a database return once their
   change has committed: block a client session, a CompID or everyone (new orders rejected;
   cancels and replaces that don't raise the quantity pass), cancel their orders at the venues,
