@@ -560,6 +560,23 @@ mod tests {
         serving.abort();
     }
 
+    /// The audit log is opened, or created, at start: one that can't be stops the start.
+    #[tokio::test]
+    async fn the_audit_log_opens_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        write(&dir, "users.toml", "");
+        let config = API.replace("audit.jsonl", "missing/audit.jsonl");
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{config}listen = \"127.0.0.1:0\"\n"));
+        let e = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
+        assert!(e.to_string().contains("cannot open the audit log"), "{e}");
+        std::fs::create_dir(dir.path().join("missing")).unwrap();
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        assert!(dir.path().join("missing/audit.jsonl").exists());
+        service.shutdown().await;
+        serving.abort();
+    }
+
     /// The API answers health over a real socket, and shutdown stops it first.
     #[tokio::test]
     async fn the_api_answers_health_until_shutdown() {

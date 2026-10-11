@@ -15,7 +15,8 @@
 //! or a token, or changes a role or clients, applies from the next request; a session whose user
 //! was removed, or whose password changed, ends.
 //!
-//! Auth outcomes all pass through [`login`], [`logout`] and [`refuse`]; they're logged there.
+//! Auth outcomes all pass through [`login`], [`logout`] and [`refuse`]; they're logged there, and
+//! recorded in the audit log (a login before its session starts) as [`crate::audit`] says.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -41,6 +42,7 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use super::ApiError;
+use crate::audit::Entry;
 use crate::auth::{MAX_NAME_LEN, MAX_PASSWORD_LEN, Role, User, Users, check_name, random, verify_password};
 use crate::book::{ClientId, Scope};
 use crate::config::Api;
@@ -148,6 +150,10 @@ struct Window {
     failures: u32,
 }
 
+/// The longest request target an `authenticate` refusal's audit line keeps, in bytes: the path is
+/// the client's to write.
+const MAX_AUDIT_TARGET_LEN: usize = 256;
+
 /// Why a request wasn't authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -179,6 +185,24 @@ impl Refusal {
             Self::Csrf => "missing or wrong X-CSRF-Token",
             Self::Limited => "too many failed logins: try again in a minute",
         }
+    }
+
+    /// Whether the audit log records it: not a request with no credentials, nor one whose
+    /// session has ended, which a console left open sends every few seconds and which try no
+    /// credential. See [`crate::audit`].
+    fn audited(self) -> bool {
+        !matches!(self, Self::NoCredentials | Self::SessionEnded)
+    }
+}
+
+/// A refusal, and the user it was for if the request named one validly (a session's user, whose
+/// CSRF token was wrong).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refused(Refusal, Option<String>);
+
+impl From<Refusal> for Refused {
+    fn from(refusal: Refusal) -> Self {
+        Self(refusal, None)
     }
 }
 
@@ -267,9 +291,10 @@ impl Auth {
         ip.unwrap_or(peer.ip()).to_canonical()
     }
 
-    /// Checks `password` for user `name`, from `ip`, and starts a session. An unknown user costs
-    /// a password check too, so how long a refusal takes doesn't say whether the user exists.
-    async fn login(&self, name: &str, password: String, ip: IpAddr) -> Result<LoggedIn, Refusal> {
+    /// Checks `password` for user `name`, from `ip`, returning the user, whom
+    /// [`start_session`](Self::start_session) then logs in. An unknown user costs a password check
+    /// too, so how long a refusal takes doesn't say whether the user exists.
+    async fn verify(&self, name: &str, password: String, ip: IpAddr) -> Result<User, Refusal> {
         if name.len() > MAX_NAME_LEN || password.len() > MAX_PASSWORD_LEN {
             // No user has such a name or password: nothing to guess, and nothing worth a window.
             return Err(Refusal::BadPassword);
@@ -299,6 +324,11 @@ impl Auth {
             self.count_failure(name, ip);
             return Err(Refusal::BadPassword);
         };
+        Ok(user.clone())
+    }
+
+    /// Starts a session for `user`, called `name`, as verified.
+    fn start_session(&self, name: &str, user: &User) -> LoggedIn {
         let session = Base64UrlUnpadded::encode_string(&random::<32>());
         let csrf = Base64UrlUnpadded::encode_string(&random::<32>());
         let now = self.now();
@@ -312,7 +342,7 @@ impl Auth {
                 last_seen: now,
             },
         );
-        Ok(LoggedIn { session, me: Me::new(name, user, Some(csrf)) })
+        LoggedIn { session, me: Me::new(name, user, Some(csrf)) }
     }
 
     /// Refuses a login for `name` or `ip` if either has had too many failures lately, or if the
@@ -353,13 +383,13 @@ impl Auth {
 
     /// The caller of a request with `headers`, by `method`, from `ip`; see the module
     /// documentation.
-    fn authenticate(&self, method: &Method, headers: &HeaderMap, ip: IpAddr) -> Result<Caller, Refusal> {
+    fn authenticate(&self, method: &Method, headers: &HeaderMap, ip: IpAddr) -> Result<Caller, Refused> {
         let users = self.users();
         if let Some(value) = headers.get(AUTHORIZATION) {
             // The scheme is case-insensitive (RFC 9110).
             let (scheme, token) = value.to_str().ok().and_then(|v| v.split_once(' ')).ok_or(Refusal::BadToken)?;
             if !scheme.eq_ignore_ascii_case("bearer") {
-                return Err(Refusal::BadToken);
+                return Err(Refusal::BadToken.into());
             }
             let (name, user) = users.by_token(token.trim()).ok_or(Refusal::BadToken)?;
             return Ok(Caller::new(name, user, ip, None));
@@ -371,12 +401,12 @@ impl Auth {
         let user = users.get(&session.user).filter(|user| user.password == session.password);
         let (Some(user), false) = (user, session.ended(now)) else {
             sessions.remove(id);
-            return Err(Refusal::SessionEnded);
+            return Err(Refusal::SessionEnded.into());
         };
         if !matches!(*method, Method::GET | Method::HEAD) {
             let sent = headers.get(CSRF_HEADER).map_or(&[][..], |value| value.as_bytes());
             if !bool::from(sent.ct_eq(session.csrf.as_bytes())) {
-                return Err(Refusal::Csrf);
+                return Err(Refused(Refusal::Csrf, Some(session.user.clone())));
             }
         }
         session.last_seen = now;
@@ -508,7 +538,6 @@ impl Caller {
     }
 
     /// Refuses, 403, a caller whose role is below `role`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the endpoints after login check roles"))]
     pub(crate) fn require(&self, role: Role) -> Result<(), ApiError> {
         if self.role >= role {
             Ok(())
@@ -580,7 +609,33 @@ pub(super) async fn authenticate(
             request.extensions_mut().insert(caller);
             next.run(request).await
         }
-        Err(refusal) => refuse(refusal, None, ip).into_response(),
+        Err(Refused(refusal, user)) => {
+            let error = refuse(refusal, user.as_deref(), ip);
+            if !refusal.audited() {
+                return error.into_response();
+            }
+            // Method and path are ASCII, so cutting them anywhere is at a character's boundary.
+            let mut target = format!("{} {}", request.method(), request.uri().path());
+            debug_assert!(target.is_ascii());
+            target.truncate(MAX_AUDIT_TARGET_LEN);
+            let entry = Entry { user, ..unidentified(ip, "authenticate", Some(target)) };
+            state.refused(entry, error).await.into_response()
+        }
+    }
+}
+
+/// An audit line for `action` by a caller not (yet) identified, from `ip`.
+fn unidentified(ip: IpAddr, action: &str, target: Option<String>) -> Entry {
+    Entry {
+        time: chrono::Utc::now(),
+        user: None,
+        role: None,
+        ip,
+        action: action.to_string(),
+        target,
+        params: serde_json::Value::Null,
+        reason: None,
+        result: String::new(),
     }
 }
 
@@ -625,15 +680,22 @@ pub(super) async fn login(
 ) -> Result<Response, ApiError> {
     let Json(Login { user, password }) = body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
     let ip = state.auth.client_ip(peer, &headers);
-    match state.auth.login(&user, password, ip).await {
-        Ok(LoggedIn { session, me }) => {
+    // A name no user could have is the client's to write anything in: not into the logs.
+    let valid = check_name(&user).is_ok();
+    let mut entry = Entry { user: valid.then(|| user.clone()), ..unidentified(ip, "login", None) };
+    match state.auth.verify(&user, password, ip).await {
+        Ok(found) => {
+            entry.role = Some(found.role);
+            entry.result = "allowed".to_string();
+            // Before the session exists: no line, no session.
+            state.audit.record(&entry).await.map_err(|e| super::audit_failed(&e))?;
+            let LoggedIn { session, me } = state.auth.start_session(&user, &found);
             info!(user, %ip, "API login");
             Ok(([(SET_COOKIE, state.auth.cookie(&session))], Json(me)).into_response())
         }
         Err(refusal) => {
-            // A name no user could have is the client's to write anything in: not into the log.
-            let name = if check_name(&user).is_ok() { user.as_str() } else { "<invalid>" };
-            Err(refuse(refusal, Some(name), ip))
+            let error = refuse(refusal, Some(if valid { user.as_str() } else { "<invalid>" }), ip);
+            Err(state.refused(entry, error).await)
         }
     }
 }
@@ -642,12 +704,15 @@ pub(super) async fn login(
 pub(super) async fn logout(
     axum::extract::State(state): axum::extract::State<super::State>,
     caller: Caller,
-) -> Response {
+) -> Result<Response, ApiError> {
+    let mut entry = super::entry_for(&caller, "logout", None);
+    entry.result = "allowed".to_string();
+    state.audit.record(&entry).await.map_err(|e| super::audit_failed(&e))?;
     if let Some(session) = &caller.session {
         state.auth.end_session(&session.id);
     }
     info!(user = caller.user, ip = %caller.ip, "API logout");
-    (StatusCode::NO_CONTENT, [(SET_COOKIE, state.auth.cookie(""))]).into_response()
+    Ok((StatusCode::NO_CONTENT, [(SET_COOKIE, state.auth.cookie(""))]).into_response())
 }
 
 /// `GET /api/me`: who the caller is, and with a session its CSRF token.
@@ -658,11 +723,9 @@ pub(super) async fn me(caller: Caller) -> Json<Me> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{Answer, send};
     use super::*;
-    use axum::body::Body;
     use axum::extract::connect_info::MockConnectInfo;
-    use std::sync::Weak;
-    use tower::ServiceExt;
 
     const PEER: &str = "192.0.2.1:5000";
 
@@ -692,27 +755,32 @@ mod tests {
         (Arc::new(auth), clock)
     }
 
-    fn app(auth: &Arc<Auth>) -> axum::Router {
-        super::super::router(super::super::State { service: Weak::new(), auth: auth.clone() })
-            .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+    /// The API's routes, and the directory of its audit log, `audit.jsonl`.
+    struct App {
+        router: axum::Router,
+        dir: tempfile::TempDir,
     }
 
-    struct Answer {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: serde_json::Value,
-    }
+    impl std::ops::Deref for App {
+        type Target = axum::Router;
 
-    async fn send(app: &axum::Router, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Answer {
-        let mut request = Request::builder().method(method).uri(path).header("content-type", "application/json");
-        for (name, value) in headers {
-            request = request.header(*name, *value);
+        fn deref(&self) -> &axum::Router {
+            &self.router
         }
-        let response = app.clone().oneshot(request.body(Body::from(body.to_string())).unwrap()).await.unwrap();
-        let (parts, body) = response.into_parts();
-        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-        let body = if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap() };
-        Answer { status: parts.status, headers: parts.headers, body }
+    }
+
+    impl App {
+        /// The audit log's lines so far.
+        fn audit(&self) -> Vec<serde_json::Value> {
+            let text = std::fs::read_to_string(self.dir.path().join("audit.jsonl")).unwrap();
+            text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+        }
+    }
+
+    fn app(auth: &Arc<Auth>) -> App {
+        let (state, dir) = super::super::tests::state(auth.clone());
+        let router = super::super::router(state).layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()));
+        App { router, dir }
     }
 
     async fn login(app: &axum::Router, user: &str, password: &str) -> Answer {
@@ -937,8 +1005,8 @@ mod tests {
         assert_eq!(answer.body["error"], Refusal::Limited.message());
         // Another address is limited for alice too; bob isn't, from another address.
         let elsewhere = "198.51.100.7".parse().unwrap();
-        assert_eq!(auth.login("alice", "secret".into(), elsewhere).await.err(), Some(Refusal::Limited));
-        assert!(auth.login("bob", "hunter2".into(), "198.51.100.7".parse().unwrap()).await.is_ok());
+        assert_eq!(auth.verify("alice", "secret".into(), elsewhere).await.err(), Some(Refusal::Limited));
+        assert!(auth.verify("bob", "hunter2".into(), "198.51.100.7".parse().unwrap()).await.is_ok());
         clock.pass(LOGIN_WINDOW - Duration::from_secs(1));
         assert_eq!(login(&app, "alice", "secret").await.status, StatusCode::TOO_MANY_REQUESTS);
         clock.pass(Duration::from_secs(1));
@@ -954,7 +1022,7 @@ mod tests {
         let mut guesses = tokio::task::JoinSet::new();
         for _ in 0..50 {
             let auth = auth.clone();
-            guesses.spawn(async move { auth.login("alice", "guess".into(), ip).await.err() });
+            guesses.spawn(async move { auth.verify("alice", "guess".into(), ip).await.err() });
         }
         let refusals = guesses.join_all().await;
         let tried = refusals.iter().filter(|r| **r == Some(Refusal::BadPassword)).count();
@@ -983,11 +1051,11 @@ mod tests {
         let (auth, _) = auth(users(), false);
         for i in 0..LOGIN_FAILURES {
             let ip = format!("2001:db8:1:2::{i}").parse().unwrap();
-            assert_eq!(auth.login(&format!("nobody{i}"), "guess".into(), ip).await.err(), Some(Refusal::BadPassword));
+            assert_eq!(auth.verify(&format!("nobody{i}"), "guess".into(), ip).await.err(), Some(Refusal::BadPassword));
         }
         let same = "2001:db8:1:2:ffff::9".parse().unwrap();
-        assert_eq!(auth.login("bob", "hunter2".into(), same).await.err(), Some(Refusal::Limited));
-        assert!(auth.login("bob", "hunter2".into(), "2001:db8:1:3::1".parse().unwrap()).await.is_ok());
+        assert_eq!(auth.verify("bob", "hunter2".into(), same).await.err(), Some(Refusal::Limited));
+        assert!(auth.verify("bob", "hunter2".into(), "2001:db8:1:3::1".parse().unwrap()).await.is_ok());
     }
 
     /// When the limit's names are full, expired windows go; if none have, new names are refused,
@@ -1025,6 +1093,79 @@ mod tests {
         assert_eq!(auth.check_limit("bob", ip(1)), Ok(()));
     }
 
+    /// Logins and logouts are recorded, allowed or refused, never with a password, token or
+    /// CSRF token; so are refusals that tried a credential (a wrong token, a wrong CSRF token, the
+    /// login limit), and not those that tried none (no credentials, a session ended).
+    #[tokio::test]
+    async fn auth_outcomes_are_audited() {
+        let mut users = users();
+        let token = users.add_token("bob").unwrap();
+        let (auth, _) = auth(users, false);
+        let app = app(&auth);
+        let (cookie, csrf) = session(&app, "alice", "secret").await;
+        assert_eq!(login(&app, "alice", "guess").await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(login(&app, &"x".repeat(MAX_NAME_LEN + 1), "guess").await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(send(&app, "GET", "/api/me", &[], "").await.status, StatusCode::UNAUTHORIZED);
+        let ended = [("cookie", "jetbridge_session=made-up")];
+        assert_eq!(send(&app, "GET", "/api/me", &ended, "").await.status, StatusCode::UNAUTHORIZED);
+        let wrong = [("authorization", "Bearer jb_wrong")];
+        assert_eq!(send(&app, "GET", "/api/me", &wrong, "").await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(send(&app, "POST", "/api/logout", &[("cookie", &cookie)], "").await.status, StatusCode::FORBIDDEN);
+        let headers = [("cookie", cookie.as_str()), ("x-csrf-token", &csrf)];
+        assert_eq!(send(&app, "POST", "/api/logout", &headers, "").await.status, StatusCode::NO_CONTENT);
+        let bearer = format!("Bearer {token}");
+        assert_eq!(send(&app, "GET", "/api/me", &[("authorization", &bearer)], "").await.status, StatusCode::OK);
+        for _ in 1..LOGIN_FAILURES {
+            login(&app, "alice", "guess").await;
+        }
+        assert_eq!(login(&app, "alice", "secret").await.status, StatusCode::TOO_MANY_REQUESTS);
+
+        let lines = app.audit();
+        let line = |i: usize| {
+            let line: &serde_json::Value = &lines[i];
+            let field = |name: &str| line[name].as_str().unwrap_or("-").to_string();
+            [field("user"), field("role"), field("action"), field("target"), field("result")].join(" | ")
+        };
+        let wrong_password = "alice | - | login | - | refused: wrong user or password";
+        let expected = [
+            "alice | operator | login | - | allowed",
+            wrong_password,
+            "- | - | login | - | refused: wrong user or password",
+            "- | - | authenticate | GET /api/me | refused: unknown or revoked token",
+            "alice | - | authenticate | POST /api/logout | refused: missing or wrong X-CSRF-Token",
+            "alice | operator | logout | - | allowed",
+            wrong_password,
+            wrong_password,
+            wrong_password,
+            wrong_password,
+            "alice | - | login | - | refused: too many failed logins: try again in a minute",
+        ];
+        assert_eq!((0..lines.len()).map(line).collect::<Vec<_>>(), expected);
+        assert_eq!(lines[0]["ip"], "192.0.2.1");
+        let text = std::fs::read_to_string(app.dir.path().join("audit.jsonl")).unwrap();
+        let session = cookie.split_once('=').unwrap().1;
+        for secret in ["secret", "guess", &csrf, session, &token] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+    }
+
+    /// A login whose audit line can't be written answers 503 and starts no session; a logout's
+    /// answers 503 and the session lives on.
+    #[tokio::test]
+    async fn no_audit_line_no_login_or_logout() {
+        let (auth, _) = auth(users(), false);
+        let app = app(&auth);
+        let (cookie, csrf) = session(&app, "alice", "secret").await;
+        crate::audit::tests::make_read_only(&app.dir.path().join("audit.jsonl"));
+        let answer = login(&app, "bob", "hunter2").await;
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!answer.headers.contains_key(SET_COOKIE));
+        assert_eq!(auth.sessions().len(), 1);
+        let headers = [("cookie", cookie.as_str()), ("x-csrf-token", &csrf)];
+        assert_eq!(send(&app, "POST", "/api/logout", &headers, "").await.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status, StatusCode::OK);
+    }
+
     /// When the sessions are full, the least recently used goes.
     #[tokio::test]
     async fn the_least_recently_used_session_goes_when_full() {
@@ -1054,7 +1195,7 @@ mod tests {
         session(&app, "bob", "hunter2").await;
         assert_eq!(auth.sessions().len(), MAX_SESSIONS);
         assert!(auth.authenticate(&Method::GET, &headers("0"), ip).is_ok());
-        assert_eq!(auth.authenticate(&Method::GET, &headers("1"), ip).err(), Some(Refusal::SessionEnded));
+        assert_eq!(auth.authenticate(&Method::GET, &headers("1"), ip).err(), Some(Refusal::SessionEnded.into()));
     }
 
     /// Behind a proxy, the client is the last X-Forwarded-For hop, else the peer; otherwise

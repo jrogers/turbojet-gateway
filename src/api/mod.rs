@@ -5,6 +5,9 @@
 //! Handlers reach the gateway and the service through `State`, which holds the service weakly:
 //! the service owns the server, so a strong reference from the server's handlers would keep both
 //! alive for as long as each other.
+//!
+//! Mutations run through `audited`, which writes their audit line before they run (see
+//! [`crate::audit`]).
 
 use std::io;
 use std::net::SocketAddr;
@@ -12,23 +15,28 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::Json;
+use axum::extract::Query;
+use axum::extract::rejection::QueryRejection;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::serve::ListenerExt;
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
+use crate::audit::{Audit, Entry};
+use crate::auth::Role;
 use crate::config::{Api, Error};
 use crate::service::Service;
 
 mod auth;
 mod listener;
 
-use auth::Auth;
+use auth::{Auth, Caller};
 
 /// How long shutdown waits for requests under way to finish before closing their connections.
 /// The API's requests are quick: a reload, or a cancel waiting for its commit, takes well under
@@ -42,6 +50,19 @@ pub(crate) struct State {
     #[expect(dead_code, reason = "the endpoints after health reach the gateway and sessions through it")]
     service: Weak<Service>,
     auth: Arc<Auth>,
+    audit: Arc<Audit>,
+}
+
+impl State {
+    /// Records `entry` as refused with `error`, within the audit log's budget for refusals, and
+    /// answers `error`; or 503 if the line can't be written.
+    async fn refused(&self, mut entry: Entry, error: ApiError) -> ApiError {
+        entry.result = format!("refused: {}", error.message);
+        match self.audit.record_refusal(&entry).await {
+            Ok(()) => error,
+            Err(e) => audit_failed(&e),
+        }
+    }
 }
 
 /// An error answer, the API's only one: `{"error": message}` with `status`.
@@ -69,6 +90,7 @@ fn router(state: State) -> axum::Router {
     let authenticated = axum::Router::new()
         .route("/api/me", get(auth::me))
         .route("/api/logout", post(auth::logout))
+        .route("/api/audit", get(read_audit))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate));
     axum::Router::new()
         .route("/api/health", get(health))
@@ -89,6 +111,129 @@ async fn health() -> Json<Health> {
     Json(Health { version: env!("CARGO_PKG_VERSION") })
 }
 
+/// A reason's length at most, in bytes: a sentence or a ticket number, not a document.
+const MAX_REASON_LEN: usize = 1_000;
+
+/// Entries `GET /api/audit` returns without a `limit`.
+const AUDIT_READ_DEFAULT: usize = 100;
+
+/// A mutation as the audit log records it: what [`audited`] needs besides the action itself.
+#[derive(Debug)]
+pub(crate) struct Mutation {
+    /// Its name, as the audit log has it: `pause`, `cancel_order`, `block`...
+    pub(crate) action: &'static str,
+    pub(crate) target: Option<String>,
+    /// Its other arguments. Never secrets.
+    pub(crate) params: serde_json::Value,
+    /// The body's `reason`, which every mutation needs, non-empty.
+    pub(crate) reason: Option<String>,
+}
+
+/// Runs `action`, a mutation by `caller`, once its audit line is written; see [`crate::audit`].
+///
+/// Refuses it, recording the refusal, if `allowed` is an error (the caller's role or scope, or a
+/// target that doesn't exist) or the reason is missing, blank or too long (400). Then records it
+/// as allowed, runs it, and if it answers an error, records that as a second line, `failed: ...`:
+/// a handler reports an outcome other than done by answering an error. Answers 503, not running
+/// it, if the line can't be written.
+///
+/// The writing and the action run on a task of their own, so a client that gives up midway
+/// can't leave an allowed line without its action, nor an action without its outcome.
+#[cfg_attr(not(test), expect(dead_code, reason = "the mutation endpoints call it"))]
+pub(crate) async fn audited<T: Send + 'static>(
+    state: &State,
+    caller: &Caller,
+    mutation: Mutation,
+    allowed: Result<(), ApiError>,
+    action: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    let reason = mutation.reason.unwrap_or_default();
+    let too_long = reason.len() > MAX_REASON_LEN;
+    let refusal = allowed.err().or_else(|| {
+        if reason.trim().is_empty() {
+            Some(ApiError::new(StatusCode::BAD_REQUEST, "a mutation needs a reason"))
+        } else if too_long {
+            Some(ApiError::new(StatusCode::BAD_REQUEST, format!("the reason is over {MAX_REASON_LEN} bytes")))
+        } else {
+            None
+        }
+    });
+    let mut entry = entry_for(caller, mutation.action, mutation.target);
+    entry.params = mutation.params;
+    // A reason too long isn't kept: the refusal says why.
+    entry.reason = (!reason.is_empty() && !too_long).then_some(reason);
+    if let Some(error) = refusal {
+        return Err(state.refused(entry, error).await);
+    }
+    let audit = state.audit.clone();
+    let run = async move {
+        entry.result = "allowed".to_string();
+        audit.record(&entry).await.map_err(|e| audit_failed(&e))?;
+        let outcome = action.await;
+        if let Err(failed) = &outcome {
+            entry.time = Utc::now();
+            entry.result = format!("failed: {}", failed.message);
+            if let Err(e) = audit.record(&entry).await {
+                // Done is done: the caller hears what happened, whatever the log.
+                error!(action = entry.action, "cannot write a mutation's outcome to the audit log: {e}");
+            }
+        }
+        outcome
+    };
+    tokio::spawn(run).await.unwrap_or_else(|e| {
+        error!("a mutation panicked: {e}");
+        Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "the action failed"))
+    })
+}
+
+/// An audit line for `caller` doing `action` to `target`, with no params, reason or result yet.
+pub(crate) fn entry_for(caller: &Caller, action: &str, target: Option<String>) -> Entry {
+    Entry {
+        time: Utc::now(),
+        user: Some(caller.user.clone()),
+        role: Some(caller.role),
+        ip: caller.ip,
+        action: action.to_string(),
+        target,
+        params: serde_json::Value::Null,
+        reason: None,
+        result: String::new(),
+    }
+}
+
+/// The answer, 503, when the audit log can't be written: whatever it was for didn't happen.
+fn audit_failed(e: &io::Error) -> ApiError {
+    error!("cannot write the audit log: {e}");
+    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "the audit log can't be written: nothing was done")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditQuery {
+    /// RFC 3339.
+    since: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+}
+
+/// `GET /api/audit?since=&limit=` [admin]: the audit log's last `limit` entries (at most
+/// [`MAX_READ`](crate::audit::MAX_READ), by default [`AUDIT_READ_DEFAULT`]) from `since`, oldest
+/// first.
+async fn read_audit(
+    axum::extract::State(state): axum::extract::State<State>,
+    caller: Caller,
+    query: Result<Query<AuditQuery>, QueryRejection>,
+) -> Result<Json<Vec<Entry>>, ApiError> {
+    if let Err(error) = caller.require(Role::Admin) {
+        return Err(state.refused(entry_for(&caller, "read_audit", None), error).await);
+    }
+    let Query(query) = query.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let entries = state.audit.read(query.since, query.limit.unwrap_or(AUDIT_READ_DEFAULT)).await.map_err(|e| {
+        error!("cannot read the audit log: {e}");
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot read the audit log: {e}"))
+    })?;
+    Ok(Json(entries))
+}
+
 /// The API's listener, bound, and its TLS set up: not yet serving. Binding comes before anything
 /// else starts, so a port in use or a bad certificate stops nothing half-started.
 #[derive(Debug)]
@@ -98,13 +243,18 @@ pub(crate) struct Bound {
     #[cfg(feature = "tls")]
     tls: Option<turbojet::tls::ServerTls>,
     auth: Arc<Auth>,
+    audit: Arc<Audit>,
 }
 
 impl Bound {
-    /// Binds `config.listen`, or takes `given`, and loads `config.tls`'s certificate and key and
-    /// `config.users`.
+    /// Binds `config.listen`, or takes `given`, loads `config.tls`'s certificate and key and
+    /// `config.users`, and opens `config.audit`, creating it if missing. The audit log stays the
+    /// one opened here until a restart.
     pub(crate) async fn bind(config: &Api, given: Option<std::net::TcpListener>) -> Result<Self, Error> {
         let auth = Arc::new(Auth::load(config).map_err(Error::new)?);
+        let audit = Audit::open(&config.audit)
+            .map_err(|e| Error::new(format!("cannot open the audit log {}: {e}", config.audit.display())))?;
+        let audit = Arc::new(audit);
         #[cfg(feature = "tls")]
         let tls = match &config.tls {
             Some(tls) => {
@@ -128,13 +278,14 @@ impl Bound {
             #[cfg(feature = "tls")]
             tls,
             auth,
+            audit,
         })
     }
 
     /// Serves the API's routes, with handlers reaching `service`.
     pub(crate) fn serve(self, service: Weak<Service>) -> Server {
         let local_addr = self.listener.local_addr().unwrap_or(self.config.listen);
-        let app = router(State { service, auth: self.auth.clone() });
+        let app = router(State { service, auth: self.auth.clone(), audit: self.audit });
         let (stop, stopped) = oneshot::channel::<()>();
         #[cfg(feature = "tls")]
         let task = match &self.tls {
@@ -249,26 +400,248 @@ pub(crate) mod tests {
     use super::*;
     use axum::extract::ConnectInfo;
 
-    /// The API's routes, and `/test/peer` answering the client's address as handlers see it.
-    fn app() -> axum::Router {
-        let auth = Auth::new(std::path::PathBuf::new(), crate::auth::Users::default(), false, false);
-        router(State { service: Weak::new(), auth: Arc::new(auth) })
-            .route("/test/peer", get(async |ConnectInfo(addr): ConnectInfo<SocketAddr>| addr.to_string()))
+    /// A state with `auth`, no service, and an audit log in a new directory, which lives as long
+    /// as the directory returned.
+    pub(crate) fn state(auth: Arc<Auth>) -> (State, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(Audit::open(&dir.path().join("audit.jsonl")).unwrap());
+        (State { service: Weak::new(), auth, audit }, dir)
     }
 
-    /// Serves [`app`] on a plain loopback listener, returning its address and its stop.
-    async fn serve_plain() -> (SocketAddr, oneshot::Sender<()>) {
+    /// The API's routes, and `/test/peer` answering the client's address as handlers see it.
+    fn app() -> (axum::Router, tempfile::TempDir) {
+        let auth = Auth::new(std::path::PathBuf::new(), crate::auth::Users::default(), false, false);
+        let (state, dir) = state(Arc::new(auth));
+        let app =
+            router(state).route("/test/peer", get(async |ConnectInfo(addr): ConnectInfo<SocketAddr>| addr.to_string()));
+        (app, dir)
+    }
+
+    /// Serves [`app`] on a plain loopback listener, returning its address, its stop and its
+    /// audit log's directory.
+    async fn serve_plain() -> (SocketAddr, oneshot::Sender<()>, tempfile::TempDir) {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
-        spawn(listener::Plain::new(tcp), app(), stopped);
-        (addr, stop)
+        let (app, dir) = app();
+        spawn(listener::Plain::new(tcp), app, stopped);
+        (addr, stop, dir)
+    }
+
+    pub(crate) struct Answer {
+        pub(crate) status: StatusCode,
+        pub(crate) headers: axum::http::HeaderMap,
+        pub(crate) body: serde_json::Value,
+    }
+
+    /// `method path` with `headers` and a JSON `body`, to `app` in-process.
+    pub(crate) async fn send(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Answer {
+        use tower::ServiceExt;
+        let mut request =
+            axum::http::Request::builder().method(method).uri(path).header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(axum::body::Body::from(body.to_string())).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body = if body.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&body).unwrap() };
+        Answer { status: parts.status, headers: parts.headers, body }
+    }
+
+    mod audited {
+        use super::*;
+        use crate::audit::tests::make_read_only;
+        use crate::auth::Users;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Deserialize)]
+        struct Flip {
+            reason: Option<String>,
+        }
+
+        /// A test mutation, `POST /test/flip {reason}` [operator]: flips `switch` on, and answers
+        /// 409, not done, if it was on already.
+        struct Fixture {
+            app: axum::Router,
+            switch: Arc<AtomicBool>,
+            dir: tempfile::TempDir,
+            /// Bearer headers' values: a viewer's, an operator's and an admin's.
+            viewer: String,
+            operator: String,
+            admin: String,
+        }
+
+        fn fixture() -> Fixture {
+            let mut users = Users::default();
+            let mut bearer = |name: &str, role: Role| {
+                users.add(name, role, Vec::new(), "a password").unwrap();
+                format!("Bearer {}", users.add_token(name).unwrap())
+            };
+            let (viewer, operator, admin) =
+                (bearer("vic", Role::Viewer), bearer("olga", Role::Operator), bearer("ada", Role::Admin));
+            let (state, dir) = state(Arc::new(Auth::new(std::path::PathBuf::new(), users, false, false)));
+            let switch = Arc::new(AtomicBool::new(false));
+            let flipped = switch.clone();
+            let flip = move |axum::extract::State(state): axum::extract::State<State>,
+                             caller: Caller,
+                             Json(flip): Json<Flip>| {
+                let flipped = flipped.clone();
+                async move {
+                    let mutation = Mutation {
+                        action: "flip",
+                        target: Some("switch".into()),
+                        params: serde_json::json!({ "to": true }),
+                        reason: flip.reason,
+                    };
+                    let allowed = caller.require(Role::Operator);
+                    audited(&state, &caller, mutation, allowed, async move {
+                        if flipped.swap(true, Ordering::SeqCst) {
+                            Err(ApiError::new(StatusCode::CONFLICT, "already on"))
+                        } else {
+                            Ok(StatusCode::NO_CONTENT)
+                        }
+                    })
+                    .await
+                }
+            };
+            let test = axum::Router::new()
+                .route("/test/flip", post(flip))
+                .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate))
+                .with_state(state.clone());
+            let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+            let app = router(state).merge(test).layer(axum::extract::connect_info::MockConnectInfo(peer));
+            Fixture { app, switch, dir, viewer, operator, admin }
+        }
+
+        impl Fixture {
+            async fn flip(&self, bearer: &str, body: &str) -> StatusCode {
+                send(&self.app, "POST", "/test/flip", &[("authorization", bearer)], body).await.status
+            }
+
+            fn path(&self) -> std::path::PathBuf {
+                self.dir.path().join("audit.jsonl")
+            }
+
+            fn lines(&self) -> Vec<serde_json::Value> {
+                let text = std::fs::read_to_string(self.path()).unwrap_or_default();
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+            }
+        }
+
+        /// An allowed mutation is recorded before it runs, and done is one line; one that's
+        /// refused (role, no reason, a blank one, one too long) is recorded as refused and doesn't
+        /// run; one allowed but not done gets a second line saying why.
+        #[tokio::test]
+        async fn mutations_are_recorded_allowed_refused_and_failed() {
+            let fixture = fixture();
+            let reason = r#"{"reason":"testing"}"#;
+            assert_eq!(fixture.flip(&fixture.viewer, reason).await, StatusCode::FORBIDDEN);
+            for body in ["{}", r#"{"reason":"  "}"#, &format!(r#"{{"reason":"{}"}}"#, "x".repeat(MAX_REASON_LEN + 1))] {
+                assert_eq!(fixture.flip(&fixture.operator, body).await, StatusCode::BAD_REQUEST, "{body}");
+            }
+            assert!(!fixture.switch.load(Ordering::SeqCst));
+            assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::NO_CONTENT);
+            assert!(fixture.switch.load(Ordering::SeqCst));
+            assert_eq!(fixture.flip(&fixture.admin, reason).await, StatusCode::CONFLICT);
+
+            let lines = fixture.lines();
+            let results: Vec<_> = lines.iter().map(|line| line["result"].as_str().unwrap()).collect();
+            assert_eq!(
+                results,
+                [
+                    "refused: needs the operator role; vic is viewer",
+                    "refused: a mutation needs a reason",
+                    "refused: a mutation needs a reason",
+                    &format!("refused: the reason is over {MAX_REASON_LEN} bytes"),
+                    "allowed",
+                    "allowed",
+                    "failed: already on",
+                ]
+            );
+            let allowed = &lines[4];
+            assert_eq!(allowed["user"], "olga");
+            assert_eq!(allowed["role"], "operator");
+            assert_eq!(allowed["ip"], "192.0.2.1");
+            assert_eq!(allowed["action"], "flip");
+            assert_eq!(allowed["target"], "switch");
+            assert_eq!(allowed["params"], serde_json::json!({ "to": true }));
+            assert_eq!(allowed["reason"], "testing");
+            assert!(allowed["time"].as_str().unwrap().ends_with('Z'));
+            assert_eq!(lines[2]["reason"], "  ");
+            assert_eq!(lines[3]["reason"], serde_json::Value::Null);
+            assert_eq!(lines[6]["user"], "ada");
+        }
+
+        /// A mutation whose line can't be written, the file read-only or its directory gone,
+        /// answers 503 and doesn't run.
+        #[tokio::test]
+        async fn a_mutation_whose_line_fails_doesnt_run() {
+            let fixture = fixture();
+            make_read_only(&fixture.path());
+            let reason = r#"{"reason":"testing"}"#;
+            assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!fixture.switch.load(Ordering::SeqCst));
+            assert!(fixture.lines().is_empty());
+
+            std::fs::remove_dir_all(fixture.dir.path()).unwrap();
+            assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!fixture.switch.load(Ordering::SeqCst));
+        }
+
+        /// An admin reads the log back, from `since`, the last `limit`; an operator is refused,
+        /// and that's recorded.
+        #[tokio::test]
+        async fn the_log_reads_back() {
+            let fixture = fixture();
+            let audit = Audit::open(&fixture.path()).unwrap();
+            for hour in ["09", "10", "11"] {
+                let entry = Entry {
+                    time: format!("2026-10-11T{hour}:00:00Z").parse().unwrap(),
+                    user: Some("olga".into()),
+                    role: Some(Role::Operator),
+                    ip: [192, 0, 2, 1].into(),
+                    action: "flip".into(),
+                    target: Some(format!("at {hour}")),
+                    params: serde_json::Value::Null,
+                    reason: Some("testing".into()),
+                    result: "allowed".into(),
+                };
+                audit.record(&entry).await.unwrap();
+            }
+            let read = async |query: &str| {
+                send(&fixture.app, "GET", &format!("/api/audit{query}"), &[("authorization", &fixture.admin)], "").await
+            };
+            let targets = |answer: Answer| {
+                assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+                let entries = answer.body.as_array().unwrap().clone();
+                entries.iter().map(|e| e["target"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+            };
+            assert_eq!(targets(read("").await), ["at 09", "at 10", "at 11"]);
+            assert_eq!(targets(read("?since=2026-10-11T10:00:00Z").await), ["at 10", "at 11"]);
+            assert_eq!(targets(read("?since=2026-10-11T09:30:00Z&limit=1").await), ["at 11"]);
+            assert_eq!(read("?since=yesterday").await.status, StatusCode::BAD_REQUEST);
+
+            let answer = send(&fixture.app, "GET", "/api/audit", &[("authorization", &fixture.operator)], "").await;
+            assert_eq!(answer.status, StatusCode::FORBIDDEN);
+            let lines = fixture.lines();
+            let last = lines.last().unwrap();
+            assert_eq!(last["action"], "read_audit");
+            assert_eq!(last["result"], "refused: needs the admin role; olga is operator");
+        }
     }
 
     /// Unknown paths and methods answer the API's JSON error, not axum's plain text.
     #[tokio::test]
     async fn unknown_paths_and_methods_are_json_errors() {
-        let (addr, _stop) = serve_plain().await;
+        let (addr, _stop, _dir) = serve_plain().await;
         let response = request(addr, "GET", "/api/nothing").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
         assert!(response.ends_with(r#"{"error":"no such path: /api/nothing"}"#), "{response}");
@@ -280,7 +653,7 @@ pub(crate) mod tests {
     /// Handlers see the client's address: its end of the connection.
     #[tokio::test]
     async fn handlers_see_the_clients_address() {
-        let (addr, _stop) = serve_plain().await;
+        let (addr, _stop, _dir) = serve_plain().await;
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let client = stream.local_addr().unwrap();
         assert!(exchange(stream, "GET", "/test/peer").await.ends_with(&client.to_string()));
@@ -293,7 +666,7 @@ pub(crate) mod tests {
 
         /// Serves [`app`] over TLS with a new certificate for localhost, returning the address,
         /// the certificate and the stop.
-        async fn serve_tls() -> (SocketAddr, String, oneshot::Sender<()>) {
+        async fn serve_tls() -> (SocketAddr, String, oneshot::Sender<()>, tempfile::TempDir) {
             let dir = tempfile::tempdir().unwrap();
             let (cert, key) = localhost_cert();
             let files = ApiTls { cert: dir.path().join("api.pem"), key: dir.path().join("api.key") };
@@ -302,13 +675,14 @@ pub(crate) mod tests {
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = tcp.local_addr().unwrap();
             let (stop, stopped) = oneshot::channel();
-            spawn(listener::Tls::new(tcp, listener::server(&files).unwrap().acceptor()), app(), stopped);
-            (addr, cert, stop)
+            let (app, audit_dir) = app();
+            spawn(listener::Tls::new(tcp, listener::server(&files).unwrap().acceptor()), app, stopped);
+            (addr, cert, stop, audit_dir)
         }
 
         #[tokio::test]
         async fn handlers_see_the_clients_address_over_tls() {
-            let (addr, cert, _stop) = serve_tls().await;
+            let (addr, cert, _stop, _dir) = serve_tls().await;
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
             let client = tcp.local_addr().unwrap();
             let response = exchange(tls_client(&cert).await.unwrap().connect(tcp).await.unwrap(), "GET", "/test/peer");
@@ -318,7 +692,7 @@ pub(crate) mod tests {
         /// A client that connects and sends nothing doesn't hold up others' handshakes.
         #[tokio::test]
         async fn a_stalled_connection_doesnt_hold_up_tls_handshakes() {
-            let (addr, cert, _stop) = serve_tls().await;
+            let (addr, cert, _stop, _dir) = serve_tls().await;
             let _stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             // Well within the stalled handshake's timeout, so the two can't have run in turn.
