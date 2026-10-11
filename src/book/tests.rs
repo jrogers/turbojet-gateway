@@ -3532,7 +3532,13 @@ fn views_serialize_as_the_api_sends_them() {
     );
     assert_eq!((&json["qty"], &json["price"]), (&"100".into(), &"10".into()));
     assert_eq!(json["requests"][0]["kind"], "new");
-    assert!(json.get("id").is_none(), "{json}");
+    // The API's paging cursor.
+    assert_eq!(json["id"], 1);
+    // A blotter's status filter reads the names the views write.
+    for status in [Status::PendingNew, Status::PartiallyFilled, Status::Canceled] {
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(serde_json::from_value::<Status>(json).unwrap(), status);
+    }
     let json = serde_json::to_value(book.risk_view()).unwrap();
     assert_eq!(json["sessions"][0]["open"], "1000");
     let json = serde_json::to_value(Scope::CompId("FUNDA".into())).unwrap();

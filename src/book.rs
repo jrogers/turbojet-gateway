@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use turbojet::SessionId;
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
@@ -170,7 +170,7 @@ pub enum TimeInForce {
     Fok,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     PendingNew,
@@ -306,14 +306,11 @@ impl Scope {
     }
 }
 
-/// As [`ScopeName`] writes it, which parses back to this scope's name.
+/// As its [`ScopeName`] writes it, which parses back to that name. Copies a session's name: for
+/// logs and the API, not the order path.
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Session(client) => write!(f, "session:{client}"),
-            Self::CompId(comp_id) => write!(f, "comp:{comp_id}"),
-            Self::All => f.write_str("all"),
-        }
+        fmt::Display::fmt(&ScopeName::from(self), f)
     }
 }
 
@@ -340,6 +337,16 @@ impl fmt::Display for ScopeName {
             Self::Session(session) => write!(f, "session:{session}"),
             Self::CompId(comp_id) => write!(f, "comp:{comp_id}"),
             Self::All => f.write_str("all"),
+        }
+    }
+}
+
+impl From<&Scope> for ScopeName {
+    fn from(scope: &Scope) -> Self {
+        match scope {
+            Scope::Session(client) => Self::Session(client.session().into()),
+            Scope::CompId(comp_id) => Self::CompId(comp_id.clone()),
+            Scope::All => Self::All,
         }
     }
 }
@@ -906,6 +913,10 @@ impl Book {
     fn check(&self) {
         for (id, order) in &self.orders {
             let sent = self.downstream.get(&order.downstream).expect("an order's downstream is recorded");
+            // Its original too, after a replace: when it was created.
+            let original = self.downstream.get(&order.name).expect("an order's original request is recorded");
+            assert_eq!(original.order, *id);
+            assert_eq!(original.kind, None, "an order's name is its original request's");
             assert_eq!(sent.order, *id);
             assert_ne!(sent.kind, Some(CancelKind::Cancel), "an order's downstream is never a cancel's");
             if let Some(pending) = &order.pending {

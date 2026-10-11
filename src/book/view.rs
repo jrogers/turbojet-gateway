@@ -1,7 +1,7 @@
 //! What the book shows an operator: owned views of its orders and risk, built under the gateway's
 //! lock from the book's own maps, without copying them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -14,9 +14,12 @@ use super::{
 use crate::risk::Limits;
 
 /// Orders one call to [`Book::orders`] returns at most: a blotter page. Each view is a few hundred
-/// bytes, and the walk that finds them holds the gateway's lock, so a page stays small; the rest
-/// are a page away (`after`).
+/// bytes, made under the gateway's lock, so a page bounds both the views and what the walk keeps;
+/// the rest are a page away (`after`).
 pub const MAX_ORDERS_PER_PAGE: usize = 1_000;
+
+/// Digits in the largest `u64`, so in any OrderId: what [`Book::order_named`] tries at most.
+const MAX_ORDER_ID_DIGITS: usize = 20;
 
 /// Which orders [`Book::orders`] returns: those matching every field set, by OrderId.
 #[derive(Debug, Clone, Default)]
@@ -48,8 +51,9 @@ impl OrderFilter {
 /// An order as a blotter shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OrderView {
-    /// The book's key, for paging ([`OrderFilter::after`]); `order_id` is what the wire knows.
-    #[serde(skip)]
+    /// The book's key: the API's paging cursor ([`OrderFilter::after`]), as a number. `order_id`
+    /// is what the wire knows.
+    #[serde(serialize_with = "order_id_number")]
     pub id: OrderId,
     /// Our OrderID(37): [`Order::name`].
     pub order_id: CompactString,
@@ -71,8 +75,8 @@ pub struct OrderView {
     /// A replace the venue hasn't answered.
     pub pending_replace: bool,
     pub gateway_cancel: Option<GatewayCancelView>,
-    /// When the order was sent to its venue; `None` if the book no longer has that request.
-    pub created: Option<DateTime<Utc>>,
+    /// When the order was sent to its venue.
+    pub created: DateTime<Utc>,
 }
 
 /// An order with every request sent for it.
@@ -156,18 +160,21 @@ pub struct SessionRisk {
 }
 
 impl Book {
-    /// The orders matching `filter`, by OrderId: one walk of the book, the views made only for the
-    /// page.
+    /// The orders matching `filter`, by OrderId. The walk is of the whole book, O(book) under the
+    /// gateway's lock; the page's limit bounds what it keeps and the views it makes.
+    // ponytail: a walk per page; an index of OrderIds in order (a BTreeMap) gives `range(after..)`
+    // at O(page) if blotter calls show up in the gateway's latency.
     pub fn orders(&self, filter: &OrderFilter) -> Vec<OrderView> {
         let limit = filter.limit.unwrap_or(MAX_ORDERS_PER_PAGE).min(MAX_ORDERS_PER_PAGE);
-        let mut page: Vec<&Order> = self.orders.values().filter(|order| filter.matches(order)).collect();
-        if page.len() > limit {
-            // The lowest `limit` without sorting every match.
-            page.select_nth_unstable_by_key(limit, |order| order.id.0);
-            page.truncate(limit);
+        // The lowest `limit` IDs so far, the highest on top to be pushed out.
+        let mut lowest = BinaryHeap::with_capacity(limit.saturating_add(1));
+        for order in self.orders.values().filter(|order| filter.matches(order)) {
+            lowest.push(order.id.0);
+            if lowest.len() > limit {
+                lowest.pop();
+            }
         }
-        page.sort_unstable_by_key(|order| order.id.0);
-        page.into_iter().map(|order| self.view(order)).collect()
+        lowest.into_sorted_vec().into_iter().map(|id| self.view(&self.orders[&OrderId(id)])).collect()
     }
 
     /// The order and every request sent for it, if the book holds it.
@@ -197,6 +204,7 @@ impl Book {
     /// a handful of lookups, rather than stripping this start's prefix.
     pub fn order_named(&self, name: &str) -> Option<OrderId> {
         let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let digits = digits.min(MAX_ORDER_ID_DIGITS);
         (1..=digits).find_map(|len| {
             let id = OrderId(name[name.len() - len..].parse().ok()?);
             self.orders.get(&id).filter(|order| order.name == name).map(|order| order.id)
@@ -249,7 +257,11 @@ impl Book {
             pending_cancel: self.outstanding_cancel(order).is_some(),
             pending_replace: order.pending.is_some(),
             gateway_cancel: order.gateway_cancel.as_ref().map(GatewayCancelView::from),
-            created: self.downstream.get(&order.name).map(|sent| sent.sent_at),
+            created: self.downstream.get(&order.name).expect("an order's original request is recorded").sent_at,
         }
     }
+}
+
+fn order_id_number<S: serde::Serializer>(id: &OrderId, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(id.0)
 }
