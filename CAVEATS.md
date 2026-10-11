@@ -9,9 +9,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - Every ID the gateway issues (OrderIDs, ExecIDs and the ClOrdIDs sent to venues) starts with a
   prefix from the start time: six base-36 digits of the seconds since 2026, such as `0EI800` in
   `0EI8001-1`. Each start waits for the next second before taking its prefix, so a start takes up
-  to a second longer, and two starts don't share one unless the clock goes back; a start that
-  finds a venue holding a request under its own prefix stops, saying so. The prefix takes six of
-  a venue's ClOrdID length limit.
+  to a second longer, and two starts don't share one unless the clock goes back; with a database,
+  a start that finds a venue holding a request under its own prefix stops, saying so. The prefix
+  takes six of a venue's ClOrdID length limit.
 - A venue session that's slow to store, or stuck, holds back the clients whose requests it hasn't
   stored: 256 messages past the oldest one waiting, a client's session stops reading from it until
   the venue's session catches up, its requests for other venues and its cancels included.
@@ -54,12 +54,11 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - The database is never pruned: done orders, the requests sent and ClOrdIDs used stay in it as
   history, so it grows for as long as the gateway trades. A start loads only live orders and
   each client's current day.
-- The `[database] url` is read at start only. A reload that finds it changed logs a warning and
-  keeps the database in use.
 - Reports go to clients as the book makes them, before the change behind them commits. A fill
   whose change hadn't committed when the gateway crashed is redelivered by the venue after the
   restart and reaches the client again, with the same ExecID and PossResend(97)=Y: a client should
-  tell fills apart by ExecID. A new report the venue sends while its session recovers may be
+  tell fills apart by ExecID, so it shouldn't discard a PossResend report whose ExecID it hasn't
+  seen. A new report the venue sends while its session recovers may be
   marked PossResend too, under a new ExecID.
 - A request the venue's session dropped unsent (the client told Rejected, "venue unavailable")
   can still reach the venue if the gateway crashes before the reject commits: the restart sends
@@ -69,23 +68,24 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   message held behind it stops reading 256 messages past it, new orders are rejected as
   "gateway unavailable", operator calls don't return, and shutdown waits for it too: a second
   Ctrl-C or SIGTERM exits.
-- "Gateway unavailable" is judged by the database writer: a batch counts from when the writer
-  takes it, so a writer the runtime doesn't run for over a second doesn't trigger it.
 - Messages handled in the last commit before a clean shutdown are redelivered, flagged as
   possible resends, at the next start: the sessions had closed before they could record them
   as received. The book takes them as repeats.
 - Each time a venue's session reconnects it asks the venue to resend from its oldest message
   not yet committed; the reports it has already handled are dropped as stale.
 - Each start reads every message in every venue's session store, to compare its requests with
-  the database: measured once at about 3.9 s per million stored messages, so a large store
-  makes for a slow start.
-- With a database, venue sessions must be kept in a durable store (`kind = "disk"`, say). A venue
-  kept in memory isn't refused at its first start, only at a start where the database has
-  orders for that venue (live, or of a client's current day). A venue a reload adds isn't
-  checked.
+  the database: about 3.9 s per million stored messages, measured from an in-memory store; a
+  disk store adds its read time. A large store makes for a slow start.
+- A venue kept in the memory store isn't refused at its first start, only at a start where the
+  database has live orders, or orders of a client's current day, for that venue. A venue a
+  reload adds isn't checked. Client sessions aren't checked at all.
+- A client session kept in memory, or a client that logs on with ResetSeqNumFlag(141)=Y after a
+  restart, doesn't redeliver the messages that hadn't committed before the stop, and loses the
+  reports its session had stored but not yet sent.
 - Deleting a venue's disk store while the database has orders for that venue stops every start,
   since the gateway can no longer tell what the venue was sent. To start a venue's sequence
-  numbers again, reset them (Turbojet's `reset_sequence_numbers`) rather than delete its files.
+  numbers again, reset them rather than delete its files: `Service::venue_session(name)`, then
+  `reset_sequence_numbers()` on it while it's disconnected.
 - An orphan (a request the venue's session stored that the database never recorded, from a crash
   within a commit of sending it) is logged as an error at the start. An orphaned order is
   cancelled at the venue's next logon, under a ClOrdID of the gateway's own (`<prefix>C<n>`);
@@ -103,6 +103,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
     restart before the earlier one is answered ends in Restated, not Replaced;
   - one taken after the order has ended is answered Replaced, with the order's final status
     (Canceled, say).
+
+  In each case the venue's order has the terms of the last replace it accepted; the logs say
+  which.
 - A request the database has as sent, unanswered, that the venue's session never stored (a
   crash after the commit, before the store) is sent at the venue's next logon, marked
   PossResend(97). Some aren't:
