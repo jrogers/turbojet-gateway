@@ -3066,14 +3066,15 @@ fn a_refused_orphan_leaves_the_gateway_cancel_going() {
 }
 
 /// An orphaned replace the venue accepted applies its terms, so a fill past the old quantity
-/// counts; the gateway's cancel, naming the order's old ID, refused as unknown, goes again under
-/// the new one, and its Canceled ends the order. The client hears the replace as a restatement.
+/// counts, and the order keeps working: no gateway cancel. The client hears the replace as a
+/// restatement.
 #[test]
-fn an_accepted_orphaned_replace_applies_and_the_gateway_cancel_follows_it() {
+fn an_accepted_orphaned_replace_applies_and_the_order_keeps_working() {
     let mut book = acked();
-    run(&mut book, orphaned_replace("1-1", 200));
+    assert!(run(&mut book, orphaned_replace("1-1", 200)).is_empty());
     assert_eq!(book.downstream["1-1"].kind, Some(CancelKind::Replace));
-    assert_eq!(gateway_cancel_sent(&run(&mut book, venue_up("NASDAQ"))), ("1-2", "1"));
+    assert!(book.cancelling().is_empty());
+    assert!(run(&mut book, venue_up("NASDAQ")).is_empty());
     let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
     assert_eq!(report_of(&out).exec_type, ExecType::Restated);
     let order = book.order(OrderId(1)).unwrap();
@@ -3088,27 +3089,19 @@ fn an_accepted_orphaned_replace_applies_and_the_gateway_cancel_follows_it() {
         (report.exec_type, report.cum_qty, report.leaves_qty),
         (ExecType::Trade, Decimal::from(150), Decimal::from(50))
     );
-    let mut unknown = venue_cancel_reject("NASDAQ", "1-2", Status::PartiallyFilled);
-    if let Input::VenueCancelReject { reason, .. } = &mut unknown {
-        *reason = Some(1);
-    }
-    assert_eq!(gateway_cancel_sent(&run(&mut book, unknown)), ("1-3", "1-1"));
-    let out = run(&mut book, venue_report("1-3", Status::Canceled, 0, 150));
-    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
-    assert_eq!(report.status, Status::Canceled);
-    assert!(book.cancelling().is_empty());
+    assert_eq!(book.order(OrderId(1)).unwrap().status, Status::PartiallyFilled);
 }
 
-/// An orphaned replace the venue refuses leaves the order's terms, and the gateway's cancel,
-/// waiting for the venue, goes on the refusal.
+/// An orphaned replace the venue refuses leaves the order's terms, working, and tells the client
+/// nothing: it never asked.
 #[test]
-fn a_rejected_orphaned_replace_leaves_the_order_and_its_cancel_goes() {
+fn a_rejected_orphaned_replace_leaves_the_order_working() {
     let mut book = acked();
     run(&mut book, orphaned_replace("1-1", 200));
-    let out = run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New));
-    assert_eq!(gateway_cancel_sent(&out), ("1-2", "1"));
+    assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::New)).is_empty());
     let order = book.order(OrderId(1)).unwrap();
-    assert_eq!((order.request.qty, order.pending.is_none()), (Decimal::from(100), true));
+    assert_eq!((order.request.qty, order.pending.is_none(), order.status), (Decimal::from(100), true, Status::New));
+    assert!(book.cancelling().is_empty());
 }
 
 /// Not ours to cancel: an order the book doesn't hold, another venue's, or an ID that isn't an
@@ -3230,7 +3223,7 @@ fn an_orphaned_replace_waits_for_the_pending_replaces_answer() {
     assert!(run(&mut book, orphaned_replace("1-2", 300)).is_empty());
     assert_eq!(book.order(OrderId(1)).unwrap().pending.as_ref().unwrap().downstream, "1-1");
     assert!(book.orphan_waiting("1-2"));
-    assert_eq!(gateway_cancel_sent(&run_live(&mut book, venue_up("NASDAQ"))), ("1-3", "1"));
+    assert!(run_live(&mut book, venue_up("NASDAQ")).is_empty());
 
     let out = run_live(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
     let report = report_of(&out);

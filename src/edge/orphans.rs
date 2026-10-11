@@ -12,7 +12,8 @@
 //!   shape the scan ignores). The venue's answers, and any reports on the order, are logged at
 //!   error, not passed to the book;
 //! - an orphaned cancel or replace of an order the book holds is [`Input::Orphan`]: the venue's
-//!   answers to it apply to the order, which the gateway cancels at the venue's logon.
+//!   answers to it apply to the order. A cancel's order the gateway cancels at the venue's
+//!   logon; a replace's keeps working.
 //!
 //! Each orphan is recorded once handled (see [`Changes::orphans`]), so a restart doesn't take it
 //! again.
@@ -58,7 +59,7 @@ pub struct Orphans {
     pub scanned: usize,
     /// Orders the database never had, whose cancels wait for the venue's logon.
     pub orders: usize,
-    /// Cancels and replaces of orders the book holds, which the gateway is cancelling.
+    /// Cancels and replaces of orders the book holds, taken by the book.
     pub amendments: usize,
     /// Requests the database has that the venues' sessions never stored, to send at their logons.
     pub unsent: usize,
@@ -205,7 +206,7 @@ impl Gateway {
     }
 
     /// Hands the book an orphaned cancel or replace of an order the database has: `true` if the
-    /// book took it, and the order's cancel with it. One it doesn't is recorded, logged.
+    /// book took it. One it doesn't is recorded, logged.
     async fn orphaned_amendment(
         self: &Arc<Self>,
         log: &mut dyn SessionLog,

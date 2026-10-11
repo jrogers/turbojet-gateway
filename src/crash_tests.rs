@@ -692,11 +692,11 @@ fn terms(report: &v44::ExecutionReport) -> Terms {
 }
 
 /// A replace the venue's session stored and sent, not yet committed at the crash: after the
-/// restart the orphaned replace is found and the order cancelled (what the client asked for is
-/// unknown until it redelivers the replace, which is then taken as the orphaned one). The
-/// venue's answers and fills in between reach the client; none are lost.
+/// restart the orphaned replace is found and recorded pending, the client's redelivered replace
+/// is taken as it, and the venue's Replaced answers the client. The order keeps working and the
+/// fill after reaches the client.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_cancelled() {
+async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_keeps_working() {
     let mut setup = Setup::new().await;
     let order = partly_filled(&mut setup).await;
     setup.gateway().store().hooks.gate.send_replace(false);
@@ -705,25 +705,18 @@ async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_cancelled() {
     assert_eq!((sent.orig_cl_ord_id.as_str(), sent.order_qty), (&*order, Some(150.into())));
 
     setup.crash_and_restart().await;
-    let cancel: v44::OrderCancelRequest = setup.venue_events.parse().await;
+    let downstream = sent.cl_ord_id.to_string();
+    let adopted = |database: &Snapshot| database.sent.get(&*downstream).is_some_and(|sent| sent.cl_ord_id == "C2");
+    setup.until_stored(adopted).await;
     setup.venue_send(replaced(&sent.cl_ord_id, &order));
     setup.venue_send(fill_of(&sent.cl_ord_id, "E-2", 20, (150, 60)));
-    setup.venue_send(canceled(&cancel.cl_ord_id, &cancel.orig_cl_ord_id, 60));
-    let mut seen: Vec<Terms> = Vec::new();
-    while seen.last().is_none_or(|(_, exec_type, ..)| *exec_type != v44::ExecType::Canceled) {
-        seen.push(terms(&setup.events.execution_report().await));
-    }
-    assert_eq!(
-        seen,
-        [
-            (Some("C2".into()), v44::ExecType::Replaced, Some(150.into()), 40.into(), 110.into()),
-            (Some("C2".into()), v44::ExecType::Trade, Some(150.into()), 60.into(), 90.into()),
-            (Some("C2".into()), v44::ExecType::Canceled, Some(150.into()), 60.into(), 0.into()),
-        ]
-    );
+    let replaced = setup.events.execution_report().await;
+    assert_eq!(terms(&replaced), (Some("C2".into()), v44::ExecType::Replaced, Some(150.into()), 40.into(), 110.into()));
+    let filled = setup.events.execution_report().await;
+    assert_eq!(terms(&filled), (Some("C2".into()), v44::ExecType::Trade, Some(150.into()), 60.into(), 90.into()));
     setup.assert_quiet().await;
     let database = setup.database().await;
-    assert_eq!(stored(&database, "C2"), [(Status::Canceled, 60.into())]);
+    assert_eq!(stored(&database, "C2"), [(Status::PartiallyFilled, 60.into())]);
 }
 
 /// Cancel on disconnect fires, its cancel stored and sent by the venue's session, and the gateway

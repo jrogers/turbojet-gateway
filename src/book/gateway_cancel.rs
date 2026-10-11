@@ -138,14 +138,19 @@ impl Book {
         order.amendments = order.amendments.max(amendment);
         // A done order has no replace pending: its replace can only be refused.
         let replace = replace.filter(|_| !order.status.is_done());
-        tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, ?replace, "venue holds a request the store lacks: cancelling its order");
         let waits = order.pending.is_some();
         match replace {
             None => {
+                tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, "venue holds a cancel the store lacks: cancelling its order");
                 self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Cancel));
                 self.touched.sent.insert(downstream);
+                // Sent at `VenueUp`, or by the edge's retry tick if the venue is up already.
+                if self.start_gateway_cancel(id).is_some() {
+                    self.cancel_unsent = true;
+                }
             }
             Some(OrphanedReplace { qty, price, ord_type, time_in_force }) => {
+                tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, ?replace, "venue holds a replace the store lacks: pending on its order");
                 let price = limit_price(ord_type, price);
                 let risk_price = self.risk.risk_price(&order.request.symbol, price);
                 // Set when it's made pending.
@@ -160,10 +165,6 @@ impl Book {
                     self.make_orphan_pending(id, pending);
                 }
             }
-        }
-        // Sent at `VenueUp`, or by the edge's retry tick if the venue is up already.
-        if self.start_gateway_cancel(id).is_some() {
-            self.cancel_unsent = true;
         }
     }
 

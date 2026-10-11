@@ -409,6 +409,10 @@ impl Book {
             None => {}
         }
         self.risk.track(order.id, order.exposure());
+        if sent.origin == Origin::Gateway && response_to == CancelKind::Replace {
+            // An orphaned replace (see `Input::Orphan`) the client never took as its own.
+            return tracing::warn!(%venue, %downstream, ?reason, ?text, "venue refused an orphaned replace; the order keeps its terms");
+        }
         if sent.origin == Origin::Gateway {
             // Not the gateway's latest cancel (an orphaned request, see `Input::Orphan`, or a
             // cancel since superseded): its refusal leaves the gateway's cancel as it is.

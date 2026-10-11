@@ -427,12 +427,12 @@ pub enum Input {
     /// At a start: a cancel or replace sent under `downstream` (`<order name>-<n>`) that `venue`'s
     /// session stored, but the store never recorded (the gateway stopped within a commit of
     /// sending it); `replace` holds a replace's terms. Recorded as the gateway's own request, so
-    /// the venue's answers apply to the order (a replace pending, its terms applied if the venue
-    /// accepts it), and the order gets the gateway's cancel, waiting for `VenueUp`: what the
-    /// client asked for is unknown. The client hears of fills and the order's end, and of an
-    /// orphaned replace accepted as a restatement; a replace waits for the one pending to be
-    /// answered, and a client's redelivered replace with its terms is taken as it. One for an
-    /// order the book doesn't hold (done, and dropped at a roll) is logged.
+    /// the venue's answers apply to the order. A cancel is a cancel: the order also gets the
+    /// gateway's own, waiting for `VenueUp`. A replace is pending, its terms applied if the venue
+    /// accepts it, and the order keeps working: the client hears Replaced if its redelivered
+    /// replace with those terms is taken as it, else Restated. A replace waits for the one pending
+    /// to be answered. One for an order the book doesn't hold (done, and dropped at a roll) is
+    /// logged.
     Orphan {
         venue: VenueId,
         downstream: CompactString,
