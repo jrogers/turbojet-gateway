@@ -31,12 +31,11 @@ impl Book {
         if order.venue != *venue {
             return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");
         }
-        if stale(order, answered, &report) {
-            // A restatement is the venue changing the order: losing one needs a look.
-            if report.exec_type == ExecType::Restated {
-                return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "restatement dropped during a pending request");
+        if let Some(changed) = dropped(venue, order, answered, &mut report) {
+            if changed {
+                self.touched.orders.insert(id);
             }
-            return tracing::debug!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "stale execution report dropped");
+            return;
         }
         // A fill whose status is behind (PartiallyFilled sent before a cancel the order now
         // awaits, say) applies keeping the order's status, as a report without one would: it
@@ -196,6 +195,40 @@ pub(super) fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool
     order.status.is_done()
         || report.cum_qty < order.cum_qty
         || (report.cum_qty == order.cum_qty && (report.last_qty > Decimal::ZERO || behind(order, answered, report)))
+}
+
+/// `Some` if `report` is dropped, logged: [`stale`], or it [`repeats`] what the order has, its
+/// VenueOrderID taken if the order had none, with whether that changed the order.
+fn dropped(venue: &VenueId, order: &mut Order, answered: bool, report: &mut VenueReport) -> Option<bool> {
+    let (downstream, exec_id) = (&report.downstream, &report.exec_id);
+    if stale(order, answered, report) {
+        // A restatement is the venue changing the order: losing one needs a look.
+        if report.exec_type == ExecType::Restated {
+            tracing::warn!(%venue, %downstream, %exec_id, "restatement dropped during a pending request");
+        } else {
+            tracing::debug!(%venue, %downstream, %exec_id, "stale execution report dropped");
+        }
+        return Some(false);
+    }
+    if !repeats(order, report) {
+        return None;
+    }
+    tracing::debug!(%venue, %downstream, %exec_id, "execution report changing nothing dropped");
+    let known = order.venue_order_id.is_some();
+    order.record_venue_order_id(report.venue_order_id.take(), false);
+    Some(!known && order.venue_order_id.is_some())
+}
+
+/// Whether `report` changes nothing: under the order's current downstream ClOrdID, at its
+/// status, no fill and the same CumQty, and neither a restatement nor a replace's acceptance. A
+/// venue repeating its ack (a resend, or a redelivery after the gateway restarted) is noise to the
+/// client, and a report forwarded would carry a new ExecID it couldn't tell from news.
+fn repeats(order: &Order, report: &VenueReport) -> bool {
+    report.downstream == order.downstream
+        && report.status == Some(order.status)
+        && report.cum_qty == order.cum_qty
+        && report.last_qty == Decimal::ZERO
+        && !matches!(report.exec_type, ExecType::Restated | ExecType::Replaced)
 }
 
 /// Whether the report's status is behind the order's, so would roll it back:

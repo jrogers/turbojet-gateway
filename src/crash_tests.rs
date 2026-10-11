@@ -107,21 +107,6 @@ impl Events {
         }
     }
 
-    /// The next report but status reports and the venue's ack of `cl_ord_id` sent again: a venue
-    /// may redeliver its ack after a restart (the gateway stopped before its session stored the
-    /// ack's release), and the book, changing nothing, forwards it again, marked PossResend.
-    async fn report_past_resent_ack(&mut self, cl_ord_id: &str) -> v44::ExecutionReport {
-        loop {
-            let msg = self.report().await;
-            let report: v44::ExecutionReport = msg.parse().unwrap_or_else(|e| panic!("{e:?}: {msg:?}"));
-            let resent_ack = report.exec_type == v44::ExecType::New && report.cl_ord_id.as_deref() == Some(cl_ord_id);
-            if !resent_ack {
-                return report;
-            }
-            assert_eq!(msg.get(tags::POSS_RESEND), Some("Y"), "{msg:?}");
-        }
-    }
-
     async fn message(&mut self) -> Message {
         match self.next().await {
             Event::Message(msg) => msg,
@@ -1001,7 +986,7 @@ async fn a_clients_cancel_the_venue_never_got_goes_after_a_crash() {
     let sent: v44::OrderCancelRequest = msg.parse().unwrap();
     assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), (&*downstream, &*order));
     setup.venue_send(canceled(&downstream, &order, 0));
-    let canceled = setup.events.report_past_resent_ack("C1").await;
+    let canceled = setup.events.execution_report().await;
     assert_eq!(
         (canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref(), canceled.exec_type),
         (Some("C2"), Some("C1"), v44::ExecType::Canceled)
@@ -1031,7 +1016,7 @@ async fn a_gateway_cancel_the_venue_never_got_goes_after_a_crash() {
     assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), (&*downstream, &*order));
     setup.venue_send(canceled(&downstream, &order, 0));
     setup.reconnect_client().await;
-    let canceled = setup.events.report_past_resent_ack("C1").await;
+    let canceled = setup.events.execution_report().await;
     assert_eq!((canceled.cl_ord_id.as_deref(), canceled.exec_type), (Some("C1"), v44::ExecType::Canceled));
     setup.assert_quiet().await;
     let database = setup.database().await;

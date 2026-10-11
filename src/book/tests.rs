@@ -311,6 +311,23 @@ fn an_older_fill_after_a_newer_one_is_dropped() {
     assert_eq!((order.status, order.cum_qty), (Status::Filled, 100.into()));
 }
 
+/// A venue repeating a report that changes nothing (an ack again, at the order's status and
+/// CumQty, on its current downstream) reaches the client no more, though its VenueOrderID is
+/// taken if the book had none; a restatement at the same status still goes.
+#[test]
+fn a_report_changing_nothing_is_dropped() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    assert_eq!(run(&mut book, venue_report("1", Status::New, 0, 0)).len(), 1);
+    let mut again = venue_report("1", Status::New, 0, 0);
+    if let Input::VenueReport { report, .. } = &mut again {
+        report.venue_order_id = Some("V-1".into());
+    }
+    assert!(run(&mut book, again).is_empty());
+    assert_eq!(book.order(OrderId(1)).unwrap().venue_order_id.as_deref(), Some("V-1"));
+    assert_eq!(run(&mut book, venue_report_as("1", ExecType::Restated, Status::New, 0, 0)).len(), 1);
+}
+
 #[test]
 fn a_report_without_a_fill_at_the_same_cum_qty_is_forwarded() {
     let mut book = book();
