@@ -5,10 +5,11 @@
 //!
 //! - **a token**, `Authorization: Bearer jb_...`, for scripts. A header that's there but wrong is
 //!   refused, never passed over for the cookie.
-//! - **a session**, from `POST /api/login`: the `jetbridge_session` cookie, which a browser sends
-//!   by itself, so every request but a GET or HEAD must also carry `X-CSRF-Token`, the session's
-//!   own token, which a page on another site can't read. Sessions are kept in memory: a restart
-//!   logs everyone out.
+//! - **a session**, from `POST /api/login`: the session cookie (`__Host-jetbridge_session` under
+//!   TLS, here or at a proxy; `jetbridge_session` on plain loopback), which a browser sends by
+//!   itself, so every request but a GET or HEAD must also carry `X-CSRF-Token`, the session's own
+//!   token, which a page on another site can't read. A session ends after [`SESSION_IDLE`] unused
+//!   or [`SESSION_MAX`] in all. Sessions are kept in memory: a restart logs everyone out.
 //!
 //! Each request reads the user afresh from the users file in use, so a reload that removes a user
 //! or a token, or changes a role or clients, applies from the next request; a session whose user
@@ -18,9 +19,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::hash::Hash;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -38,12 +41,17 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use super::ApiError;
-use crate::auth::{MAX_NAME_LEN, Role, User, Users, random, verify_password};
+use crate::auth::{MAX_NAME_LEN, MAX_PASSWORD_LEN, Role, User, Users, check_name, random, verify_password};
 use crate::book::{ClientId, Scope};
 use crate::config::Api;
 
-/// The session cookie's name.
+/// The session cookie's name over plain HTTP (on loopback), for `Path=/api`.
 pub(crate) const SESSION_COOKIE: &str = "jetbridge_session";
+
+/// The session cookie's name under TLS, here or at a proxy. The `__Host-` prefix makes browsers
+/// refuse it unless it's `Secure`, `Path=/` and has no `Domain`, so a sibling subdomain can't
+/// plant or shadow it.
+pub(crate) const SESSION_COOKIE_SECURE: &str = "__Host-jetbridge_session";
 
 /// The header a session's every request but a GET or HEAD carries its CSRF token in.
 const CSRF_HEADER: &str = "x-csrf-token";
@@ -52,24 +60,32 @@ const CSRF_HEADER: &str = "x-csrf-token";
 /// shift stays logged in, and one left overnight doesn't.
 pub(crate) const SESSION_IDLE: Duration = Duration::from_secs(8 * 60 * 60);
 
+/// How long a session lasts however much it's used: a stolen cookie stops working within a day,
+/// and an operator logs in once a day at least.
+pub(crate) const SESSION_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Sessions at once. A handful of operators need a few each; when full, the least recently used
 /// goes. Refusing new logins instead would let a script that logs in without logging out lock
 /// everyone out of the kill switch until its sessions idle out; evicting costs a forgotten
 /// console its session, and the one in use is never the least recently used.
 const MAX_SESSIONS: usize = 1024;
 
-/// Failed logins a user name or an IP address may have in a [`LOGIN_WINDOW`]; then logins for it
-/// are refused, 429, until the window passes.
+/// Failed logins a user name or an address may have in a [`LOGIN_WINDOW`]; then logins for it
+/// are refused, 429, until the window passes. An IPv6 address counts as its /64, which one host
+/// usually has whole.
 const LOGIN_FAILURES: u32 = 5;
 
 /// See [`LOGIN_FAILURES`]. The window starts at its first failure.
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 
-/// User names and IP addresses the login limit keeps a window for. Expired windows are dropped
-/// when it fills; if it's still full, logins for names and addresses not in it are refused until
-/// some expire: past this many in a minute, someone is guessing, and refusing beats forgetting
-/// who.
-const MAX_LOGIN_WINDOWS: usize = 10_000;
+/// User names the login limit keeps a window for. Expired windows are dropped when it fills; if
+/// it's still full, logins for names not in it are refused until some expire: past this many in a
+/// minute, someone is guessing, and refusing beats forgetting who. Names and addresses have a
+/// limit each, so a flood of one can't crowd the other out.
+const MAX_NAME_WINDOWS: usize = 10_000;
+
+/// Addresses the login limit keeps a window for: as [`MAX_NAME_WINDOWS`], for addresses.
+const MAX_ADDRESS_WINDOWS: usize = 10_000;
 
 /// Password checks at once. Each takes argon2's 19 MiB and some tens of milliseconds of a
 /// blocking thread; more wait their turn.
@@ -85,12 +101,15 @@ pub(crate) struct Auth {
     users: RwLock<Arc<Users>>,
     /// By session ID.
     sessions: Mutex<HashMap<String, Session>>,
-    failures: Mutex<HashMap<LimitKey, Window>>,
+    failures: Mutex<Failures>,
     checks: Semaphore,
     /// Whether the session cookie is `Secure`: served over TLS, here or at a proxy.
     secure: bool,
     /// Whether the client's address is the last `X-Forwarded-For` hop rather than the peer's.
     behind_proxy: bool,
+    /// Whether a proxy's missing or unreadable `X-Forwarded-For` has been warned of: once is
+    /// enough to say the proxy is misconfigured.
+    proxy_warned: AtomicBool,
     clock: Clock,
 }
 
@@ -105,13 +124,22 @@ struct Session {
     /// The user's password hash at login: a changed password ends the session.
     password: String,
     csrf: String,
+    created: Instant,
     last_seen: Instant,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum LimitKey {
-    User(String),
-    Ip(IpAddr),
+impl Session {
+    fn ended(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_seen) >= SESSION_IDLE
+            || now.saturating_duration_since(self.created) >= SESSION_MAX
+    }
+}
+
+/// Failed logins: windows by name, and by address.
+#[derive(Debug, Default)]
+struct Failures {
+    names: HashMap<String, Window>,
+    addresses: HashMap<IpAddr, Window>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,10 +207,11 @@ impl Auth {
             path,
             users: RwLock::new(Arc::new(users)),
             sessions: Mutex::new(HashMap::new()),
-            failures: Mutex::new(HashMap::new()),
+            failures: Mutex::new(Failures::default()),
             checks: Semaphore::new(MAX_PASSWORD_CHECKS),
             secure,
             behind_proxy,
+            proxy_warned: AtomicBool::new(false),
             clock: Arc::new(Instant::now),
         }
     }
@@ -207,23 +236,42 @@ impl Auth {
         (self.clock)()
     }
 
+    /// The sessions. A panic while they were held can't have left one half-changed: each change
+    /// is a single insert, remove or field write.
+    fn sessions(&self) -> MutexGuard<'_, HashMap<String, Session>> {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The login limit's windows; as with [`sessions`](Self::sessions), never half-changed.
+    fn failures(&self) -> MutexGuard<'_, Failures> {
+        self.failures.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The client's address: the peer's, or behind a proxy the last `X-Forwarded-For` hop, the
-    /// one the proxy added (those before it are the client's to write). A proxy that sends none,
-    /// or garbage, is the client.
+    /// one the proxy added (those before it are the client's to write), with or without a port.
+    /// A proxy that sends none, or garbage, is the client, and is warned of once.
     pub(crate) fn client_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
         let forwarded = || {
             let last = headers.get_all("x-forwarded-for").iter().next_back()?.to_str().ok()?;
-            last.rsplit(',').next()?.trim().parse::<IpAddr>().ok()
+            let hop = last.rsplit(',').next()?.trim();
+            hop.parse::<IpAddr>().ok().or_else(|| hop.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
         };
         let ip = if self.behind_proxy { forwarded() } else { None };
+        if self.behind_proxy && ip.is_none() && !self.proxy_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                %peer,
+                "behind_proxy, but a request has no X-Forwarded-For with an address: the proxy itself counts as \
+                 the client (set the proxy to send it); not warning again"
+            );
+        }
         ip.unwrap_or(peer.ip()).to_canonical()
     }
 
     /// Checks `password` for user `name`, from `ip`, and starts a session. An unknown user costs
     /// a password check too, so how long a refusal takes doesn't say whether the user exists.
     async fn login(&self, name: &str, password: String, ip: IpAddr) -> Result<LoggedIn, Refusal> {
-        if name.len() > MAX_NAME_LEN {
-            // No user has such a name: nothing to guess, and nothing worth a window.
+        if name.len() > MAX_NAME_LEN || password.len() > MAX_PASSWORD_LEN {
+            // No user has such a name or password: nothing to guess, and nothing worth a window.
             return Err(Refusal::BadPassword);
         }
         self.check_limit(name, ip)?;
@@ -233,7 +281,9 @@ impl Auth {
         let correct = {
             let _turn = self.checks.acquire().await.expect("the semaphore is never closed");
             // Again, as failures counted while this waited its turn may have reached the limit:
-            // else a burst of guesses all passing the first check would each get a try.
+            // else a burst of guesses all passing the first check would each get a try. With
+            // it, a burst gets at most LOGIN_FAILURES + MAX_PASSWORD_CHECKS - 1 tries: the
+            // limit's less one, plus those already being checked.
             self.check_limit(name, ip)?;
             tokio::task::spawn_blocking(move || match hash {
                 Some(hash) => verify_password(&hash, &password),
@@ -251,57 +301,45 @@ impl Auth {
         };
         let session = Base64UrlUnpadded::encode_string(&random::<32>());
         let csrf = Base64UrlUnpadded::encode_string(&random::<32>());
+        let now = self.now();
         self.add_session(
             session.clone(),
             Session {
                 user: name.to_string(),
                 password: user.password.clone(),
                 csrf: csrf.clone(),
-                last_seen: self.now(),
+                created: now,
+                last_seen: now,
             },
         );
         Ok(LoggedIn { session, me: Me::new(name, user, Some(csrf)) })
     }
 
     /// Refuses a login for `name` or `ip` if either has had too many failures lately, or if the
-    /// limit is full of others.
+    /// limit is full of other names, or other addresses.
     fn check_limit(&self, name: &str, ip: IpAddr) -> Result<(), Refusal> {
         let now = self.now();
-        let mut failures = self.failures.lock().expect("login limit lock poisoned");
-        let keys = [LimitKey::User(name.to_string()), LimitKey::Ip(ip)];
-        if failures.len() >= MAX_LOGIN_WINDOWS {
-            failures.retain(|_, window| !window.expired(now));
-            if failures.len() >= MAX_LOGIN_WINDOWS && keys.iter().all(|key| !failures.contains_key(key)) {
-                warn!(%ip, "the login limit is full: refusing logins from new names and addresses");
-                return Err(Refusal::Limited);
-            }
+        let mut failures = self.failures();
+        let checked = check_window(&mut failures.names, name, MAX_NAME_WINDOWS, now)
+            .and_then(|()| check_window(&mut failures.addresses, &limit_address(ip), MAX_ADDRESS_WINDOWS, now));
+        if checked == Err(Limited::Full) {
+            warn!(%ip, "the login limit is full: refusing logins from new names or addresses");
         }
-        let limited = |key| failures.get(key).is_some_and(|w: &Window| !w.expired(now) && w.failures >= LOGIN_FAILURES);
-        if keys.iter().any(limited) { Err(Refusal::Limited) } else { Ok(()) }
+        checked.map_err(|_| Refusal::Limited)
     }
 
     fn count_failure(&self, name: &str, ip: IpAddr) {
         let now = self.now();
-        let mut failures = self.failures.lock().expect("login limit lock poisoned");
-        for key in [LimitKey::User(name.to_string()), LimitKey::Ip(ip)] {
-            let full = failures.len() >= MAX_LOGIN_WINDOWS;
-            match failures.get_mut(&key) {
-                Some(window) if !window.expired(now) => window.failures += 1,
-                Some(window) => *window = Window { start: now, failures: 1 },
-                // The next login is refused by check_limit anyway.
-                None if full => {}
-                None => {
-                    failures.insert(key, Window { start: now, failures: 1 });
-                }
-            }
-        }
+        let mut failures = self.failures();
+        count_window(&mut failures.names, name.to_string(), MAX_NAME_WINDOWS, now);
+        count_window(&mut failures.addresses, limit_address(ip), MAX_ADDRESS_WINDOWS, now);
     }
 
     fn add_session(&self, id: String, session: Session) {
         let now = self.now();
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        let mut sessions = self.sessions();
         if sessions.len() >= MAX_SESSIONS {
-            sessions.retain(|_, session| now.saturating_duration_since(session.last_seen) < SESSION_IDLE);
+            sessions.retain(|_, session| !session.ended(now));
         }
         if sessions.len() >= MAX_SESSIONS {
             let oldest = sessions.iter().min_by_key(|(_, s)| s.last_seen).map(|(id, _)| id.clone());
@@ -318,16 +356,20 @@ impl Auth {
     fn authenticate(&self, method: &Method, headers: &HeaderMap, ip: IpAddr) -> Result<Caller, Refusal> {
         let users = self.users();
         if let Some(value) = headers.get(AUTHORIZATION) {
-            let token = value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")).ok_or(Refusal::BadToken)?;
+            // The scheme is case-insensitive (RFC 9110).
+            let (scheme, token) = value.to_str().ok().and_then(|v| v.split_once(' ')).ok_or(Refusal::BadToken)?;
+            if !scheme.eq_ignore_ascii_case("bearer") {
+                return Err(Refusal::BadToken);
+            }
             let (name, user) = users.by_token(token.trim()).ok_or(Refusal::BadToken)?;
             return Ok(Caller::new(name, user, ip, None));
         }
-        let id = session_cookie(headers).ok_or(Refusal::NoCredentials)?;
+        let id = session_cookie(headers, self.cookie_name()).ok_or(Refusal::NoCredentials)?;
         let now = self.now();
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        let mut sessions = self.sessions();
         let session = sessions.get_mut(id).ok_or(Refusal::SessionEnded)?;
         let user = users.get(&session.user).filter(|user| user.password == session.password);
-        let (Some(user), false) = (user, now.saturating_duration_since(session.last_seen) >= SESSION_IDLE) else {
+        let (Some(user), false) = (user, session.ended(now)) else {
             sessions.remove(id);
             return Err(Refusal::SessionEnded);
         };
@@ -343,20 +385,76 @@ impl Auth {
     }
 
     fn end_session(&self, id: &str) {
-        self.sessions.lock().expect("sessions lock poisoned").remove(id);
+        self.sessions().remove(id);
+    }
+
+    fn cookie_name(&self) -> &'static str {
+        if self.secure { SESSION_COOKIE_SECURE } else { SESSION_COOKIE }
     }
 
     /// The `Set-Cookie` value for session `id`; an empty `id` clears the cookie.
     fn cookie(&self, id: &str) -> String {
-        let secure = if self.secure { "; Secure" } else { "" };
+        let path = if self.secure { "Path=/; Secure" } else { "Path=/api" };
         let expire = if id.is_empty() { "; Max-Age=0" } else { "" };
-        format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/api{secure}{expire}")
+        format!("{}={id}; HttpOnly; SameSite=Strict; {path}{expire}", self.cookie_name())
     }
 }
 
 impl Window {
     fn expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.start) >= LOGIN_WINDOW
+    }
+}
+
+/// Why [`check_window`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limited {
+    /// The key has had its failures.
+    Key,
+    /// The key has no window, and there's no room for one.
+    Full,
+}
+
+/// Refuses `key` if its window has had [`LOGIN_FAILURES`], or if it has none and `windows` is full
+/// at `max` even with the expired ones dropped.
+fn check_window<K, Q>(windows: &mut HashMap<K, Window>, key: &Q, max: usize, now: Instant) -> Result<(), Limited>
+where
+    K: Hash + Eq + std::borrow::Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    if let Some(window) = windows.get(key) {
+        let limited = !window.expired(now) && window.failures >= LOGIN_FAILURES;
+        return if limited { Err(Limited::Key) } else { Ok(()) };
+    }
+    if windows.len() >= max {
+        windows.retain(|_, window| !window.expired(now));
+    }
+    if windows.len() >= max { Err(Limited::Full) } else { Ok(()) }
+}
+
+/// Counts a failure for `key`, starting a window if it has none and there's room: if there
+/// isn't, its next login is refused by [`check_window`] anyway.
+fn count_window<K: Hash + Eq>(windows: &mut HashMap<K, Window>, key: K, max: usize, now: Instant) {
+    let full = windows.len() >= max;
+    match windows.get_mut(&key) {
+        Some(window) if !window.expired(now) => window.failures += 1,
+        Some(window) => *window = Window { start: now, failures: 1 },
+        None if full => {}
+        None => {
+            windows.insert(key, Window { start: now, failures: 1 });
+        }
+    }
+    debug_assert!(windows.len() <= max);
+}
+
+/// The address the login limit counts `ip` as: an IPv6 address as its /64.
+fn limit_address(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
     }
 }
 
@@ -368,14 +466,14 @@ fn dummy_hash() -> &'static str {
     DUMMY.get_or_init(|| crate::auth::hash_password(&Base64UrlUnpadded::encode_string(&random::<32>())))
 }
 
-/// The session cookie's value, if the request has one.
-fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+/// The value of the session cookie `name`, if the request has one.
+fn session_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     headers
         .get_all(COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
-        .find_map(|cookie| cookie.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
+        .find_map(|cookie| cookie.trim().strip_prefix(name)?.strip_prefix('='))
 }
 
 /// Who is calling, for handlers: take it as an argument. Only routes behind [`authenticate`]
@@ -384,8 +482,8 @@ fn session_cookie(headers: &HeaderMap) -> Option<&str> {
 pub(crate) struct Caller {
     pub(crate) user: String,
     pub(crate) role: Role,
-    /// The CompIDs the caller may act on; empty, all.
-    pub(crate) clients: Vec<String>,
+    /// The CompIDs the caller may act on; `None`, all.
+    pub(crate) clients: Option<Vec<String>>,
     pub(crate) ip: IpAddr,
     /// With the cookie, not a token.
     session: Option<SessionRef>,
@@ -423,7 +521,10 @@ impl Caller {
     /// its own CompIDs' clients only (so never on [`Scope::All`]).
     #[cfg_attr(not(test), expect(dead_code, reason = "the mutations check scopes"))]
     pub(crate) fn may_act_on<T: Target + ?Sized>(&self, target: &T) -> bool {
-        self.clients.is_empty() || target.comp_id().is_some_and(|comp_id| self.clients.iter().any(|c| c == comp_id))
+        match &self.clients {
+            None => true,
+            Some(clients) => target.comp_id().is_some_and(|comp_id| clients.iter().any(|c| c == comp_id)),
+        }
     }
 }
 
@@ -495,7 +596,8 @@ pub(super) struct Login {
 pub(super) struct Me {
     user: String,
     role: Role,
-    clients: Vec<String>,
+    /// `null`: all.
+    clients: Option<Vec<String>>,
     /// With a session: the token its requests but GETs carry in `X-CSRF-Token`. A page reloaded
     /// gets it again from `GET /api/me`, which another site's page can't read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -528,7 +630,11 @@ pub(super) async fn login(
             info!(user, %ip, "API login");
             Ok(([(SET_COOKIE, state.auth.cookie(&session))], Json(me)).into_response())
         }
-        Err(refusal) => Err(refuse(refusal, Some(&user), ip)),
+        Err(refusal) => {
+            // A name no user could have is the client's to write anything in: not into the log.
+            let name = if check_name(&user).is_ok() { user.as_str() } else { "<invalid>" };
+            Err(refuse(refusal, Some(name), ip))
+        }
     }
 }
 
@@ -654,6 +760,9 @@ mod tests {
         let set = answer.headers[SET_COOKIE].to_str().unwrap();
         assert!(set.starts_with("jetbridge_session="), "{set}");
         assert!(set.ends_with("; HttpOnly; SameSite=Strict; Path=/api"), "{set}");
+        // The scheme of Authorization is case-insensitive: a session's cookie is no fallback.
+        let lower = [("authorization", "bearer jb_wrong")];
+        assert_eq!(send(&app, "GET", "/api/me", &lower, "").await.body["error"], Refusal::BadToken.message());
 
         let (cookie, csrf) = session(&app, "alice", "secret").await;
         let me = send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await;
@@ -661,7 +770,10 @@ mod tests {
         assert_eq!(me.body["user"], "alice");
         assert_eq!(me.body["csrf"], csrf.as_str());
 
-        for (user, password) in [("alice", "Secret"), ("carol", "secret"), (&"x".repeat(65) as &str, "secret")] {
+        let long_name = "x".repeat(MAX_NAME_LEN + 1);
+        let long_password = "x".repeat(MAX_PASSWORD_LEN + 1);
+        let tries = [("alice", "Secret"), ("carol", "secret"), (&long_name, "secret"), ("alice", &long_password)];
+        for (user, password) in tries {
             let answer = login(&app, user, password).await;
             assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{user}");
             assert!(!answer.headers.contains_key(SET_COOKIE));
@@ -671,12 +783,22 @@ mod tests {
         assert_eq!(send(&app, "POST", "/api/login", &[], "{\"user\":\"alice\"}").await.status, StatusCode::BAD_REQUEST);
     }
 
-    /// Under TLS or behind a proxy, the cookie is Secure.
-    #[test]
-    fn the_cookie_is_secure_under_tls() {
-        let auth = Auth::new(PathBuf::new(), Users::default(), true, true);
-        assert!(auth.cookie("x").ends_with("; Path=/api; Secure"));
+    /// Under TLS or behind a proxy, the cookie is Secure, for the whole host, with the `__Host-`
+    /// prefix; and it's that name the gateway reads.
+    #[tokio::test]
+    async fn the_cookie_is_secure_under_tls() {
+        let (auth, _) = auth(users(), false);
+        let mut auth = Arc::into_inner(auth).unwrap();
+        auth.secure = true;
+        let auth = Arc::new(auth);
+        assert_eq!(auth.cookie("x"), "__Host-jetbridge_session=x; HttpOnly; SameSite=Strict; Path=/; Secure");
         assert!(auth.cookie("").ends_with("; Secure; Max-Age=0"));
+        let app = app(&auth);
+        let (cookie, _) = session(&app, "bob", "hunter2").await;
+        assert!(cookie.starts_with("__Host-jetbridge_session="));
+        assert_eq!(send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status, StatusCode::OK);
+        let plain = cookie.replace("__Host-", "");
+        assert_eq!(send(&app, "GET", "/api/me", &[("cookie", &plain)], "").await.status, StatusCode::UNAUTHORIZED);
     }
 
     /// A token authenticates, and a token revoked by a reload doesn't, from the next request.
@@ -738,6 +860,16 @@ mod tests {
         clock.pass(SESSION_IDLE - Duration::from_secs(1));
         assert_eq!(me().await, StatusCode::OK);
         clock.pass(SESSION_IDLE);
+        assert_eq!(me().await, StatusCode::UNAUTHORIZED);
+
+        // However much it's used, a session ends SESSION_MAX after it began.
+        let (cookie, _) = session(&app, "alice", "secret").await;
+        let me = async || send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status;
+        for _ in 0..3 {
+            clock.pass(SESSION_MAX / 4);
+            assert_eq!(me().await, StatusCode::OK);
+        }
+        clock.pass(SESSION_MAX / 4);
         assert_eq!(me().await, StatusCode::UNAUTHORIZED);
 
         let (cookie, csrf_2) = session(&app, "alice", "secret").await;
@@ -813,8 +945,8 @@ mod tests {
         assert_eq!(login(&app, "alice", "secret").await.status, StatusCode::OK);
     }
 
-    /// A burst of guesses at once gets no more tries than the limit, give or take those already
-    /// being checked.
+    /// A burst of guesses at once gets at most LOGIN_FAILURES + MAX_PASSWORD_CHECKS - 1 tries:
+    /// the limit's less one, plus those already being checked.
     #[tokio::test]
     async fn a_burst_of_guesses_is_limited_too() {
         let (auth, _) = auth(users(), false);
@@ -826,7 +958,7 @@ mod tests {
         }
         let refusals = guesses.join_all().await;
         let tried = refusals.iter().filter(|r| **r == Some(Refusal::BadPassword)).count();
-        let limit = usize::try_from(LOGIN_FAILURES).unwrap() + MAX_PASSWORD_CHECKS;
+        let limit = usize::try_from(LOGIN_FAILURES).unwrap() + MAX_PASSWORD_CHECKS - 1;
         assert!(tried <= limit, "{tried} guesses checked");
         assert!(refusals.iter().all(|r| matches!(r, Some(Refusal::BadPassword | Refusal::Limited))));
     }
@@ -844,24 +976,53 @@ mod tests {
         assert_eq!(login(&app, "bob", "hunter2").await.status, StatusCode::OK);
     }
 
-    /// When the limit is full, expired windows go; if none have, new names and addresses are
-    /// refused.
+    /// An IPv6 address counts as its /64: a host can't step through its addresses to dodge the
+    /// limit. Another /64 isn't limited.
+    #[tokio::test]
+    async fn ipv6_addresses_are_limited_by_their_64() {
+        let (auth, _) = auth(users(), false);
+        for i in 0..LOGIN_FAILURES {
+            let ip = format!("2001:db8:1:2::{i}").parse().unwrap();
+            assert_eq!(auth.login(&format!("nobody{i}"), "guess".into(), ip).await.err(), Some(Refusal::BadPassword));
+        }
+        let same = "2001:db8:1:2:ffff::9".parse().unwrap();
+        assert_eq!(auth.login("bob", "hunter2".into(), same).await.err(), Some(Refusal::Limited));
+        assert!(auth.login("bob", "hunter2".into(), "2001:db8:1:3::1".parse().unwrap()).await.is_ok());
+    }
+
+    /// When the limit's names are full, expired windows go; if none have, new names are refused,
+    /// but not names it has, nor any address: names don't crowd out addresses. And the reverse.
     #[tokio::test]
     async fn the_login_limit_is_bounded() {
         let (auth, clock) = auth(users(), false);
-        let ip = |i: usize| IpAddr::from(std::net::Ipv6Addr::from(u128::try_from(i).unwrap()));
+        let ip = |i: usize| IpAddr::from([10, 0, u8::try_from(i / 256).unwrap(), u8::try_from(i % 256).unwrap()]);
+        let start = auth.now();
         {
-            let mut failures = auth.failures.lock().unwrap();
-            let start = auth.now();
-            for i in 0..MAX_LOGIN_WINDOWS {
-                failures.insert(LimitKey::Ip(ip(i)), Window { start, failures: 1 });
+            let mut failures = auth.failures();
+            for i in 0..MAX_NAME_WINDOWS {
+                failures.names.insert(format!("n{i}"), Window { start, failures: 1 });
             }
         }
-        assert_eq!(auth.check_limit("bob", ip(MAX_LOGIN_WINDOWS)), Err(Refusal::Limited));
-        assert_eq!(auth.check_limit("bob", ip(0)), Ok(()));
+        assert_eq!(auth.check_limit("bob", ip(0)), Err(Refusal::Limited));
+        assert_eq!(auth.check_limit("n0", ip(0)), Ok(()));
+        auth.count_failure("bob", ip(0));
+        assert_eq!(auth.failures().names.len(), MAX_NAME_WINDOWS);
+        assert_eq!(auth.failures().addresses.len(), 1);
+
         clock.pass(LOGIN_WINDOW);
-        assert_eq!(auth.check_limit("bob", ip(MAX_LOGIN_WINDOWS)), Ok(()));
-        assert!(auth.failures.lock().unwrap().is_empty());
+        assert_eq!(auth.check_limit("bob", ip(0)), Ok(()));
+        assert!(auth.failures().names.is_empty());
+
+        let start = auth.now();
+        {
+            let mut failures = auth.failures();
+            for i in 0..MAX_ADDRESS_WINDOWS {
+                failures.addresses.insert(ip(i), Window { start, failures: 1 });
+            }
+        }
+        let new = IpAddr::from([192, 0, 2, 1]);
+        assert_eq!(auth.check_limit("bob", new), Err(Refusal::Limited));
+        assert_eq!(auth.check_limit("bob", ip(1)), Ok(()));
     }
 
     /// When the sessions are full, the least recently used goes.
@@ -876,6 +1037,7 @@ mod tests {
                 user: "bob".into(),
                 password: user.password.clone(),
                 csrf: String::new(),
+                created: auth.now(),
                 last_seen: auth.now(),
             };
             auth.add_session(i.to_string(), session);
@@ -890,7 +1052,7 @@ mod tests {
         assert!(auth.authenticate(&Method::GET, &headers("0"), ip).is_ok());
         let app = app(&auth);
         session(&app, "bob", "hunter2").await;
-        assert_eq!(auth.sessions.lock().unwrap().len(), MAX_SESSIONS);
+        assert_eq!(auth.sessions().len(), MAX_SESSIONS);
         assert!(auth.authenticate(&Method::GET, &headers("0"), ip).is_ok());
         assert_eq!(auth.authenticate(&Method::GET, &headers("1"), ip).err(), Some(Refusal::SessionEnded));
     }
@@ -908,8 +1070,11 @@ mod tests {
         assert_eq!(proxied.client_ip(peer, &headers), "2001:db8::1".parse::<IpAddr>().unwrap());
         assert_eq!(direct.client_ip(peer, &headers), peer.ip());
         assert_eq!(proxied.client_ip(peer, &HeaderMap::new()), peer.ip());
-        let garbage = HeaderMap::from_iter([("x-forwarded-for".parse().unwrap(), "unknown".parse().unwrap())]);
-        assert_eq!(proxied.client_ip(peer, &garbage), peer.ip());
+        let one = |value: &str| HeaderMap::from_iter([("x-forwarded-for".parse().unwrap(), value.parse().unwrap())]);
+        assert_eq!(proxied.client_ip(peer, &one("unknown")), peer.ip());
+        assert!(proxied.proxy_warned.load(Ordering::Relaxed));
+        assert_eq!(proxied.client_ip(peer, &one("203.0.113.9:4711")), IpAddr::from([203, 0, 113, 9]));
+        assert_eq!(proxied.client_ip(peer, &one("a, [2001:db8::2]:443")), "2001:db8::2".parse::<IpAddr>().unwrap());
         let mapped: SocketAddr = "[::ffff:192.0.2.1]:1".parse().unwrap();
         assert_eq!(direct.client_ip(mapped, &headers), peer.ip());
     }

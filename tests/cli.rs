@@ -24,19 +24,21 @@ fn users(path: &Path) -> Users {
 }
 
 /// Adds a user (the password twice from stdin), gives them a token, checks both authenticate,
-/// revokes the token by its first characters, and removes the user.
+/// changes the password, revokes the token by its first characters, and removes the user.
 #[test]
 fn the_users_commands_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("users.toml");
     let file = path.to_str().unwrap();
 
-    let added =
-        jetbridge(&["user", "add", "alice", "--role", "operator", "--clients", "FUNDA", "--users", file], "pw1\npw1\n");
+    let short = jetbridge(&["user", "add", "alice", "--role", "operator", "--users", file], "short\nshort\n");
+    assert!(String::from_utf8_lossy(&short.stderr).contains("shorter than 12"), "{short:?}");
+    let add = ["user", "add", "alice", "--role", "operator", "--clients", "FUNDA", "--users", file];
+    let added = jetbridge(&add, "correct horse 1\ncorrect horse 1\n");
     assert!(added.status.success(), "{added:?}");
     let alice = users(&path).get("alice").cloned().unwrap();
-    assert!(verify_password(&alice.password, "pw1"));
-    assert_eq!(alice.clients, ["FUNDA"]);
+    assert!(verify_password(&alice.password, "correct horse 1"));
+    assert_eq!(alice.clients, Some(vec!["FUNDA".to_string()]));
 
     let differ = jetbridge(&["user", "add", "bob", "--role", "admin", "--users", file], "a\nb\n");
     assert!(!differ.status.success());
@@ -48,6 +50,15 @@ fn the_users_commands_round_trip() {
     let token = String::from_utf8(added.stdout).unwrap().trim().to_string();
     assert_eq!(users(&path).by_token(&token).map(|(name, _)| name), Some("alice"));
     assert!(!std::fs::read_to_string(&path).unwrap().contains(&token), "the token itself is kept");
+
+    // A new password keeps the token, role and clients.
+    let changed = jetbridge(&["user", "passwd", "alice", "--users", file], "correct horse 2\ncorrect horse 2\n");
+    assert!(changed.status.success(), "{changed:?}");
+    let users_now = users(&path);
+    let alice = users_now.get("alice").unwrap();
+    assert!(verify_password(&alice.password, "correct horse 2"));
+    assert_eq!(alice.clients, Some(vec!["FUNDA".to_string()]));
+    assert_eq!(users_now.by_token(&token).map(|(name, _)| name), Some("alice"));
 
     let revoked = jetbridge(&["token", "revoke", "alice", &token[..6], "--users", file], "");
     assert!(revoked.status.success(), "{revoked:?}");

@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 const USAGE: &str = "\
 usage: jetbridge --config FILE
        jetbridge user add NAME --role viewer|operator|admin [--clients A,B] --users FILE
+       jetbridge user passwd NAME --users FILE
        jetbridge user remove NAME --users FILE
        jetbridge token add NAME --users FILE
        jetbridge token revoke NAME PREFIX --users FILE
@@ -26,10 +27,12 @@ On Unix, SIGHUP reloads the files; a file that doesn't load keeps the one in use
 SIGTERM logs every session out and exits. RUST_LOG sets what's logged (info by default).
 
 The user and token commands edit the operator API's users file, creating it if need be; a
-reload applies the change. `user add` asks for the password twice (one line each from stdin
-when it isn't a terminal); --clients limits the user to acting on those CompIDs. `token add`
-prints the new token once: only its hash is kept. `token revoke` takes the token, or the id
-`token add` showed, or its first characters.";
+reload applies the change. Run them as the gateway's user: the rewritten file belongs to whoever
+runs them. `user add` and `user passwd` ask for the password twice (one line each from stdin
+when it isn't a terminal), at least 12 bytes; --clients limits the user to acting on those
+CompIDs. `user passwd` keeps the user's role, clients and tokens, and ends their sessions.
+`token add` prints the new token once: only its hash is kept. `token revoke` takes the token, or
+the id `token add` showed, or its first characters.";
 
 /// What the arguments ask for.
 #[derive(Debug, PartialEq, Eq)]
@@ -46,6 +49,7 @@ enum Command {
 #[derive(Debug, PartialEq, Eq)]
 enum Change {
     AddUser { name: String, role: Role, clients: Vec<String> },
+    SetPassword { name: String },
     RemoveUser { name: String },
     AddToken { name: String },
     RevokeToken { name: String, prefix: String },
@@ -126,7 +130,7 @@ fn parse_users_args(kind: &str, mut args: impl Iterator<Item = String>) -> Resul
             "--help" | "-h" => return Ok(Command::Help),
             "--users" => users = Some(PathBuf::from(value()?)),
             "--role" => role = Some(value()?.parse::<Role>()?),
-            "--clients" => clients = Some(value()?.split(',').map(str::to_string).collect::<Vec<_>>()),
+            "--clients" => clients = Some(value()?.split(',').map(|c| c.trim().to_string()).collect::<Vec<_>>()),
             _ if arg.starts_with('-') => return Err(format!("unknown argument {arg:?}")),
             _ => words.push(arg),
         }
@@ -138,6 +142,7 @@ fn parse_users_args(kind: &str, mut args: impl Iterator<Item = String>) -> Resul
             role: role.take().ok_or("user add needs --role")?,
             clients: clients.take().unwrap_or_default(),
         },
+        ("user", ["passwd", name]) => Change::SetPassword { name: (*name).to_string() },
         ("user", ["remove", name]) => Change::RemoveUser { name: (*name).to_string() },
         ("token", ["add", name]) => Change::AddToken { name: (*name).to_string() },
         ("token", ["revoke", name, prefix]) => {
@@ -157,12 +162,18 @@ fn edit_users(path: &Path, change: Change) -> Result<(), String> {
     let mut users = Users::load_or_new(path)?;
     match change {
         Change::AddUser { name, role, clients } => {
-            let password = read_password(&format!("password for {name}: "))?;
-            if read_password("again: ")? != password {
-                return Err("the passwords differ".to_string());
+            if users.get(&name).is_some() {
+                return Err(format!("user {name:?} exists: change its password with user passwd"));
             }
-            users.add(&name, role, clients, &password)?;
+            users.add(&name, role, clients, &new_password(&name)?)?;
             eprintln!("added {role} {name}");
+        }
+        Change::SetPassword { name } => {
+            if users.get(&name).is_none() {
+                return Err(format!("no user {name:?}"));
+            }
+            users.set_password(&name, &new_password(&name)?)?;
+            eprintln!("changed {name}'s password");
         }
         Change::RemoveUser { name } => {
             if !users.remove(&name) {
@@ -184,9 +195,21 @@ fn edit_users(path: &Path, change: Change) -> Result<(), String> {
             eprintln!("revoked {name}'s token {id}");
         }
     }
-    users.save(path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    if let Some(warning) = users.save(path).map_err(|e| format!("cannot write {}: {e}", path.display()))? {
+        eprintln!("warning: {warning}");
+    }
     eprintln!("reload the gateway (SIGHUP) for it to take effect");
     Ok(())
+}
+
+/// A new password for `name`, asked for twice.
+fn new_password(name: &str) -> Result<String, String> {
+    let password = read_password(&format!("password for {name}: "))?;
+    if read_password("again: ")? != password {
+        return Err("the passwords differ".to_string());
+    }
+    jetbridge::auth::check_new_password(&password)?;
+    Ok(password)
 }
 
 /// A password: typed without echo at a terminal, else a line from stdin.
@@ -261,7 +284,7 @@ mod tests {
     fn parses_the_users_commands() {
         let users = |change| Ok(Command::Users { users: "u.toml".into(), change });
         assert_eq!(
-            parse(&["user", "add", "alice", "--role", "operator", "--clients", "A,B", "--users", "u.toml"]),
+            parse(&["user", "add", "alice", "--role", "operator", "--clients", "A, B", "--users", "u.toml"]),
             users(Change::AddUser {
                 name: "alice".into(),
                 role: Role::Operator,
@@ -275,6 +298,10 @@ mod tests {
         assert_eq!(
             parse(&["user", "remove", "bob", "--users", "u.toml"]),
             users(Change::RemoveUser { name: "bob".into() })
+        );
+        assert_eq!(
+            parse(&["user", "passwd", "bob", "--users", "u.toml"]),
+            users(Change::SetPassword { name: "bob".into() })
         );
         assert_eq!(
             parse(&["token", "add", "bob", "--users", "u.toml"]),

@@ -3,20 +3,22 @@
 //! ```toml
 //! [user.alice]
 //! role = "operator"                 # viewer, operator or admin; each may do what those before it may
-//! password = "$argon2id$v=19$..."   # a PHC string: `jetbridge user add` writes it
+//! password = "$argon2id$v=19$..."   # argon2id, at its default cost or more: `user add` writes it
 //! clients = ["FUNDA"]               # optional: acts on these CompIDs only; all, if left out
+//!                                   # (an empty list is refused)
 //!
 //! [[user.alice.tokens]]             # `jetbridge token add` writes these
 //! id = "q3Xr9a_T"                   # the token's first characters after `jb_`, to revoke it by
 //! sha256 = "5f2c..."                # the token's SHA-256, hex: the token itself isn't kept
 //! ```
 //!
-//! An empty file (or one with only comments) has no users. Unknown keys are errors. The binary's
+//! An empty file (or one with only comments) has no users. Unknown keys are errors, and so is a
+//! token hash used twice. The binary's
 //! `user` and `token` commands edit the file, rewriting it whole (comments aren't kept); the
 //! gateway rereads it at start and on reload.
 
 use std::collections::BTreeMap;
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::io::{self, Write as _};
 use std::path::Path;
 use std::str::FromStr;
@@ -31,6 +33,13 @@ use subtle::ConstantTimeEq;
 /// A user name's length at most, in bytes. Login names longer than any user's are refused
 /// before the login limit counts them, so this also bounds what the limit keeps per name.
 pub const MAX_NAME_LEN: usize = 64;
+
+/// A password's length at most, in bytes: well past any passphrase, and short of making argon2
+/// hash megabytes for whoever sends them. Longer ones are refused before they're hashed.
+pub const MAX_PASSWORD_LEN: usize = 1024;
+
+/// A new password's length at least, in bytes: the operator API can stop a client's trading.
+pub const MIN_PASSWORD_LEN: usize = 12;
 
 /// What a token starts with: tells it from a password in a script, or in a leak scan.
 const TOKEN_PREFIX: &str = "jb_";
@@ -84,9 +93,10 @@ pub struct User {
     pub role: Role,
     /// The password's argon2 hash, a PHC string.
     pub password: String,
-    /// The CompIDs the user may act on; empty, all of them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub clients: Vec<String>,
+    /// The CompIDs the user may act on; `None`, all of them. An empty list is refused: leaving
+    /// `clients` out is the only way to say all, so a list emptied by mistake doesn't widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tokens: Vec<Token>,
 }
@@ -132,29 +142,45 @@ impl Users {
         }
     }
 
-    /// Writes the users to `path` whole, through a temporary file renamed over it, so a reader
-    /// never sees half a file. The file keeps its permissions; a new one is readable by its
-    /// owner only, on Unix.
+    /// Writes the users to `path` whole, through a temporary file in its directory renamed over
+    /// it, so a reader never sees half a file and a crash leaves the old one or the new. The file
+    /// keeps its permissions; a new one is readable by its owner only. Returns a warning if the
+    /// file's owner changed: whoever runs this owns the new file, so run it as the gateway's user.
     ///
     /// # Errors
     ///
-    /// Writing or renaming fails.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
+    /// Writing, renaming or syncing the directory fails.
+    pub fn save(&self, path: &Path) -> io::Result<Option<String>> {
         let text = toml::to_string(self).map_err(io::Error::other)?;
-        let mut temporary = path.as_os_str().to_owned();
-        temporary.push(".tmp");
-        let temporary = Path::new(&temporary);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(temporary)?;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            file.set_permissions(metadata.permissions())?;
+        let directory = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        let old = std::fs::metadata(path).ok();
+        if let Some(old) = &old {
+            file.as_file().set_permissions(old.permissions())?;
         }
         file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(temporary, path)
+        file.as_file().sync_all()?;
+        let warning = owner_change(old.as_ref(), &file.as_file().metadata()?);
+        file.persist(path).map_err(|e| e.error)?;
+        // The rename itself is durable once the directory is.
+        #[cfg(unix)]
+        std::fs::File::open(directory)?.sync_all()?;
+        Ok(warning)
+    }
+
+    /// User `name`'s new password, their role, clients and tokens kept.
+    ///
+    /// # Errors
+    ///
+    /// No such user, or the password is empty or too long.
+    pub fn set_password(&mut self, name: &str, password: &str) -> Result<(), String> {
+        check_password(password)?;
+        let user = self.user.get_mut(name).ok_or_else(|| format!("no user {name:?}"))?;
+        user.password = hash_password(password);
+        Ok(())
     }
 
     /// The user called `name`.
@@ -171,18 +197,18 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// The name isn't one a user may have, the user exists, or the password is empty.
+    /// The name isn't one a user may have, the user exists, the password is empty or too long,
+    /// or a client is empty. No `clients` means all.
     pub fn add(&mut self, name: &str, role: Role, clients: Vec<String>, password: &str) -> Result<(), String> {
         check_name(name)?;
         if self.user.contains_key(name) {
-            return Err(format!("user {name:?} exists: remove it first"));
+            return Err(format!("user {name:?} exists: remove it first, or change its password with user passwd"));
         }
-        if password.is_empty() {
-            return Err("the password is empty".to_string());
-        }
+        check_password(password)?;
         if clients.iter().any(String::is_empty) {
             return Err("an empty client CompID".to_string());
         }
+        let clients = (!clients.is_empty()).then_some(clients);
         self.user
             .insert(name.to_string(), User { role, password: hash_password(password), clients, tokens: Vec::new() });
         Ok(())
@@ -238,7 +264,10 @@ impl Users {
     }
 
     /// The user whose token `token` is, and their name. Compares the token's hash with every
-    /// token's in constant time, so how long it takes says nothing of how close a guess was.
+    /// token's, in constant time and without stopping at a match, so how long it takes depends
+    /// only on how many tokens there are. (A leak would say little anyway: it would be of how
+    /// close a guess's SHA-256 came, not the token.) Loading refuses a hash used twice,
+    /// so at most one matches.
     pub fn by_token(&self, token: &str) -> Option<(&str, &User)> {
         let hash = sha256_hex(token);
         let mut found = None;
@@ -253,14 +282,23 @@ impl Users {
     }
 
     fn check(&self) -> Result<(), String> {
+        let mut hashes = std::collections::HashSet::new();
         for (name, user) in &self.user {
             check_name(name)?;
-            PasswordHash::new(&user.password)
-                .map_err(|e| format!("user {name:?}: the password isn't a PHC hash: {e}"))?;
-            if user.clients.iter().any(String::is_empty) {
-                return Err(format!("user {name:?}: an empty client CompID"));
+            check_hash(&user.password).map_err(|e| format!("user {name:?}: password: {e}"))?;
+            match &user.clients {
+                Some(clients) if clients.is_empty() => {
+                    return Err(format!("user {name:?}: clients = []: leave clients out to mean all"));
+                }
+                Some(clients) if clients.iter().any(String::is_empty) => {
+                    return Err(format!("user {name:?}: an empty client CompID"));
+                }
+                _ => {}
             }
             for token in &user.tokens {
+                if !hashes.insert(token.sha256.as_str()) {
+                    return Err(format!("user {name:?}: token {:?}: another token has the same hash", token.id));
+                }
                 let hex = token.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
                 if token.sha256.len() != 64 || !hex {
                     return Err(format!("user {name:?}: token {:?}: sha256 isn't 64 lowercase hex digits", token.id));
@@ -286,12 +324,82 @@ impl FromStr for Users {
 
 /// A user name is 1 to [`MAX_NAME_LEN`] letters, digits and `.`, `_`, `-` or `@`: an email
 /// address works, and names print plainly in logs and the audit file.
-fn check_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
     let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@');
     if name.is_empty() || name.len() > MAX_NAME_LEN || !name.chars().all(allowed) {
         return Err(format!("user name {name:?}: 1 to {MAX_NAME_LEN} letters, digits, '.', '_', '-' or '@'"));
     }
     Ok(())
+}
+
+/// Refuses an empty password, or one over [`MAX_PASSWORD_LEN`]. New ones must also be
+/// [`MIN_PASSWORD_LEN`] long: see [`check_new_password`].
+fn check_password(password: &str) -> Result<(), String> {
+    if password.is_empty() {
+        return Err("the password is empty".to_string());
+    }
+    if password.len() > MAX_PASSWORD_LEN {
+        return Err(format!("the password is over {MAX_PASSWORD_LEN} bytes"));
+    }
+    Ok(())
+}
+
+/// Refuses a new password shorter than [`MIN_PASSWORD_LEN`] or longer than [`MAX_PASSWORD_LEN`].
+///
+/// # Errors
+///
+/// It's too short or too long.
+pub fn check_new_password(password: &str) -> Result<(), String> {
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err(format!("the password is shorter than {MIN_PASSWORD_LEN} bytes"));
+    }
+    check_password(password)
+}
+
+/// Refuses a hash other than argon2id's, or one cheaper than argon2's defaults (which
+/// [`hash_password`] uses): a weak hash is quick to crack if the file leaks, and quicker to check
+/// than an unknown user's, which would tell who exists.
+fn check_hash(phc: &str) -> Result<(), String> {
+    let hash = PasswordHash::new(phc).map_err(|e| format!("not a PHC hash: {e}"))?;
+    if hash.algorithm != argon2::Algorithm::Argon2id.ident() {
+        return Err(format!("{} isn't argon2id", hash.algorithm));
+    }
+    let params = argon2::Params::try_from(&hash).map_err(|e| format!("bad argon2 parameters: {e}"))?;
+    if params.m_cost() < argon2::Params::DEFAULT_M_COST
+        || params.t_cost() < argon2::Params::DEFAULT_T_COST
+        || params.p_cost() < argon2::Params::DEFAULT_P_COST
+    {
+        return Err(format!(
+            "argon2 parameters m={}, t={}, p={} are below the defaults m={}, t={}, p={}",
+            params.m_cost(),
+            params.t_cost(),
+            params.p_cost(),
+            argon2::Params::DEFAULT_M_COST,
+            argon2::Params::DEFAULT_T_COST,
+            argon2::Params::DEFAULT_P_COST,
+        ));
+    }
+    Ok(())
+}
+
+/// A warning if the file a save replaces, `old`, had another owner than the new one.
+#[cfg(unix)]
+fn owner_change(old: Option<&std::fs::Metadata>, new: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let old = old?;
+    (old.uid() != new.uid()).then(|| {
+        format!(
+            "the file's owner changed from uid {} to uid {}: the gateway may no longer read it; run this as the \
+             gateway's user",
+            old.uid(),
+            new.uid()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn owner_change(_: Option<&std::fs::Metadata>, _: &std::fs::Metadata) -> Option<String> {
+    None
 }
 
 /// The id a token is revoked by: its first characters after the prefix. Also cuts a prefix the
@@ -320,10 +428,7 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
 }
 
 fn sha256_hex(text: &str) -> String {
-    Sha256::digest(text.as_bytes()).iter().fold(String::with_capacity(64), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    })
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 #[cfg(test)]
@@ -408,6 +513,63 @@ mod tests {
         assert!(users.revoke_token("a", "abcd").unwrap_err().contains("more than one"));
         assert_eq!(users.revoke_token("a", "jb_abcd2222rest-of-token"), Ok("abcd2222".to_string()));
         assert_eq!(users.revoke_token("a", "abc"), Ok("abcd1111".to_string()));
+    }
+
+    /// `clients = []` is refused: leaving it out is the only way to say all.
+    #[test]
+    fn an_empty_client_list_is_refused() {
+        let hash = hash_password("pw");
+        let text = format!("[user.a]\nrole = \"viewer\"\npassword = \"{hash}\"\nclients = []\n");
+        assert!(text.parse::<Users>().unwrap_err().contains("leave clients out"));
+        let mut users = Users::default();
+        users.add("a", Role::Viewer, Vec::new(), "pw").unwrap();
+        assert_eq!(users.get("a").unwrap().clients, None);
+        assert!(!toml::to_string(&users).unwrap().contains("clients"));
+    }
+
+    /// Only argon2id hashes at argon2's default cost or more are taken.
+    #[test]
+    fn weak_hashes_are_refused() {
+        let user = |hash: &str| format!("[user.a]\nrole = \"viewer\"\npassword = \"{hash}\"\n");
+        let salt = SaltString::encode_b64(&[7; 16]).unwrap();
+        let weak = argon2::Params::new(1024, 1, 1, None).unwrap();
+        let weak = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, weak);
+        let weak = weak.hash_password(b"pw", &salt).unwrap().to_string();
+        assert!(user(&weak).parse::<Users>().unwrap_err().contains("below the defaults"));
+        let argon2i = Argon2::new(argon2::Algorithm::Argon2i, argon2::Version::V0x13, argon2::Params::default());
+        let argon2i = argon2i.hash_password(b"pw", &salt).unwrap().to_string();
+        assert!(user(&argon2i).parse::<Users>().unwrap_err().contains("isn't argon2id"));
+        assert!(user(&hash_password("pw")).parse::<Users>().is_ok());
+    }
+
+    /// Two tokens with one hash, under one user or two, are refused.
+    #[test]
+    fn a_token_hash_used_twice_is_refused() {
+        let mut users = Users::default();
+        users.add("a", Role::Viewer, Vec::new(), "pw").unwrap();
+        users.add("b", Role::Viewer, Vec::new(), "pw").unwrap();
+        users.add_token("a").unwrap();
+        let copy = users.get("a").unwrap().tokens.clone();
+        users.user.get_mut("b").unwrap().tokens = copy;
+        let text = toml::to_string(&users).unwrap();
+        assert!(text.parse::<Users>().unwrap_err().contains("same hash"), "{text}");
+    }
+
+    /// A new password keeps the role, clients and tokens; passwords are bounded.
+    #[test]
+    fn a_new_password_keeps_the_rest() {
+        let mut users = Users::default();
+        users.add("a", Role::Operator, vec!["FUNDA".into()], "old password").unwrap();
+        let token = users.add_token("a").unwrap();
+        users.set_password("a", "new password").unwrap();
+        let a = users.get("a").unwrap();
+        assert!(verify_password(&a.password, "new password"));
+        assert_eq!((a.role, a.clients.clone()), (Role::Operator, Some(vec!["FUNDA".to_string()])));
+        assert!(users.by_token(&token).is_some());
+        assert!(users.set_password("b", "new password").is_err());
+        assert!(users.set_password("a", &"x".repeat(MAX_PASSWORD_LEN + 1)).is_err());
+        assert!(check_new_password("short").is_err());
+        assert!(check_new_password(&"x".repeat(MIN_PASSWORD_LEN)).is_ok());
     }
 
     /// The file's permissions survive a rewrite; a new file is its owner's only.

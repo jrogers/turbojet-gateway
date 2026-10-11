@@ -22,6 +22,8 @@ rpassword = "7"
 # The users file keeps tokens' SHA-256, compared in constant time.
 sha2 = "0.10"
 subtle = "2"
+# The users file's atomic rewrite: a temporary file beside it, renamed over it.
+tempfile = "3"
 # By path while the engine API Jetbridge needs is still changing; crates.io once released.
 turbojet = { path = "../turbojet/crates/turbojet" }
 # `tz`: named time zones in session schedules and `day_end`.
@@ -49,7 +51,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # Self-signed certificates for the TLS test, at Turbojet's version.
 rcgen = "0.14"
-tempfile = "3"
 # Calling the API's router in-process.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # The end-to-end tests' relay between the gateway and a venue.
