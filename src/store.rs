@@ -43,12 +43,14 @@ pub struct Store {
 }
 
 /// Test hooks on [`Store::write`]: it waits while `gate` is shut, then fails while `failures` is
-/// above zero, counting it down; past that, it runs its statements and then fails, rolling them
-/// back, while `failures_in_transaction` is above zero.
+/// above zero, counting it down; past that, it runs its statements, then waits while
+/// `gate_in_transaction` is shut, the transaction open, then fails, rolling them back, while
+/// `failures_in_transaction` is above zero.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Hooks {
     pub(crate) gate: tokio::sync::watch::Sender<bool>,
+    pub(crate) gate_in_transaction: tokio::sync::watch::Sender<bool>,
     pub(crate) failures: std::sync::atomic::AtomicUsize,
     pub(crate) failures_in_transaction: std::sync::atomic::AtomicUsize,
 }
@@ -58,6 +60,7 @@ impl Default for Hooks {
     fn default() -> Self {
         Self {
             gate: tokio::sync::watch::Sender::new(true),
+            gate_in_transaction: tokio::sync::watch::Sender::new(true),
             failures: std::sync::atomic::AtomicUsize::new(0),
             failures_in_transaction: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -67,10 +70,21 @@ impl Default for Hooks {
 #[cfg(test)]
 impl Hooks {
     async fn before_write(&self) -> io::Result<()> {
-        let mut open = self.gate.subscribe();
-        open.wait_for(|open| *open).await.map_err(io::Error::other)?;
+        wait_open(&self.gate).await?;
         fail(&self.failures)
     }
+
+    async fn before_commit(&self) -> io::Result<()> {
+        wait_open(&self.gate_in_transaction).await?;
+        fail(&self.failures_in_transaction)
+    }
+}
+
+/// Waits while `gate` is shut.
+#[cfg(test)]
+async fn wait_open(gate: &tokio::sync::watch::Sender<bool>) -> io::Result<()> {
+    let mut open = gate.subscribe();
+    open.wait_for(|open| *open).await.map(drop).map_err(io::Error::other)
 }
 
 /// Fails while `count` is above zero, counting it down. One writer task writes, so nothing races
@@ -144,7 +158,7 @@ impl Store {
         }
         // Dropped uncommitted, the transaction rolls back.
         #[cfg(test)]
-        fail(&self.hooks.failures_in_transaction)?;
+        self.hooks.before_commit().await?;
         transaction.commit().await.map_err(database("committing a write"))
     }
 
