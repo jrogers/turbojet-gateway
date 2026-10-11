@@ -33,7 +33,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
-use turbojet::fields::{Decimal, UtcTimestamp};
+use turbojet::fields::{Code, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{
     Acceptor, Application, Context, Disconnect, DiskStorage, FixMessage, Initiator, InitiatorConfig, MemoryStorage,
@@ -315,7 +315,7 @@ impl Setup {
         assert_eq!(sent.cl_ord_id.as_str(), downstream);
         self.venue_send(acked(&downstream, 100));
         let new = self.events.execution_report().await;
-        assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some(cl_ord_id), v44::ExecType::New));
+        assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some(cl_ord_id), Code::Known(v44::ExecType::New)));
         downstream
     }
 
@@ -329,7 +329,7 @@ impl Setup {
         assert!(sent.cl_ord_id.starts_with(&last), "{sent:?}");
         self.venue_send(acked(&sent.cl_ord_id, 100));
         let new = self.events.execution_report().await;
-        assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("LAST"), v44::ExecType::New));
+        assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("LAST"), Code::Known(v44::ExecType::New)));
         tokio::join!(self.events.assert_quiet(), self.venue_events.assert_quiet());
     }
 
@@ -596,7 +596,7 @@ async fn a_crash_before_an_order_commits_cancels_the_orphan_and_books_the_resent
     setup.venue_send(canceled(&cancel.cl_ord_id, &orphan, 0));
     setup.venue_send(acked(&again.cl_ord_id, 100));
     let new = setup.events.execution_report().await;
-    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), Code::Known(v44::ExecType::New)));
     assert_eq!(new.order_id.as_str(), setup.id(1, "1"));
 
     let database = setup.database().await;
@@ -683,7 +683,7 @@ async fn a_block_and_its_cancels_carry_on_across_a_crash() {
     let canceled_report = setup.events.execution_report().await;
     assert_eq!(
         (canceled_report.cl_ord_id.as_deref(), canceled_report.exec_type),
-        (Some("C1"), v44::ExecType::Canceled)
+        (Some("C1"), Code::Known(v44::ExecType::Canceled))
     );
     setup.gateway().committed().await;
 
@@ -693,7 +693,7 @@ async fn a_block_and_its_cancels_carry_on_across_a_crash() {
     let canceled_report = setup.events.execution_report().await;
     assert_eq!(
         (canceled_report.cl_ord_id.as_deref(), canceled_report.exec_type),
-        (Some("C2"), v44::ExecType::Canceled)
+        (Some("C2"), Code::Known(v44::ExecType::Canceled))
     );
     setup.send(order("C3"));
     let rejected = setup.events.execution_report().await;
@@ -732,7 +732,7 @@ async fn a_kill_switch_that_never_committed_still_cancels_after_a_crash() {
     let canceled_report = setup.events.execution_report().await;
     assert_eq!(
         (canceled_report.cl_ord_id.as_deref(), canceled_report.exec_type),
-        (Some("C1"), v44::ExecType::Canceled)
+        (Some("C1"), Code::Known(v44::ExecType::Canceled))
     );
     setup.assert_quiet().await;
     let database = setup.database().await;
@@ -745,7 +745,7 @@ async fn partly_filled(setup: &mut Setup) -> String {
     let downstream = setup.working_order("C1", 1).await;
     setup.venue_send(fill(&downstream, "E-1", 40, 40));
     let partial = setup.events.execution_report().await;
-    assert_eq!((partial.exec_type, partial.cum_qty), (v44::ExecType::Trade, 40.into()));
+    assert_eq!((partial.exec_type, partial.cum_qty), (Code::Known(v44::ExecType::Trade), 40.into()));
     setup.gateway().committed().await;
     downstream
 }
@@ -761,11 +761,11 @@ fn replaced(downstream: &str, orig: &str) -> Message {
 }
 
 /// Of a client's report: ClOrdID, ExecType, OrderQty, CumQty and LeavesQty.
-type Terms = (Option<String>, v44::ExecType, Option<Decimal>, Decimal, Decimal);
+type Terms = (Option<String>, Code<v44::ExecType>, Option<Decimal>, Decimal, Decimal);
 
 fn terms(report: &v44::ExecutionReport) -> Terms {
     let cl_ord_id = report.cl_ord_id.as_deref().map(str::to_owned);
-    (cl_ord_id, report.exec_type, report.order_qty, report.cum_qty, report.leaves_qty)
+    (cl_ord_id, report.exec_type.clone(), report.order_qty, report.cum_qty, report.leaves_qty)
 }
 
 /// A replace the venue's session stored and sent, not yet committed at the crash: after the
@@ -788,9 +788,15 @@ async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_keeps_working(
     setup.venue_send(replaced(&sent.cl_ord_id, &order));
     setup.venue_send(fill_of(&sent.cl_ord_id, "E-2", 20, (150, 60)));
     let replaced = setup.events.execution_report().await;
-    assert_eq!(terms(&replaced), (Some("C2".into()), v44::ExecType::Replaced, Some(150.into()), 40.into(), 110.into()));
+    assert_eq!(
+        terms(&replaced),
+        (Some("C2".into()), Code::Known(v44::ExecType::Replaced), Some(150.into()), 40.into(), 110.into())
+    );
     let filled = setup.events.execution_report().await;
-    assert_eq!(terms(&filled), (Some("C2".into()), v44::ExecType::Trade, Some(150.into()), 60.into(), 90.into()));
+    assert_eq!(
+        terms(&filled),
+        (Some("C2".into()), Code::Known(v44::ExecType::Trade), Some(150.into()), 60.into(), 90.into())
+    );
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C2"), [(Status::PartiallyFilled, 60.into())]);
@@ -821,11 +827,11 @@ async fn a_crash_during_cancel_on_disconnect_still_cancels_and_tells_the_client(
         v44::OrdStatus::Canceled,
         v44::CxlRejResponseTo::OrderCancelRequest,
     );
-    too_late.cxl_rej_reason = Some(v44::CxlRejReason::TooLateToCancel);
+    too_late.cxl_rej_reason = Some(v44::CxlRejReason::TooLateToCancel.into());
     setup.venue_send(too_late.to_message());
     setup.reconnect_client().await;
     let canceled = setup.events.execution_report().await;
-    assert_eq!((canceled.cl_ord_id.as_deref(), canceled.exec_type), (Some("C1"), v44::ExecType::Canceled));
+    assert_eq!((canceled.cl_ord_id.as_deref(), canceled.exec_type), (Some("C1"), Code::Known(v44::ExecType::Canceled)));
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::Canceled, Decimal::ZERO)]);
@@ -929,9 +935,15 @@ async fn a_replace_the_venue_never_got_before_a_crash_goes_after_it() {
     setup.venue_send(replaced(&sent.cl_ord_id, &order));
     setup.venue_send(fill_of(&sent.cl_ord_id, "E-2", 110, (150, 150)));
     let replaced = setup.events.execution_report().await;
-    assert_eq!(terms(&replaced), (Some("C2".into()), v44::ExecType::Replaced, Some(150.into()), 40.into(), 110.into()));
+    assert_eq!(
+        terms(&replaced),
+        (Some("C2".into()), Code::Known(v44::ExecType::Replaced), Some(150.into()), 40.into(), 110.into())
+    );
     let filled = setup.events.execution_report().await;
-    assert_eq!(terms(&filled), (Some("C2".into()), v44::ExecType::Trade, Some(150.into()), 150.into(), 0.into()));
+    assert_eq!(
+        terms(&filled),
+        (Some("C2".into()), Code::Known(v44::ExecType::Trade), Some(150.into()), 150.into(), 0.into())
+    );
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C2"), [(Status::Filled, 150.into())]);
@@ -955,7 +967,7 @@ async fn a_request_lost_to_a_store_reset_is_not_sent_again() {
     setup.assert_quiet().await;
     setup.venue_send(acked(&sent.cl_ord_id, 100));
     let new = setup.events.execution_report().await;
-    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), Code::Known(v44::ExecType::New)));
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
 }
@@ -1006,7 +1018,7 @@ async fn a_clients_cancel_the_venue_never_got_goes_after_a_crash() {
     let canceled = setup.events.execution_report().await;
     assert_eq!(
         (canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref(), canceled.exec_type),
-        (Some("C2"), Some("C1"), v44::ExecType::Canceled)
+        (Some("C2"), Some("C1"), Code::Known(v44::ExecType::Canceled))
     );
     setup.assert_quiet().await;
     let database = setup.database().await;
@@ -1035,7 +1047,7 @@ async fn a_gateway_cancel_the_venue_never_got_goes_after_a_crash() {
     setup.venue_send(canceled(&downstream, &order, 0));
     setup.reconnect_client().await;
     let canceled = setup.events.execution_report().await;
-    assert_eq!((canceled.cl_ord_id.as_deref(), canceled.exec_type), (Some("C1"), v44::ExecType::Canceled));
+    assert_eq!((canceled.cl_ord_id.as_deref(), canceled.exec_type), (Some("C1"), Code::Known(v44::ExecType::Canceled)));
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::Canceled, Decimal::ZERO)]);
@@ -1085,7 +1097,7 @@ async fn an_orphan_handled_is_not_taken_again_at_the_next_restart() {
         }
     }
     let new = setup.events.execution_report().await;
-    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), Code::Known(v44::ExecType::New)));
     setup.database().await;
 
     setup.crash_and_restart().await;
@@ -1111,7 +1123,7 @@ async fn an_unsent_request_sent_once_is_not_sent_again_at_the_next_restart() {
     setup.assert_quiet().await;
     setup.venue_send(acked(&sent.cl_ord_id, 100));
     let new = setup.events.execution_report().await;
-    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), Code::Known(v44::ExecType::New)));
 }
 
 /// A crash in the middle of the writer's transaction, its statements run and not committed: the
@@ -1179,7 +1191,10 @@ async fn an_unsent_order_from_before_a_session_reset_is_rejected_not_sent() {
 
     setup.crash_and_restart().await;
     let rejected = setup.events.execution_report().await;
-    assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+    assert_eq!(
+        (rejected.cl_ord_id.as_deref(), rejected.exec_type.known()),
+        (Some("C1"), Some(v44::ExecType::Rejected))
+    );
     assert!(rejected.text.as_deref().is_some_and(|text| text.contains("reset")), "{rejected:?}");
     setup.assert_quiet().await;
     let database = setup.database().await;

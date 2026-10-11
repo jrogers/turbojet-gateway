@@ -6,7 +6,7 @@
 //! other than Buy, Sell or SellShort, a quantity that isn't positive, a Limit order without a
 //! price and a Market order with one.
 
-use turbojet::fields::{CompactString, Decimal, UtcTimestamp};
+use turbojet::fields::{CodeRef, CompactString, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{FixMessage, Message, MessageReject};
 use turbojet_fix44 as fix;
@@ -57,7 +57,7 @@ pub fn client_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
                 ord_status_to_fix(*status),
                 response_to,
             );
-            reject.cxl_rej_reason = Some(cxl_rej_reason_to_fix(*reason));
+            reject.cxl_rej_reason = Some(cxl_rej_reason_to_fix(*reason).into());
             reject.text = Some(text.clone());
             reject.transact_time = Some(now);
             Some(reject.to_message())
@@ -184,16 +184,17 @@ fn symbol(symbol: Option<&str>) -> Result<CompactString, MessageReject> {
     symbol.map(CompactString::from).ok_or(MessageReject::required_tag_missing(tags::SYMBOL))
 }
 
-fn side_in(side: fix::Side) -> Result<Side, MessageReject> {
-    side_from_fix(side).ok_or_else(|| unsupported(tags::SIDE, "Side", side))
+fn side_in(side: CodeRef<'_, fix::Side>) -> Result<Side, MessageReject> {
+    side.known().and_then(side_from_fix).ok_or_else(|| unsupported(tags::SIDE, "Side", side.code()))
 }
 
-fn ord_type_in(ord_type: fix::OrdType) -> Result<OrdType, MessageReject> {
-    ord_type_from_fix(ord_type).ok_or_else(|| unsupported(tags::ORD_TYPE, "OrdType", ord_type))
+fn ord_type_in(ord_type: CodeRef<'_, fix::OrdType>) -> Result<OrdType, MessageReject> {
+    ord_type.known().and_then(ord_type_from_fix).ok_or_else(|| unsupported(tags::ORD_TYPE, "OrdType", ord_type.code()))
 }
 
-fn time_in_force_in(time_in_force: fix::TimeInForce) -> Result<TimeInForce, MessageReject> {
-    time_in_force_from_fix(time_in_force).ok_or_else(|| unsupported(tags::TIME_IN_FORCE, "TimeInForce", time_in_force))
+fn time_in_force_in(time_in_force: CodeRef<'_, fix::TimeInForce>) -> Result<TimeInForce, MessageReject> {
+    let unsupported = || unsupported(tags::TIME_IN_FORCE, "TimeInForce", time_in_force.code());
+    time_in_force.known().and_then(time_in_force_from_fix).ok_or_else(unsupported)
 }
 
 fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionReport {
@@ -213,17 +214,17 @@ fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionR
     message.account.clone_from(&request.account);
     message.symbol = Some(request.symbol.clone());
     message.order_qty = Some(request.qty);
-    message.ord_type = Some(ord_type_to_fix(request.ord_type));
+    message.ord_type = Some(ord_type_to_fix(request.ord_type).into());
     message.price = request.price;
-    message.time_in_force = request.time_in_force.map(time_in_force_to_fix);
+    message.time_in_force = request.time_in_force.map(|time_in_force| time_in_force_to_fix(time_in_force).into());
     if report.last_qty > Decimal::ZERO {
         message.last_qty = Some(report.last_qty);
         message.last_px = Some(report.last_px);
     }
-    message.ord_rej_reason = report.reject.map(ord_rej_reason_to_fix);
+    message.ord_rej_reason = report.reject.map(|reject| ord_rej_reason_to_fix(reject).into());
     // A status request about no order: FIX 4.4 answers Rejected, UnknownOrder.
     if report.reject.is_none() && report.order_id.is_none() && report.status == Status::Rejected {
-        message.ord_rej_reason = Some(fix::OrdRejReason::UnknownOrder);
+        message.ord_rej_reason = Some(fix::OrdRejReason::UnknownOrder.into());
     }
     message.text.clone_from(&report.text);
     message.transact_time = Some(now);
@@ -238,7 +239,7 @@ fn new_order_single(downstream: &CompactString, request: &OrderRequest, now: Utc
     order.symbol = Some(request.symbol.clone());
     order.order_qty = Some(request.qty);
     order.price = request.price;
-    order.time_in_force = request.time_in_force.map(time_in_force_to_fix);
+    order.time_in_force = request.time_in_force.map(|time_in_force| time_in_force_to_fix(time_in_force).into());
     order
 }
 
@@ -258,7 +259,7 @@ fn replace_request(
     replace.symbol = Some(request.symbol.clone());
     replace.order_qty = Some(request.qty);
     replace.price = request.price;
-    replace.time_in_force = request.time_in_force.map(time_in_force_to_fix);
+    replace.time_in_force = request.time_in_force.map(|time_in_force| time_in_force_to_fix(time_in_force).into());
     replace
 }
 
@@ -502,6 +503,7 @@ fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> fix::CxlRejReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turbojet::fields::Code;
 
     fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
@@ -662,7 +664,7 @@ mod tests {
     #[test]
     fn a_new_order_single_becomes_a_new_order() {
         let mut order = limit_order();
-        order.time_in_force = Some(fix::TimeInForce::ImmediateOrCancel);
+        order.time_in_force = Some(fix::TimeInForce::ImmediateOrCancel.into());
         let msg = order.to_message();
         let Input::NewOrder { client, request: parsed, redelivered, .. } = client_input(&client(), &msg, true).unwrap()
         else {
@@ -682,7 +684,7 @@ mod tests {
     #[test]
     fn a_market_order_needs_no_price() {
         let mut order = limit_order();
-        order.ord_type = fix::OrdType::Market;
+        order.ord_type = fix::OrdType::Market.into();
         order.price = None;
         let Input::NewOrder { request, .. } = input(&order).unwrap() else { panic!() };
         assert_eq!((request.ord_type, request.price), (OrdType::Market, None));
@@ -712,16 +714,16 @@ mod tests {
         order.price = None;
         cases.push((order, "Conditionally required tag 44 missing"));
         let mut order = limit_order();
-        order.ord_type = fix::OrdType::Market;
+        order.ord_type = fix::OrdType::Market.into();
         cases.push((order, "Some(44)"));
         let mut order = limit_order();
-        order.ord_type = fix::OrdType::Stop;
+        order.ord_type = fix::OrdType::Stop.into();
         cases.push((order, "Some(40)"));
         let mut order = limit_order();
-        order.time_in_force = Some(fix::TimeInForce::GoodTillDate);
+        order.time_in_force = Some(fix::TimeInForce::GoodTillDate.into());
         cases.push((order, "Some(59)"));
         let mut order = limit_order();
-        order.side = fix::Side::Cross;
+        order.side = fix::Side::Cross.into();
         cases.push((order, "Some(54)"));
         let mut order = limit_order();
         order.symbol = None;
@@ -730,6 +732,13 @@ mod tests {
             let reject = input(&order).unwrap_err();
             assert_eq!(rejected_tag(&reject), expected, "{order:?}: {reject}");
         }
+    }
+
+    #[test]
+    fn a_new_order_with_a_code_outside_the_dictionary_is_rejected_like_an_unsupported_one() {
+        let mut order = limit_order();
+        order.side = Code::Unknown("Z".into());
+        assert_eq!(input(&order), Err(MessageReject::value_incorrect(tags::SIDE, "Side Z is not supported")));
     }
 
     #[test]
@@ -766,7 +775,7 @@ mod tests {
         };
         assert_eq!(input(&limit_replace()).unwrap(), expected);
         let mut replace = limit_replace();
-        replace.time_in_force = Some(fix::TimeInForce::GoodTillCancel);
+        replace.time_in_force = Some(fix::TimeInForce::GoodTillCancel.into());
         let Input::Replace { time_in_force, .. } = input(&replace).unwrap() else { panic!() };
         assert_eq!(time_in_force, Some(TimeInForce::Gtc));
     }
@@ -784,16 +793,16 @@ mod tests {
         replace.price = None;
         cases.push((replace, "Conditionally required tag 44 missing"));
         let mut replace = limit_replace();
-        replace.ord_type = fix::OrdType::Market;
+        replace.ord_type = fix::OrdType::Market.into();
         cases.push((replace, "Some(44)"));
         let mut replace = limit_replace();
-        replace.ord_type = fix::OrdType::StopLimit;
+        replace.ord_type = fix::OrdType::StopLimit.into();
         cases.push((replace, "Some(40)"));
         let mut replace = limit_replace();
-        replace.time_in_force = Some(fix::TimeInForce::AtTheClose);
+        replace.time_in_force = Some(fix::TimeInForce::AtTheClose.into());
         cases.push((replace, "Some(59)"));
         let mut replace = limit_replace();
-        replace.side = fix::Side::Undisclosed;
+        replace.side = fix::Side::Undisclosed.into();
         cases.push((replace, "Some(54)"));
         for (replace, expected) in cases {
             let reject = input(&replace).unwrap_err();
@@ -867,7 +876,11 @@ mod tests {
         assert_eq!((er.order_id.as_str(), er.exec_id.as_str()), ("7", "7.3"));
         assert_eq!(
             (er.exec_type, er.ord_status, er.side),
-            (fix::ExecType::Trade, fix::OrdStatus::PartiallyFilled, fix::Side::Sell)
+            (
+                Code::Known(fix::ExecType::Trade),
+                Code::Known(fix::OrdStatus::PartiallyFilled),
+                Code::Known(fix::Side::Sell)
+            )
         );
         assert_eq!((er.cl_ord_id.as_deref(), er.orig_cl_ord_id.as_deref()), (Some("C2"), Some("C1")));
         assert_eq!((er.last_qty, er.last_px), (Some(dec("40")), Some(dec("10.25"))));
@@ -876,7 +889,7 @@ mod tests {
         assert_eq!((er.order_qty, er.price), (Some(dec("100")), Some(dec("10.5"))));
         assert_eq!(
             (er.ord_type, er.time_in_force),
-            (Some(fix::OrdType::Limit), Some(fix::TimeInForce::GoodTillCancel))
+            (Some(Code::Known(fix::OrdType::Limit)), Some(Code::Known(fix::TimeInForce::GoodTillCancel)))
         );
         assert_eq!((er.ord_rej_reason, er.text.as_deref(), er.transact_time), (None, Some("fill"), Some(time())));
     }
@@ -899,10 +912,10 @@ mod tests {
             ..report()
         };
         let er = client_report(reject);
-        assert_eq!((er.order_id.as_str(), er.ord_status), ("NONE", fix::OrdStatus::Rejected));
+        assert_eq!((er.order_id.as_str(), er.ord_status), ("NONE", Code::Known(fix::OrdStatus::Rejected)));
         assert_eq!(
             (er.ord_rej_reason, er.text.as_deref()),
-            (Some(fix::OrdRejReason::DuplicateOrder), Some("duplicate ClOrdID"))
+            (Some(Code::Known(fix::OrdRejReason::DuplicateOrder)), Some("duplicate ClOrdID"))
         );
     }
 
@@ -918,7 +931,7 @@ mod tests {
         let er = client_report(unknown);
         assert_eq!(
             (er.exec_type, er.ord_rej_reason),
-            (fix::ExecType::OrderStatus, Some(fix::OrdRejReason::UnknownOrder))
+            (Code::Known(fix::ExecType::OrderStatus), Some(Code::Known(fix::OrdRejReason::UnknownOrder)))
         );
     }
 
@@ -942,18 +955,18 @@ mod tests {
         );
         assert_eq!(
             (reject.ord_status, reject.cxl_rej_response_to),
-            (fix::OrdStatus::PendingReplace, fix::CxlRejResponseTo::OrderCancel)
+            (Code::Known(fix::OrdStatus::PendingReplace), Code::Known(fix::CxlRejResponseTo::OrderCancel))
         );
         assert_eq!(
             (reject.cxl_rej_reason, reject.text.as_deref()),
-            (Some(fix::CxlRejReason::OrderAlreadyInPendingStatus), Some("replace pending"))
+            (Some(Code::Known(fix::CxlRejReason::OrderAlreadyInPendingStatus)), Some("replace pending"))
         );
         assert_eq!(reject.transact_time, Some(time()));
         let reject: fix::OrderCancelReject =
             client_message(&output(None, CancelKind::Cancel), time()).unwrap().parse().unwrap();
         assert_eq!(
             (reject.order_id.as_str(), reject.cxl_rej_response_to),
-            ("NONE", fix::CxlRejResponseTo::OrderCancelRequest)
+            ("NONE", Code::Known(fix::CxlRejResponseTo::OrderCancelRequest))
         );
     }
 
@@ -1076,9 +1089,9 @@ mod tests {
     fn a_venue_reject_keeps_its_reason_code_and_order_id_none() {
         let mut report = venue_fill();
         (report.order_id, report.exec_type, report.ord_status) =
-            ("NONE".into(), fix::ExecType::Rejected, fix::OrdStatus::Rejected);
+            ("NONE".into(), fix::ExecType::Rejected.into(), fix::OrdStatus::Rejected.into());
         (report.last_qty, report.last_px, report.cum_qty) = (None, None, Decimal::ZERO);
-        report.ord_rej_reason = Some(fix::OrdRejReason::UnknownSymbol);
+        report.ord_rej_reason = Some(fix::OrdRejReason::UnknownSymbol.into());
         let report = venue_report_of(&report).unwrap();
         assert_eq!((report.exec_type, report.status), (ExecType::Rejected, Some(Status::Rejected)));
         assert_eq!((report.last_qty, report.last_px), (Decimal::ZERO, Decimal::ZERO));
@@ -1095,7 +1108,7 @@ mod tests {
         ];
         for (fix_exec_type, ord_status, exec_type) in cases {
             let mut report = venue_fill();
-            (report.exec_type, report.ord_status) = (fix_exec_type, ord_status);
+            (report.exec_type, report.ord_status) = (fix_exec_type.into(), ord_status.into());
             let report = venue_report_of(&report).unwrap();
             assert_eq!((report.exec_type, report.status), (exec_type, None), "{fix_exec_type:?}");
         }
@@ -1106,7 +1119,7 @@ mod tests {
         for (cum_qty, status) in [("0", Status::New), ("40", Status::PartiallyFilled)] {
             let mut report = venue_fill();
             (report.exec_type, report.ord_status, report.cum_qty) =
-                (fix::ExecType::Replaced, fix::OrdStatus::Replaced, dec(cum_qty));
+                (fix::ExecType::Replaced.into(), fix::OrdStatus::Replaced.into(), dec(cum_qty));
             let report = venue_report_of(&report).unwrap();
             assert_eq!((report.exec_type, report.status), (ExecType::Replaced, Some(status)), "{cum_qty}");
         }
@@ -1116,7 +1129,7 @@ mod tests {
     fn trade_busts_and_corrections_are_dropped() {
         for exec_type in [fix::ExecType::TradeCancel, fix::ExecType::TradeCorrect] {
             let mut report = venue_fill();
-            report.exec_type = exec_type;
+            report.exec_type = exec_type.into();
             assert_eq!(venue_report_of(&report), None, "{exec_type:?}");
         }
     }
@@ -1138,7 +1151,7 @@ mod tests {
             fix::OrdStatus::New,
             fix::CxlRejResponseTo::OrderCancelRequest,
         );
-        reject.cxl_rej_reason = Some(fix::CxlRejReason::TooLateToCancel);
+        reject.cxl_rej_reason = Some(fix::CxlRejReason::TooLateToCancel.into());
         reject.text = Some("too late".into());
         let expected = Input::VenueCancelReject {
             venue: venue(),
@@ -1149,7 +1162,7 @@ mod tests {
             venue_order_id: Some("V-9".into()),
         };
         assert_eq!(venue_input(&venue(), &reject.to_message()).unwrap(), Some(expected));
-        reject.ord_status = fix::OrdStatus::DoneForDay;
+        reject.ord_status = fix::OrdStatus::DoneForDay.into();
         let Some(Input::VenueCancelReject { status, .. }) = venue_input(&venue(), &reject.to_message()).unwrap() else {
             panic!()
         };
@@ -1211,6 +1224,14 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_venue_report_with_an_unknown_exec_type_is_restated() {
+        let mut fill = venue_fill();
+        fill.exec_type = Code::Unknown("Z".into());
+        let report = venue_report_of(&fill).unwrap();
+        assert_eq!((report.exec_type, report.last_qty), (ExecType::Restated, dec("40")));
+    }
+
+    #[test]
     fn venue_reports_without_what_the_book_needs_are_rejected() {
         let fill = venue_fill().to_message();
         for tag in [tags::EXEC_ID, tags::ORD_STATUS, tags::EXEC_TYPE, fix::tags::CUM_QTY, fix::tags::AVG_PX] {
@@ -1236,7 +1257,7 @@ mod tests {
     fn a_replaced_ord_status_with_nothing_left_is_filled() {
         let mut report = venue_fill();
         (report.exec_type, report.ord_status, report.cum_qty, report.leaves_qty) =
-            (fix::ExecType::Replaced, fix::OrdStatus::Replaced, dec("80"), Decimal::ZERO);
+            (fix::ExecType::Replaced.into(), fix::OrdStatus::Replaced.into(), dec("80"), Decimal::ZERO);
         assert_eq!(venue_report_of(&report).unwrap().status, Some(Status::Filled));
     }
 
@@ -1283,14 +1304,17 @@ mod tests {
     fn a_new_order_goes_to_the_venue_under_its_downstream_cl_ord_id() {
         let [output, ..] = venue_outputs();
         let order: fix::NewOrderSingle = venue_message(&output, time()).unwrap().parse().unwrap();
-        assert_eq!((order.cl_ord_id.as_str(), order.side, order.transact_time), ("7", fix::Side::Sell, time()));
+        assert_eq!(
+            (order.cl_ord_id.as_str(), order.side, order.transact_time),
+            ("7", Code::Known(fix::Side::Sell), time())
+        );
         assert_eq!((order.symbol.as_deref(), order.account.as_deref()), (Some("AAPL"), Some("ACC")));
         assert_eq!(order.ex_destination.as_deref(), Some("XNAS"));
         assert_eq!(
             (order.ord_type, order.order_qty, order.price),
-            (fix::OrdType::Limit, Some(dec("100")), Some(dec("10.5")))
+            (Code::Known(fix::OrdType::Limit), Some(dec("100")), Some(dec("10.5")))
         );
-        assert_eq!(order.time_in_force, Some(fix::TimeInForce::GoodTillCancel));
+        assert_eq!(order.time_in_force, Some(Code::Known(fix::TimeInForce::GoodTillCancel)));
     }
 
     #[test]
@@ -1300,7 +1324,7 @@ mod tests {
         assert_eq!((cancel.cl_ord_id.as_str(), cancel.orig_cl_ord_id.as_str()), ("7-2", "7-1"));
         assert_eq!(
             (cancel.order_id.as_deref(), cancel.side, cancel.transact_time),
-            (Some("V-9"), fix::Side::Sell, time())
+            (Some("V-9"), Code::Known(fix::Side::Sell), time())
         );
         assert_eq!((cancel.symbol.as_deref(), cancel.order_qty), (Some("AAPL"), Some(dec("100"))));
         let Output::Cancel { venue_order_id, .. } = &mut output else { unreachable!() };
@@ -1317,10 +1341,10 @@ mod tests {
         assert_eq!((replace.order_id.as_deref(), replace.transact_time), (Some("V-9"), time()));
         assert_eq!(
             (replace.ord_type, replace.order_qty, replace.price),
-            (fix::OrdType::Limit, Some(dec("100")), Some(dec("10.5")))
+            (Code::Known(fix::OrdType::Limit), Some(dec("100")), Some(dec("10.5")))
         );
-        assert_eq!((replace.symbol.as_deref(), replace.side), (Some("AAPL"), fix::Side::Sell));
-        assert_eq!(replace.time_in_force, Some(fix::TimeInForce::GoodTillCancel));
+        assert_eq!((replace.symbol.as_deref(), replace.side), (Some("AAPL"), Code::Known(fix::Side::Sell)));
+        assert_eq!(replace.time_in_force, Some(Code::Known(fix::TimeInForce::GoodTillCancel)));
     }
 
     #[test]

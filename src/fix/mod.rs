@@ -125,9 +125,9 @@ fn check_price(ord_type: OrdType, price: Option<Decimal>) -> Result<(), MessageR
     }
 }
 
-/// The reject for an enumerated value the book doesn't model.
-fn unsupported(tag: u32, name: &str, value: impl FixEnum + std::fmt::Debug) -> MessageReject {
-    MessageReject::value_incorrect(tag, format!("{name} {value:?} ({}) is not supported", value.code()))
+/// The reject for an enumerated value the book doesn't model, or a code the dictionary doesn't list.
+fn unsupported(tag: u32, name: &str, code: &str) -> MessageReject {
+    MessageReject::value_incorrect(tag, format!("{name} {code} is not supported"))
 }
 
 fn required(msg: &Message, tag: u32) -> Result<&str, MessageReject> {
@@ -170,6 +170,7 @@ mod tests {
     use crate::book::Book;
     use crate::router::{Router, Rule, Target};
     use turbojet::FixMessage;
+    use turbojet::fields::Code;
     use {turbojet_fix42 as v42, turbojet_fix44 as v44};
 
     #[test]
@@ -243,7 +244,10 @@ mod tests {
             let input = venue.venue_input(&"NASDAQ".into(), &fill.to_message()).unwrap().unwrap();
             let [output] = run(&mut book, input).try_into().unwrap();
             let er: v42::ExecutionReport = client.client_message(&output, time()).unwrap().parse().unwrap();
-            assert_eq!((er.exec_trans_type, er.exec_type), (v42::ExecTransType::New, exec_type));
+            assert_eq!(
+                (er.exec_trans_type, er.exec_type),
+                (Code::Known(v42::ExecTransType::New), Code::Known(exec_type))
+            );
             assert_eq!((er.cl_ord_id.as_deref(), er.order_id.as_str()), (Some("C1"), "1"));
             assert_eq!((er.last_shares, er.cum_qty, er.leaves_qty), (Some(last_qty), cum_qty, leaves_qty));
         }
@@ -278,7 +282,7 @@ mod tests {
             let input = venue.venue_input(&"NASDAQ".into(), &fill.to_message()).unwrap().unwrap();
             let [output] = run(&mut book, input).try_into().unwrap();
             let er: v44::ExecutionReport = client.client_message(&output, time()).unwrap().parse().unwrap();
-            assert_eq!((er.exec_type, er.ord_status), (v44::ExecType::Trade, client_status));
+            assert_eq!((er.exec_type, er.ord_status), (Code::Known(v44::ExecType::Trade), Code::Known(client_status)));
             assert_eq!((er.cl_ord_id.as_deref(), er.order_id.as_str()), (Some("C1"), "1"));
             assert_eq!((er.last_qty, er.cum_qty, er.leaves_qty), (Some(last_qty), cum_qty, leaves_qty));
         }

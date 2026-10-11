@@ -821,7 +821,7 @@ pub(crate) mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
     use tokio::time::timeout;
-    use turbojet::fields::Decimal;
+    use turbojet::fields::{Code, Decimal};
     use turbojet::message::tags;
     use turbojet::store::{Commit, SentMessages, SessionLog};
     use turbojet::{
@@ -959,7 +959,14 @@ pub(crate) mod tests {
                     let (last_qty, px) = (Decimal::from(last_qty), Decimal::from(10));
                     let (exec_id, leaves_qty) = (format!("X{last_qty}"), qty - last_qty);
                     let mut report = v44::ExecutionReport::new(
-                        "V-1", exec_id, exec_type, status, order.side, leaves_qty, last_qty, px,
+                        "V-1",
+                        exec_id,
+                        exec_type,
+                        status,
+                        order.side.clone(),
+                        leaves_qty,
+                        last_qty,
+                        px,
                     );
                     report.cl_ord_id = Some(order.cl_ord_id.clone());
                     (report.last_qty, report.last_px) = (Some(last_qty), Some(px));
@@ -1065,10 +1072,10 @@ pub(crate) mod tests {
         let new = report(&mut client_events).await;
         assert_eq!(
             (new.cl_ord_id.as_deref(), new.exec_type, new.ord_status),
-            (Some("C1"), v44::ExecType::New, v44::OrdStatus::New)
+            (Some("C1"), Code::Known(v44::ExecType::New), Code::Known(v44::OrdStatus::New))
         );
         let fill = report(&mut client_events).await;
-        assert_eq!((fill.cl_ord_id.as_deref(), fill.exec_type), (Some("C1"), v44::ExecType::Trade));
+        assert_eq!((fill.cl_ord_id.as_deref(), fill.exec_type), (Some("C1"), Code::Known(v44::ExecType::Trade)));
         assert_eq!((fill.last_qty, fill.cum_qty, fill.leaves_qty), (Some(100.into()), 100.into(), 0.into()));
     }
 
@@ -1082,7 +1089,10 @@ pub(crate) mod tests {
 
         client.handle().send(order("C1")).unwrap();
         let rejected = report(&mut events).await;
-        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        assert_eq!(
+            (rejected.cl_ord_id.as_deref(), rejected.exec_type),
+            (Some("C1"), Code::Known(v44::ExecType::Rejected))
+        );
         assert_eq!(rejected.text.as_deref(), Some(VENUE_UNAVAILABLE));
     }
 
@@ -1154,7 +1164,10 @@ pub(crate) mod tests {
         }
         answers.sort_by_key(|msg| msg.msg_type().code().to_owned());
         let rejected: v44::ExecutionReport = answers[0].parse().unwrap();
-        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        assert_eq!(
+            (rejected.cl_ord_id.as_deref(), rejected.exec_type),
+            (Some("C1"), Code::Known(v44::ExecType::Rejected))
+        );
         assert!(rejected.text.as_deref().unwrap().starts_with(VENUE_UNAVAILABLE), "{:?}", rejected.text);
         let refused: v44::OrderCancelReject = answers[1].parse().unwrap();
         assert_eq!((refused.cl_ord_id.as_str(), refused.orig_cl_ord_id.as_str()), ("C2", "C1"));
@@ -1589,14 +1602,14 @@ pub(crate) mod tests {
         let resent = report(&mut client_events).await;
         assert_eq!(
             (resent.cl_ord_id.as_deref(), resent.exec_type, resent.ord_status),
-            (Some("C1"), v44::ExecType::OrderStatus, v44::OrdStatus::PendingNew)
+            (Some("C1"), Code::Known(v44::ExecType::OrderStatus), Code::Known(v44::OrdStatus::PendingNew))
         );
 
         gate.send_replace(true);
         let sent: v44::NewOrderSingle = next_message(&mut venue_events).await.parse().unwrap();
         assert_eq!(sent.cl_ord_id, "1");
         let new = report(&mut client_events).await;
-        assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+        assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), Code::Known(v44::ExecType::New)));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let again = std::iter::from_fn(|| venue_events.try_recv().ok())
             .filter(|event| matches!(event, Event::Message(msg) if msg.msg_type() == MsgType::NewOrderSingle))
@@ -1830,7 +1843,10 @@ pub(crate) mod tests {
         let [msg] = undelivered(&store).await.try_into().unwrap();
         assert_eq!(msg.get(tags::BEGIN_STRING), Some("FIX.4.4"));
         let rejected: v44::ExecutionReport = msg.parse().unwrap();
-        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        assert_eq!(
+            (rejected.cl_ord_id.as_deref(), rejected.exec_type),
+            (Some("C1"), Code::Known(v44::ExecType::Rejected))
+        );
 
         let (_client, mut events) = client(&gateway).await;
         assert_eq!(report(&mut events).await.cl_ord_id.as_deref(), Some("C1"));
@@ -1894,7 +1910,10 @@ pub(crate) mod tests {
         store.hooks.gate.send_replace(false);
         release.send(()).unwrap();
         let rejected = report(&mut events).await;
-        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        assert_eq!(
+            (rejected.cl_ord_id.as_deref(), rejected.exec_type),
+            (Some("C1"), Code::Known(v44::ExecType::Rejected))
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(log.in_flight(), Some(2), "released before the reject committed");
         store.hooks.gate.send_replace(true);
@@ -2105,7 +2124,10 @@ pub(crate) mod tests {
         let resent = next_message(&mut events).await;
         assert_eq!(resent.get(tags::POSS_RESEND), Some("Y"));
         let rejected: v44::ExecutionReport = resent.parse().unwrap();
-        assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+        assert_eq!(
+            (rejected.cl_ord_id.as_deref(), rejected.exec_type),
+            (Some("C1"), Code::Known(v44::ExecType::Rejected))
+        );
         delivered(&after).await;
         assert!(store.load().await.unwrap().undelivered.is_empty());
         assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err(), "sent twice");
@@ -2188,7 +2210,7 @@ pub(crate) mod tests {
             next_of_type(&mut events, MsgType::OrderCancelRequest).await.parse().unwrap();
         assert_eq!((cancel.orig_cl_ord_id.as_str(), cancel.cl_ord_id.as_str()), ("OLDOLD1", "NEWNEWC1"));
         assert_eq!((cancel.account.as_deref(), cancel.symbol.as_deref()), (Some("ACC"), Some("AAPL")));
-        assert_eq!((cancel.side, cancel.order_qty), (v44::Side::Buy, Some(100.into())));
+        assert_eq!((cancel.side, cancel.order_qty), (Code::Known(v44::Side::Buy), Some(100.into())));
         assert!(gateway.lock().orphan_cancels.is_empty());
         assert!(
             timeout(Duration::from_millis(100), next_of_type(&mut events, MsgType::OrderCancelRequest)).await.is_err()

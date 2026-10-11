@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
-use turbojet::fields::{Decimal, UtcTimestamp};
+use turbojet::fields::{Code, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{
     Acceptor, Application, Context, Disconnect, FixMessage, Initiator, InitiatorConfig, MemoryStorage, Message,
@@ -311,7 +311,7 @@ impl Setup {
     fn c1(&self, exec_id: &str, exec_type: v44::ExecType, last_qty: Option<i64>, cum_qty: i64) -> Seen {
         let last_qty = last_qty.map(Decimal::from);
         let (cum, leaves) = (cum_qty.into(), (100 - cum_qty).into());
-        (Some("C1".into()), self.id("1"), self.id(exec_id), exec_type, last_qty, cum, leaves)
+        (Some("C1".into()), self.id("1"), self.id(exec_id), exec_type.into(), last_qty, cum, leaves)
     }
 
     fn send(&self, msg: Message) {
@@ -387,17 +387,20 @@ fn fill(cl_ord_id: &str, exec_id: &str, last_qty: i64, cum_qty: i64) -> Message 
 }
 
 /// Of a client's report: ClOrdID, OrderID, ExecID, ExecType, LastQty, CumQty and LeavesQty.
-type Seen = (Option<String>, String, String, v44::ExecType, Option<Decimal>, Decimal, Decimal);
+type Seen = (Option<String>, String, String, Code<v44::ExecType>, Option<Decimal>, Decimal, Decimal);
 
 fn seen(report: &v44::ExecutionReport) -> Seen {
     let cl_ord_id = report.cl_ord_id.as_deref().map(str::to_owned);
     let (order_id, exec_id) = (report.order_id.to_string(), report.exec_id.to_string());
-    (cl_ord_id, order_id, exec_id, report.exec_type, report.last_qty, report.cum_qty, report.leaves_qty)
+    (cl_ord_id, order_id, exec_id, report.exec_type.clone(), report.last_qty, report.cum_qty, report.leaves_qty)
 }
 
 /// A Rejected report for `cl_ord_id` the book made without booking an order.
 fn assert_unbooked_reject(rejected: &v44::ExecutionReport, cl_ord_id: &str, exec_id: &str) {
-    assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some(cl_ord_id), v44::ExecType::Rejected));
+    assert_eq!(
+        (rejected.cl_ord_id.as_deref(), rejected.exec_type.known()),
+        (Some(cl_ord_id), Some(v44::ExecType::Rejected))
+    );
     assert_eq!((rejected.order_id.as_str(), rejected.exec_id.as_str()), ("NONE", exec_id));
     assert_eq!(rejected.ord_status, v44::OrdStatus::Rejected);
 }
@@ -418,7 +421,7 @@ async fn an_order_goes_to_the_venue_and_its_ack_and_fills_come_back() {
     assert_eq!(new.ord_status, v44::OrdStatus::New);
     let partial: v44::ExecutionReport = setup.events.parse().await;
     assert_eq!(seen(&partial), setup.c1("1.2", v44::ExecType::Trade, Some(40), 40));
-    assert_eq!((partial.ord_status, partial.last_px), (v44::OrdStatus::PartiallyFilled, Some(10.into())));
+    assert_eq!((partial.ord_status, partial.last_px), (Code::Known(v44::OrdStatus::PartiallyFilled), Some(10.into())));
     let filled: v44::ExecutionReport = setup.events.parse().await;
     assert_eq!(seen(&filled), setup.c1("1.3", v44::ExecType::Trade, Some(60), 100));
     assert_eq!(filled.ord_status, v44::OrdStatus::Filled);
@@ -437,7 +440,10 @@ async fn a_cancel_goes_to_the_venue_and_its_canceled_comes_back() {
     setup.venue.send(canceled.to_message());
 
     let canceled: v44::ExecutionReport = setup.events.parse().await;
-    assert_eq!((canceled.exec_type, canceled.ord_status), (v44::ExecType::Canceled, v44::OrdStatus::Canceled));
+    assert_eq!(
+        (canceled.exec_type, canceled.ord_status),
+        (Code::Known(v44::ExecType::Canceled), Code::Known(v44::OrdStatus::Canceled))
+    );
     assert_eq!((canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref()), (Some("C2"), Some("C1")));
     assert_eq!((canceled.order_id.as_str(), canceled.exec_id.as_str()), (&*setup.id("1"), &*setup.id("1.2")));
     assert_eq!((canceled.cum_qty, canceled.leaves_qty), (0.into(), 0.into()));
@@ -485,7 +491,7 @@ async fn an_order_for_a_venue_that_went_down_is_rejected() {
 
     setup.send(order("C1", "AAPL"));
     let rejected: v44::ExecutionReport = setup.events.parse().await;
-    assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+    assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), Code::Known(v44::ExecType::Rejected)));
     assert_eq!((rejected.order_id.as_str(), rejected.exec_id.as_str()), (&*setup.id("1"), &*setup.id("1.1")));
     assert_eq!(rejected.ord_status, v44::OrdStatus::Rejected);
     assert_eq!(rejected.text.as_deref(), Some("venue unavailable"));
@@ -499,7 +505,7 @@ async fn a_duplicate_clordid_is_rejected() {
     setup.send(order("C1", "AAPL"));
     let rejected: v44::ExecutionReport = setup.events.parse().await;
     assert_unbooked_reject(&rejected, "C1", &setup.id("R1"));
-    assert_eq!(rejected.ord_rej_reason, Some(v44::OrdRejReason::DuplicateOrder));
+    assert_eq!(rejected.ord_rej_reason, Some(Code::Known(v44::OrdRejReason::DuplicateOrder)));
     assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("2"));
 }
 
@@ -527,10 +533,16 @@ async fn a_fix42_client_trades_on_a_fix44_venue() {
         (new.cl_ord_id.as_deref(), new.order_id.as_str(), new.exec_id.as_str()),
         (Some("C1"), &*setup.id("1"), &*setup.id("1.1"))
     );
-    assert_eq!((new.exec_trans_type, new.exec_type), (v42::ExecTransType::New, v42::ExecType::New));
+    assert_eq!(
+        (new.exec_trans_type, new.exec_type),
+        (Code::Known(v42::ExecTransType::New), Code::Known(v42::ExecType::New))
+    );
     let filled: v42::ExecutionReport = setup.events.parse().await;
-    assert_eq!((filled.exec_trans_type, filled.exec_type), (v42::ExecTransType::New, v42::ExecType::Fill));
-    assert_eq!((filled.ord_status, filled.exec_id.as_str()), (v42::OrdStatus::Filled, &*setup.id("1.2")));
+    assert_eq!(
+        (filled.exec_trans_type, filled.exec_type),
+        (Code::Known(v42::ExecTransType::New), Code::Known(v42::ExecType::Fill))
+    );
+    assert_eq!((filled.ord_status, filled.exec_id.as_str()), (Code::Known(v42::OrdStatus::Filled), &*setup.id("1.2")));
     assert_eq!((filled.last_shares, filled.cum_qty, filled.leaves_qty), (Some(100.into()), 100.into(), 0.into()));
 }
 
@@ -581,7 +593,7 @@ async fn a_venues_cancel_reject_reaches_the_client() {
 
     let refused: v44::OrderCancelReject = setup.events.parse().await;
     assert_eq!((refused.cl_ord_id.as_str(), refused.orig_cl_ord_id.as_str()), ("C2", "C1"));
-    assert_eq!((refused.order_id.as_str(), refused.ord_status), (&*setup.id("1"), v44::OrdStatus::New));
+    assert_eq!((refused.order_id.as_str(), refused.ord_status), (&*setup.id("1"), Code::Known(v44::OrdStatus::New)));
     assert_eq!(refused.cxl_rej_response_to, v44::CxlRejResponseTo::OrderCancelRequest);
 }
 
@@ -648,7 +660,7 @@ async fn venue_resends_after_a_reconnect_reach_the_client_once() {
     assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("2"));
     setup.venue.send(acked(&setup.id("2")));
     let new: v44::ExecutionReport = setup.events.parse().await;
-    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C2"), v44::ExecType::New));
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C2"), Code::Known(v44::ExecType::New)));
 }
 
 /// Two sessions of one CompID, told apart by SubID, are two clients: each may use the same
@@ -680,7 +692,7 @@ async fn sessions_of_one_comp_id_each_get_their_own_reports() {
     }
     setup.venue.send(fill(&setup.id("2"), "E-1", 100, 100));
     let filled: v44::ExecutionReport = desks[1].1.parse().await;
-    assert_eq!((filled.order_id.as_str(), filled.exec_type), (&*setup.id("2"), v44::ExecType::Trade));
+    assert_eq!((filled.order_id.as_str(), filled.exec_type), (&*setup.id("2"), Code::Known(v44::ExecType::Trade)));
     let gateway = setup.service.gateway().clone();
     until(|| gateway.unfinished().undelivered.is_empty()).await;
     assert!(desks[0].1.0.try_recv().is_err() && setup.events.0.try_recv().is_err());
@@ -720,7 +732,10 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
     for cl_ord_id in ["C1", "C2"] {
         let canceled: v44::ExecutionReport = setup.events.parse().await;
         assert_eq!((canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref()), (Some(cl_ord_id), None));
-        assert_eq!((canceled.exec_type, canceled.ord_status), (v44::ExecType::Canceled, v44::OrdStatus::Canceled));
+        assert_eq!(
+            (canceled.exec_type, canceled.ord_status),
+            (Code::Known(v44::ExecType::Canceled), Code::Known(v44::OrdStatus::Canceled))
+        );
     }
     assert!(gateway.cancelling().is_empty());
 
@@ -728,7 +743,7 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
     let rejected: v44::ExecutionReport = setup.events.parse().await;
     assert_unbooked_reject(&rejected, "C3", &setup.id("R1"));
     assert_eq!(rejected.text.as_deref(), Some("blocked by an operator"));
-    assert_eq!(rejected.ord_rej_reason, Some(v44::OrdRejReason::Other));
+    assert_eq!(rejected.ord_rej_reason, Some(Code::Known(v44::OrdRejReason::Other)));
     assert!(gateway.unblock(session).await);
     assert_eq!(setup.order("C4").await.cl_ord_id, &*setup.id("3"));
 }
@@ -779,7 +794,10 @@ async fn a_client_that_drops_has_its_orders_cancelled_after_the_grace() {
     setup.events.logged_on().await;
     let canceled: v44::ExecutionReport = setup.events.parse().await;
     assert_eq!((canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref()), (Some("C1"), None));
-    assert_eq!((canceled.exec_type, canceled.ord_status), (v44::ExecType::Canceled, v44::OrdStatus::Canceled));
+    assert_eq!(
+        (canceled.exec_type, canceled.ord_status),
+        (Code::Known(v44::ExecType::Canceled), Code::Known(v44::OrdStatus::Canceled))
+    );
     assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("2"));
 }
 
@@ -940,12 +958,14 @@ async fn burst(setup: &mut Setup) {
         let id = reports[0].order_id.to_string();
         let got: Vec<_> = reports
             .iter()
-            .map(|r| (r.order_id.to_string(), r.exec_id.to_string(), r.exec_type, r.cum_qty, r.leaves_qty))
+            .map(|r| (r.order_id.to_string(), r.exec_id.to_string(), r.exec_type.clone(), r.cum_qty, r.leaves_qty))
             .collect();
         let expected: Vec<_> =
             [(1, v44::ExecType::New, 0), (2, v44::ExecType::Trade, 40), (3, v44::ExecType::Trade, 100)]
                 .into_iter()
-                .map(|(n, exec_type, cum)| (id.clone(), format!("{id}.{n}"), exec_type, cum.into(), (100 - cum).into()))
+                .map(|(n, exec_type, cum)| {
+                    (id.clone(), format!("{id}.{n}"), Code::Known(exec_type), cum.into(), (100 - cum).into())
+                })
                 .collect();
         assert_eq!(got, expected);
         assert!(order_ids.insert(id));
@@ -975,7 +995,7 @@ async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
     let rejected: v44::ExecutionReport = setup.events.parse().await;
     assert_unbooked_reject(&rejected, "C1", &setup.id("R1"));
     assert_eq!(rejected.text.as_deref(), Some("quantity over the limit (risk max_order_qty)"));
-    assert_eq!(rejected.ord_rej_reason, Some(v44::OrdRejReason::OrderExceedsLimit));
+    assert_eq!(rejected.ord_rej_reason, Some(Code::Known(v44::OrdRejReason::OrderExceedsLimit)));
     std::fs::write(setup.dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT)).unwrap();
     setup.service.reload();
     assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("1"));
