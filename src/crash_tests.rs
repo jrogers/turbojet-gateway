@@ -180,9 +180,14 @@ struct Gateway {
 }
 
 impl Gateway {
-    /// Starts Jetbridge from `dir`'s files, its venue's and client's sessions in gated disk
-    /// stores, open while `venue` and `client` are.
-    fn start(dir: &Path, venue: watch::Receiver<bool>, client: watch::Receiver<bool>) -> Self {
+    /// Starts Jetbridge from `dir`'s files, serving clients on `listener`, its venue's and
+    /// client's sessions in gated disk stores, open while `venue` and `client` are.
+    fn start(
+        dir: &Path,
+        listener: std::net::TcpListener,
+        venue: watch::Receiver<bool>,
+        client: watch::Receiver<bool>,
+    ) -> Self {
         let path = dir.join("jetbridge.toml");
         let stores = vec![
             ("venue".to_string(), gated_disk(&dir.join("venue-store"), venue)),
@@ -192,7 +197,7 @@ impl Gateway {
         let (stop, stopped) = oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            let (service, serving) = runtime.block_on(Service::start_with_stores(&path, stores)).unwrap();
+            let (service, serving) = runtime.block_on(Service::start_with(&path, stores, Some(listener))).unwrap();
             let service = Arc::new(service);
             started.send((service.clone(), runtime.handle().clone())).unwrap();
             let _ = runtime.block_on(stopped);
@@ -238,6 +243,8 @@ impl Gateway {
 /// The client, the venue and the gateway between them, logged on.
 struct Setup {
     dir: tempfile::TempDir,
+    /// The clients' listener, a copy given to each start.
+    listener: std::net::TcpListener,
     gateway: Option<Gateway>,
     /// Shut, the venue's session at the gateway stores nothing.
     venue_gate: watch::Sender<bool>,
@@ -269,11 +276,14 @@ impl Setup {
         let (app, mut venue_events) = recorder();
         let venue = Acceptor::new(SessionConfig::new("FIX.4.4", VENUE), Arc::new(MemoryStorage::new()), app).unwrap();
         tokio::spawn(venue.clone().serve(listener));
-        let port = gateway_port();
+        // Kept open across starts, so the port stays the gateway's while it's down: a client
+        // connecting then waits in the backlog for the next start, as under socket activation.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         write_config(dir.path(), port, venue_port, (cancel, database));
         let (venue_gate, venue_open) = watch::channel(true);
         let (client_gate, client_open) = watch::channel(true);
-        let gateway = Gateway::start(dir.path(), venue_open, client_open);
+        let gateway = Gateway::start(dir.path(), listener.try_clone().unwrap(), venue_open, client_open);
         venue_events.logged_on().await;
 
         let (app, mut events) = recorder();
@@ -284,7 +294,7 @@ impl Setup {
         events.logged_on().await;
         let prefixes = vec![gateway.service.gateway().id_prefix().to_string()];
         let gateway = Some(gateway);
-        Self { dir, gateway, venue_gate, client_gate, venue, venue_events, client, running, events, prefixes }
+        Self { dir, listener, gateway, venue_gate, client_gate, venue, venue_events, client, running, events, prefixes }
     }
 
     fn gateway(&self) -> &Gateway {
@@ -363,7 +373,7 @@ impl Setup {
         let (venue_gate, venue_open) = watch::channel(true);
         let (client_gate, client_open) = watch::channel(true);
         (self.venue_gate, self.client_gate) = (venue_gate, client_gate);
-        let gateway = Gateway::start(self.dir.path(), venue_open, client_open);
+        let gateway = Gateway::start(self.dir.path(), self.listener.try_clone().unwrap(), venue_open, client_open);
         self.prefixes.push(gateway.service.gateway().id_prefix().to_string());
         self.gateway = Some(gateway);
         self.venue_events.logged_on().await;
@@ -430,18 +440,6 @@ fn gated_disk(dir: &Path, open: watch::Receiver<bool>) -> Arc<dyn SessionStorage
 
 fn database_url(dir: &Path) -> String {
     format!("sqlite://{}?mode=rwc", dir.join("jetbridge.db").display())
-}
-
-/// A port for the gateway to listen on at every start, free now: outside the ephemeral ranges
-/// (Linux's from 32768, macOS's from 49152), so no connection's local port takes it while the
-/// gateway is down, and picked at random, so tests running at once don't pick the same.
-fn gateway_port() -> u16 {
-    use std::hash::{BuildHasher, RandomState};
-    let start = RandomState::new().hash_one(std::thread::current().id());
-    (0..1_000)
-        .map(|n| 20_000 + u16::try_from((start + n) % 12_000).expect("below 12000"))
-        .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
-        .expect("a free port")
 }
 
 /// Jetbridge's files: clients on `port`, the venue at `venue_port`, both sessions on disk, the

@@ -70,14 +70,17 @@ impl Service {
     /// be bound, a venue speaks a FIX version the gateway doesn't convert, or TLS or a venue can't
     /// be set up.
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
-        Self::start_with_stores(path, Vec::new()).await
+        Self::start_with(path, Vec::new(), None).await
     }
 
     /// As [`start`](Self::start), the sessions file also naming `stores` (see
-    /// [`config::load_with_stores`]).
-    pub(crate) async fn start_with_stores(
+    /// [`config::load_with_stores`]), and serving clients on `listener` if given, rather than
+    /// binding the file's address: a listener kept open across starts, as socket activation keeps
+    /// one, holds its port while the gateway is down.
+    pub(crate) async fn start_with(
         path: &Path,
         stores: Vec<(String, Arc<dyn turbojet::SessionStorage>)>,
+        listener: Option<std::net::TcpListener>,
     ) -> Result<(Self, Serving), Error> {
         let loaded = config::load_with_stores(path, stores)?;
         // First, so a database that won't open stops nothing half-started.
@@ -114,11 +117,8 @@ impl Service {
                 .await
                 .map_err(|e| Error::new(format!("cannot look for orphaned venue requests: {e}")))?;
         }
-        let listen = sessions.listen().expect("load checked the file has [acceptor]");
         // Bound before the venues start, so a port in use stops nothing half-started.
-        let listener =
-            TcpListener::bind(&listen).await.map_err(|e| Error::new(format!("cannot bind {listen}: {e}")))?;
-        let local_addr = listener.local_addr().map_err(|e| Error::new(format!("{listen}: {e}")))?;
+        let (listener, local_addr) = listen(&sessions, listener).await?;
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
@@ -294,6 +294,23 @@ impl Service {
     fn serve(&self, listener: TcpListener) -> Result<Serving, Error> {
         Ok(tokio::spawn(self.acceptor.clone().serve(listener)))
     }
+}
+
+/// The clients' listener: `given`, or one bound to the sessions file's address.
+async fn listen(
+    sessions: &SessionsFile,
+    given: Option<std::net::TcpListener>,
+) -> Result<(TcpListener, SocketAddr), Error> {
+    let listen = sessions.listen().expect("load checked the file has [acceptor]");
+    let listener = match given {
+        Some(listener) => listener
+            .set_nonblocking(true)
+            .and_then(|()| TcpListener::from_std(listener))
+            .map_err(|e| Error::new(format!("cannot listen on the listener given: {e}")))?,
+        None => TcpListener::bind(&listen).await.map_err(|e| Error::new(format!("cannot bind {listen}: {e}")))?,
+    };
+    let local_addr = listener.local_addr().map_err(|e| Error::new(format!("{listen}: {e}")))?;
+    Ok((listener, local_addr))
 }
 
 /// The start of the next second: the time a start takes its ID prefix from (see
