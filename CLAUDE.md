@@ -2,7 +2,7 @@
 
 Jetbridge is a FIX connectivity gateway built on the Turbojet engine (`../turbojet`, by path).
 
-- House style is Turbojet's [STYLE.md](../turbojet/STYLE.md); read it before writing code.
+- House style is Turbojet's [STYLE.md](../turbojet/docs/STYLE.md); read it before writing code.
 - Plans and working notes go in `docs/plans/` (gitignored).
 - Feature branches are git worktrees under `.worktrees/` (gitignored).
 - Commits are small and each says why.
