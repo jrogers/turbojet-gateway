@@ -1,44 +1,119 @@
 # Known caveats
 
 Behaviour that is deliberate or documented, but worth knowing about before you rely on Jetbridge.
-Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/main/CAVEATS.md).
+Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/main/docs/CAVEATS.md).
+What's still open is in [ROADMAP.md](ROADMAP.md).
 
-## Kept in memory
+## The book
 
-- The book (orders, the ClOrdIDs each client has used, what was sent to each venue) and the
-  reports held for clients live in memory. A stop loses them; shutting down logs how many open
-  orders and undelivered reports it leaves. Open orders stay working at their venues.
-- After a restart, numbering starts again at 1, but every ID the gateway issues (OrderIDs,
-  ExecIDs and the ClOrdIDs sent to venues) starts with a prefix from the start time: six base-36
-  digits of the seconds since 2026, such as `0EI800` in `0EI8001-1`. A late report from a venue
-  on an order from before the restart names an unknown order and is dropped with a warning. Two
-  starts within the same second share a prefix, and so repeat IDs. The prefix takes six of a
-  venue's ClOrdID length limit.
-- A client's request is committed by its session before the report answering it is stored by
-  the client's session: a stop in between loses the report.
-- A client's order, cancel or replace counts as received by its session only once the venue's
-  session has stored what it was forwarded as. A stop after the venue's session stored it but
-  before the client's session recorded that has the client resend it, and with the book gone, a
-  new order goes to the venue again under a new ClOrdID: the venue can get it twice. (A resent
-  cancel or replace names an order the empty book doesn't know, and is rejected.)
-- A client that reconnects while its venue is still storing a request has the resent request
-  answered from the book, and counted as received at once: a stop before the venue stores it
-  loses it. A venue store that fails releases the request too, stored or not.
+- Every ID the gateway issues (OrderIDs, ExecIDs and the ClOrdIDs sent to venues) starts with a
+  prefix from the start time: six base-36 digits of the seconds since 2026, such as `0EI800` in
+  `0EI8001-1`. Each start waits for the next second before taking its prefix, so a start takes up
+  to a second longer, and two starts don't share one unless the clock goes back; a start that
+  finds a venue holding a request under its own prefix stops, saying so. The prefix takes six of
+  a venue's ClOrdID length limit.
 - A venue session that's slow to store, or stuck, holds back the clients whose requests it hasn't
   stored: 256 messages past the oldest one waiting, a client's session stops reading from it until
-  the venue's session catches up, its requests for other venues and its cancels included. Turbojet logs a warning when that happens. Its
-  `turbojet_held_back` gauge needs Turbojet's `metrics` feature, which Jetbridge isn't built with.
-- Operators' blocks (see the README's kill switch) are kept in memory: a restart lifts them.
-- So is what the risk limits count: a restart forgets each session's open and filled notional and
-  every symbol's last fill price. Credit counts fills since the later of the trading day's start
-  and the gateway's, and orders left working at the venues across a restart count for nothing.
+  the venue's session catches up, its requests for other venues and its cancels included.
+  Turbojet logs a warning when that happens. Its `turbojet_held_back` gauge needs Turbojet's
+  `metrics` feature, which Jetbridge isn't built with. A database that's slow or down holds
+  sessions back the same way (see below).
 - A gateway cancel (the kill switch's) that a venue's session can't queue is tried again once a
   second while the session is connected, without limit.
 - At the end of a session's trading day its done orders, their ClOrdIDs and requests sent, and
-  its filled notional are dropped (see the README's trading day). Live orders carry over, GTC
-  ones for as long as they work, and so do last fill prices, one per symbol traded. The bound of
-  1,000,000 ClOrdIDs per client (plus 10,000 for cancels and replaces once it's reached) counts
-  per day, from the ClOrdIDs of the live orders carried over.
+  its filled notional are dropped from memory (see the README's trading day); with a database
+  they stay in it as history. Live orders carry over, GTC ones for as long as they work, and so
+  do last fill prices, one per symbol traded. The bound of 1,000,000 ClOrdIDs per client (plus
+  10,000 for cancels and replaces once it's reached) counts per day, from the ClOrdIDs of the
+  live orders carried over.
+
+## Without a database
+
+- The book (orders, the ClOrdIDs each client has used, what was sent to each venue), the reports
+  held for clients, operators' blocks and what the risk limits count live in memory. A stop
+  loses them; shutting down logs how many open orders and undelivered reports it leaves. Open
+  orders stay working at their venues.
+- After a restart, numbering starts again at 1 under the new prefix. A late report from a venue
+  on an order from before the restart names an unknown order and is dropped with a warning.
+- A restart forgets each session's open and filled notional and every symbol's last fill price.
+  Credit counts fills since the later of the trading day's start and the gateway's, and orders
+  left working at the venues across a restart count for nothing. A restart lifts every block.
+- A client's request is committed by its session before the report answering it is stored by
+  the client's session: a stop in between loses the report.
+- A client's order, cancel or replace counts as received by its session once the venue's session
+  has stored what it was forwarded as. A stop after the venue's session stored it but before the
+  client's session recorded that has the client resend it, and with the book gone, a new order
+  goes to the venue again under a new ClOrdID: the venue can get it twice. (A resent cancel or
+  replace names an order the empty book doesn't know, and is rejected.)
+- A client that reconnects while its venue is still storing a request has the resent request
+  answered from the book, and counted as received at once: a stop before the venue stores it
+  loses it. A venue store that fails releases the request too, stored or not.
+
+## Database and recovery
+
+- The database is never pruned: done orders, the requests sent and ClOrdIDs used stay in it as
+  history, so it grows for as long as the gateway trades. A start loads only live orders and
+  each client's current day.
+- The `[database] url` is read at start only. A reload that finds it changed logs a warning and
+  keeps the database in use.
+- Reports go to clients as the book makes them, before the change behind them commits. A fill
+  whose change hadn't committed when the gateway crashed is redelivered by the venue after the
+  restart and reaches the client again, with the same ExecID and PossResend(97)=Y: a client should
+  tell fills apart by ExecID. A new report the venue sends while its session recovers may be
+  marked PossResend too, under a new ExecID.
+- A request the venue's session dropped unsent (the client told Rejected, "venue unavailable")
+  can still reach the venue if the gateway crashes before the reject commits: the restart sends
+  it, and the client then hears New after Rejected.
+- A write the database refuses every time (a full disk, say) is retried for as long as the
+  gateway runs, at most a second apart, with an error logged each time. Every session with a
+  message held behind it stops reading 256 messages past it, new orders are rejected as
+  "gateway unavailable", operator calls don't return, and shutdown waits for it too: a second
+  Ctrl-C or SIGTERM exits.
+- "Gateway unavailable" is judged by the database writer: a batch counts from when the writer
+  takes it, so a writer the runtime doesn't run for over a second doesn't trigger it.
+- Messages handled in the last commit before a clean shutdown are redelivered, flagged as
+  possible resends, at the next start: the sessions had closed before they could record them
+  as received. The book takes them as repeats.
+- Each time a venue's session reconnects it asks the venue to resend from its oldest message
+  not yet committed; the reports it has already handled are dropped as stale.
+- Each start reads every message in every venue's session store, to compare its requests with
+  the database: measured once at about 3.9 s per million stored messages, so a large store
+  makes for a slow start.
+- With a database, venue sessions must be kept in a durable store (`kind = "disk"`, say). A venue
+  kept in memory isn't refused at its first start, only at a start where the database has
+  orders for that venue (live, or of a client's current day). A venue a reload adds isn't
+  checked.
+- Deleting a venue's disk store while the database has orders for that venue stops every start,
+  since the gateway can no longer tell what the venue was sent. To start a venue's sequence
+  numbers again, reset them (Turbojet's `reset_sequence_numbers`) rather than delete its files.
+- An orphan (a request the venue's session stored that the database never recorded, from a crash
+  within a commit of sending it) is logged as an error at the start. An orphaned order is
+  cancelled at the venue's next logon, under a ClOrdID of the gateway's own (`<prefix>C<n>`);
+  the venue's answers to that cancel, and any fills on the order, are logged as errors and reach
+  no client, so check the logs for fills before the cancel. The client's resent order is booked
+  and sent afresh, so the venue sees the order twice, the first cancelled. A cancel the venue's
+  session drops goes again at the next logon.
+- An orphaned cancel has its order cancelled by the gateway. An orphaned replace stays pending on
+  its order, which keeps working; the client's redelivered replace with the same terms is taken
+  as it, and the venue's acceptance reaches the client as Replaced:
+  - a replace that isn't marked as a possible resend (PossDupFlag or PossResend) isn't taken as
+    the orphan: the venue's acceptance reaches the client as Restated, with the new terms;
+  - a redelivered replace on other terms is refused as "replace pending" while the orphan is;
+  - one taken while the orphan waits for an earlier replace to be answered isn't stored: a
+    restart before the earlier one is answered ends in Restated, not Replaced;
+  - one taken after the order has ended is answered Replaced, with the order's final status
+    (Canceled, say).
+- A request the database has as sent, unanswered, that the venue's session never stored (a
+  crash after the commit, before the store) is sent at the venue's next logon, marked
+  PossResend(97). Some aren't:
+  - one sent before the venue's store was created or last reset is left pending, logged: the
+    venue had it;
+  - if the venue's session resets its sequence numbers at that logon (a new schedule period, or
+    `reset_on_logon`), each fails instead, and a client's gets a reject. The reset is told from the
+    session's sequence numbers, so one whose store was empty at the start can't be told, and the
+    requests are sent;
+  - a store with a size budget that has evicted an unanswered request since its last reset
+    makes it look unsent: it goes again, and the venue may refuse it as a duplicate.
 
 ## Trading day
 
@@ -62,8 +137,8 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   session's hours can follow different schedules.
 - A possible resend of an order the gateway doesn't know is booked if it doesn't say when it was
   first sent, or was first sent since its session's day began; one first sent before is rejected
-  as a duplicate. In a session's first day since the gateway started, every such resend is
-  booked.
+  as a duplicate. In a session's first day (since the gateway started, without a database), every
+  such resend is booked.
 - The roll walks the whole book, under the book's lock, once for all the sessions whose day ends
   at the same tick, or once for a session rolled by its own message: a large book holds the lock
   for a while.
@@ -102,9 +177,9 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
 
 - The reference price for a Market order's notional and for the price band is the symbol's last
   fill on any venue, for any client, as the venues reported it. There's no market data: a symbol
-  that hasn't filled since start has no reference, so the band doesn't apply to it and a Market
-  order in it is rejected where `max_notional` or `credit` applies. A fill price of zero or less
-  isn't taken as a reference.
+  that hasn't filled (since start, without a database) has no reference, so the band doesn't
+  apply to it and a Market order in it is rejected where `max_notional` or `credit` applies. A
+  fill price of zero or less isn't taken as a reference.
 - A Market order booked without a reference (where no notional or credit limit applied) counts
   as zero notional for as long as it's live: a credit limit added later, or a reference that
   appears, doesn't re-price it. A Market order's notional is fixed at the reference when it's
@@ -128,8 +203,8 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   replace is checked against credit only when it raises the order's notional, so one that cuts the
   notional passes even over the credit limit; one at the same price (or Market again) with no more
   quantity skips every risk check.
-- The last fill prices are kept per symbol for the gateway's life, across trading days: one entry
-  for each symbol traded.
+- The last fill prices are kept per symbol for the gateway's life, across trading days (and
+  restarts, with a database): one entry for each symbol traded.
 - A reload's new limits apply to the next order or replace: orders already working aren't
   checked again or cancelled.
 
@@ -172,8 +247,9 @@ Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/
   trigger (a `disconnect` client's too), as the sessions file in use says now, not as it was at the
   client's logon; other clients' orders stay working at their venues. Before logging the venues
   out, shutdown waits up to 5 s for them to answer all the gateway's cancels (the kill switch's
-  too), and the clients don't receive those Canceled reports. A venue that's down with cancels
-  waiting for it costs the full 5 s. A process that stops without shutting down loses its
-  countdowns, as it loses the book.
+  too), and the clients don't receive those Canceled reports before the stop (with a database, they
+  get them, marked PossResend, when they log on after a restart). A venue that's down with
+  cancels waiting for it costs the full 5 s. A process that stops without shutting down loses
+  its countdowns: a restart doesn't start them again.
 - A panic in the book stops the process rather than carry on with a book that may be half
   changed.
