@@ -181,13 +181,13 @@ impl Gateway {
         // A loaded machine (several suites at once) can take over the 1 s the writer allows a
         // batch before it rejects new orders as "gateway unavailable": the designed back-pressure,
         // which these tests aren't about.
-        let options = StartOptions { stores, listener: Some(listener), max_commit_wait: Some(WAIT) };
+        let options =
+            StartOptions { stores, listener: Some(listener), api_listener: None, max_commit_wait: Some(WAIT) };
         let (started, starting) = std::sync::mpsc::channel();
         let (stop, stopped) = oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let (service, serving) = runtime.block_on(Service::start_with(&path, options)).unwrap();
-            let service = Arc::new(service);
             started.send((service.clone(), runtime.handle().clone())).unwrap();
             let _ = runtime.block_on(stopped);
             // The crash: see the module documentation. A blocking job not yet started never runs.

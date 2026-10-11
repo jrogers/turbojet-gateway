@@ -23,3 +23,9 @@ self_trade = true
 [risk.client.FUNDA]
 max_notional = "2500000.50"
 credit = 10000000                 # open + filled today + this order
+
+# The operator API, on loopback: off it, it needs tls = { cert, key } or behind_proxy = true.
+[api]
+listen = "127.0.0.1:8080"
+users = "users.toml"              # paths relative to this file
+audit = "audit.jsonl"

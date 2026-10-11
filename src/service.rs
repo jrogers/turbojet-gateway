@@ -1,22 +1,26 @@
 //! The gateway running from its configuration files: the acceptor serving clients, an initiator
-//! per venue, and reloading. The binary adds arguments and signals.
+//! per venue, the operator API if configured, and reloading. The binary adds arguments and
+//! signals.
 
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use turbojet::{Acceptor, SessionHandle, SessionId};
+use turbojet::{Acceptor, SessionHandle, SessionId, SessionSchedule};
 use turbojet_config::{Changes, Initiators, SessionsFile};
 
+use crate::api;
 use crate::book::{self, Snapshot};
 use crate::config::{self, Error};
 use crate::edge::{ClientApp, Gateway, Schedules, TICK_INTERVAL, VenueApp, Writer};
 use crate::fix::Version;
+use crate::risk;
+use crate::router::Router;
 use crate::store::Store;
 
 /// The Text(58) of the Logouts sent at shutdown.
@@ -67,6 +71,8 @@ pub struct Service {
     writing: Option<JoinHandle<()>>,
     /// The database, if there is one.
     store: Option<Store>,
+    /// The operator API, with `[api]`: set once the acceptor serves, taken at shutdown.
+    api: Mutex<Option<api::Server>>,
 }
 
 impl Drop for Service {
@@ -75,6 +81,9 @@ impl Drop for Service {
         if let Some(writing) = &self.writing {
             writing.abort();
         }
+        if let Ok(Some(api)) = self.api.get_mut() {
+            api.abort();
+        }
     }
 }
 
@@ -82,21 +91,21 @@ impl Drop for Service {
 pub type Serving = JoinHandle<io::Result<()>>;
 
 impl Service {
-    /// Loads the configuration file at `path`, starts the venues' initiators, and serves the
-    /// clients' acceptor. Call it within a tokio runtime.
+    /// Loads the configuration file at `path`, starts the venues' initiators, serves the clients'
+    /// acceptor, and then the operator API, with `[api]`. Call it within a tokio runtime.
     ///
     /// # Errors
     ///
-    /// The configuration doesn't load, the database can't be opened, the acceptor's address can't
-    /// be bound, a venue speaks a FIX version the gateway doesn't convert, or TLS or a venue can't
-    /// be set up.
-    pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
+    /// The configuration doesn't load, the database can't be opened, the acceptor's or the API's
+    /// address can't be bound, a venue speaks a FIX version the gateway doesn't convert, or TLS or
+    /// a venue can't be set up.
+    pub async fn start(path: &Path) -> Result<(Arc<Self>, Serving), Error> {
         Self::start_with(path, StartOptions::default()).await
     }
 
     /// As [`start`](Self::start), with `options`.
-    pub(crate) async fn start_with(path: &Path, options: StartOptions) -> Result<(Self, Serving), Error> {
-        let StartOptions { stores, listener, max_commit_wait } = options;
+    pub(crate) async fn start_with(path: &Path, options: StartOptions) -> Result<(Arc<Self>, Serving), Error> {
+        let StartOptions { stores, listener, api_listener, max_commit_wait } = options;
         let loaded = config::load_with_stores(path, stores)?;
         if loaded.database.is_some() {
             check_durable(&loaded.sessions)?;
@@ -109,34 +118,16 @@ impl Service {
             }
             None => (None, None),
         };
-        let prefix = book::start_prefix(next_second().await);
         let sessions = Arc::new(loaded.sessions);
-        let schedules = {
-            let sessions = sessions.clone();
-            Schedules(Arc::new(move |comp_id| sessions.counterparty_config(comp_id)?.schedule))
-        };
-        let gateway = Gateway::new(loaded.router, loaded.version)
-            .with_id_prefix(prefix)
-            .with_limits(loaded.limits)
-            .with_days(loaded.day_end, schedules);
         let store = database.as_ref().map(|(store, ..)| store.clone());
-        let (gateway, recovery) = match database {
-            Some((store, snapshot, writer)) => (gateway.with_writer(writer), Some((store, snapshot))),
-            None => (gateway, None),
-        };
-        let gateway = Arc::new(gateway);
-        // Before any session starts: the clients' sessions find their orders and reports, and the
-        // venues' stores are read before their initiators open them.
-        if let Some((store, snapshot)) = recovery {
-            gateway.restore(snapshot);
-            let venues = sessions.initiator_stores();
-            gateway
-                .cancel_orphans(&store, venues)
-                .await
-                .map_err(|e| Error::new(format!("cannot look for orphaned venue requests: {e}")))?;
-        }
+        let gateway =
+            start_gateway(loaded.router, loaded.version, loaded.limits, loaded.day_end, &sessions, database).await?;
         // Bound before the venues start, so a port in use stops nothing half-started.
         let (listener, local_addr) = listen(&sessions, listener).await?;
+        let api = match &loaded.api {
+            Some(config) => Some(api::Bound::bind(config, api_listener).await?),
+            None => None,
+        };
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
@@ -151,6 +142,7 @@ impl Service {
             retrying,
             writing,
             store,
+            api: Mutex::new(None),
         };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
@@ -168,12 +160,21 @@ impl Service {
             id_prefix = %service.gateway.id_prefix(),
             "gateway listening"
         );
+        let service = Arc::new(service);
+        if let Some(api) = api {
+            *service.api.lock().expect("API lock poisoned") = Some(api.serve(Arc::downgrade(&service)));
+        }
         Ok((service, serving))
     }
 
     /// The address the acceptor listens on.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The address the operator API listens on, while it serves.
+    pub fn api_addr(&self) -> Option<SocketAddr> {
+        self.api.lock().expect("API lock poisoned").as_ref().map(api::Server::local_addr)
     }
 
     /// The gateway: the book and where its outputs go.
@@ -197,7 +198,8 @@ impl Service {
         self.initiators.handle(name)
     }
 
-    /// Rereads the sessions file, and the routes, limits and `day_end`, logging what changed.
+    /// Rereads the sessions file, and the routes, limits, `day_end` and the API's certificate,
+    /// logging what changed.
     /// Either file that doesn't load is logged and stays as it was (routes, limits and `day_end`
     /// together); the routes are checked against the venues the gateway took after the sessions
     /// reload, so a venue added to both files at once can be routed to. A changed schedule or
@@ -230,7 +232,7 @@ impl Service {
         }
         let venues = self.set_venues();
         let config = match config::reload(&self.path, &venues, self.database.as_deref()) {
-            Ok((router, limits, day_end)) => {
+            Ok((router, limits, day_end, api)) => {
                 let summary = ConfigSummary {
                     routes: router.rules().len(),
                     clients: limits.by_comp_id.len(),
@@ -244,6 +246,7 @@ impl Service {
                 );
                 self.gateway.set_config(router, limits);
                 self.gateway.set_day_end(day_end);
+                warnings.extend(self.reload_api(api.as_ref()));
                 Ok(summary)
             }
             Err(e) => {
@@ -254,11 +257,29 @@ impl Service {
         Reloaded { sessions, config, warnings }
     }
 
-    /// Logs the clients' sessions out, cancels the working orders of those with cancel on
+    /// Takes the reloaded `[api]`'s certificate, returning (and logging) what waits for a restart.
+    fn reload_api(&self, config: Option<&config::Api>) -> Vec<String> {
+        let warnings = match &*self.api.lock().expect("API lock poisoned") {
+            Some(server) => server.reload(config),
+            None if config.is_some() => vec!["[api] added: the API starts at the next start".to_string()],
+            None => Vec::new(),
+        };
+        for warning in &warnings {
+            warn!("{warning}");
+        }
+        warnings
+    }
+
+    /// Stops the operator API (its requests under way finish first, briefly), logs the clients'
+    /// sessions out, cancels the working orders of those with cancel on
     /// disconnect (pending countdowns fire as the clients go; the shutdown's own Logouts start
     /// none), waits for the venues to answer the gateway's cancels, logs the venues' sessions out,
     /// returning once all have closed, then logs what the stop loses.
     pub async fn shutdown(&self) {
+        let api = self.api.lock().expect("API lock poisoned").take();
+        if let Some(api) = api {
+            api.shutdown().await;
+        }
         self.acceptor.shutdown(Some(SHUTTING_DOWN)).await;
         self.gateway.cancel_at_shutdown(|comp_id| {
             self.sessions.counterparty_config(comp_id).is_some_and(|config| config.cancel_on_disconnect.is_some())
@@ -334,6 +355,42 @@ impl Service {
     }
 }
 
+/// The gateway, with the file's routes, `limits` and `day_end`, the clients' schedules from
+/// `sessions`, and the book restored from `database`, if given, its orphaned venue requests
+/// cancelled.
+async fn start_gateway(
+    router: Router,
+    version: Version,
+    limits: risk::Config,
+    day_end: SessionSchedule,
+    sessions: &Arc<SessionsFile>,
+    database: Option<(Store, Snapshot, Writer)>,
+) -> Result<Arc<Gateway>, Error> {
+    let prefix = book::start_prefix(next_second().await);
+    let schedules = {
+        let sessions = sessions.clone();
+        Schedules(Arc::new(move |comp_id| sessions.counterparty_config(comp_id)?.schedule))
+    };
+    let gateway =
+        Gateway::new(router, version).with_id_prefix(prefix).with_limits(limits).with_days(day_end, schedules);
+    let (gateway, recovery) = match database {
+        Some((store, snapshot, writer)) => (gateway.with_writer(writer), Some((store, snapshot))),
+        None => (gateway, None),
+    };
+    let gateway = Arc::new(gateway);
+    // Before any session starts: the clients' sessions find their orders and reports, and the
+    // venues' stores are read before their initiators open them.
+    if let Some((store, snapshot)) = recovery {
+        gateway.restore(snapshot);
+        let venues = sessions.initiator_stores();
+        gateway
+            .cancel_orphans(&store, venues)
+            .await
+            .map_err(|e| Error::new(format!("cannot look for orphaned venue requests: {e}")))?;
+    }
+    Ok(gateway)
+}
+
 /// The clients' listener: `given`, or one bound to the sessions file's address.
 async fn listen(
     sessions: &SessionsFile,
@@ -380,6 +437,8 @@ pub(crate) struct StartOptions {
     /// Serves clients on this rather than binding the file's address: a listener kept open across
     /// starts, as socket activation keeps one, holds its port while the gateway is down.
     pub(crate) listener: Option<std::net::TcpListener>,
+    /// Serves the API on this rather than binding `[api] listen`.
+    pub(crate) api_listener: Option<std::net::TcpListener>,
     /// The writer's [`MAX_COMMIT_WAIT`](crate::edge::writer::MAX_COMMIT_WAIT) instead.
     pub(crate) max_commit_wait: Option<Duration>,
 }
@@ -449,14 +508,106 @@ mod tests {
             .replace("127.0.0.1:9876", "127.0.0.1:0")
             .replace("127.0.0.1:9877", "127.0.0.1:1");
         write(&dir, "sessions.toml", &sessions);
-        std::fs::copy(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/jetbridge.toml"),
-            dir.path().join("jetbridge.toml"),
-        )
-        .unwrap();
+        let jetbridge = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/jetbridge.toml"))
+            .unwrap()
+            .replace("127.0.0.1:8080", "127.0.0.1:0");
+        write(&dir, "jetbridge.toml", &jetbridge);
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         assert_ne!(service.local_addr().port(), 0);
         assert!(tokio::net::TcpStream::connect(service.local_addr()).await.is_ok());
+        assert!(service.api_addr().is_some());
+        service.shutdown().await;
+        serving.abort();
+    }
+
+    const API: &str = "[api]\nusers = \"users.toml\"\naudit = \"audit.jsonl\"\n";
+
+    /// The API answers health over a real socket, and shutdown stops it first.
+    #[tokio::test]
+    async fn the_api_answers_health_until_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let addr = service.api_addr().unwrap();
+        let response = api::tests::get_over(addr, "GET", "/api/health").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("content-type: application/json"), "{response}");
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(response.ends_with(&format!("{{\"version\":\"{version}\"}}")), "{response}");
+        service.shutdown().await;
+        assert_eq!(service.api_addr(), None);
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+        serving.abort();
+    }
+
+    /// `behind_proxy = true` lets the API listen off loopback without TLS (here the address is
+    /// the file's; the test serves on a loopback listener given instead). A reload asking for a
+    /// different address warns that it waits for a restart.
+    #[tokio::test]
+    async fn the_api_serves_behind_a_proxy_off_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        let config =
+            |listen: &str| format!("sessions = \"sessions.toml\"\n{API}listen = \"{listen}\"\nbehind_proxy = true\n");
+        write(&dir, "jetbridge.toml", &config("0.0.0.0:8080"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let options = StartOptions { api_listener: Some(listener), ..StartOptions::default() };
+        let (service, serving) = Service::start_with(&dir.path().join("jetbridge.toml"), options).await.unwrap();
+        assert!(api::tests::get_over(addr, "GET", "/api/health").await.starts_with("HTTP/1.1 200"));
+        assert!(service.reload().warnings.is_empty());
+        write(&dir, "jetbridge.toml", &config("0.0.0.0:8081"));
+        let reloaded = service.reload();
+        assert!(reloaded.config.is_ok(), "{reloaded:?}");
+        let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
+        assert!(warning.contains("[api] changed"), "{warning}");
+        service.shutdown().await;
+        serving.abort();
+    }
+
+    /// A self-signed certificate for localhost, as PEM: the certificate and its key.
+    #[cfg(feature = "tls")]
+    fn localhost_cert() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// GET /api/health over TLS to `addr`, trusting only `cert`.
+    #[cfg(feature = "tls")]
+    async fn health_over_tls(addr: SocketAddr, cert: &str) -> std::io::Result<String> {
+        use turbojet::tls::{ClientTls, Trust};
+        let connector = ClientTls::new(Trust::from_pem(cert.as_bytes())?, None)?.connector();
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let stream = connector.connect("localhost".try_into().unwrap(), tcp).await?;
+        Ok(api::tests::exchange(stream, "GET", "/api/health").await)
+    }
+
+    /// With `[api] tls` the API serves HTTPS, and a reload presents a renewed certificate.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn the_api_serves_over_tls_and_a_reload_renews_its_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = localhost_cert();
+        write(&dir, "api.pem", &cert);
+        write(&dir, "api.key", &key);
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        let tls = "tls = { cert = \"api.pem\", key = \"api.key\" }\n";
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n{tls}"));
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let addr = service.api_addr().unwrap();
+        let response = health_over_tls(addr, &cert).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"version\""), "{response}");
+
+        let (renewed, renewed_key) = localhost_cert();
+        write(&dir, "api.pem", &renewed);
+        write(&dir, "api.key", &renewed_key);
+        let reloaded = service.reload();
+        assert!(reloaded.warnings.is_empty(), "{reloaded:?}");
+        assert!(health_over_tls(addr, &cert).await.is_err());
+        assert!(health_over_tls(addr, &renewed).await.unwrap().starts_with("HTTP/1.1 200"));
         service.shutdown().await;
         serving.abort();
     }

@@ -100,6 +100,12 @@ self_trade = true
 [risk.client.FUNDA]
 max_notional = "2500000.50"
 credit = 10000000                 # open + filled today + this order
+
+# The operator API, on loopback: off it, it needs tls = { cert, key } or behind_proxy = true.
+[api]
+listen = "127.0.0.1:8080"
+users = "users.toml"              # paths relative to this file
+audit = "audit.jsonl"
 ```
 
 - `sessions`: the sessions file, relative to this file. Read at start only; a reload rereads the
@@ -122,6 +128,12 @@ now.
   [Trading day](#trading-day).
 - `[risk.defaults]` and `[risk.client.COMPID]`: see [Risk limits](#risk-limits).
 - `[database]`: see [Database](#database).
+- `[api]`, optional: the operator API, an HTTP JSON server in the gateway's process. `listen` is
+  an IP address and port; `users` and `audit` are files, relative to this file; `tls = { cert,
+  key }` (PEM, with the `tls` feature) serves HTTPS, and a reload takes a renewed certificate;
+  other changes apply at the next start. Off loopback the API refuses to start without `tls`,
+  unless `behind_proxy = true` says a proxy in front terminates TLS. `GET /api/health` answers
+  `{"version": "..."}`.
 
 ### sessions.toml
 
@@ -349,7 +361,8 @@ as one warning with the count per session. Other clients' orders stay working at
   kept: a bad sessions file keeps the sessions as they were, and a bad `jetbridge.toml` keeps the
   routes, limits and `day_end`. New routes and limits apply to new orders; orders already working
   stay with their venue. A new `day_end` or schedule applies from each session's next trading day.
-- **Ctrl-C or SIGTERM** logs every client out ("gateway shutting down"), which fires any
+- **Ctrl-C or SIGTERM** stops the API (waiting up to 5 seconds for its requests under way), logs
+  every client out ("gateway shutting down"), which fires any
   cancel-on-disconnect countdowns under way, and cancels the working orders of clients with cancel
   on disconnect (see above); waits up to 5 seconds for the venues to answer the
   gateway's cancels; then logs every venue out, waits for the last changes to commit to the

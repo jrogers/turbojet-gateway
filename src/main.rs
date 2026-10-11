@@ -41,7 +41,6 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let service = Arc::new(service);
     let reloading = reload_on_hangup(service.clone());
     let code = tokio::select! {
         result = serving => {

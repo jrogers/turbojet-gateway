@@ -264,7 +264,7 @@ impl Default for Options {
 
 /// Jetbridge, its venue, and a client logged on through it.
 struct Setup {
-    service: Service,
+    service: Arc<Service>,
     venue: Venue,
     relay: Option<Relay>,
     client: Initiator,

@@ -26,6 +26,13 @@
 //!
 //! [database]                      # optional: without it, the book is kept in memory only
 //! url = "sqlite://jetbridge.db?mode=rwc"  # `mode=rwc` creates the file
+//!
+//! [api]                           # optional: the operator API, an HTTP JSON server
+//! listen = "127.0.0.1:8080"       # an IP address and port
+//! users = "users.toml"            # who may use it; relative to this file
+//! audit = "audit.jsonl"           # what they did; relative to this file
+//! tls = { cert = "api.pem", key = "api.key" }  # optional, PEM; needs the `tls` feature
+//! behind_proxy = false            # true: a proxy in front terminates TLS
 //! ```
 //!
 //! Amounts are TOML integers, floats or strings, read as decimals: a string keeps every digit
@@ -46,6 +53,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -91,6 +99,32 @@ pub struct Loaded {
     pub day_end: SessionSchedule,
     /// The `[database]` URL the book is kept in, if any: read at start only.
     pub database: Option<String>,
+    /// The operator API, if the file has `[api]`.
+    pub api: Option<Api>,
+}
+
+/// `[api]`: the operator API's server, its paths resolved against the configuration file's
+/// directory and the bind rule checked (see the module documentation).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Api {
+    pub listen: SocketAddr,
+    /// The users file.
+    pub users: PathBuf,
+    /// The audit log.
+    pub audit: PathBuf,
+    pub tls: Option<ApiTls>,
+    /// A proxy in front terminates TLS, so a non-loopback `listen` without `tls` is fine.
+    #[serde(default)]
+    pub behind_proxy: bool,
+}
+
+/// `[api] tls`: the server's certificate chain and private key, PEM files.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiTls {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 /// Reads the configuration file at `path` and the sessions file it names.
@@ -120,22 +154,24 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
     check_venues(path, &router, &sessions.initiator_names())?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
+    let api = file.api(path)?;
     let database = file.database.map(|database| database.url);
-    Ok(Loaded { router, limits, sessions, version, day_end, database })
+    Ok(Loaded { router, limits, sessions, version, day_end, database, api })
 }
 
-/// Reads the routes, limits and `day_end` in the configuration file at `path` again, checking
-/// that each venue the routes name is one of `venues`. A `[database] url` other than `database`,
-/// the one in use, is logged: it applies at the next start.
+/// Reads the routes, limits, `day_end` and `[api]` in the configuration file at `path` again,
+/// checking that each venue the routes name is one of `venues`. A `[database] url` other than
+/// `database`, the one in use, is logged: it applies at the next start.
 ///
 /// # Errors
 ///
-/// As [`load`], for the routes, limits and `day_end`, or a route names a venue not in `venues`.
+/// As [`load`], for the routes, limits, `day_end` and `[api]`, or a route names a venue not in
+/// `venues`.
 pub fn reload(
     path: &Path,
     venues: &[String],
     database: Option<&str>,
-) -> Result<(Router, risk::Config, SessionSchedule), Error> {
+) -> Result<(Router, risk::Config, SessionSchedule, Option<Api>), Error> {
     let file = read(path)?;
     if file.database.as_ref().map(|database| database.url.as_str()) != database {
         warn!(file = %path.display(), "[database] url changed: the gateway keeps its database until the next start");
@@ -144,7 +180,8 @@ pub fn reload(
     check_venues(path, &router, venues)?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
-    Ok((router, limits, day_end))
+    let api = file.api(path)?;
+    Ok((router, limits, day_end, api))
 }
 
 /// `day_end` as written, `HH:MM[:SS] [ZONE]`, as a schedule whose periods run from one end of day
@@ -213,6 +250,7 @@ struct File {
     #[serde(default)]
     risk: Risk,
     database: Option<Database>,
+    api: Option<Api>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +365,27 @@ impl File {
     fn day_end(&self, path: &Path) -> Result<SessionSchedule, Error> {
         day_end(self.day_end.as_deref().unwrap_or("00:00 UTC"))
             .map_err(|e| Error(format!("{}: day_end: {e}", path.display())))
+    }
+
+    /// `[api]`, its paths made relative to `path`'s directory, if the build and the bind rule
+    /// allow it.
+    fn api(&self, path: &Path) -> Result<Option<Api>, Error> {
+        let Some(api) = &self.api else { return Ok(None) };
+        let error = |message: String| Error(format!("{}: [api] {message}", path.display()));
+        if api.tls.is_some() && !cfg!(feature = "tls") {
+            return Err(error("tls: this build has no TLS; build with the `tls` feature".to_string()));
+        }
+        if !api.listen.ip().is_loopback() && api.tls.is_none() && !api.behind_proxy {
+            return Err(error(format!(
+                "listen = \"{}\" isn't a loopback address, and without tls the API's passwords and \
+                 tokens would cross the network in the clear: set tls, or behind_proxy = true if a \
+                 proxy in front terminates TLS",
+                api.listen
+            )));
+        }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let tls = api.tls.as_ref().map(|tls| ApiTls { cert: dir.join(&tls.cert), key: dir.join(&tls.key) });
+        Ok(Some(Api { users: dir.join(&api.users), audit: dir.join(&api.audit), tls, ..api.clone() }))
     }
 
     /// The routes, read from `path`, with their [`warnings`] logged.
@@ -571,7 +630,7 @@ self_trade = false
         let path = dir.path().join("jetbridge.toml");
         let venues = load(&path).unwrap().sessions.initiator_names();
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = 5").unwrap();
-        let (_, limits, _) = reload(&path, &venues, None).unwrap();
+        let (_, limits, ..) = reload(&path, &venues, None).unwrap();
         assert_eq!(limits.limits("FUNDA").max_order_qty, Some(decimal("5")));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = -5").unwrap();
         assert!(reload(&path, &venues, None).is_err());
@@ -623,8 +682,47 @@ self_trade = false
     #[test]
     fn reloading_reads_day_end() {
         let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
-        let (.., reloaded) = reload(&dir.path().join("jetbridge.toml"), &[], None).unwrap();
+        let (_, _, reloaded, _) = reload(&dir.path().join("jetbridge.toml"), &[], None).unwrap();
         assert_eq!(reloaded, day_end("17:00").unwrap());
+    }
+
+    /// `[api]`'s paths are relative to the file; `listen` is required, unknown keys are errors.
+    #[test]
+    fn the_api_section_resolves_its_paths_and_takes_no_other_key() {
+        let jetbridge = "sessions = \"sessions.toml\"\n[api]\nlisten = \"127.0.0.1:8080\"\n\
+                         users = \"users.toml\"\naudit = \"log/audit.jsonl\"\n";
+        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
+        let api = load(&dir.path().join("jetbridge.toml")).unwrap().api.unwrap();
+        assert_eq!(api.listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(api.users, dir.path().join("users.toml"));
+        assert_eq!(api.audit, dir.path().join("log/audit.jsonl"));
+        assert_eq!((api.tls, api.behind_proxy), (None, false));
+        assert!(load_error(&format!("{jetbridge}port = 1")).contains("unknown field `port`"));
+        let without_listen = jetbridge.replace("listen = \"127.0.0.1:8080\"\n", "");
+        assert!(load_error(&without_listen).contains("missing field `listen`"));
+    }
+
+    /// The bind rule: off loopback, the API needs TLS or a proxy in front saying it terminates TLS.
+    #[test]
+    fn the_api_listens_off_loopback_only_with_tls_or_behind_a_proxy() {
+        let api = |listen: &str, more: &str| {
+            let jetbridge = format!(
+                "sessions = \"sessions.toml\"\n[api]\nlisten = \"{listen}\"\nusers = \"u\"\naudit = \"a\"\n{more}"
+            );
+            let dir = dir(&[("jetbridge.toml", &jetbridge), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("jetbridge.toml")).map(|loaded| loaded.api.unwrap().listen).map_err(|e| e.to_string())
+        };
+        assert!(api("127.0.0.1:8080", "").is_ok());
+        assert!(api("[::1]:8080", "").is_ok());
+        let error = api("0.0.0.0:8080", "").unwrap_err();
+        assert!(error.contains("[api] listen = \"0.0.0.0:8080\" isn't a loopback address"), "{error}");
+        assert!(api("0.0.0.0:8080", "behind_proxy = true").is_ok());
+        let tls = api("0.0.0.0:8080", "tls = { cert = \"c.pem\", key = \"k.pem\" }");
+        if cfg!(feature = "tls") {
+            assert!(tls.is_ok(), "{tls:?}");
+        } else {
+            assert!(tls.unwrap_err().contains("this build has no TLS"));
+        }
     }
 
     /// The example files the readme shows load.
