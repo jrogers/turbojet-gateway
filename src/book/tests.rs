@@ -328,6 +328,15 @@ fn a_report_changing_nothing_is_dropped() {
     assert_eq!(run(&mut book, venue_report_as("1", ExecType::Restated, Status::New, 0, 0)).len(), 1);
 }
 
+/// DoneForDay with the order's status given explicitly, unchanged (150=3, 39=0), still reaches
+/// the client: it's the end of the order's day.
+#[test]
+fn done_for_day_with_an_unchanged_status_is_forwarded() {
+    let mut book = acked();
+    let out = run(&mut book, venue_report_as("1", ExecType::DoneForDay, Status::New, 0, 0));
+    assert_eq!(report_of(&out).exec_type, ExecType::DoneForDay);
+}
+
 #[test]
 fn a_report_without_a_fill_at_the_same_cum_qty_is_forwarded() {
     let mut book = book();

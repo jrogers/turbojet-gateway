@@ -220,7 +220,8 @@ fn dropped(venue: &VenueId, order: &mut Order, answered: bool, report: &mut Venu
 }
 
 /// Whether `report` changes nothing: under the order's current downstream ClOrdID, at its
-/// status, no fill and the same CumQty, and neither a restatement nor a replace's acceptance. A
+/// status, no fill and the same CumQty, and not a restatement, a replace's acceptance or the end
+/// of the order's day (DoneForDay, which may carry the status unchanged). A
 /// venue repeating its ack (a resend, or a redelivery after the gateway restarted) is noise to the
 /// client, and a report forwarded would carry a new ExecID it couldn't tell from news.
 fn repeats(order: &Order, report: &VenueReport) -> bool {
@@ -228,7 +229,7 @@ fn repeats(order: &Order, report: &VenueReport) -> bool {
         && report.status == Some(order.status)
         && report.cum_qty == order.cum_qty
         && report.last_qty == Decimal::ZERO
-        && !matches!(report.exec_type, ExecType::Restated | ExecType::Replaced)
+        && !matches!(report.exec_type, ExecType::Restated | ExecType::Replaced | ExecType::DoneForDay)
 }
 
 /// Whether the report's status is behind the order's, so would roll it back:
