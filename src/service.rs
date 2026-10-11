@@ -28,12 +28,16 @@ const SHUTTING_DOWN: &str = "gateway shutting down";
 /// doesn't answer in this long isn't going to soon.
 const CANCELS_WAIT: Duration = Duration::from_secs(5);
 
-/// What [`Service::reload`] did with each file: what changed, or why the file was kept as it was.
+/// What [`Service::reload`] did with each file: what changed, or why the file was kept as it
+/// was; and what it took but warns about.
 #[derive(Debug)]
 pub struct Reloaded {
     pub sessions: Result<Changes, String>,
     /// The routes, limits and `day_end`, taken together or not at all.
     pub config: Result<ConfigSummary, String>,
+    /// Problems with what was taken: a sessions file that, with a database, keeps a session's
+    /// messages only in memory, so a restart loses what recovery needs.
+    pub warnings: Vec<String>,
 }
 
 /// The routes, limits and `day_end` a reload took.
@@ -197,28 +201,32 @@ impl Service {
     /// Either file that doesn't load is logged and stays as it was (routes, limits and `day_end`
     /// together); the routes are checked against the venues the gateway took after the sessions
     /// reload, so a venue added to both files at once can be routed to. A changed schedule or
-    /// `day_end` applies from each session's next trading day. Returns what it logged.
+    /// `day_end` applies from each session's next trading day. Returns what it logged: each file's
+    /// changes or why it was kept, and any warning about what was taken.
     pub fn reload(&self) -> Reloaded {
         let sessions = self.sessions.reload_all(Some(&self.acceptor), &self.initiators).map_err(|e| e.to_string());
         match &sessions {
             Ok(changes) => {
                 info!(
-                added = ?changes.added,
-                changed = ?changes.changed,
-                removed = ?changes.removed,
-                logged_out = ?changes.logged_out,
-                started = ?changes.started,
-                reconfigured = ?changes.reconfigured,
-                stopped = ?changes.stopped,
+                    added = ?changes.added,
+                    changed = ?changes.changed,
+                    removed = ?changes.removed,
+                    logged_out = ?changes.logged_out,
+                    started = ?changes.started,
+                    reconfigured = ?changes.reconfigured,
+                    stopped = ?changes.stopped,
                     "reloaded the sessions file"
                 );
             }
             Err(e) => warn!("keeping the sessions file in use: {e}"),
         }
+        let mut warnings = Vec::new();
         if self.database.is_some()
             && let Err(e) = check_durable(&self.sessions)
         {
-            error!("the reloaded sessions file loses what a restart needs: {e}");
+            let warning = format!("the reloaded sessions file loses what a restart needs: {e}");
+            error!("{warning}");
+            warnings.push(warning);
         }
         let venues = self.set_venues();
         let config = match config::reload(&self.path, &venues, self.database.as_deref()) {
@@ -243,7 +251,7 @@ impl Service {
                 Err(e.to_string())
             }
         };
-        Reloaded { sessions, config }
+        Reloaded { sessions, config, warnings }
     }
 
     /// Logs the clients' sessions out, cancels the working orders of those with cancel on
@@ -552,6 +560,31 @@ mod tests {
         .await;
         assert!(error.contains("venue B's session must be kept in a durable store"), "{error}");
         assert!(!db.exists());
+    }
+
+    /// A reload adding a venue whose session is kept in memory is taken, with a warning:
+    /// stopping a running gateway over it would be worse.
+    #[tokio::test]
+    async fn a_reload_adding_a_memory_session_store_with_a_database_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("book.db");
+        let config = format!("{}[database]\nurl = \"sqlite://{}?mode=rwc\"\n", routes_to("B"), db.display());
+        write(&dir, "jetbridge.toml", &config);
+        let durable = format!(
+            "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n{ACCEPTOR}listen = \"127.0.0.1:0\"\n\
+             [defaults]\nstore = \"disk\"\n{}store = \"disk\"\n",
+            venue_section("B", "FIX.4.4")
+        );
+        write(&dir, "sessions.toml", &durable);
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        assert!(service.reload().warnings.is_empty());
+        write(&dir, "sessions.toml", &format!("{durable}{}store = \"memory\"\n", venue_section("C", "FIX.4.4")));
+        let reloaded = service.reload();
+        assert!(reloaded.sessions.is_ok(), "{reloaded:?}");
+        let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
+        assert!(warning.contains("venue C's session must be kept in a durable store"), "{warning}");
+        service.shutdown().await;
+        serving.abort();
     }
 
     /// With `[acceptor.tls]`, clients log on over TLS: here a client from a sessions file of its
