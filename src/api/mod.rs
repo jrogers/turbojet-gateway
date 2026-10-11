@@ -15,6 +15,7 @@ use axum::Json;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -23,6 +24,8 @@ use tracing::{info, warn};
 
 use crate::config::{Api, Error};
 use crate::service::Service;
+
+mod listener;
 
 /// How long shutdown waits for requests under way to finish before closing their connections.
 /// The API's requests are quick: a reload, or a cancel waiting for its commit, takes well under
@@ -90,7 +93,9 @@ impl Bound {
     pub(crate) async fn bind(config: &Api, given: Option<std::net::TcpListener>) -> Result<Self, Error> {
         #[cfg(feature = "tls")]
         let tls = match &config.tls {
-            Some(tls) => Some(tls::server(tls).map_err(|e| Error::new(format!("cannot set up the API's TLS: {e}")))?),
+            Some(tls) => {
+                Some(listener::server(tls).map_err(|e| Error::new(format!("cannot set up the API's TLS: {e}")))?)
+            }
             None => None,
         };
         let listen = config.listen;
@@ -116,19 +121,13 @@ impl Bound {
         let local_addr = self.listener.local_addr().unwrap_or(self.config.listen);
         let app = router(State { service });
         let (stop, stopped) = oneshot::channel::<()>();
-        let stopped = async {
-            let _ = stopped.await;
-        };
         #[cfg(feature = "tls")]
         let task = match &self.tls {
-            Some(tls) => {
-                let listener = tls::Listener::new(self.listener, tls.acceptor());
-                tokio::spawn(axum::serve(listener, app).with_graceful_shutdown(stopped).into_future())
-            }
-            None => tokio::spawn(axum::serve(self.listener, app).with_graceful_shutdown(stopped).into_future()),
+            Some(tls) => spawn(listener::Tls::new(self.listener, tls.acceptor()), app, stopped),
+            None => spawn(listener::Plain::new(self.listener), app, stopped),
         };
         #[cfg(not(feature = "tls"))]
-        let task = tokio::spawn(axum::serve(self.listener, app).with_graceful_shutdown(stopped).into_future());
+        let task = spawn(listener::Plain::new(self.listener), app, stopped);
         info!(addr = %local_addr, tls = self.config.tls.is_some(), "API listening");
         Server {
             config: self.config,
@@ -139,6 +138,24 @@ impl Bound {
             task,
         }
     }
+}
+
+/// Serves `app` on `listener` until `stopped` resolves (or its sender is dropped), giving handlers
+/// the client's address as `ConnectInfo<SocketAddr>`.
+fn spawn<L>(listener: L, app: axum::Router, stopped: oneshot::Receiver<()>) -> JoinHandle<io::Result<()>>
+where
+    L: axum::serve::Listener<Addr = SocketAddr>,
+{
+    // Tapped, as axum implements ConnectInfo for its own TcpListener and for any tapped listener.
+    let listener = listener.tap_io(|_| ());
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .into_future(),
+    )
 }
 
 /// The API, serving.
@@ -204,117 +221,129 @@ impl Server {
     }
 }
 
-#[cfg(feature = "tls")]
-mod tls {
-    use std::io;
-    use std::net::SocketAddr;
-    use std::time::Duration;
-
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::task::JoinSet;
-    use tokio_rustls::server::TlsStream;
-    use tracing::{debug, warn};
-    use turbojet::tls::{ClientTrust, Identity, ServerTls, TlsAcceptor};
-
-    use crate::config::ApiTls;
-
-    /// How long a client has to finish its TLS handshake.
-    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-    /// Handshakes under way at once; connections beyond it are closed. An operator API has a few
-    /// clients, so this many at once is a flood, and each costs a task and its buffers.
-    const MAX_HANDSHAKES: usize = 64;
-
-    /// Turbojet's reloadable TLS, presenting `files`, without client certificates: the API
-    /// authenticates its users itself.
-    pub(super) fn server(files: &ApiTls) -> io::Result<ServerTls> {
-        ServerTls::new(Identity::from_pem_files(&files.cert, &files.key)?, ClientTrust::None)
-    }
-
-    /// Accepts TCP connections and hands axum those whose TLS handshake completes. Handshakes run
-    /// on their own tasks, so a slow one doesn't hold up the rest.
-    pub(super) struct Listener {
-        tcp: TcpListener,
-        tls: TlsAcceptor,
-        handshakes: JoinSet<Option<(TlsStream<TcpStream>, SocketAddr)>>,
-    }
-
-    impl Listener {
-        pub(super) fn new(tcp: TcpListener, tls: TlsAcceptor) -> Self {
-            Self { tcp, tls, handshakes: JoinSet::new() }
-        }
-    }
-
-    impl axum::serve::Listener for Listener {
-        type Io = TlsStream<TcpStream>;
-        type Addr = SocketAddr;
-
-        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-            loop {
-                tokio::select! {
-                    accepted = self.tcp.accept() => match accepted {
-                        Ok((_, addr)) if self.handshakes.len() >= MAX_HANDSHAKES => {
-                            warn!(%addr, "too many API TLS handshakes under way: closing the connection");
-                        }
-                        Ok((stream, addr)) => {
-                            let handshake = self.tls.accept(stream);
-                            self.handshakes.spawn(async move {
-                                match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
-                                    Ok(Ok(stream)) => Some((stream, addr)),
-                                    Ok(Err(e)) => {
-                                        debug!(%addr, "API TLS handshake failed: {e}");
-                                        None
-                                    }
-                                    Err(_) => {
-                                        debug!(%addr, "API TLS handshake timed out");
-                                        None
-                                    }
-                                }
-                            });
-                        }
-                        // Out of file descriptors, say: wait for some to close, as axum does.
-                        Err(e) => {
-                            warn!("API accept failed: {e}");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    },
-                    // Matched in the body: a pattern here that failed would leave the branch off
-                    // until the next connection arrives.
-                    Some(joined) = self.handshakes.join_next(), if !self.handshakes.is_empty() => {
-                        if let Ok(Some(done)) = joined {
-                            return done;
-                        }
-                    }
-                }
-            }
-        }
-
-        fn local_addr(&self) -> io::Result<Self::Addr> {
-            self.tcp.local_addr()
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use axum::extract::ConnectInfo;
+
+    /// The API's routes, and `/test/peer` answering the client's address as handlers see it.
+    fn app() -> axum::Router {
+        router(State { service: Weak::new() })
+            .route("/test/peer", get(async |ConnectInfo(addr): ConnectInfo<SocketAddr>| addr.to_string()))
+    }
+
+    /// Serves [`app`] on a plain loopback listener, returning its address and its stop.
+    async fn serve_plain() -> (SocketAddr, oneshot::Sender<()>) {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel();
+        spawn(listener::Plain::new(tcp), app(), stopped);
+        (addr, stop)
+    }
 
     /// Unknown paths and methods answer the API's JSON error, not axum's plain text.
     #[tokio::test]
     async fn unknown_paths_and_methods_are_json_errors() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(axum::serve(listener, router(State { service: Weak::new() })).into_future());
-        let response = get_over(addr, "GET", "/api/nothing").await;
+        let (addr, _stop) = serve_plain().await;
+        let response = request(addr, "GET", "/api/nothing").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
         assert!(response.ends_with(r#"{"error":"no such path: /api/nothing"}"#), "{response}");
-        let response = get_over(addr, "POST", "/api/health").await;
+        let response = request(addr, "POST", "/api/health").await;
         assert!(response.starts_with("HTTP/1.1 405"), "{response}");
         assert!(response.ends_with(r#"{"error":"method not allowed"}"#), "{response}");
     }
 
+    /// Handlers see the client's address: its end of the connection.
+    #[tokio::test]
+    async fn handlers_see_the_clients_address() {
+        let (addr, _stop) = serve_plain().await;
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = stream.local_addr().unwrap();
+        assert!(exchange(stream, "GET", "/test/peer").await.ends_with(&client.to_string()));
+    }
+
+    #[cfg(feature = "tls")]
+    mod tls {
+        use super::*;
+        use crate::config::ApiTls;
+
+        /// Serves [`app`] over TLS with a new certificate for localhost, returning the address,
+        /// the certificate and the stop.
+        async fn serve_tls() -> (SocketAddr, String, oneshot::Sender<()>) {
+            let dir = tempfile::tempdir().unwrap();
+            let (cert, key) = localhost_cert();
+            let files = ApiTls { cert: dir.path().join("api.pem"), key: dir.path().join("api.key") };
+            std::fs::write(&files.cert, &cert).unwrap();
+            std::fs::write(&files.key, key).unwrap();
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+            let (stop, stopped) = oneshot::channel();
+            spawn(listener::Tls::new(tcp, listener::server(&files).unwrap().acceptor()), app(), stopped);
+            (addr, cert, stop)
+        }
+
+        #[tokio::test]
+        async fn handlers_see_the_clients_address_over_tls() {
+            let (addr, cert, _stop) = serve_tls().await;
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let client = tcp.local_addr().unwrap();
+            let response = exchange(tls_client(&cert).await.unwrap().connect(tcp).await.unwrap(), "GET", "/test/peer");
+            assert!(response.await.ends_with(&client.to_string()));
+        }
+
+        /// A client that connects and sends nothing doesn't hold up others' handshakes.
+        #[tokio::test]
+        async fn a_stalled_connection_doesnt_hold_up_tls_handshakes() {
+            let (addr, cert, _stop) = serve_tls().await;
+            let _stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Well within the stalled handshake's timeout, so the two can't have run in turn.
+            let response = tokio::time::timeout(Duration::from_secs(2), request_tls(addr, &cert, "/api/health"))
+                .await
+                .expect("held up by the stalled connection")
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+    }
+
+    /// A self-signed certificate for localhost, as PEM: the certificate and its key.
+    #[cfg(feature = "tls")]
+    pub(crate) fn localhost_cert() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// A TLS client for localhost trusting only `cert`.
+    #[cfg(feature = "tls")]
+    pub(crate) struct TlsClient(turbojet::tls::TlsConnector);
+
+    #[cfg(feature = "tls")]
+    impl TlsClient {
+        pub(crate) async fn connect(
+            &self,
+            tcp: tokio::net::TcpStream,
+        ) -> io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+            self.0.connect("localhost".try_into().expect("a valid name"), tcp).await
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) async fn tls_client(cert: &str) -> io::Result<TlsClient> {
+        use turbojet::tls::{ClientTls, Trust};
+        Ok(TlsClient(ClientTls::new(Trust::from_pem(cert.as_bytes())?, None)?.connector()))
+    }
+
+    /// GET `path` over TLS to `addr`, trusting only `cert`, and the whole answer.
+    #[cfg(feature = "tls")]
+    pub(crate) async fn request_tls(addr: SocketAddr, cert: &str, path: &str) -> io::Result<String> {
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let stream = tls_client(cert).await?.connect(tcp).await?;
+        Ok(exchange(stream, "GET", path).await)
+    }
+
     /// `method path` sent to `addr` over plain HTTP/1.1, and the whole answer.
-    pub(crate) async fn get_over(addr: SocketAddr, method: &str, path: &str) -> String {
+    pub(crate) async fn request(addr: SocketAddr, method: &str, path: &str) -> String {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         exchange(stream, method, path).await
     }

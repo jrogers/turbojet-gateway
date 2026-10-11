@@ -131,7 +131,8 @@ now.
 - `[api]`, optional: the operator API, an HTTP JSON server in the gateway's process. `listen` is
   an IP address and port; `users` and `audit` are files, relative to this file; `tls = { cert,
   key }` (PEM, with the `tls` feature) serves HTTPS, and a reload takes a renewed certificate;
-  other changes apply at the next start. Off loopback the API refuses to start without `tls`,
+  other changes apply at the next start, and an `[api]` that doesn't load refuses the whole
+  reload of this file. Off loopback the API refuses to start without `tls`,
   unless `behind_proxy = true` says a proxy in front terminates TLS. `GET /api/health` answers
   `{"version": "..."}`.
 
@@ -355,21 +356,22 @@ as one warning with the count per session. Other clients' orders stay working at
 ## Signals
 
 - **SIGHUP** (Unix) reloads. The sessions file first, as turbojet-config reloads it: changed
-  settings apply from each session's next logon, added venues start and removed ones are logged
-  out and stopped. Then the routes, risk limits and `day_end`, the routes checked against the
-  venues running after that. A file that doesn't load is logged as a warning and the one in use is
-  kept: a bad sessions file keeps the sessions as they were, and a bad `jetbridge.toml` keeps the
-  routes, limits and `day_end`. New routes and limits apply to new orders; orders already working
-  stay with their venue. A new `day_end` or schedule applies from each session's next trading day.
+  settings apply from each session's next logon, added venues start and removed ones are logged out
+  and stopped. Then the routes, risk limits and `day_end`, the routes checked against the venues
+  running after that. A file that doesn't load is logged as a warning and the one in use is kept: a
+  bad sessions file keeps the sessions as they were, and a bad `jetbridge.toml` keeps the routes,
+  limits and `day_end` (an `[api]` that doesn't load, or breaks the bind rule, makes the whole file
+  bad). Then the API's certificate, with `[api] tls`. New routes and limits apply to new orders;
+  orders already working stay with their venue. A new `day_end` or schedule applies from each
+  session's next trading day.
 - **Ctrl-C or SIGTERM** stops the API (waiting up to 5 seconds for its requests under way), logs
-  every client out ("gateway shutting down"), which fires any
-  cancel-on-disconnect countdowns under way, and cancels the working orders of clients with cancel
-  on disconnect (see above); waits up to 5 seconds for the venues to answer the
-  gateway's cancels; then logs every venue out, waits for the last changes to commit to the
-  database, if there is one, and exits. A second signal exits at once. On the way out it logs how
-  many orders are still open at each venue and how many reports weren't delivered to each
-  client. With a database, the next start restores both. Without one, both are lost: the open
-  orders stay working at their venues with nothing to report their fills to.
+  every client out ("gateway shutting down"), which fires any cancel-on-disconnect countdowns under
+  way, and cancels the working orders of clients with cancel on disconnect (see above); waits up to
+  5 seconds for the venues to answer the gateway's cancels; then logs every venue out, waits for the
+  last changes to commit to the database, if there is one, and exits. A second signal exits at once.
+  On the way out it logs how many orders are still open at each venue and how many reports weren't
+  delivered to each client. With a database, the next start restores both. Without one, both are
+  lost: the open orders stay working at their venues with nothing to report their fills to.
 
 ## Logging
 

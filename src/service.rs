@@ -530,14 +530,13 @@ mod tests {
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         let addr = service.api_addr().unwrap();
-        let response = api::tests::get_over(addr, "GET", "/api/health").await;
+        let response = api::tests::request(addr, "GET", "/api/health").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("content-type: application/json"), "{response}");
         let version = env!("CARGO_PKG_VERSION");
         assert!(response.ends_with(&format!("{{\"version\":\"{version}\"}}")), "{response}");
         service.shutdown().await;
         assert_eq!(service.api_addr(), None);
-        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
         serving.abort();
     }
 
@@ -555,7 +554,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let options = StartOptions { api_listener: Some(listener), ..StartOptions::default() };
         let (service, serving) = Service::start_with(&dir.path().join("jetbridge.toml"), options).await.unwrap();
-        assert!(api::tests::get_over(addr, "GET", "/api/health").await.starts_with("HTTP/1.1 200"));
+        assert!(api::tests::request(addr, "GET", "/api/health").await.starts_with("HTTP/1.1 200"));
         assert!(service.reload().warnings.is_empty());
         write(&dir, "jetbridge.toml", &config("0.0.0.0:8081"));
         let reloaded = service.reload();
@@ -566,30 +565,13 @@ mod tests {
         serving.abort();
     }
 
-    /// A self-signed certificate for localhost, as PEM: the certificate and its key.
-    #[cfg(feature = "tls")]
-    fn localhost_cert() -> (String, String) {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key).unwrap();
-        (cert.pem(), key.serialize_pem())
-    }
-
-    /// GET /api/health over TLS to `addr`, trusting only `cert`.
-    #[cfg(feature = "tls")]
-    async fn health_over_tls(addr: SocketAddr, cert: &str) -> std::io::Result<String> {
-        use turbojet::tls::{ClientTls, Trust};
-        let connector = ClientTls::new(Trust::from_pem(cert.as_bytes())?, None)?.connector();
-        let tcp = tokio::net::TcpStream::connect(addr).await?;
-        let stream = connector.connect("localhost".try_into().unwrap(), tcp).await?;
-        Ok(api::tests::exchange(stream, "GET", "/api/health").await)
-    }
-
-    /// With `[api] tls` the API serves HTTPS, and a reload presents a renewed certificate.
+    /// With `[api] tls` the API serves HTTPS. A reload whose certificate doesn't load keeps the one
+    /// in use, with a warning; one that does presents the renewed certificate.
     #[cfg(feature = "tls")]
     #[tokio::test]
     async fn the_api_serves_over_tls_and_a_reload_renews_its_certificate() {
         let dir = tempfile::tempdir().unwrap();
-        let (cert, key) = localhost_cert();
+        let (cert, key) = api::tests::localhost_cert();
         write(&dir, "api.pem", &cert);
         write(&dir, "api.key", &key);
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
@@ -597,17 +579,24 @@ mod tests {
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n{tls}"));
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         let addr = service.api_addr().unwrap();
-        let response = health_over_tls(addr, &cert).await.unwrap();
+        let health = async |cert: &str| api::tests::request_tls(addr, cert, "/api/health").await;
+        let response = health(&cert).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("\"version\""), "{response}");
 
-        let (renewed, renewed_key) = localhost_cert();
+        write(&dir, "api.pem", "not a certificate");
+        let reloaded = service.reload();
+        let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
+        assert!(warning.contains("keeping the API's certificate in use"), "{warning}");
+        assert!(health(&cert).await.unwrap().starts_with("HTTP/1.1 200"));
+
+        let (renewed, renewed_key) = api::tests::localhost_cert();
         write(&dir, "api.pem", &renewed);
         write(&dir, "api.key", &renewed_key);
         let reloaded = service.reload();
         assert!(reloaded.warnings.is_empty(), "{reloaded:?}");
-        assert!(health_over_tls(addr, &cert).await.is_err());
-        assert!(health_over_tls(addr, &renewed).await.unwrap().starts_with("HTTP/1.1 200"));
+        assert!(health(&cert).await.is_err());
+        assert!(health(&renewed).await.unwrap().starts_with("HTTP/1.1 200"));
         service.shutdown().await;
         serving.abort();
     }

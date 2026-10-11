@@ -166,7 +166,8 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
 /// # Errors
 ///
 /// As [`load`], for the routes, limits, `day_end` and `[api]`, or a route names a venue not in
-/// `venues`.
+/// `venues`. An `[api]` that doesn't load (or breaks the bind rule) refuses the whole file: the
+/// routes, limits and `day_end` in it aren't taken either.
 pub fn reload(
     path: &Path,
     venues: &[String],
@@ -375,7 +376,7 @@ impl File {
         if api.tls.is_some() && !cfg!(feature = "tls") {
             return Err(error("tls: this build has no TLS; build with the `tls` feature".to_string()));
         }
-        if !api.listen.ip().is_loopback() && api.tls.is_none() && !api.behind_proxy {
+        if !api.listen.ip().to_canonical().is_loopback() && api.tls.is_none() && !api.behind_proxy {
             return Err(error(format!(
                 "listen = \"{}\" isn't a loopback address, and without tls the API's passwords and \
                  tokens would cross the network in the clear: set tls, or behind_proxy = true if a \
@@ -716,6 +717,8 @@ self_trade = false
         assert!(api("[::1]:8080", "").is_ok());
         let error = api("0.0.0.0:8080", "").unwrap_err();
         assert!(error.contains("[api] listen = \"0.0.0.0:8080\" isn't a loopback address"), "{error}");
+        assert!(api("[::ffff:127.0.0.1]:8080", "").is_ok());
+        assert!(api("[::]:8080", "").unwrap_err().contains("isn't a loopback address"));
         assert!(api("0.0.0.0:8080", "behind_proxy = true").is_ok());
         let tls = api("0.0.0.0:8080", "tls = { cert = \"c.pem\", key = \"k.pem\" }");
         if cfg!(feature = "tls") {
