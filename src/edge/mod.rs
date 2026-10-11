@@ -93,7 +93,7 @@ pub struct Gateway {
     writer: Option<Writer>,
 }
 
-/// What a stop would lose until the book is persisted: see [`Gateway::unfinished`].
+/// What the gateway leaves unfinished at a stop: see [`Gateway::unfinished`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unfinished {
     /// Open orders, per venue holding any.
@@ -298,7 +298,8 @@ impl Gateway {
         self.lock().book.router().clone()
     }
 
-    /// What a stop would lose until the book is persisted.
+    /// What a stop leaves unfinished: open orders, undelivered reports and the gateway's own
+    /// cancels. Without a database a stop loses them; with one, a restart restores them.
     pub fn unfinished(&self) -> Unfinished {
         let state = self.lock();
         Unfinished {

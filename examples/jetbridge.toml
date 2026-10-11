@@ -22,4 +22,4 @@ self_trade = true
 # FUNDA's own: the keys it sets replace the defaults', the rest are the defaults'.
 [risk.client.FUNDA]
 max_notional = "2500000.50"
-credit = 10000000                 # open + filled since start + this order
+credit = 10000000                 # open + filled today + this order

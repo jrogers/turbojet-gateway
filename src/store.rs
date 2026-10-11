@@ -170,7 +170,7 @@ impl Store {
     /// The database refuses a query, or holds a value this build can't read.
     pub async fn load(&self) -> io::Result<Snapshot> {
         // One transaction, so the orders and what names them are of the same commit: a SQLite
-        // transaction reads one snapshot; PostgreSQL's needs REPEATABLE READ for that (task D3).
+        // transaction reads one snapshot; PostgreSQL's would need REPEATABLE READ for that.
         let mut transaction = self.pool.begin().await.map_err(database("starting a load"))?;
         let connection = &mut *transaction;
         let mut snapshot = Snapshot::default();
