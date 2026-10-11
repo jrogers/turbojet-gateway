@@ -41,6 +41,15 @@ pub const MAX_PASSWORD_LEN: usize = 1024;
 /// A new password's length at least, in bytes: the operator API can stop a client's trading.
 pub const MIN_PASSWORD_LEN: usize = 12;
 
+/// The most memory a password hash may ask argon2 for, in KiB (its `m`): 1 GiB, fifty times the
+/// default. A hash in the users file that asks more, hand-edited, would make every login for it
+/// (and four at once) allocate that much.
+const MAX_HASH_MEMORY_KIB: u32 = 1024 * 1024;
+
+/// The most passes a password hash may ask argon2 for (its `t`): ten times the default, at its
+/// memory a few seconds a login at most.
+const MAX_HASH_PASSES: u32 = 20;
+
 /// What a token starts with: tells it from a password in a script, or in a leak scan.
 const TOKEN_PREFIX: &str = "jb_";
 
@@ -358,7 +367,8 @@ pub fn check_new_password(password: &str) -> Result<(), String> {
 
 /// Refuses a hash other than argon2id's, or one cheaper than argon2's defaults (which
 /// [`hash_password`] uses): a weak hash is quick to crack if the file leaks, and quicker to check
-/// than an unknown user's, which would tell who exists.
+/// than an unknown user's, which would tell who exists. Refuses one dearer than
+/// [`MAX_HASH_MEMORY_KIB`] or [`MAX_HASH_PASSES`] too: each login would cost that.
 fn check_hash(phc: &str) -> Result<(), String> {
     let hash = PasswordHash::new(phc).map_err(|e| format!("not a PHC hash: {e}"))?;
     if hash.algorithm != argon2::Algorithm::Argon2id.ident() {
@@ -377,6 +387,14 @@ fn check_hash(phc: &str) -> Result<(), String> {
             argon2::Params::DEFAULT_M_COST,
             argon2::Params::DEFAULT_T_COST,
             argon2::Params::DEFAULT_P_COST,
+        ));
+    }
+    if params.m_cost() > MAX_HASH_MEMORY_KIB || params.t_cost() > MAX_HASH_PASSES {
+        return Err(format!(
+            "argon2 parameters m={}, t={} are over the most a login may cost, m={MAX_HASH_MEMORY_KIB}, \
+             t={MAX_HASH_PASSES}",
+            params.m_cost(),
+            params.t_cost(),
         ));
     }
     Ok(())
@@ -527,7 +545,7 @@ mod tests {
         assert!(!toml::to_string(&users).unwrap().contains("clients"));
     }
 
-    /// Only argon2id hashes at argon2's default cost or more are taken.
+    /// Only argon2id hashes at argon2's default cost or more, and at most the ceiling, are taken.
     #[test]
     fn weak_hashes_are_refused() {
         let user = |hash: &str| format!("[user.a]\nrole = \"viewer\"\npassword = \"{hash}\"\n");
@@ -539,6 +557,11 @@ mod tests {
         let argon2i = Argon2::new(argon2::Algorithm::Argon2i, argon2::Version::V0x13, argon2::Params::default());
         let argon2i = argon2i.hash_password(b"pw", &salt).unwrap().to_string();
         assert!(user(&argon2i).parse::<Users>().unwrap_err().contains("isn't argon2id"));
+        // Too dear: edited by hand, as hashing one would take a gigabyte and more.
+        let dear = |m: u32, t: u32| hash_password("pw").replacen("m=19456,t=2", &format!("m={m},t={t}"), 1);
+        assert!(user(&dear(MAX_HASH_MEMORY_KIB, MAX_HASH_PASSES)).parse::<Users>().is_ok());
+        assert!(user(&dear(MAX_HASH_MEMORY_KIB + 1, 2)).parse::<Users>().unwrap_err().contains("over the most"));
+        assert!(user(&dear(19_456, MAX_HASH_PASSES + 1)).parse::<Users>().unwrap_err().contains("over the most"));
         assert!(user(&hash_password("pw")).parse::<Users>().is_ok());
     }
 
