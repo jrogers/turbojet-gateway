@@ -14,12 +14,14 @@
 //! a process dies: a disk store's write and fsync already running on a blocking thread (the crash
 //! waits for it, so its lock is released before the restart), and a SQLite statement already
 //! handed to sqlx's worker thread. An OS crash could lose what they write (and unsynced writes
-//! that a process crash keeps): these tests are of process crashes.
+//! that a process crash keeps): these tests are of process crashes. Dropping a connected session
+//! runs Turbojet's `Session::drop`, which calls `on_logout` and starts cancel on disconnect's
+//! countdown; nothing it starts is ever polled, so neither has a lasting effect.
 //!
-//! **Where it crashes.** Gates, not sleeps: the venue's session store holds its commits while
-//! its gate is shut (so it neither stores nor sends), and the database's writer waits before each
-//! write while the store's test gate is shut.
-//!
+//! **Where it crashes.** Gates, not sleeps: the venue's and the client's session stores at the
+//! gateway hold their commits while their gates are shut (so they neither store nor send), and
+//! the database's writer waits before each write, or inside its transaction after its statements,
+//! while the store's test gates are shut.
 
 use std::future::Future;
 use std::path::Path;
@@ -49,6 +51,8 @@ const VENUE: &str = "VENUE";
 const GATEWAY: &str = "JETBRIDGE";
 /// How long any one event may take: a restart waits up to a second for its ID prefix.
 const WAIT: Duration = Duration::from_secs(5);
+/// How long a test waits to see that nothing more arrives: loopback delivers in well under it.
+const QUIET: Duration = Duration::from_millis(100);
 
 /// Something the client or the venue saw.
 #[derive(Debug)]
@@ -92,9 +96,30 @@ impl Events {
         assert!(matches!(event, Event::LoggedOn), "expected a logon, got {event:?}");
     }
 
+    /// The next logout, past status reports (see [`report`](Self::report)).
     async fn logged_out(&mut self) {
-        let event = self.next().await;
-        assert!(matches!(event, Event::LoggedOut), "expected a logout, got {event:?}");
+        loop {
+            match self.next().await {
+                Event::LoggedOut => return,
+                Event::Message(msg) if msg.get(tags::EXEC_TYPE) == Some("I") => {}
+                event => panic!("expected a logout, got {event:?}"),
+            }
+        }
+    }
+
+    /// The next report but status reports and the venue's ack of `cl_ord_id` sent again: a venue
+    /// may redeliver its ack after a restart (the gateway stopped before its session stored the
+    /// ack's release), and the book, changing nothing, forwards it again, marked PossResend.
+    async fn report_past_resent_ack(&mut self, cl_ord_id: &str) -> v44::ExecutionReport {
+        loop {
+            let msg = self.report().await;
+            let report: v44::ExecutionReport = msg.parse().unwrap_or_else(|e| panic!("{e:?}: {msg:?}"));
+            let resent_ack = report.exec_type == v44::ExecType::New && report.cl_ord_id.as_deref() == Some(cl_ord_id);
+            if !resent_ack {
+                return report;
+            }
+            assert_eq!(msg.get(tags::POSS_RESEND), Some("Y"), "{msg:?}");
+        }
     }
 
     async fn message(&mut self) -> Message {
@@ -131,6 +156,17 @@ impl Events {
         if let Ok(event) = self.0.try_recv() {
             panic!("unexpected {event:?}");
         }
+    }
+
+    /// Nothing but status reports arrives for [`QUIET`].
+    async fn assert_quiet(&mut self) {
+        let quiet = async {
+            while let Some(event) = self.0.recv().await {
+                let status = matches!(&event, Event::Message(msg) if msg.get(tags::EXEC_TYPE) == Some("I"));
+                assert!(status, "unexpected {event:?}");
+            }
+        };
+        assert!(timeout(QUIET, quiet).await.is_err(), "closed");
     }
 }
 
@@ -219,10 +255,12 @@ struct Setup {
 
 impl Setup {
     async fn new() -> Self {
-        Self::with_cancel_on_disconnect(None).await
+        Self::with(None, true).await
     }
 
-    async fn with_cancel_on_disconnect(cancel: Option<Duration>) -> Self {
+    /// With the client cancelled on disconnect after `cancel`, if given, and the book in a
+    /// database if `database`.
+    async fn with(cancel: Option<Duration>, database: bool) -> Self {
         // RUST_LOG=info, say, to see what the gateway logs.
         let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter(EnvFilter::from_default_env()).try_init();
         let dir = tempfile::tempdir().unwrap();
@@ -231,9 +269,8 @@ impl Setup {
         let (app, mut venue_events) = recorder();
         let venue = Acceptor::new(SessionConfig::new("FIX.4.4", VENUE), Arc::new(MemoryStorage::new()), app).unwrap();
         tokio::spawn(venue.clone().serve(listener));
-        // A port to listen on at every start, for the client to reconnect to.
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        write_config(dir.path(), port, venue_port, cancel);
+        let port = gateway_port();
+        write_config(dir.path(), port, venue_port, (cancel, database));
         let (venue_gate, venue_open) = watch::channel(true);
         let (client_gate, client_open) = watch::channel(true);
         let gateway = Gateway::start(dir.path(), venue_open, client_open);
@@ -286,7 +323,8 @@ impl Setup {
     }
 
     /// Nothing more is on its way to the client or the venue: a last order's request is the
-    /// venue's next message and its ack the client's.
+    /// venue's next message and its ack the client's (status reports aside), and nothing else
+    /// arrives for a while after.
     async fn assert_quiet(&mut self) {
         self.send(order("LAST"));
         let sent: v44::NewOrderSingle = self.venue_events.parse().await;
@@ -295,6 +333,7 @@ impl Setup {
         self.venue_send(acked(&sent.cl_ord_id, 100));
         let new = self.events.execution_report().await;
         assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("LAST"), v44::ExecType::New));
+        tokio::join!(self.events.assert_quiet(), self.venue_events.assert_quiet());
     }
 
     /// Stops the gateway dead, and starts it again on its files once the client and venue have
@@ -393,9 +432,21 @@ fn database_url(dir: &Path) -> String {
     format!("sqlite://{}?mode=rwc", dir.join("jetbridge.db").display())
 }
 
+/// A port for the gateway to listen on at every start, free now: outside the ephemeral ranges
+/// (Linux's from 32768, macOS's from 49152), so no connection's local port takes it while the
+/// gateway is down, and picked at random, so tests running at once don't pick the same.
+fn gateway_port() -> u16 {
+    use std::hash::{BuildHasher, RandomState};
+    let start = RandomState::new().hash_one(std::thread::current().id());
+    (0..1_000)
+        .map(|n| 20_000 + u16::try_from((start + n) % 12_000).expect("below 12000"))
+        .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+        .expect("a free port")
+}
+
 /// Jetbridge's files: clients on `port`, the venue at `venue_port`, both sessions on disk, the
-/// book in SQLite, the client cancelled on disconnect after `cancel` if given.
-fn write_config(dir: &Path, port: u16, venue_port: u16, cancel: Option<Duration>) {
+/// client cancelled on disconnect after `cancel` if given, the book in SQLite if `database`.
+fn write_config(dir: &Path, port: u16, venue_port: u16, (cancel, database): (Option<Duration>, bool)) {
     let cancel = cancel
         .map(|grace| format!("cancel_on_disconnect = \"disconnect\"\ncancel_grace = \"{}ms\"\n", grace.as_millis()))
         .unwrap_or_default();
@@ -425,10 +476,8 @@ store = "venue"
 "#
     );
     std::fs::write(dir.join("sessions.toml"), sessions).unwrap();
-    let config = format!(
-        "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"{VENUE}\"\n[database]\nurl = \"{}\"\n",
-        database_url(dir)
-    );
+    let database = if database { format!("[database]\nurl = \"{}\"\n", database_url(dir)) } else { String::new() };
+    let config = format!("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"{VENUE}\"\n{database}");
     std::fs::write(dir.join("jetbridge.toml"), config).unwrap();
 }
 
@@ -436,6 +485,12 @@ fn order(cl_ord_id: &str) -> Message {
     let mut order = v44::NewOrderSingle::new(cl_ord_id, v44::Side::Buy, UtcTimestamp::now(), v44::OrdType::Limit);
     (order.symbol, order.order_qty, order.price) = (Some("AAPL".into()), Some(100.into()), Some(10.into()));
     order.to_message()
+}
+
+fn cancel(cl_ord_id: &str, orig_cl_ord_id: &str) -> Message {
+    let mut cancel = v44::OrderCancelRequest::new(orig_cl_ord_id, cl_ord_id, v44::Side::Buy, UtcTimestamp::now());
+    cancel.symbol = Some("AAPL".into());
+    cancel.to_message()
 }
 
 fn replace(cl_ord_id: &str, orig_cl_ord_id: &str, qty: i64) -> Message {
@@ -743,7 +798,7 @@ async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_keeps_working(
 /// answer applies, and the client hears of the cancel once it's back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_during_cancel_on_disconnect_still_cancels_and_tells_the_client() {
-    let mut setup = Setup::with_cancel_on_disconnect(Some(Duration::from_millis(50))).await;
+    let mut setup = Setup::with(Some(Duration::from_millis(50)), true).await;
     let order = setup.working_order("C1", 1).await;
     setup.gateway().committed().await;
     setup.gateway().store().hooks.gate.send_replace(false);
@@ -812,7 +867,8 @@ async fn a_fill_lost_in_a_crash_is_redelivered_and_reported_again_as_possibly_re
     // Turbojet marks the new fill too if it arrives while the gateway's ResendRequest for the
     // first is outstanding, within the window that may have been handled: it can't tell them
     // apart then. Either way the client has a new ExecID to take.
-    fills[2].3 = None;
+    let flag = fills[2].3.take();
+    assert!(matches!(flag.as_deref(), None | Some("Y")), "{flag:?}");
     let filled = (setup.id(0, "1.3"), Some(60.into()), 100.into(), None);
     assert_eq!(fills, [partial, again, filled]);
     setup.assert_quiet().await;
@@ -837,9 +893,15 @@ async fn a_crash_before_the_venue_stores_an_order_sends_it_once_after_the_restar
     let sent: v44::NewOrderSingle = msg.parse().unwrap();
     assert_eq!(sent.cl_ord_id.as_str(), setup.id(0, "1"));
     setup.venue_send(acked(&sent.cl_ord_id, 100));
-    let new = setup.events.execution_report().await;
-    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
-    assert_eq!(new.order_id.as_str(), setup.id(0, "1"));
+    // The ack, and the status answering the client's redelivered order, in either order.
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let report: v44::ExecutionReport = setup.events.parse().await;
+        assert_eq!((report.cl_ord_id.as_deref(), report.order_id.as_str()), (Some("C1"), &*setup.id(0, "1")));
+        seen.push(report.exec_type);
+    }
+    seen.sort_by_key(|exec_type| *exec_type == v44::ExecType::New);
+    assert_eq!(seen, [v44::ExecType::OrderStatus, v44::ExecType::New]);
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
@@ -892,4 +954,210 @@ async fn a_request_lost_to_a_store_reset_is_not_sent_again() {
     assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
+}
+
+/// The most common window: a fill's change committed, its hold released, but the venue's session
+/// not yet storing the release when the gateway crashes (its store gated after the fill was
+/// handed over and before the commit). The venue redelivers the fill, the book drops it as
+/// stale, and the client sees nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_committed_but_not_released_is_redelivered_and_dropped() {
+    let mut setup = Setup::new().await;
+    let downstream = setup.working_order("C1", 1).await;
+    setup.gateway().committed().await;
+    let writer = setup.gateway().store().hooks.gate.clone();
+    writer.send_replace(false);
+    setup.venue_send(fill(&downstream, "E-1", 40, 40));
+    let partial = fill_seen(&setup.events.report().await);
+    assert_eq!(partial, (setup.id(0, "1.2"), Some(40.into()), 40.into(), None));
+    // Handed over and held: now the release can't be stored.
+    setup.venue_gate.send_replace(false);
+    writer.send_replace(true);
+    setup.gateway().committed().await;
+
+    setup.crash_and_restart().await;
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::PartiallyFilled, 40.into())]);
+}
+
+/// A client's cancel the database recorded but the venue's session never stored: after the
+/// restart it goes to the venue under its ClOrdID, and the venue's Canceled answers the client.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clients_cancel_the_venue_never_got_goes_after_a_crash() {
+    let mut setup = Setup::new().await;
+    let order = setup.working_order("C1", 1).await;
+    setup.venue_gate.send_replace(false);
+    setup.send(cancel("C2", "C1"));
+    let downstream = format!("{order}-1");
+    setup.until_stored(|database| database.sent.contains_key(&*downstream)).await;
+    setup.venue_events.assert_empty();
+
+    setup.crash_and_restart().await;
+    let msg = setup.venue_events.message().await;
+    assert_eq!(msg.get(tags::POSS_RESEND), Some("Y"));
+    let sent: v44::OrderCancelRequest = msg.parse().unwrap();
+    assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), (&*downstream, &*order));
+    setup.venue_send(canceled(&downstream, &order, 0));
+    let canceled = setup.events.report_past_resent_ack("C1").await;
+    assert_eq!(
+        (canceled.cl_ord_id.as_deref(), canceled.orig_cl_ord_id.as_deref(), canceled.exec_type),
+        (Some("C2"), Some("C1"), v44::ExecType::Canceled)
+    );
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::Canceled, Decimal::ZERO)]);
+}
+
+/// The gateway's own cancel (cancel on disconnect's) the database recorded but the venue's
+/// session never stored: after the restart it goes to the venue, and the client, back, hears
+/// the order is canceled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gateway_cancel_the_venue_never_got_goes_after_a_crash() {
+    let mut setup = Setup::with(Some(Duration::from_millis(50)), true).await;
+    let order = setup.working_order("C1", 1).await;
+    setup.venue_gate.send_replace(false);
+    setup.disconnect_client().await;
+    let downstream = format!("{order}-1");
+    setup.until_stored(|database| database.sent.contains_key(&*downstream)).await;
+    setup.venue_events.assert_empty();
+
+    setup.crash_and_restart().await;
+    let msg = setup.venue_events.message().await;
+    assert_eq!(msg.get(tags::POSS_RESEND), Some("Y"));
+    let sent: v44::OrderCancelRequest = msg.parse().unwrap();
+    assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), (&*downstream, &*order));
+    setup.venue_send(canceled(&downstream, &order, 0));
+    setup.reconnect_client().await;
+    let canceled = setup.events.report_past_resent_ack("C1").await;
+    assert_eq!((canceled.cl_ord_id.as_deref(), canceled.exec_type), (Some("C1"), v44::ExecType::Canceled));
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::Canceled, Decimal::ZERO)]);
+}
+
+/// Neither the database nor the venue's session stored the order at the crash: the client's
+/// redelivered order is booked afresh under the new start's ID and sent once, with no orphan to
+/// cancel.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_order_neither_stored_is_booked_afresh_after_a_crash() {
+    let mut setup = Setup::new().await;
+    setup.gateway().store().hooks.gate.send_replace(false);
+    setup.venue_gate.send_replace(false);
+    setup.send(order("C1"));
+    let gateway = setup.gateway().service.gateway().clone();
+    until(|| !gateway.unfinished().open_orders.is_empty()).await;
+    drop(gateway);
+
+    setup.crash_and_restart().await;
+    let sent: v44::NewOrderSingle = setup.venue_events.parse().await;
+    assert_eq!(sent.cl_ord_id.as_str(), setup.id(1, "1"));
+    setup.venue_send(acked(&sent.cl_ord_id, 100));
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.order_id.as_str()), (Some("C1"), &*setup.id(1, "1")));
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
+}
+
+/// An orphan handled after one crash isn't taken again after a second: the venue gets nothing
+/// more.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_orphan_handled_is_not_taken_again_at_the_next_restart() {
+    let mut setup = Setup::new().await;
+    setup.gateway().store().hooks.gate.send_replace(false);
+    setup.send(order("C1"));
+    let orphan: v44::NewOrderSingle = setup.venue_events.parse().await;
+    setup.crash_and_restart().await;
+    for _ in 0..2 {
+        let msg = setup.venue_events.message().await;
+        if let Ok(cancel) = msg.parse::<v44::OrderCancelRequest>() {
+            assert_eq!(cancel.orig_cl_ord_id, orphan.cl_ord_id);
+            setup.venue_send(canceled(&cancel.cl_ord_id, &orphan.cl_ord_id, 0));
+        } else {
+            let again: v44::NewOrderSingle = msg.parse().unwrap();
+            setup.venue_send(acked(&again.cl_ord_id, 100));
+        }
+    }
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+    setup.database().await;
+
+    setup.crash_and_restart().await;
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
+}
+
+/// A request sent again after one crash isn't sent again after a second: the venue's session
+/// stored it this time.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsent_request_sent_once_is_not_sent_again_at_the_next_restart() {
+    let mut setup = Setup::new().await;
+    setup.venue_gate.send_replace(false);
+    setup.send(order("C1"));
+    setup.until_stored(|database| !stored(database, "C1").is_empty()).await;
+    setup.crash_and_restart().await;
+    let sent: v44::NewOrderSingle = setup.venue_events.parse().await;
+    assert_eq!(sent.cl_ord_id.as_str(), setup.id(0, "1"));
+    setup.database().await;
+
+    setup.crash_and_restart().await;
+    setup.assert_quiet().await;
+    setup.venue_send(acked(&sent.cl_ord_id, 100));
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), v44::ExecType::New));
+}
+
+/// A crash in the middle of the writer's transaction, its statements run and not committed: the
+/// transaction goes with the connection, the database stays unlocked, and the order the venue's
+/// session sent is an orphan, as if nothing had been written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_inside_a_transaction_leaves_nothing_of_it() {
+    let mut setup = Setup::new().await;
+    setup.gateway().store().hooks.gate_in_transaction.send_replace(false);
+    setup.send(order("C1"));
+    let orphan: v44::NewOrderSingle = setup.venue_events.parse().await;
+
+    setup.crash_and_restart().await;
+    let mut cancelled = false;
+    for _ in 0..2 {
+        let msg = setup.venue_events.message().await;
+        if let Ok(cancel) = msg.parse::<v44::OrderCancelRequest>() {
+            assert_eq!(cancel.orig_cl_ord_id, orphan.cl_ord_id);
+            cancelled = true;
+            setup.venue_send(canceled(&cancel.cl_ord_id, &orphan.cl_ord_id, 0));
+        } else {
+            let again: v44::NewOrderSingle = msg.parse().unwrap();
+            assert_eq!(again.cl_ord_id.as_str(), setup.id(1, "1"));
+            setup.venue_send(acked(&again.cl_ord_id, 100));
+        }
+    }
+    assert!(cancelled, "the orphan wasn't cancelled");
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.order_id.as_str()), (Some("C1"), &*setup.id(1, "1")));
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
+}
+
+/// Without a database: the client's order is held until the venue's session has stored it, so
+/// a crash before then has the client redeliver it, and the new start, with an empty book,
+/// books and sends it. The venue gets it once; the client hears one ack.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_database_an_order_the_venue_never_stored_is_redelivered_and_sent() {
+    let mut setup = Setup::with(None, false).await;
+    setup.venue_gate.send_replace(false);
+    setup.send(order("C1"));
+    let gateway = setup.gateway().service.gateway().clone();
+    until(|| !gateway.unfinished().open_orders.is_empty()).await;
+    drop(gateway);
+
+    setup.crash_and_restart().await;
+    let sent: v44::NewOrderSingle = setup.venue_events.parse().await;
+    assert_eq!(sent.cl_ord_id.as_str(), setup.id(1, "1"));
+    setup.venue_send(acked(&sent.cl_ord_id, 100));
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.order_id.as_str()), (Some("C1"), &*setup.id(1, "1")));
+    setup.assert_quiet().await;
 }
