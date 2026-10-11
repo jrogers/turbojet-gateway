@@ -6,14 +6,12 @@
 //! other than Buy, Sell or SellShort, a quantity that isn't positive, a Limit order without a
 //! price and a Market order with one.
 
-use turbojet::fields::{CodeRef, CompactString, Decimal, UtcTimestamp};
+use turbojet::fields::{Code, CodeRef, CompactString, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{FixMessage, Message, MessageReject};
 use turbojet_fix44 as fix;
 
-use super::{
-    check_price, from_code_number, order_id_out, quantity, reason_code, replaced_status, required, unsupported,
-};
+use super::{check_price, order_id_out, quantity, reason_code, replaced_status, required, unsupported, venue_code};
 use crate::book::{
     CancelKind, CancelRejectReason, ClientId, ClientReport, ExecType, Input, OrdType, OrderRequest, Output,
     RejectReason, Side, Status, TimeInForce, VenueId, VenueReport,
@@ -57,7 +55,7 @@ pub fn client_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
                 ord_status_to_fix(*status),
                 response_to,
             );
-            reject.cxl_rej_reason = Some(cxl_rej_reason_to_fix(*reason).into());
+            reject.cxl_rej_reason = Some(cxl_rej_reason_to_fix(*reason));
             reject.text = Some(text.clone());
             reject.transact_time = Some(now);
             Some(reject.to_message())
@@ -221,7 +219,7 @@ fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionR
         message.last_qty = Some(report.last_qty);
         message.last_px = Some(report.last_px);
     }
-    message.ord_rej_reason = report.reject.map(|reject| ord_rej_reason_to_fix(reject).into());
+    message.ord_rej_reason = report.reject.map(ord_rej_reason_to_fix);
     // A status request about no order: FIX 4.4 answers Rejected, UnknownOrder.
     if report.reject.is_none() && report.order_id.is_none() && report.status == Status::Rejected {
         message.ord_rej_reason = Some(fix::OrdRejReason::UnknownOrder.into());
@@ -469,9 +467,9 @@ fn exec_type_from_fix(exec_type: fix::ExecType) -> Option<ExecType> {
 
 /// FIX 4.4 has codes for Duplicate (6) and, for the quantity, notional and credit limits, Order
 /// exceeds limit (3); the book's other reasons say Other (99) and the report's Text says why. A
-/// venue's code passes through if FIX 4.4 has it.
-fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
-    match reason {
+/// venue's code passes through, listed in FIX 4.4 or not.
+fn ord_rej_reason_to_fix(reason: RejectReason) -> Code<fix::OrdRejReason> {
+    let known = match reason {
         RejectReason::Duplicate => fix::OrdRejReason::DuplicateOrder,
         RejectReason::NoRoute
         | RejectReason::RouteRejected
@@ -485,25 +483,26 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
         RejectReason::Risk(
             RiskReject::Symbol | RiskReject::NoReferencePrice | RiskReject::PriceBand | RiskReject::SelfTrade,
         ) => fix::OrdRejReason::Other,
-        RejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::OrdRejReason::Other),
-    }
+        RejectReason::Venue(code) => return venue_code(code),
+    };
+    known.into()
 }
 
-fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> fix::CxlRejReason {
-    match reason {
+fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> Code<fix::CxlRejReason> {
+    let known = match reason {
         CancelRejectReason::TooLate => fix::CxlRejReason::TooLateToCancel,
         CancelRejectReason::UnknownOrder => fix::CxlRejReason::UnknownOrder,
         CancelRejectReason::AlreadyPending => fix::CxlRejReason::OrderAlreadyInPendingStatus,
         CancelRejectReason::Duplicate => fix::CxlRejReason::DuplicateClOrdID,
         CancelRejectReason::Other => fix::CxlRejReason::Other,
-        CancelRejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::CxlRejReason::Other),
-    }
+        CancelRejectReason::Venue(code) => return venue_code(code),
+    };
+    known.into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turbojet::fields::Code;
 
     fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
@@ -640,7 +639,7 @@ mod tests {
             (RejectReason::Venue(3), "3"),
             (RejectReason::Venue(15), "15"),
             // FIX 5.0 added 16 onwards; a 4.4 client gets Other and the Text.
-            (RejectReason::Venue(18), "99"),
+            (RejectReason::Venue(18), "18"),
         ];
         for (reason, code) in reasons {
             assert_eq!(ord_rej_reason_to_fix(reason).code(), code, "{reason:?}");
@@ -652,7 +651,7 @@ mod tests {
             (CancelRejectReason::Duplicate, "6"),
             (CancelRejectReason::Other, "99"),
             (CancelRejectReason::Venue(2), "2"),
-            (CancelRejectReason::Venue(7), "99"),
+            (CancelRejectReason::Venue(7), "7"),
         ];
         for (reason, code) in reasons {
             assert_eq!(cxl_rej_reason_to_fix(reason).code(), code, "{reason:?}");

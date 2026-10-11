@@ -20,6 +20,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   sessions back the same way (see below).
 - A gateway cancel (the kill switch's) that a venue's session can't queue is tried again once a
   second while the session is connected, without limit.
+- A venue's OrdRejReason or CxlRejReason reaches the client as the venue sent it, even a code
+  the client's FIX version doesn't list; a client whose engine checks codes against its
+  dictionary may refuse the message.
 - At the end of a session's trading day its done orders, their ClOrdIDs and requests sent, and
   its filled notional are dropped from memory (see the README's trading day); with a database
   they stay in it as history. Live orders carry over, GTC ones for as long as they work, and so
@@ -78,9 +81,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   disk store adds its read time. A large store makes for a slow start.
 - A reload that keeps a client's or venue's session in memory is applied all the same, with an
   error logged; the next start refuses the file.
-- A client that logs on with ResetSeqNumFlag(141)=Y after a
-  restart, doesn't redeliver the messages that hadn't committed before the stop, and loses the
-  reports its session had stored but not yet sent.
+- A client that logs on with ResetSeqNumFlag(141)=Y after a restart doesn't redeliver the
+  messages that hadn't committed before the stop, and loses the reports its session had stored
+  but not yet sent.
 - Deleting a venue's disk store while the database has orders for that venue stops every start,
   since the gateway can no longer tell what the venue was sent. To start a venue's sequence
   numbers again, reset them rather than delete its files: `Service::venue_session(name)`, then

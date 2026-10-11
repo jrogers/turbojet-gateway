@@ -1,7 +1,7 @@
 //! Conversion between FIX messages and the book's types, one module per FIX version. Pure: no
 //! sessions and no clocks; the caller passes the time for TransactTime.
 
-use turbojet::fields::{CompactString, Decimal, FixEnum, UtcTimestamp, format_compact};
+use turbojet::fields::{Code, CompactString, Decimal, FixEnum, UtcTimestamp, format_compact};
 use turbojet::message::tags;
 use turbojet::{Message, MessageReject};
 
@@ -160,8 +160,9 @@ fn order_id_out(order_id: Option<&CompactString>) -> CompactString {
 }
 
 /// The enum value for a numeric FIX code, if the enum has it.
-fn from_code_number<E: FixEnum>(code: u32) -> Option<E> {
-    E::from_code(&format_compact!("{code}"))
+fn venue_code<E: FixEnum>(code: u32) -> Code<E> {
+    let code = format_compact!("{code}");
+    E::from_code(&code).map_or_else(|| Code::Unknown(code.into()), Code::Known)
 }
 
 #[cfg(test)]
@@ -170,7 +171,6 @@ mod tests {
     use crate::book::Book;
     use crate::router::{Router, Rule, Target};
     use turbojet::FixMessage;
-    use turbojet::fields::Code;
     use {turbojet_fix42 as v42, turbojet_fix44 as v44};
 
     #[test]

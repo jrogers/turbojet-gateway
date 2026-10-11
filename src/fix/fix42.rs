@@ -13,14 +13,12 @@
 //! OrderCancelReplaceRequest require HandlInst(21). The reason codes are fewer: Broker option
 //! (OrdRejReason 0, CxlRejReason 2) stands in for the book's own reasons.
 
-use turbojet::fields::{CodeRef, CompactString, Decimal, UtcTimestamp};
+use turbojet::fields::{Code, CodeRef, CompactString, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{FixMessage, Message, MessageReject};
 use turbojet_fix42 as fix;
 
-use super::{
-    check_price, from_code_number, order_id_out, quantity, reason_code, replaced_status, required, unsupported,
-};
+use super::{check_price, order_id_out, quantity, reason_code, replaced_status, required, unsupported, venue_code};
 use crate::book::{
     CancelKind, CancelRejectReason, ClientId, ClientReport, ExecType, Input, OrdType, OrderRequest, Output,
     RejectReason, Side, Status, TimeInForce, VenueId, VenueReport,
@@ -68,7 +66,7 @@ pub fn client_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
                 ord_status_to_fix(*status),
                 response_to,
             );
-            reject.cxl_rej_reason = Some(cxl_rej_reason_to_fix(*reason).into());
+            reject.cxl_rej_reason = Some(cxl_rej_reason_to_fix(*reason));
             reject.text = Some(text.clone());
             reject.transact_time = Some(now);
             Some(reject.to_message())
@@ -232,7 +230,7 @@ fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionR
         message.last_shares = Some(report.last_qty);
         message.last_px = Some(if filled { report.last_px } else { Decimal::ZERO });
     }
-    message.ord_rej_reason = report.reject.map(|reject| ord_rej_reason_to_fix(reject).into());
+    message.ord_rej_reason = report.reject.map(ord_rej_reason_to_fix);
     // A status request about no order: FIX 4.2 answers Rejected, UnknownOrder.
     if report.reject.is_none() && report.order_id.is_none() && report.status == Status::Rejected {
         message.ord_rej_reason = Some(fix::OrdRejReason::UnknownOrder.into());
@@ -509,9 +507,9 @@ fn exec_type_from_fix(trans: fix::ExecTransType, exec_type: fix::ExecType) -> Op
 
 /// FIX 4.2 has codes for Duplicate (6) and, for the quantity, notional and credit limits, Order
 /// exceeds limit (3); the book's other reasons say Broker option (0) and the report's Text says
-/// why. A venue's code passes through if FIX 4.2 has it.
-fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
-    match reason {
+/// why. A venue's code passes through, listed in FIX 4.2 or not.
+fn ord_rej_reason_to_fix(reason: RejectReason) -> Code<fix::OrdRejReason> {
+    let known = match reason {
         RejectReason::Duplicate => fix::OrdRejReason::DuplicateOrder,
         RejectReason::NoRoute
         | RejectReason::RouteRejected
@@ -525,26 +523,28 @@ fn ord_rej_reason_to_fix(reason: RejectReason) -> fix::OrdRejReason {
         RejectReason::Risk(
             RiskReject::Symbol | RiskReject::NoReferencePrice | RiskReject::PriceBand | RiskReject::SelfTrade,
         ) => fix::OrdRejReason::BrokerCredit,
-        RejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::OrdRejReason::BrokerCredit),
-    }
+        RejectReason::Venue(code) => return venue_code(code),
+    };
+    known.into()
 }
 
-/// FIX 4.2's CxlRejReason has codes 0 to 3 only. Duplicate, Other and a venue's code 4.2 lacks
-/// become 2, Broker option (BrokerCredit in the generated enum); the Text says why.
-fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> fix::CxlRejReason {
-    match reason {
+/// FIX 4.2's CxlRejReason has codes 0 to 3 only. Duplicate and Other become 2, Broker option
+/// (BrokerCredit in the generated enum), and the Text says why; a venue's code passes through,
+/// listed in FIX 4.2 or not.
+fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> Code<fix::CxlRejReason> {
+    let known = match reason {
         CancelRejectReason::TooLate => fix::CxlRejReason::TooLateToCancel,
         CancelRejectReason::UnknownOrder => fix::CxlRejReason::UnknownOrder,
         CancelRejectReason::AlreadyPending => fix::CxlRejReason::OrderAlreadyInPendingStatus,
         CancelRejectReason::Duplicate | CancelRejectReason::Other => fix::CxlRejReason::BrokerCredit,
-        CancelRejectReason::Venue(code) => from_code_number(code).unwrap_or(fix::CxlRejReason::BrokerCredit),
-    }
+        CancelRejectReason::Venue(code) => return venue_code(code),
+    };
+    known.into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turbojet::fields::Code;
 
     fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
@@ -709,8 +709,8 @@ mod tests {
             (RejectReason::Venue(3), "3"),
             (RejectReason::Venue(8), "8"),
             // FIX 4.3 added 9 onwards; a 4.2 client gets Broker option and the Text.
-            (RejectReason::Venue(13), "0"),
-            (RejectReason::Venue(99), "0"),
+            (RejectReason::Venue(13), "13"),
+            (RejectReason::Venue(99), "99"),
         ];
         for (reason, code) in reasons {
             assert_eq!(ord_rej_reason_to_fix(reason).code(), code, "{reason:?}");
@@ -722,8 +722,8 @@ mod tests {
             (CancelRejectReason::Duplicate, "2"),
             (CancelRejectReason::Other, "2"),
             (CancelRejectReason::Venue(2), "2"),
-            (CancelRejectReason::Venue(6), "2"),
-            (CancelRejectReason::Venue(99), "2"),
+            (CancelRejectReason::Venue(6), "6"),
+            (CancelRejectReason::Venue(99), "99"),
         ];
         for (reason, code) in reasons {
             assert_eq!(cxl_rej_reason_to_fix(reason).code(), code, "{reason:?}");
