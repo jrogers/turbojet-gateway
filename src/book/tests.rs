@@ -3122,6 +3122,18 @@ fn a_rejected_orphaned_replace_leaves_the_order_working() {
     assert!(book.cancelling().is_empty());
 }
 
+/// An orphaned replace of an order done since is recorded as a replace, so the venue's refusal
+/// maps to the order, and nothing is cancelled or told.
+#[test]
+fn an_orphaned_replace_of_a_done_order_is_recorded_as_a_replace() {
+    let mut book = acked();
+    run(&mut book, venue_report("1", Status::Filled, 100, 100));
+    assert!(run(&mut book, orphaned_replace("1-1", 200)).is_empty());
+    assert_eq!(book.downstream["1-1"].kind, Some(CancelKind::Replace));
+    assert!(book.cancelling().is_empty());
+    assert!(run(&mut book, venue_cancel_reject("NASDAQ", "1-1", Status::Filled)).is_empty());
+}
+
 /// Not ours to cancel: an order the book doesn't hold, another venue's, or an ID that isn't an
 /// amendment's.
 #[test]

@@ -138,8 +138,12 @@ impl Book {
         self.touched.orders.insert(id);
         // Numbered past it, so no later request reuses its ID.
         order.amendments = order.amendments.max(amendment);
-        // A done order has no replace pending: its replace can only be refused.
-        let replace = replace.filter(|_| !order.status.is_done());
+        if replace.is_some() && order.status.is_done() {
+            tracing::error!(%venue, %downstream, order = %order.name, client = %order.client, symbol = %order.request.symbol, status = ?order.status, "venue holds a replace the store lacks, of a done order: recorded, so its answers map to the order");
+            self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Replace, self.now));
+            self.touched.sent.insert(downstream);
+            return;
+        }
         let waits = order.pending.is_some();
         match replace {
             None => {
