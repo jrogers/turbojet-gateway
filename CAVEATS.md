@@ -76,10 +76,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - Each start reads every message in every venue's session store, to compare its requests with
   the database: about 3.9 s per million stored messages, measured from an in-memory store; a
   disk store adds its read time. A large store makes for a slow start.
-- A venue kept in the memory store isn't refused at its first start, only at a start where the
-  database has live orders, or orders of a client's current day, for that venue. A venue a
-  reload adds isn't checked. Client sessions aren't checked at all.
-- A client session kept in memory, or a client that logs on with ResetSeqNumFlag(141)=Y after a
+- A reload that keeps a client's or venue's session in memory is applied all the same, with an
+  error logged; the next start refuses the file.
+- A client that logs on with ResetSeqNumFlag(141)=Y after a
   restart, doesn't redeliver the messages that hadn't committed before the stop, and loses the
   reports its session had stored but not yet sent.
 - Deleting a venue's disk store while the database has orders for that venue stops every start,

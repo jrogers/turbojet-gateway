@@ -30,10 +30,6 @@ Operator actions (block, unblock, cancel all) are library calls on the gateway t
   masked properly in connect errors (including a `password` query parameter), the `?mode=rwc` hint
   only for SQLite URLs, and the startup load under REPEATABLE READ.
 - **Pruning history** (S). Done orders are never deleted, so the database grows without limit.
-- **Refuse memory session stores at the first start** (S). With a database, client and venue
-  sessions both need a durable store. Today a memory venue store is refused only once the
-  database holds orders for that venue, and a client's isn't checked. Needs Turbojet to say
-  whether a store is durable.
 - **Orphan scan checkpoint** (M). Each start reads every venue store whole, about 3.9 s per
   million stored messages; a checkpoint would read only what's past the last commit.
 - **Orphaned replace edge cases** (S). The cases listed in CAVEATS where a client hears Restated

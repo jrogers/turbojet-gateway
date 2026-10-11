@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use turbojet::{Acceptor, SessionHandle, SessionId};
 use turbojet_config::{Initiators, SessionsFile};
 
@@ -77,6 +77,9 @@ impl Service {
     pub(crate) async fn start_with(path: &Path, options: StartOptions) -> Result<(Self, Serving), Error> {
         let StartOptions { stores, listener, max_commit_wait } = options;
         let loaded = config::load_with_stores(path, stores)?;
+        if loaded.database.is_some() {
+            check_durable(&loaded.sessions)?;
+        }
         // First, so a database that won't open stops nothing half-started.
         let (database, writing) = match &loaded.database {
             Some(url) => {
@@ -193,6 +196,11 @@ impl Service {
                 );
             }
             Err(e) => warn!("keeping the sessions file in use: {e}"),
+        }
+        if self.database.is_some()
+            && let Err(e) = check_durable(&self.sessions)
+        {
+            error!("the reloaded sessions file loses what a restart needs: {e}");
         }
         let venues = self.set_venues();
         match config::reload(&self.path, &venues, self.database.as_deref()) {
@@ -340,6 +348,23 @@ pub(crate) struct StartOptions {
     pub(crate) max_commit_wait: Option<Duration>,
 }
 
+/// With a database, every session must outlive the process: a client's or venue's session kept
+/// in memory forgets the messages the book's state assumes were stored.
+fn check_durable(sessions: &SessionsFile) -> Result<(), Error> {
+    if sessions.acceptor_store().is_some_and(|store| !store.is_durable()) {
+        return Err(Error::new(
+            "with a [database], the clients' sessions must be kept in a durable store (kind = \"disk\", say): \
+             each counterparty's, and [defaults]' under unknown = \"admit\"",
+        ));
+    }
+    match sessions.initiator_stores().into_iter().find(|(.., store)| !store.is_durable()) {
+        Some((venue, ..)) => Err(Error::new(format!(
+            "with a [database], venue {venue}'s session must be kept in a durable store (kind = \"disk\", say)"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Opens the database at `url`, loads what the book restores, and starts the book's writer on it,
 /// rejecting new orders after `max_commit_wait` if given.
 async fn start_writer(
@@ -468,6 +493,32 @@ mod tests {
         write(&dir, "jetbridge.toml", &routes_to("B"));
         let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
         assert!(error.to_string().contains("venue \"C\": BeginString \"FIX.4.3\" is not supported"), "{error}");
+    }
+
+    /// With a database, a client's or venue's session kept in memory stops startup, before the
+    /// database is created.
+    #[tokio::test]
+    async fn a_memory_session_store_with_a_database_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n";
+        let db = dir.path().join("book.db");
+        let config = format!("{}[database]\nurl = \"sqlite://{}?mode=rwc\"\n", routes_to("B"), db.display());
+        write(&dir, "jetbridge.toml", &config);
+        let start = async |sessions: String| {
+            write(&dir, "sessions.toml", &sessions);
+            Service::start(&dir.path().join("jetbridge.toml")).await.map(|_| ()).unwrap_err().to_string()
+        };
+        let venue = venue_section("B", "FIX.4.4");
+        let error =
+            start(format!("{disk}{ACCEPTOR}listen = \"127.0.0.1:0\"\n[counterparty.C]\n{venue}store = \"disk\"\n"))
+                .await;
+        assert!(error.contains("the clients' sessions must be kept in a durable store"), "{error}");
+        let error = start(format!(
+            "{disk}{ACCEPTOR}listen = \"127.0.0.1:0\"\n[defaults]\nstore = \"disk\"\n{venue}store = \"memory\"\n"
+        ))
+        .await;
+        assert!(error.contains("venue B's session must be kept in a durable store"), "{error}");
+        assert!(!db.exists());
     }
 
     /// With `[acceptor.tls]`, clients log on over TLS: here a client from a sessions file of its

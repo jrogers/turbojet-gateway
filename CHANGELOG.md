@@ -57,9 +57,10 @@ Notable changes to Jetbridge.
   clients again, marked PossResend.
 - New orders are rejected as "gateway unavailable" while the oldest change not yet committed has
   waited over a second; cancels, replaces and venue reports keep flowing.
-- With a database, client and venue sessions must be kept in a durable store. A start that
-  finds a venue's store with no record of its session while the database has live orders, or
-  orders of a client's current day, for that venue stops; client stores aren't checked.
+- With a database, client and venue sessions must be kept in a durable store: a start with a
+  sessions file that keeps one in memory stops, and a reload that does logs an error. A start
+  that finds a venue's store with no record of its session while the database has live orders,
+  or orders of a client's current day, for that venue stops too (its files deleted, say).
 - Each start waits for the next second before taking its ID prefix, so two starts never share
   one unless the clock goes back.
 - Reports made from a message that may have been handled before a restart are marked

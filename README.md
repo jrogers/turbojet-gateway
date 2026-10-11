@@ -188,9 +188,10 @@ synced to disk.
 **Sessions need a durable store.** With a database, the `[acceptor]` and every
 `[initiator.NAME]` need a store that survives a restart (`kind = "disk"`, say), with its files
 kept: a restart reads each venue's store to see what was sent, and a client's messages that
-hadn't committed come back only through its session's stored sequence numbers. Only the venues'
-stores are checked: a start that finds a venue's store has no record of its session while the
-database has live orders, or orders of a client's current day, for that venue stops, saying so.
+hadn't committed come back only through its session's stored sequence numbers. A start with a
+sessions file that keeps a client's or venue's session in memory stops, saying so; so does one
+that finds a venue's store has no record of its session while the database has live orders, or
+orders of a client's current day, for that venue.
 
 **What a restart does.** Before any session starts, the gateway restores the book as last
 committed, then reads every request each venue's session stored and compares them with the
