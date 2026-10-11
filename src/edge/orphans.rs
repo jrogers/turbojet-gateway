@@ -71,13 +71,13 @@ pub struct Orphans {
 }
 
 /// Requests the database has as sent that a venue's session never stored, waiting for its logon:
-/// see [`Gateway::send_unsent`].
+/// see [`Gateway::unsent_inputs`].
 #[derive(Debug)]
 pub(super) struct Unsent {
-    downstreams: Vec<CompactString>,
+    pub(super) downstreams: Vec<CompactString>,
     /// The session's next outgoing number when its store was read: no higher after the logon,
     /// whose Logon takes one, the store was reset in between.
-    next_outgoing: u64,
+    pub(super) next_outgoing: u64,
 }
 
 /// Text(58) for a request not sent again because the venue's session was reset since.
@@ -286,22 +286,26 @@ impl Gateway {
         }
     }
 
-    /// At `venue`'s logon on `session`: sends again the requests its session never stored, then
-    /// the gateway's waiting cancels ([`Input::VenueUp`]) and the orphans' cancels, in that order,
-    /// as they'd have gone. Unless the session reset its store at this logon (a new schedule
-    /// period, or `reset_on_logon`): then the requests are from an earlier period, and a day
-    /// order going live in the next would be wrong, so each is a failed send instead. Read again
-    /// at the next logon if the session can't say.
-    pub(super) async fn send_unsent(self: Arc<Self>, venue: VenueId, unsent: Unsent, session: SessionHandle) {
-        let reset = match session.sequence_numbers().await {
-            // The Logon took the next number, unless the store started again from 1.
-            Ok(numbers) => numbers.next_outgoing <= unsent.next_outgoing,
-            Err(e) => {
-                warn!(%venue, "venue's session can't say its sequence numbers; requests to send again wait for its next logon: {e}");
-                self.lock().unsent.insert(venue, unsent);
-                return;
-            }
+    /// At `venue`'s logon on `session`, what its session never stored becomes: the requests to
+    /// send again, ahead of the gateway's waiting cancels and the orphans' cancels, as they'd have
+    /// gone. Unless the session reset its store at this logon (a new schedule period, or
+    /// `reset_on_logon`): then the requests are from an earlier period, and a day order going
+    /// live in the next would be wrong, so each is a failed send instead. Read in `on_logon`,
+    /// before anything else is sent: the session publishes its next outgoing number once its
+    /// Logon is recorded, and a reset store's Logon took number 1.
+    pub(super) fn unsent_inputs(&self, venue: &VenueId, unsent: Unsent, session: &SessionHandle) -> Vec<Input> {
+        let next_outgoing = session.status().and_then(|status| status.activity).map(|activity| activity.next_outgoing);
+        debug_assert!(next_outgoing.is_some(), "a session logged on publishes its numbers");
+        let Some(next_outgoing) = next_outgoing else {
+            warn!(%venue, "venue's session doesn't say its sequence numbers; requests to send again wait for its next logon");
+            self.lock().unsent.insert(venue.clone(), unsent);
+            return Vec::new();
         };
+        // The Logon took the next number, unless the store started again from 1.
+        let reset = next_outgoing <= unsent.next_outgoing;
+        if reset {
+            warn!(%venue, downstreams = ?unsent.downstreams, "venue's session reset at its logon: requests it never stored fail, not sent again");
+        }
         let to = |downstream: CompactString| {
             let venue = venue.clone();
             if reset {
@@ -310,12 +314,7 @@ impl Gateway {
                 Input::Unsent { venue, downstream }
             }
         };
-        if reset {
-            warn!(%venue, downstreams = ?unsent.downstreams, "venue's session reset at its logon: requests it never stored fail, not sent again");
-        }
-        let inputs = unsent.downstreams.into_iter().map(to);
-        self.handle_all(inputs.chain([Input::VenueUp { venue: venue.clone() }]));
-        self.send_orphan_cancels(&venue);
+        unsent.downstreams.into_iter().map(to).collect()
     }
 
     /// Sends the cancels of `venue`'s orphaned orders, its session having logged on, recording

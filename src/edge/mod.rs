@@ -788,12 +788,11 @@ impl Application for VenueApp {
     fn on_logon(&self, session: &SessionHandle) {
         let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
         let Some(venue) = venue else { return };
-        let Some(unsent) = self.0.lock().unsent.remove(&venue) else {
-            self.0.handle(Input::VenueUp { venue: venue.clone() });
-            return self.0.send_orphan_cancels(&venue);
-        };
-        // Whether they still go depends on the session's sequence numbers, which a task waits for.
-        tokio::spawn(self.0.clone().send_unsent(venue, unsent, session.clone()));
+        let unsent = self.0.lock().unsent.remove(&venue);
+        let unsent = unsent.map(|unsent| self.0.unsent_inputs(&venue, unsent, session)).unwrap_or_default();
+        // Sent before anything the book sends now, as they would have been.
+        self.0.handle_all(unsent.into_iter().chain([Input::VenueUp { venue: venue.clone() }]));
+        self.0.send_orphan_cancels(&venue);
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
@@ -1362,6 +1361,44 @@ pub(crate) mod tests {
             self.0.on_logon(session);
             let _ = self.1.send(());
         }
+    }
+
+    /// The gateway's venue application, saying when its `on_logon` returns when the book had
+    /// order 1's request sent (again).
+    struct SentOnLogon(VenueApp, UnboundedSender<Option<DateTime<Utc>>>);
+
+    impl Application for SentOnLogon {
+        fn verify_logon(&self, session: &SessionHandle, logon: &Message, info: &ConnectionInfo) -> Result<(), String> {
+            self.0.verify_logon(session, logon, info)
+        }
+
+        fn on_logon(&self, session: &SessionHandle) {
+            self.0.on_logon(session);
+            let _ = self.1.send(self.0.0.lock().book.sent("1").map(|sent| sent.sent_at));
+        }
+    }
+
+    /// A request the venue's session never stored is sent again within `on_logon`, before
+    /// anything else can reach the venue: a client's cancel arriving just after the logon can't
+    /// overtake the order it cancels. Marked PossResend.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsent_request_goes_again_within_the_venues_logon() {
+        let gateway = gateway();
+        book_order(&gateway);
+        assert_eq!(gateway.lock().book.sent("1").unwrap().sent_at, DateTime::<Utc>::UNIX_EPOCH);
+        let unsent = orphans::Unsent { downstreams: vec!["1".into()], next_outgoing: 1 };
+        gateway.lock().unsent.insert(VENUE.into(), unsent);
+        let (venue_app, mut venue_events) = quiet_peer();
+        let venue_addr = serve("VENUE", venue_app).await;
+        let (signal, mut logged_on) = unbounded_channel();
+        let app = Arc::new(SentOnLogon(VenueApp(gateway.clone()), signal));
+        let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", app);
+        assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
+        tokio::spawn(venue.clone().run());
+        let sent_at = timeout(Duration::from_secs(5), logged_on.recv()).await.expect("no logon").unwrap();
+        assert!(sent_at.is_some_and(|at| at > DateTime::<Utc>::UNIX_EPOCH), "not sent within on_logon: {sent_at:?}");
+        let sent = next_of_type(&mut venue_events, MsgType::NewOrderSingle).await;
+        assert_eq!((sent.get(tags::CL_ORD_ID), sent.get(tags::POSS_RESEND)), (Some("1"), Some("Y")));
     }
 
     /// A cancel the connected venue's session refused (its queue full) goes on the next tick.
