@@ -251,12 +251,10 @@ struct Setup {
 
 impl Setup {
     async fn new() -> Self {
-        Self::with(None, true).await
+        Self::with(Options::default()).await
     }
 
-    /// With the client cancelled on disconnect after `cancel`, if given, and the book in a
-    /// database if `database`.
-    async fn with(cancel: Option<Duration>, database: bool) -> Self {
+    async fn with(options: Options) -> Self {
         // RUST_LOG=info, say, to see what the gateway logs.
         let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter(EnvFilter::from_default_env()).try_init();
         let dir = tempfile::tempdir().unwrap();
@@ -269,7 +267,7 @@ impl Setup {
         // connecting then waits in the backlog for the next start, as under socket activation.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        write_config(dir.path(), port, venue_port, (cancel, database));
+        write_config(dir.path(), port, venue_port, &options);
         let (venue_gate, venue_open) = watch::channel(true);
         let (client_gate, client_open) = watch::channel(true);
         let gateway = Gateway::start(dir.path(), listener.try_clone().unwrap(), venue_open, client_open);
@@ -431,10 +429,27 @@ fn database_url(dir: &Path) -> String {
     format!("sqlite://{}?mode=rwc", dir.join("jetbridge.db").display())
 }
 
-/// Jetbridge's files: clients on `port`, the venue at `venue_port`, both sessions on disk, the
-/// client cancelled on disconnect after `cancel` if given, the book in SQLite if `database`.
-fn write_config(dir: &Path, port: u16, venue_port: u16, (cancel, database): (Option<Duration>, bool)) {
-    let cancel = cancel
+/// How a [`Setup`] differs from the usual.
+struct Options {
+    /// The client is cancelled on disconnect after this.
+    cancel_on_disconnect: Option<Duration>,
+    /// The book is in a SQLite file.
+    database: bool,
+    /// The venue's session resets at each logon.
+    reset_on_logon: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { cancel_on_disconnect: None, database: true, reset_on_logon: false }
+    }
+}
+
+/// Jetbridge's files: clients on `port`, the venue at `venue_port`, both sessions on disk, as
+/// `options` say.
+fn write_config(dir: &Path, port: u16, venue_port: u16, options: &Options) {
+    let Options { cancel_on_disconnect, database, reset_on_logon } = options;
+    let cancel = cancel_on_disconnect
         .map(|grace| format!("cancel_on_disconnect = \"disconnect\"\ncancel_grace = \"{}ms\"\n", grace.as_millis()))
         .unwrap_or_default();
     let sessions = format!(
@@ -460,10 +475,11 @@ target_comp_id = "{VENUE}"
 connect = ["127.0.0.1:{venue_port}"]
 reconnect = {{ initial = "20ms", max = "20ms", jitter = false }}
 store = "venue"
+reset_on_logon = {reset_on_logon}
 "#
     );
     std::fs::write(dir.join("sessions.toml"), sessions).unwrap();
-    let database = if database { format!("[database]\nurl = \"{}\"\n", database_url(dir)) } else { String::new() };
+    let database = if *database { format!("[database]\nurl = \"{}\"\n", database_url(dir)) } else { String::new() };
     let config = format!("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"{VENUE}\"\n{database}");
     std::fs::write(dir.join("jetbridge.toml"), config).unwrap();
 }
@@ -785,7 +801,8 @@ async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_keeps_working(
 /// answer applies, and the client hears of the cancel once it's back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_during_cancel_on_disconnect_still_cancels_and_tells_the_client() {
-    let mut setup = Setup::with(Some(Duration::from_millis(50)), true).await;
+    let mut setup =
+        Setup::with(Options { cancel_on_disconnect: Some(Duration::from_millis(50)), ..Options::default() }).await;
     let order = setup.working_order("C1", 1).await;
     setup.gateway().committed().await;
     setup.gateway().store().hooks.gate.send_replace(false);
@@ -1001,7 +1018,8 @@ async fn a_clients_cancel_the_venue_never_got_goes_after_a_crash() {
 /// the order is canceled.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_gateway_cancel_the_venue_never_got_goes_after_a_crash() {
-    let mut setup = Setup::with(Some(Duration::from_millis(50)), true).await;
+    let mut setup =
+        Setup::with(Options { cancel_on_disconnect: Some(Duration::from_millis(50)), ..Options::default() }).await;
     let order = setup.working_order("C1", 1).await;
     setup.venue_gate.send_replace(false);
     setup.disconnect_client().await;
@@ -1133,7 +1151,7 @@ async fn a_crash_inside_a_transaction_leaves_nothing_of_it() {
 /// books and sends it. The venue gets it once; the client hears one ack.
 #[tokio::test(flavor = "multi_thread")]
 async fn without_a_database_an_order_the_venue_never_stored_is_redelivered_and_sent() {
-    let mut setup = Setup::with(None, false).await;
+    let mut setup = Setup::with(Options { database: false, ..Options::default() }).await;
     setup.venue_gate.send_replace(false);
     setup.send(order("C1"));
     let gateway = setup.gateway().service.gateway().clone();
@@ -1147,4 +1165,23 @@ async fn without_a_database_an_order_the_venue_never_stored_is_redelivered_and_s
     let new = setup.events.execution_report().await;
     assert_eq!((new.cl_ord_id.as_deref(), new.order_id.as_str()), (Some("C1"), &*setup.id(1, "1")));
     setup.assert_quiet().await;
+}
+
+/// A venue whose session resets at each logon, as a new schedule period resets it: an order the
+/// database has and the venue's session never stored, from before the reset, isn't sent into the
+/// new session (a day order would go live a day late); the client hears it rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsent_order_from_before_a_session_reset_is_rejected_not_sent() {
+    let mut setup = Setup::with(Options { reset_on_logon: true, ..Options::default() }).await;
+    setup.venue_gate.send_replace(false);
+    setup.send(order("C1"));
+    setup.until_stored(|database| !stored(database, "C1").is_empty()).await;
+
+    setup.crash_and_restart().await;
+    let rejected = setup.events.execution_report().await;
+    assert_eq!((rejected.cl_ord_id.as_deref(), rejected.exec_type), (Some("C1"), v44::ExecType::Rejected));
+    assert!(rejected.text.as_deref().is_some_and(|text| text.contains("reset")), "{rejected:?}");
+    setup.assert_quiet().await;
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::Rejected, Decimal::ZERO)]);
 }

@@ -123,7 +123,7 @@ struct State {
     orphan_ids: HashSet<CompactString>,
     /// Requests the store has as sent that each venue's session never stored, to send at its next
     /// logon: see [`orphans`].
-    unsent: HashMap<VenueId, Vec<CompactString>>,
+    unsent: HashMap<VenueId, orphans::Unsent>,
 }
 
 #[derive(Debug)]
@@ -787,13 +787,13 @@ impl Application for VenueApp {
     /// to it, go now.
     fn on_logon(&self, session: &SessionHandle) {
         let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
-        if let Some(venue) = venue {
-            // Sent before anything the book sends now, as they would have been.
-            let unsent = self.0.lock().unsent.remove(&venue).unwrap_or_default();
-            let unsent = unsent.into_iter().map(|downstream| Input::Unsent { venue: venue.clone(), downstream });
-            self.0.handle_all(unsent.chain([Input::VenueUp { venue: venue.clone() }]));
-            self.0.send_orphan_cancels(&venue);
-        }
+        let Some(venue) = venue else { return };
+        let Some(unsent) = self.0.lock().unsent.remove(&venue) else {
+            self.0.handle(Input::VenueUp { venue: venue.clone() });
+            return self.0.send_orphan_cancels(&venue);
+        };
+        // Whether they still go depends on the session's sequence numbers, which a task waits for.
+        tokio::spawn(self.0.clone().send_unsent(venue, unsent, session.clone()));
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {

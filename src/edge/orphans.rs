@@ -34,6 +34,7 @@
 //! database has seen, if starts show it.
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use std::io;
@@ -44,7 +45,7 @@ use turbojet::codec::{self, Decoded};
 use turbojet::fields::{CompactString, UtcTimestamp, format_compact};
 use turbojet::message::tags;
 use turbojet::store::{Fetched, Opened, SentMessages, SessionLog};
-use turbojet::{Message, MsgType, Receipt, SessionId, SessionStorage};
+use turbojet::{Message, MsgType, Receipt, SessionHandle, SessionId, SessionStorage};
 
 use super::Gateway;
 use crate::book::{Changes, ClientId, Input, OrdType, OrphanedReplace, VenueId};
@@ -68,6 +69,19 @@ pub struct Orphans {
     /// Requests the database has that the venues' sessions never stored, to send at their logons.
     pub unsent: usize,
 }
+
+/// Requests the database has as sent that a venue's session never stored, waiting for its logon:
+/// see [`Gateway::send_unsent`].
+#[derive(Debug)]
+pub(super) struct Unsent {
+    downstreams: Vec<CompactString>,
+    /// The session's next outgoing number when its store was read: no higher after the logon,
+    /// whose Logon takes one, the store was reset in between.
+    next_outgoing: u64,
+}
+
+/// Text(58) for a request not sent again because the venue's session was reset since.
+const NOT_SENT_RESET: &str = "not sent before the gateway restarted, and the venue's session has been reset since";
 
 /// The cancel of an order the database never had, waiting for its venue's logon.
 #[derive(Debug)]
@@ -122,7 +136,7 @@ impl Gateway {
             self.check_prefix(&venue, &requests)?;
             let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
             let created = log.created_at().map(DateTime::<Utc>::from);
-            found.unsent += self.find_unsent(&venue, &ids, created);
+            found.unsent += self.find_unsent(&venue, &ids, created, log.next_outgoing());
             let chains = chains(requests);
             ids.extend(chains.keys().cloned());
             let unknown: HashSet<CompactString> = store.unknown_downstreams(&ids).await?.into_iter().collect();
@@ -150,13 +164,21 @@ impl Gateway {
     /// Keeps for `venue`'s next logon the requests the book has as sent to it, unanswered, that
     /// aren't among those its session `stored`, returning how many. Only those sent since the
     /// store was `created` (or last reset): one missing from before then was lost to a reset, and
-    /// the venue had it, so it's left pending, as is everything if the store doesn't say.
-    fn find_unsent(&self, venue: &VenueId, stored: &[CompactString], created: Option<DateTime<Utc>>) -> usize {
+    /// the venue had it, so it's left pending, as is everything if the store doesn't say. "Since"
+    /// is a millisecond after: a store may keep its creation time in milliseconds, and a request
+    /// wrongly left pending is better than one sent twice.
+    fn find_unsent(
+        &self,
+        venue: &VenueId,
+        stored: &[CompactString],
+        created: Option<DateTime<Utc>>,
+        next_outgoing: u64,
+    ) -> usize {
         let stored: HashSet<&CompactString> = stored.iter().collect();
         let mut state = self.lock();
         let missing = state.book.unanswered(venue).into_iter().filter(|(downstream, _)| !stored.contains(downstream));
         let (unsent, reset): (Vec<_>, Vec<_>) =
-            missing.partition(|(_, sent_at)| created.is_some_and(|c| *sent_at >= c));
+            missing.partition(|(_, sent_at)| created.is_some_and(|c| *sent_at >= c + Duration::from_millis(1)));
         if !reset.is_empty() {
             let reset: Vec<_> = reset.into_iter().map(|(downstream, _)| downstream).collect();
             if created.is_none() {
@@ -171,7 +193,7 @@ impl Gateway {
         }
         warn!(%venue, ?unsent, "the database has requests the venue's session never stored: sending them at its logon");
         let count = unsent.len();
-        state.unsent.insert(venue.clone(), unsent);
+        state.unsent.insert(venue.clone(), Unsent { downstreams: unsent, next_outgoing });
         count
     }
 
@@ -252,6 +274,38 @@ impl Gateway {
         if let Some(writer) = &self.writer {
             writer.queue(Changes { orphans: downstreams, ..Changes::default() }, None);
         }
+    }
+
+    /// At `venue`'s logon on `session`: sends again the requests its session never stored, then
+    /// the gateway's waiting cancels ([`Input::VenueUp`]) and the orphans' cancels, in that order,
+    /// as they'd have gone. Unless the session reset its store at this logon (a new schedule
+    /// period, or `reset_on_logon`): then the requests are from an earlier period, and a day
+    /// order going live in the next would be wrong, so each is a failed send instead. Read again
+    /// at the next logon if the session can't say.
+    pub(super) async fn send_unsent(self: Arc<Self>, venue: VenueId, unsent: Unsent, session: SessionHandle) {
+        let reset = match session.sequence_numbers().await {
+            // The Logon took the next number, unless the store started again from 1.
+            Ok(numbers) => numbers.next_outgoing <= unsent.next_outgoing,
+            Err(e) => {
+                warn!(%venue, "venue's session can't say its sequence numbers; requests to send again wait for its next logon: {e}");
+                self.lock().unsent.insert(venue, unsent);
+                return;
+            }
+        };
+        let to = |downstream: CompactString| {
+            let venue = venue.clone();
+            if reset {
+                Input::SendFailed { venue, downstream, text: NOT_SENT_RESET.into() }
+            } else {
+                Input::Unsent { venue, downstream }
+            }
+        };
+        if reset {
+            warn!(%venue, downstreams = ?unsent.downstreams, "venue's session reset at its logon: requests it never stored fail, not sent again");
+        }
+        let inputs = unsent.downstreams.into_iter().map(to);
+        self.handle_all(inputs.chain([Input::VenueUp { venue: venue.clone() }]));
+        self.send_orphan_cancels(&venue);
     }
 
     /// Sends the cancels of `venue`'s orphaned orders, its session having logged on, recording
