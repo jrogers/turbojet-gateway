@@ -48,7 +48,7 @@ use turbojet::store::{Fetched, Opened, SentMessages, SessionLog};
 use turbojet::{Message, MsgType, Receipt, SessionHandle, SessionId, SessionStorage};
 
 use super::Gateway;
-use crate::book::{Changes, ClientId, Input, OrdType, OrphanedReplace, VenueId};
+use crate::book::{AlarmKind, Changes, ClientId, Input, OrdType, OrphanedReplace, VenueId};
 use crate::fix::Version;
 use crate::store::Store;
 
@@ -232,6 +232,9 @@ impl Gateway {
         let ids: Vec<CompactString> = chain.iter().map(|request| request.cl_ord_id.clone()).collect();
         let Some(newest) = chain.iter().rev().find(|request| request.kind != Kind::Cancel) else {
             error!(%venue, chain = ?ids, "venue holds cancels of an order the database never had; nothing to cancel");
+            self.alarm(AlarmKind::Orphan, || {
+                format!("venue {venue} holds cancels {ids:?} of an order the database never had")
+            });
             self.record_orphans(ids);
             return Ok(false);
         };
@@ -248,6 +251,9 @@ impl Gateway {
             cancel = cancel.get(tags::CL_ORD_ID),
             "venue holds an order the database never had: cancelling it at the venue's logon"
         );
+        self.alarm(AlarmKind::Orphan, || {
+            format!("venue {venue} holds order {ids:?}, which the database never had: cancelling it at its logon")
+        });
         let mut state = self.lock();
         state.orphan_ids.extend(ids.iter().cloned());
         state.orphan_ids.insert(cancel.get(tags::CL_ORD_ID).unwrap_or_default().into());
@@ -305,6 +311,12 @@ impl Gateway {
         let reset = next_outgoing <= unsent.next_outgoing;
         if reset {
             warn!(%venue, downstreams = ?unsent.downstreams, "venue's session reset at its logon: requests it never stored fail, not sent again");
+            self.alarm(AlarmKind::VenueStoreReset, || {
+                format!(
+                    "venue {venue}'s session reset at its logon: requests {:?} it never stored fail",
+                    unsent.downstreams
+                )
+            });
         }
         let to = |downstream: CompactString| {
             let venue = venue.clone();
@@ -380,6 +392,7 @@ impl Gateway {
             return false;
         }
         error!(%venue, %downstream, ?input, "venue's report on an orphaned order");
+        self.alarm(AlarmKind::Orphan, || format!("venue {venue} reported on orphaned request {downstream}"));
         true
     }
 }

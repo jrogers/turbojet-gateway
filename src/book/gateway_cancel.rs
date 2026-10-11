@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use turbojet::fields::CompactString;
 
 use super::{
-    Book, CancelKind, GatewayCancel, MAX_GATEWAY_CANCEL_TRIES, Order, OrderId, Origin, OrphanedReplace, Output,
-    Pending, Scope, Sent, VenueId, limit_price,
+    AlarmKind, Book, CancelKind, GatewayCancel, MAX_GATEWAY_CANCEL_TRIES, Order, OrderId, Origin, OrphanedReplace,
+    Output, Pending, Scope, Sent, VenueId, limit_price,
 };
 
 impl Book {
@@ -122,11 +122,20 @@ impl Book {
         let Some((name, amendment)) =
             downstream.rsplit_once('-').and_then(|(name, n)| Some((name, n.parse::<u32>().ok()?)))
         else {
+            self.alarm(
+                AlarmKind::Orphan,
+                format!("venue {venue} holds request {downstream}, not a cancel's or replace's"),
+            );
             return tracing::error!(%venue, %downstream, "orphaned request isn't a cancel's or replace's");
         };
         if self.downstream.contains_key(&downstream) || self.orphan_waiting(&downstream) {
             return tracing::debug!(%venue, %downstream, "orphaned request already recorded");
         }
+        // Each way on is logged at error, with what's done about it.
+        self.alarm(
+            AlarmKind::Orphan,
+            format!("venue {venue} holds request {downstream}, which the database never had"),
+        );
         // ponytail: a walk of every order per orphan, at a start only; a map by name if many.
         let Some(order) = self.orders.values_mut().find(|order| order.name == name) else {
             return tracing::error!(%venue, %downstream, "venue holds a request the store lacks, for an order no longer held (done); nothing to cancel");
@@ -249,7 +258,9 @@ impl Book {
         let gateway = order.gateway_cancel.as_mut().expect("the caller checked for the gateway's cancel");
         if gateway.tries >= MAX_GATEWAY_CANCEL_TRIES {
             gateway.stuck = true;
-            return tracing::error!(order = %order.name, tries = gateway.tries, "gateway gave up cancelling an order");
+            let text = format!("gateway gave up cancelling order {} after {} tries", order.name, gateway.tries);
+            tracing::error!(order = %order.name, tries = gateway.tries, "gateway gave up cancelling an order");
+            return self.alarm(AlarmKind::StuckCancel, text);
         }
         self.send_gateway_cancel(id, out);
     }
@@ -291,7 +302,9 @@ impl Book {
         // order a new downstream ClOrdID, which the venue may yet know.
         if matches!(reason, Some(0 | 1)) && order.downstream == gateway.orig_downstream {
             gateway.stuck = true;
-            return tracing::error!(order = %order.name, "gateway gave up cancelling an order the venue says is done or unknown");
+            let text = format!("gateway gave up cancelling order {}: the venue says it's done or unknown", order.name);
+            tracing::error!(order = %order.name, "gateway gave up cancelling an order the venue says is done or unknown");
+            return self.alarm(AlarmKind::StuckCancel, text);
         }
         self.retry_gateway_cancel(id, out);
     }

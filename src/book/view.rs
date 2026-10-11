@@ -265,3 +265,68 @@ impl Book {
 fn order_id_number<S: serde::Serializer>(id: &OrderId, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_u64(id.0)
 }
+
+/// What the gateway tells whoever listens (see `Gateway::subscribe`), as JSON tagged by `type`:
+/// `{"type":"order", ...}`, `{"type":"blocked","scope":"all"}`, `{"type":"alarm", ...}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    /// An order as it is after a step that changed it.
+    Order(OrderView),
+    /// Struct variants, not `Blocked(Scope)`: a tag can't go inside a string.
+    Blocked {
+        scope: Scope,
+    },
+    Unblocked {
+        scope: Scope,
+    },
+    Alarm(Alarm),
+}
+
+/// Something an operator has to look at, published where it's logged at error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Alarm {
+    pub time: DateTime<Utc>,
+    pub kind: AlarmKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlarmKind {
+    /// The database is too far behind: new orders are rejected. Raised again, its text saying so,
+    /// once they're taken again.
+    GatewayUnavailable,
+    /// The gateway gave up cancelling an order.
+    StuckCancel,
+    /// A venue holds a request the database never had, or reports on one.
+    Orphan,
+    /// A venue reported more filled than the order's quantity.
+    Overfill,
+    /// A venue reported on an order the book doesn't have.
+    UnknownOrder,
+    /// A venue's session reset its store, so requests it never stored failed rather than go again.
+    VenueStoreReset,
+}
+
+impl Book {
+    /// The orders touched since the changes were last taken, by OrderId, as they are now: those a
+    /// roll dropped aren't, as they were done already and shown so before it.
+    pub fn touched_views(&self) -> Vec<OrderView> {
+        let flushed = self.flushed.orders.iter().map(|row| &row.order.id);
+        let mut ids: Vec<OrderId> = self.touched.orders.iter().chain(flushed).copied().collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        ids.iter().filter_map(|id| self.orders.get(id)).map(|order| self.view(order)).collect()
+    }
+
+    /// Events the book's inputs made since the last call: blocks, unblocks and alarms.
+    pub fn take_events(&mut self) -> std::vec::Drain<'_, Event> {
+        self.events.drain(..)
+    }
+
+    /// Records an alarm of `kind` at the inputs' time, for [`take_events`](Self::take_events).
+    pub(super) fn alarm(&mut self, kind: AlarmKind, text: String) {
+        self.events.push(Event::Alarm(Alarm { time: self.now, kind, text }));
+    }
+}

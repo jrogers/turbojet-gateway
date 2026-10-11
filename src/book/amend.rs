@@ -1,8 +1,8 @@
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
 use super::{
-    Book, CancelKind, CancelRejectReason, ClientId, ExecType, OrdType, Order, OrderId, Origin, Output, Pending,
-    RejectReason, Sent, Side, Status, TimeInForce, VenueId, limit_price,
+    AlarmKind, Book, CancelKind, CancelRejectReason, ClientId, ExecType, OrdType, Order, OrderId, Origin, Output,
+    Pending, RejectReason, Sent, Side, Status, TimeInForce, VenueId, limit_price,
 };
 use crate::risk::{self, Proposed, RiskReject};
 
@@ -262,6 +262,7 @@ impl Book {
         out: &mut Vec<Output>,
     ) {
         let Some(sent) = self.downstream.get(downstream).cloned() else {
+            self.alarm(AlarmKind::UnknownOrder, format!("venue {venue} refused unknown request {downstream}"));
             return tracing::warn!(%venue, %downstream, "cancel reject for an unknown request");
         };
         let id = sent.order;

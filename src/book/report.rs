@@ -1,17 +1,34 @@
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
 use super::{
-    Book, CancelKind, ClientReport, ExecType, Order, Origin, Output, Refused, RejectReason, Sent, Status, VenueId,
-    VenueReport,
+    AlarmKind, Book, CancelKind, ClientReport, ExecType, Order, OrderId, Origin, Output, Refused, RejectReason, Sent,
+    Status, VenueId, VenueReport,
 };
 
 /// Text(58) of the restatement telling a client the venue accepted an orphaned replace.
 const ORPHAN_REPLACED: &str = "replaced at the venue by a request sent before the gateway restarted";
 
 impl Book {
+    fn unknown_report(&mut self, venue: &VenueId, report: &VenueReport) {
+        let (downstream, exec_id) = (&report.downstream, &report.exec_id);
+        tracing::warn!(%venue, %downstream, %exec_id, "execution report for an unknown order");
+        let text = format!("venue {venue} reported on unknown order {downstream} (ExecID {exec_id})");
+        self.alarm(AlarmKind::UnknownOrder, text);
+    }
+
+    /// Not applied: someone has to find out from the venue what was filled.
+    fn overfill(&mut self, venue: &VenueId, report: &VenueReport, id: OrderId, qty: Decimal) {
+        let (downstream, exec_id, cum_qty) = (&report.downstream, &report.exec_id, report.cum_qty);
+        tracing::warn!(%venue, %downstream, %exec_id, %cum_qty, "overfill");
+        let name = &self.orders[&id].name;
+        let text =
+            format!("venue {venue} reported order {name} filled {cum_qty} of {qty} (ExecID {exec_id}); not applied");
+        self.alarm(AlarmKind::Overfill, text);
+    }
+
     pub(super) fn venue_report(&mut self, venue: &VenueId, mut report: VenueReport, out: &mut Vec<Output>) {
         let Some(sent) = self.downstream.get(&report.downstream).cloned() else {
-            return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for an unknown order");
+            return self.unknown_report(venue, &report);
         };
         // Rejected under a cancel's or replace's ClOrdID is about that request, not the order.
         // Some venues refuse an amendment with ExecType=8 and the order's live OrdStatus: that
@@ -53,7 +70,7 @@ impl Book {
             _ => order.request.qty,
         };
         if report.cum_qty > qty {
-            return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, cum_qty = %report.cum_qty, "overfill");
+            return self.overfill(venue, &report, id, qty);
         }
         self.touched.orders.insert(id);
         order.record_venue_order_id(report.venue_order_id.take(), accepted);
