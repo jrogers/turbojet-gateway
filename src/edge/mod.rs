@@ -2263,7 +2263,7 @@ pub(crate) mod tests {
         let venues = Arc::new(MemoryStorage::new());
         store_sent(&venues, &id(), &[order("SAMESS1")]);
         let error = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap_err();
-        assert!(error.to_string().contains("within a second of its last start"), "{error}");
+        assert!(error.to_string().contains("under this start's ID prefix"), "{error}");
     }
 
     /// Our session with the venue, as the gateway's initiator has it.

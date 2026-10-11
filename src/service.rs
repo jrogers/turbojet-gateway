@@ -88,7 +88,7 @@ impl Service {
             }
             None => (None, None),
         };
-        let prefix = book::start_prefix(SystemTime::now());
+        let prefix = book::start_prefix(next_second().await);
         let sessions = Arc::new(loaded.sessions);
         let schedules = {
             let sessions = sessions.clone();
@@ -292,6 +292,27 @@ impl Service {
     #[expect(clippy::unnecessary_wraps, reason = "the same signature as with TLS")]
     fn serve(&self, listener: TcpListener) -> Result<Serving, Error> {
         Ok(tokio::spawn(self.acceptor.clone().serve(listener)))
+    }
+}
+
+/// The start of the next second: the time a start takes its ID prefix from (see
+/// [`book::start_prefix`]). A start that began in the second another took its prefix in, its
+/// process having stopped since, takes a later one, so no two starts share a prefix (unless the
+/// clock goes back), and every ID a start issues, its rejects' ExecIDs too, is its own.
+async fn next_second() -> SystemTime {
+    let since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    tokio::time::sleep(
+        Duration::from_secs(1).saturating_sub(Duration::from_nanos(u64::from(since_epoch.subsec_nanos()))),
+    )
+    .await;
+    loop {
+        let now = SystemTime::now();
+        let second = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if second > since_epoch.as_secs() {
+            return now;
+        }
+        // A sleep that woke a little early.
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -541,6 +562,13 @@ mod tests {
         assert_eq!(cancel.get(tags::ORIG_CL_ORD_ID), Some("PREVIO1"));
         service.shutdown().await;
         serving.abort();
+    }
+
+    /// Two starts one after the other take prefixes from different seconds, however quick.
+    #[tokio::test]
+    async fn back_to_back_starts_take_different_prefixes() {
+        let first = next_second().await;
+        assert_ne!(book::start_prefix(first), book::start_prefix(next_second().await));
     }
 
     /// A database with rows in it is restored from at the next start: here a block.

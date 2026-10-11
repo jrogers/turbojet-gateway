@@ -106,7 +106,8 @@ impl Gateway {
     /// # Errors
     ///
     /// A venue's store or the database can't be read, or a venue holds a request under this
-    /// start's prefix: the gateway started again within a second of its last start.
+    /// start's prefix: a backstop, since each start takes a second after the last's (see
+    /// `service`), unless the clock went back.
     pub async fn cancel_orphans(
         self: &Arc<Self>,
         store: &Store,
@@ -180,8 +181,8 @@ impl Gateway {
         let mut ours = requests.iter().filter(|request| request.cl_ord_id.starts_with(prefix.as_str()));
         let Some(request) = ours.next().filter(|_| !prefix.is_empty()) else { return Ok(()) };
         Err(io::Error::other(format!(
-            "venue {venue} holds request {} under this start's ID prefix {prefix}: the gateway started again \
-             within a second of its last start; start it again",
+            "venue {venue} holds request {} under this start's ID prefix {prefix}: the clock went back \
+             since the last start; start again once it has passed the last start's",
             request.cl_ord_id
         )))
     }

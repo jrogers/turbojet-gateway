@@ -20,12 +20,11 @@
 //! its gate is shut (so it neither stores nor sends), and the database's writer waits before each
 //! write while the store's test gate is shut.
 //!
-//! Each start takes the next second's ID prefix: two starts in one second would share it.
 
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -322,10 +321,6 @@ impl Setup {
 
     /// Starts the gateway again, waiting for the venue and the client (if running) to log on.
     async fn start_again(&mut self) {
-        let last = self.prefixes.last().expect("a start").clone();
-        while book::start_prefix(SystemTime::now()) == last {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         let (venue_gate, venue_open) = watch::channel(true);
         let (client_gate, client_open) = watch::channel(true);
         (self.venue_gate, self.client_gate) = (venue_gate, client_gate);
