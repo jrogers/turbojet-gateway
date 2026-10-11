@@ -3244,6 +3244,38 @@ fn an_orphaned_replace_waits_for_the_pending_replaces_answer() {
     assert_eq!(restored(&book).snapshot(), book.snapshot());
 }
 
+/// The client's redelivered replace taking an orphan still waiting behind the replace pending:
+/// its ClOrdID is the client's at once, so a cancel can name it, and once the orphan is made
+/// pending and the venue accepts it, the client hears Replaced, not a restatement.
+#[test]
+fn a_redelivered_replace_adopts_a_waiting_orphaned_one() {
+    let mut book = acked();
+    replace(&mut book, "C2", "C1", 200, 10);
+    run_live(&mut book, orphaned_replace("1-2", 300));
+    let mut redelivered = replace_input("C3", "C2", 300, 10);
+    if let Input::Replace { redelivered, ord_type, .. } = &mut redelivered {
+        (*redelivered, *ord_type) = (true, Some(OrdType::Limit));
+    }
+    assert!(run_live(&mut book, redelivered).is_empty());
+    assert_eq!(book.index.get(&("FUNDA".into(), "C3".into())), Some(&OrderId(1)));
+
+    run_live(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    let sent = &book.downstream["1-2"];
+    assert_eq!(
+        (sent.origin, sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_deref()),
+        (Origin::Client, "C3", Some("C2"))
+    );
+    let out = run_live(&mut book, venue_report_as("1-2", ExecType::Replaced, Status::New, 0, 0));
+    let report = report_of(&out);
+    assert_eq!(
+        (report.exec_type, report.cl_ord_id.as_str(), report.orig_cl_ord_id.as_deref(), report.request.qty),
+        (ExecType::Replaced, "C3", Some("C2"), Decimal::from(300))
+    );
+    let out = run_live(&mut book, cancel_input("C4", "C3"));
+    assert!(matches!(out.as_slice(), [Output::Cancel { .. }]), "{out:?}");
+    assert_eq!(restored(&book).snapshot(), book.snapshot());
+}
+
 fn unsent(downstream: &str) -> Input {
     Input::Unsent { venue: "NASDAQ".into(), downstream: downstream.into() }
 }

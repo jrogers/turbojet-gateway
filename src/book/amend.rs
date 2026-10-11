@@ -97,6 +97,20 @@ impl Book {
             ord_type,
             terms.time_in_force.or(order.request.time_in_force),
         );
+        // An orphan waiting behind the replace pending: taken now, recorded as the client's when
+        // it's made pending.
+        let waiting = self
+            .orphaned_replaces
+            .get(&id)
+            .is_some_and(|(p, adopted)| adopted.is_none() && (p.qty, p.price, p.ord_type, p.time_in_force) == wanted);
+        if waiting {
+            tracing::info!(order = %order.name, cl_ord_id = %amend.cl_ord_id, "a redelivered replace is the waiting orphaned one");
+            self.remember(&amend.client, amend.cl_ord_id.clone(), id);
+            let (pending, adopted) = self.orphaned_replaces.get_mut(&id).expect("looked up above");
+            pending.cl_ord_id = amend.cl_ord_id.clone();
+            *adopted = Some(amend.orig_cl_ord_id.clone());
+            return true;
+        }
         let orphan = |downstream: &CompactString| {
             self.downstream
                 .get(downstream)

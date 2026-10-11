@@ -624,9 +624,11 @@ pub struct Book {
     /// New orders are rejected: see [`set_unavailable`](Self::set_unavailable).
     unavailable: bool,
     /// Orphaned replaces (see [`Input::Orphan`]) of orders with a replace pending, by order, to be
-    /// made pending once that one is answered. Not stored: a restart before then finds the orphan
-    /// again in the venue's store.
-    orphaned_replaces: HashMap<OrderId, Pending>,
+    /// made pending once that one is answered, with the client's OrigClOrdID once its redelivered
+    /// replace is taken as it (the pending's `cl_ord_id` then the client's): see
+    /// `adopt_orphaned_replace`. Not stored: a restart before then finds the orphan again in the
+    /// venue's store.
+    orphaned_replaces: HashMap<OrderId, (Pending, Option<CompactString>)>,
     /// The time of the inputs being handled: see [`set_now`](Self::set_now).
     now: DateTime<Utc>,
     /// Every change taken in the tests, as a store would hold them.
@@ -854,7 +856,7 @@ impl Book {
                 assert!(gateway.tries > 0 || gateway.unsent, "{id:?}'s gateway cancel");
             }
         }
-        for (id, waiting) in &self.orphaned_replaces {
+        for (id, (waiting, _)) in &self.orphaned_replaces {
             assert!(
                 self.orders.get(id).is_some_and(|order| order.pending.is_some()),
                 "{id:?}'s orphaned replace waits on none"

@@ -162,9 +162,9 @@ impl Book {
                     // The book sent this replace only once the one pending was answered, so that
                     // answer, lost with it, is redelivered first: see `orphaned_replaces`.
                     tracing::info!(order = %order.name, pending = ?order.pending.as_ref().map(|p| &p.downstream), "orphaned replace waits for the pending one's answer");
-                    self.orphaned_replaces.insert(id, pending);
+                    self.orphaned_replaces.insert(id, (pending, None));
                 } else {
-                    self.make_orphan_pending(id, pending);
+                    self.make_orphan_pending(id, pending, None);
                 }
             }
         }
@@ -172,7 +172,7 @@ impl Book {
 
     /// Whether `downstream` is an orphaned replace waiting for the replace pending before it.
     pub fn orphan_waiting(&self, downstream: &str) -> bool {
-        self.orphaned_replaces.values().any(|pending| pending.downstream == downstream)
+        self.orphaned_replaces.values().any(|(pending, _)| pending.downstream == downstream)
     }
 
     /// Makes orphaned replaces pending whose orders' pending replaces have been answered: after
@@ -188,16 +188,29 @@ impl Book {
             .copied()
             .collect();
         for id in ready {
-            let pending = self.orphaned_replaces.remove(&id).expect("listed above");
-            self.make_orphan_pending(id, pending);
+            let (pending, adopted) = self.orphaned_replaces.remove(&id).expect("listed above");
+            self.make_orphan_pending(id, pending, adopted);
         }
     }
 
-    /// Records orphaned replace `pending` as the gateway's, pending on its order unless that's
-    /// done (then only its answers map to the order).
-    fn make_orphan_pending(&mut self, id: OrderId, mut pending: Pending) {
+    /// Records orphaned replace `pending` as the gateway's, or as the client's if its redelivered
+    /// replace `adopted` it (naming that OrigClOrdID), pending on its order unless that's done
+    /// (then only its answers map to the order).
+    fn make_orphan_pending(&mut self, id: OrderId, mut pending: Pending, adopted: Option<CompactString>) {
         let downstream = pending.downstream.clone();
-        self.downstream.insert(downstream.clone(), gateway_sent(id, CancelKind::Replace, self.now));
+        let sent = match &adopted {
+            Some(orig_cl_ord_id) => Sent {
+                order: id,
+                origin: Origin::Client,
+                cl_ord_id: pending.cl_ord_id.clone(),
+                orig_cl_ord_id: Some(orig_cl_ord_id.clone()),
+                kind: Some(CancelKind::Replace),
+                answered: false,
+                sent_at: self.now,
+            },
+            None => gateway_sent(id, CancelKind::Replace, self.now),
+        };
+        self.downstream.insert(downstream.clone(), sent);
         self.touched.sent.insert(downstream);
         let Some(order) = self.orders.get_mut(&id).filter(|order| !order.status.is_done()) else {
             return tracing::info!(order = id.0, downstream = %pending.downstream, "orphaned replace's order ended first");
@@ -205,7 +218,9 @@ impl Book {
         self.touched.orders.insert(id);
         // Accepted, it leaves the order's ClOrdID as it is, unless the client's request turns
         // out to be it (see `adopt_orphaned_replace`).
-        pending.cl_ord_id = order.request.cl_ord_id.clone();
+        if adopted.is_none() {
+            pending.cl_ord_id = order.request.cl_ord_id.clone();
+        }
         order.pending = Some(pending);
         self.risk.track(id, order.exposure());
     }
