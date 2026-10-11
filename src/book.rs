@@ -1154,6 +1154,24 @@ pub fn start_prefix(start: SystemTime) -> CompactString {
 }
 
 impl Order {
+    /// The replace sent to the venue for `pending`: the order's request with its terms.
+    pub(super) fn replace_request(&self, pending: &Pending) -> Output {
+        let request = OrderRequest {
+            qty: pending.qty,
+            price: pending.price,
+            ord_type: pending.ord_type,
+            time_in_force: pending.time_in_force,
+            ..self.request.clone()
+        };
+        Output::Replace {
+            venue: self.venue.clone(),
+            downstream: pending.downstream.clone(),
+            orig_downstream: self.downstream.clone(),
+            request,
+            venue_order_id: self.venue_order_id.clone(),
+        }
+    }
+
     /// Takes the pending replace's terms, the venue having accepted it, returning the downstream
     /// ClOrdID it supersedes.
     fn apply_replace(&mut self) -> CompactString {

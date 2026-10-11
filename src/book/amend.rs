@@ -1,8 +1,8 @@
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
 use super::{
-    Book, CancelKind, CancelRejectReason, ClientId, ExecType, OrdType, Order, OrderId, OrderRequest, Origin, Output,
-    Pending, RejectReason, Sent, Side, Status, TimeInForce, VenueId, limit_price,
+    Book, CancelKind, CancelRejectReason, ClientId, ExecType, OrdType, Order, OrderId, Origin, Output, Pending,
+    RejectReason, Sent, Side, Status, TimeInForce, VenueId, limit_price,
 };
 use crate::risk::{self, Proposed, RiskReject};
 
@@ -61,18 +61,13 @@ impl Book {
         );
         // A market order has no price: the release fallback should the contract slip.
         let price = limit_price(ord_type, price);
-        out.push(Output::Replace {
-            venue: order.venue.clone(),
-            downstream: downstream.clone(),
-            orig_downstream: order.downstream.clone(),
-            request: OrderRequest { qty, price, ord_type, time_in_force, ..order.request.clone() },
-            venue_order_id: order.venue_order_id.clone(),
-        });
         let symbol = order.request.symbol.clone();
         let risk_price = self.risk.risk_price(&symbol, price);
         let order = self.orders.get_mut(&id).expect("looked up above");
         self.touched.orders.insert(id);
-        order.pending = Some(Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price });
+        let pending = Pending { downstream, cl_ord_id, qty, price, ord_type, time_in_force, risk_price };
+        out.push(order.replace_request(&pending));
+        order.pending = Some(pending);
         self.risk.track(id, order.exposure());
     }
 
@@ -342,22 +337,9 @@ impl Book {
                 request: order.request.clone(),
                 venue_order_id: order.venue_order_id.clone(),
             }),
-            Some(CancelKind::Replace) => order.pending.as_ref().filter(|p| p.downstream == downstream).map(|p| {
-                let request = OrderRequest {
-                    qty: p.qty,
-                    price: p.price,
-                    ord_type: p.ord_type,
-                    time_in_force: p.time_in_force,
-                    ..order.request.clone()
-                };
-                Output::Replace {
-                    venue: venue.clone(),
-                    downstream: downstream.clone(),
-                    orig_downstream: order.downstream.clone(),
-                    request,
-                    venue_order_id: order.venue_order_id.clone(),
-                }
-            }),
+            Some(CancelKind::Replace) => {
+                order.pending.as_ref().filter(|p| p.downstream == downstream).map(|p| order.replace_request(p))
+            }
         };
         match output {
             Some(output) => {
