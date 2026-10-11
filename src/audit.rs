@@ -2,34 +2,41 @@
 //! each, fsynced before the action runs.
 //!
 //! ```json
-//! {"time":"2026-10-11T09:30:00.123456Z","user":"alice","role":"operator","ip":"192.0.2.1","action":"block","target":"FUNDA","params":{},"reason":"runaway algo","result":"allowed"}
+//! {"time":"2026-10-11T09:30:00.123456Z","user":"alice","role":"operator","ip":"192.0.2.1","action":"block","target":"FUNDA","params":null,"reason":"runaway algo","result":"allowed"}
 //! ```
 //!
-//! `result` is `allowed`, `refused: <why>`, or `failed: <why>` on a second line for an action that
-//! was allowed but didn't get done (a reload refused, a cancel of an order already done). An
-//! action that got done has no second line.
+//! `result` is `allowed` or `refused: <why>`. An allowed action that didn't simply get done has a
+//! second line saying what happened instead: `failed: <why>` (a reload refused, a cancel of an
+//! order already done, an action that panicked), or what the action reports, such as
+//! `unchanged: already blocked`. An action that got done has no second line.
 //!
 //! **What is recorded.** Every mutation, every login and logout, allowed or refused, is written
 //! before it runs, and if the line can't be written it doesn't run. Reads aren't recorded. Of the
 //! refusals of unauthenticated requests, a wrong password or token, a missing or wrong CSRF token
 //! and a login refused by the login limit (429, a name or address that failed too often, or the
-//! limit full) are recorded: those are someone trying credentials. A request with no credentials
-//! at all, or with a session that has ended, is logged (tracing) only: a console left open past
-//! its session asks every few seconds, and recording that would bury the attacks. An identified
-//! caller refused for their role or scope, or a mutation without a reason, is recorded too.
+//! limit full) are recorded: those are someone trying credentials. A login's name is recorded
+//! only if it's a user's, else as `<unknown>` (the tracing log has it): a password typed into the
+//! name field mustn't land here. A request with no credentials at all, or with a session that has
+//! ended, is logged (tracing) only: a console left open past its session asks every few seconds,
+//! and recording that would bury the attacks. An identified caller refused for their role or
+//! scope, or a mutation without a reason, is recorded too.
 //!
-//! **What refusals may cost.** Allowed actions are always written. Refusals, which anyone can send
-//! as fast as they like, are written at most [`REFUSALS_PER_MINUTE`] a minute, the rest logged
-//! only (with a warning when the budget runs out), so a flood of them can't grow the file faster
-//! than that, nor queue the API's mutations behind fsyncs.
+//! **What refusals may cost.** Allowed actions, and the refusals of identified callers (whose user
+//! and role are known: they're accountable for them), are always written. Refusals of anyone else
+//! (a CSRF failure too, whose request can't be trusted to be the user's), which anyone can send as
+//! fast as they like, are written at most [`REFUSALS_PER_MINUTE`] a minute, the rest logged only
+//! (with a warning when the budget runs out), so a flood of them can't grow the file faster than
+//! that, nor queue the API's mutations behind fsyncs. A line is at most [`MAX_LINE_LEN`]: one
+//! longer has its params replaced by their length and its strings cut.
 //!
 //! **The file.** It's opened by path for each line, appending, so a file moved away or deleted
 //! (rotated) is created afresh rather than written to unseen; a new file is created readable by its
-//! owner only, and its directory synced. One line is written at a time, on a blocking thread.
+//! owner only, and its directory synced. One line is written at a time, on a blocking thread. At
+//! open, a last line cut short (by a crash) is ended, so the next line starts on its own.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead as _, BufReader, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -49,6 +56,16 @@ pub const REFUSALS_PER_MINUTE: u32 = 120;
 /// Entries one read returns at most: a screenful's worth many times over, and a bounded answer.
 pub const MAX_READ: usize = 1_000;
 
+/// A line's length at most, in bytes, newline included: a mutation's params and a reason fit many
+/// times over. Reads pass over longer lines, so neither side holds more than this of one.
+pub const MAX_LINE_LEN: usize = 8 * 1024;
+
+/// What a too-long line's target, reason and result are cut to, in bytes. JSON escapes a byte in
+/// six at most, so the three cut, and the rest of a line, stay well within [`MAX_LINE_LEN`].
+const CUT_FIELD_LEN: usize = 256;
+
+const _: () = assert!(3 * 6 * CUT_FIELD_LEN + 1024 < MAX_LINE_LEN);
+
 /// One line of the audit log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -62,10 +79,54 @@ pub struct Entry {
     pub action: String,
     /// What it was asked of: a session, an order, a scope, or for `authenticate` the request.
     pub target: Option<String>,
-    /// The request's other arguments. Never secrets: no passwords, tokens or CSRF tokens.
+    /// The request's other arguments, `null` if none. Never secrets: no passwords, tokens or CSRF
+    /// tokens.
     pub params: serde_json::Value,
     pub reason: Option<String>,
     pub result: String,
+}
+
+impl Entry {
+    /// An entry for now, without params, reason or result yet.
+    pub fn new(user: Option<String>, role: Option<Role>, ip: IpAddr, action: &str, target: Option<String>) -> Self {
+        Self {
+            time: Utc::now(),
+            user,
+            role,
+            ip,
+            action: action.to_string(),
+            target,
+            params: serde_json::Value::Null,
+            reason: None,
+            result: String::new(),
+        }
+    }
+
+    /// The entry as a line, newline included, at most [`MAX_LINE_LEN`]; see the module
+    /// documentation.
+    fn line(&self) -> io::Result<String> {
+        let mut line = serde_json::to_string(self).map_err(io::Error::other)?;
+        if line.len() >= MAX_LINE_LEN {
+            let mut cut = self.clone();
+            cut.params = serde_json::json!({ "truncated": line.len() });
+            for text in [cut.target.as_mut(), cut.reason.as_mut(), Some(&mut cut.result)].into_iter().flatten() {
+                cut_at_char(text, CUT_FIELD_LEN);
+            }
+            line = serde_json::to_string(&cut).map_err(io::Error::other)?;
+        }
+        line.push('\n');
+        assert!(line.len() <= MAX_LINE_LEN, "an audit line of {} bytes", line.len());
+        Ok(line)
+    }
+}
+
+/// Cuts `text` to `max` bytes at most, at a character's boundary.
+pub(crate) fn cut_at_char(text: &mut String, max: usize) {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 /// The audit log at a path; see the module documentation.
@@ -87,13 +148,23 @@ struct Budget {
 }
 
 impl Audit {
-    /// The audit log at `path`, created if missing.
+    /// The audit log at `path`, created if missing, a torn last line ended. Warns if others may
+    /// read or write it.
     ///
     /// # Errors
     ///
-    /// It can't be created or opened for appending.
+    /// It can't be created, opened for appending, or read.
     pub fn open(path: &Path) -> io::Result<Self> {
-        open_append(path)?;
+        let mut file = open_append(path)?;
+        end_torn_line(path, &mut file)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file.metadata()?.permissions().mode();
+            if mode & 0o077 != 0 {
+                warn!(path = %path.display(), "the audit log is open to others (mode {:o}): chmod 600 it", mode & 0o777);
+            }
+        }
         Ok(Self {
             path: path.to_path_buf(),
             writer: Arc::new(tokio::sync::Mutex::new(())),
@@ -107,8 +178,7 @@ impl Audit {
     ///
     /// It couldn't be written or synced: the action it records mustn't run.
     pub async fn record(&self, entry: &Entry) -> io::Result<()> {
-        let mut line = serde_json::to_string(entry).map_err(io::Error::other)?;
-        line.push('\n');
+        let line = entry.line()?;
         let path = self.path.clone();
         let turn = self.writer.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
@@ -121,8 +191,8 @@ impl Audit {
         .map_err(io::Error::other)?
     }
 
-    /// As [`record`](Self::record), for a refusal: written only within [`REFUSALS_PER_MINUTE`],
-    /// else logged only.
+    /// As [`record`](Self::record), for a refusal of someone unidentified: written only within
+    /// [`REFUSALS_PER_MINUTE`], else logged only.
     ///
     /// # Errors
     ///
@@ -131,8 +201,9 @@ impl Audit {
         if self.spend_refusal(Instant::now()) { self.record(entry).await } else { Ok(()) }
     }
 
-    /// Whether a refusal at `now` may be written.
-    fn spend_refusal(&self, now: Instant) -> bool {
+    /// Whether a refusal at `now` may be written. The count of those skipped is reported by the
+    /// first refusal after their minute: with none after it, it isn't.
+    pub(crate) fn spend_refusal(&self, now: Instant) -> bool {
         let mut budget = self.refusals.lock().unwrap_or_else(PoisonError::into_inner);
         if now.saturating_duration_since(budget.start) >= Duration::from_secs(60) {
             if budget.skipped > 0 {
@@ -151,8 +222,9 @@ impl Audit {
         false
     }
 
-    /// The last `limit` entries (at most [`MAX_READ`]) at or after `since`, oldest first. Lines
-    /// that don't parse (one cut short by a crash) are passed over.
+    /// The last `limit` entries (at most [`MAX_READ`]) at or after `since`, in the order written.
+    /// Lines that don't parse (one cut short by a crash) or are over [`MAX_LINE_LEN`] are passed
+    /// over. No file yet is no entries.
     ///
     /// # Errors
     ///
@@ -161,11 +233,30 @@ impl Audit {
         let path = self.path.clone();
         let limit = limit.min(MAX_READ);
         tokio::task::spawn_blocking(move || {
+            let file = match File::open(&path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                opened => opened?,
+            };
             // ponytail: scans the whole file each read; an index, or reading from the end, if it
             // grows large (it isn't rotated yet).
+            let mut reader = BufReader::new(file);
             let mut entries = VecDeque::with_capacity(limit);
-            for line in BufReader::new(File::open(&path)?).lines() {
-                let Ok(entry) = serde_json::from_str::<Entry>(&line?) else { continue };
+            let mut line = Vec::with_capacity(MAX_LINE_LEN);
+            let most = u64::try_from(MAX_LINE_LEN).expect("a usize fits a u64") + 1;
+            loop {
+                line.clear();
+                if (&mut reader).take(most).read_until(b'\n', &mut line)? == 0 {
+                    break;
+                }
+                if line.len() > MAX_LINE_LEN {
+                    // A line of exactly MAX_LINE_LEN + 1 bytes ended in the take: skipping on
+                    // would swallow the next one.
+                    if line.last() != Some(&b'\n') {
+                        reader.skip_until(b'\n')?;
+                    }
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_slice::<Entry>(&line) else { continue };
                 if since.is_some_and(|since| entry.time < since) {
                     continue;
                 }
@@ -195,20 +286,42 @@ fn open_append(path: &Path) -> io::Result<File> {
         options
     };
     match options(false).open(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let file = options(true).open(path)?;
-            #[cfg(unix)]
-            {
-                let directory = match path.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => parent,
-                    _ => Path::new("."),
-                };
-                File::open(directory)?.sync_all()?;
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match options(true).open(path) {
+            // Created meanwhile, by another writer: it's there to append to.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => options(false).open(path),
+            created => {
+                let file = created?;
+                #[cfg(unix)]
+                {
+                    let directory = match path.parent() {
+                        Some(parent) if !parent.as_os_str().is_empty() => parent,
+                        _ => Path::new("."),
+                    };
+                    File::open(directory)?.sync_all()?;
+                }
+                Ok(file)
             }
-            Ok(file)
-        }
+        },
         opened => opened,
     }
+}
+
+/// Ends the file's last line, if a crash left it without its newline, so the next line written
+/// isn't glued to it and lost with it.
+fn end_torn_line(path: &Path, file: &mut File) -> io::Result<()> {
+    let mut reader = File::open(path)?;
+    if reader.metadata()?.len() == 0 {
+        return Ok(());
+    }
+    reader.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    reader.read_exact(&mut last)?;
+    if last != *b"\n" {
+        warn!(path = %path.display(), "the audit log's last line was cut short: ending it");
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -260,6 +373,53 @@ pub(crate) mod tests {
         assert_eq!(since, [entry(times[1], "allowed"), entry(times[2], "allowed")]);
         assert_eq!(read(None, 1).await.unwrap(), [entry(times[2], "allowed")]);
         assert!(read(None, 0).await.unwrap().is_empty());
+    }
+
+    /// A last line torn by a crash is ended at open, so the next line reads back whole; a
+    /// missing file reads as empty.
+    #[tokio::test]
+    async fn a_torn_last_line_is_ended_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = Audit::open(&path).unwrap();
+        audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.unwrap();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"time\":\"2026-");
+        std::fs::write(&path, &text).unwrap();
+        let audit = Audit::open(&path).unwrap();
+        audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.unwrap();
+        let read = audit.read(None, MAX_READ).await.unwrap();
+        assert_eq!(read, [entry("2026-10-11T09:00:00Z", "allowed"), entry("2026-10-11T10:00:00Z", "allowed")]);
+        std::fs::remove_file(&path).unwrap();
+        assert!(audit.read(None, MAX_READ).await.unwrap().is_empty());
+    }
+
+    /// A line over the limit has its params replaced by their length and its strings cut, at a
+    /// character's boundary; reading passes over a longer line written by someone else.
+    #[tokio::test]
+    async fn lines_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = Audit::open(&path).unwrap();
+        let mut big = entry("2026-10-11T09:00:00Z", "allowed");
+        big.params = serde_json::json!({ "text": "x".repeat(MAX_LINE_LEN) });
+        big.target = Some("é".repeat(MAX_LINE_LEN));
+        audit.record(&big).await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.len() <= MAX_LINE_LEN);
+        let [read] = audit.read(None, MAX_READ).await.unwrap().try_into().unwrap();
+        assert!(read.params["truncated"].as_u64().unwrap() > u64::try_from(MAX_LINE_LEN).unwrap());
+        assert_eq!(read.target.unwrap(), "é".repeat(CUT_FIELD_LEN / 2));
+        assert_eq!(read.result, "allowed");
+
+        let mut long = serde_json::to_string(&big).unwrap();
+        long.push('\n');
+        std::fs::write(&path, format!("{long}{text}{long}")).unwrap();
+        assert_eq!(audit.read(None, MAX_READ).await.unwrap().len(), 1);
+        // One byte over, its newline the take's last byte: the next line is still read.
+        let just_over = format!("{}\n", "x".repeat(MAX_LINE_LEN));
+        std::fs::write(&path, format!("{just_over}{text}")).unwrap();
+        assert_eq!(audit.read(None, MAX_READ).await.unwrap().len(), 1);
     }
 
     /// A file deleted (or rotated away) is created afresh at the next line.

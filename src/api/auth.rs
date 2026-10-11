@@ -42,7 +42,7 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use super::ApiError;
-use crate::audit::Entry;
+use crate::audit::{Entry, cut_at_char};
 use crate::auth::{MAX_NAME_LEN, MAX_PASSWORD_LEN, Role, User, Users, check_name, random, verify_password};
 use crate::book::{ClientId, Scope};
 use crate::config::Api;
@@ -614,28 +614,11 @@ pub(super) async fn authenticate(
             if !refusal.audited() {
                 return error.into_response();
             }
-            // Method and path are ASCII, so cutting them anywhere is at a character's boundary.
             let mut target = format!("{} {}", request.method(), request.uri().path());
-            debug_assert!(target.is_ascii());
-            target.truncate(MAX_AUDIT_TARGET_LEN);
-            let entry = Entry { user, ..unidentified(ip, "authenticate", Some(target)) };
+            cut_at_char(&mut target, MAX_AUDIT_TARGET_LEN);
+            let entry = Entry::new(user, None, ip, "authenticate", Some(target));
             state.refused(entry, error).await.into_response()
         }
-    }
-}
-
-/// An audit line for `action` by a caller not (yet) identified, from `ip`.
-fn unidentified(ip: IpAddr, action: &str, target: Option<String>) -> Entry {
-    Entry {
-        time: chrono::Utc::now(),
-        user: None,
-        role: None,
-        ip,
-        action: action.to_string(),
-        target,
-        params: serde_json::Value::Null,
-        reason: None,
-        result: String::new(),
     }
 }
 
@@ -680,22 +663,23 @@ pub(super) async fn login(
 ) -> Result<Response, ApiError> {
     let Json(Login { user, password }) = body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
     let ip = state.auth.client_ip(peer, &headers);
-    // A name no user could have is the client's to write anything in: not into the logs.
-    let valid = check_name(&user).is_ok();
-    let mut entry = Entry { user: valid.then(|| user.clone()), ..unidentified(ip, "login", None) };
     match state.auth.verify(&user, password, ip).await {
         Ok(found) => {
-            entry.role = Some(found.role);
-            entry.result = "allowed".to_string();
-            // Before the session exists: no line, no session.
-            state.audit.record(&entry).await.map_err(|e| super::audit_failed(&e))?;
-            let LoggedIn { session, me } = state.auth.start_session(&user, &found);
-            info!(user, %ip, "API login");
+            let entry = Entry::new(Some(user.clone()), Some(found.role), ip, "login", None);
+            let auth = state.auth.clone();
+            // The line before the session: no line, no session.
+            let start = async move { Ok((auth.start_session(&user, &found), None)) };
+            let LoggedIn { session, me } = super::run_audited(state.audit.clone(), entry, start).await?;
+            info!(user = me.user, %ip, "API login");
             Ok(([(SET_COOKIE, state.auth.cookie(&session))], Json(me)).into_response())
         }
         Err(refusal) => {
-            let error = refuse(refusal, Some(if valid { user.as_str() } else { "<invalid>" }), ip);
-            Err(state.refused(entry, error).await)
+            // A name no user could have is the client's to write anything in: not into the log.
+            let error = refuse(refusal, Some(if check_name(&user).is_ok() { &user } else { "<invalid>" }), ip);
+            // Nor one no user has into the audit log, whatever was typed there.
+            let known = state.auth.users().get(&user).is_some();
+            let name = if known { user } else { "<unknown>".to_string() };
+            Err(state.refused(Entry::new(Some(name), None, ip, "login", None), error).await)
         }
     }
 }
@@ -705,12 +689,17 @@ pub(super) async fn logout(
     axum::extract::State(state): axum::extract::State<super::State>,
     caller: Caller,
 ) -> Result<Response, ApiError> {
-    let mut entry = super::entry_for(&caller, "logout", None);
-    entry.result = "allowed".to_string();
-    state.audit.record(&entry).await.map_err(|e| super::audit_failed(&e))?;
-    if let Some(session) = &caller.session {
-        state.auth.end_session(&session.id);
-    }
+    // A token caller is recorded too: they asked, though there's no session to end.
+    let target = if caller.session.is_some() { "session" } else { "token" };
+    let entry = super::entry_for(&caller, "logout", Some(target.to_string()));
+    let (auth, session) = (state.auth.clone(), caller.session.clone());
+    let end = async move {
+        if let Some(session) = session {
+            auth.end_session(&session.id);
+        }
+        Ok(((), None))
+    };
+    super::run_audited(state.audit.clone(), entry, end).await?;
     info!(user = caller.user, ip = %caller.ip, "API logout");
     Ok((StatusCode::NO_CONTENT, [(SET_COOKIE, state.auth.cookie(""))]).into_response())
 }
@@ -1105,6 +1094,7 @@ mod tests {
         let (cookie, csrf) = session(&app, "alice", "secret").await;
         assert_eq!(login(&app, "alice", "guess").await.status, StatusCode::UNAUTHORIZED);
         assert_eq!(login(&app, &"x".repeat(MAX_NAME_LEN + 1), "guess").await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(login(&app, "carol", "guess").await.status, StatusCode::UNAUTHORIZED);
         assert_eq!(send(&app, "GET", "/api/me", &[], "").await.status, StatusCode::UNAUTHORIZED);
         let ended = [("cookie", "jetbridge_session=made-up")];
         assert_eq!(send(&app, "GET", "/api/me", &ended, "").await.status, StatusCode::UNAUTHORIZED);
@@ -1115,7 +1105,10 @@ mod tests {
         assert_eq!(send(&app, "POST", "/api/logout", &headers, "").await.status, StatusCode::NO_CONTENT);
         let bearer = format!("Bearer {token}");
         assert_eq!(send(&app, "GET", "/api/me", &[("authorization", &bearer)], "").await.status, StatusCode::OK);
-        for _ in 1..LOGIN_FAILURES {
+        let answer = send(&app, "POST", "/api/logout", &[("authorization", &bearer)], "").await;
+        assert_eq!(answer.status, StatusCode::NO_CONTENT);
+        // The address has two failures already, alice's and carol's.
+        for _ in 2..LOGIN_FAILURES {
             login(&app, "alice", "guess").await;
         }
         assert_eq!(login(&app, "alice", "secret").await.status, StatusCode::TOO_MANY_REQUESTS);
@@ -1130,11 +1123,12 @@ mod tests {
         let expected = [
             "alice | operator | login | - | allowed",
             wrong_password,
-            "- | - | login | - | refused: wrong user or password",
+            "<unknown> | - | login | - | refused: wrong user or password",
+            "<unknown> | - | login | - | refused: wrong user or password",
             "- | - | authenticate | GET /api/me | refused: unknown or revoked token",
             "alice | - | authenticate | POST /api/logout | refused: missing or wrong X-CSRF-Token",
-            "alice | operator | logout | - | allowed",
-            wrong_password,
+            "alice | operator | logout | session | allowed",
+            "bob | admin | logout | token | allowed",
             wrong_password,
             wrong_password,
             wrong_password,
@@ -1144,9 +1138,29 @@ mod tests {
         assert_eq!(lines[0]["ip"], "192.0.2.1");
         let text = std::fs::read_to_string(app.dir.path().join("audit.jsonl")).unwrap();
         let session = cookie.split_once('=').unwrap().1;
-        for secret in ["secret", "guess", &csrf, session, &token] {
+        for secret in ["secret", "guess", "carol", &csrf, session, &token] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
+    }
+
+    /// A refusal's target, the request's path, is cut to its limit at a character's boundary:
+    /// a path routed with a parameter may hold any character.
+    #[tokio::test]
+    async fn a_long_target_is_cut_between_characters() {
+        let (auth, _) = auth(users(), false);
+        let (state, dir) = super::super::tests::state(auth);
+        let app = axum::Router::new()
+            .route("/api/x/{id}", axum::routing::get(async || ()))
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), authenticate))
+            .with_state(state)
+            .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()));
+        // "GET /api/x/" is 11 bytes, so byte 256 falls inside an "é".
+        let path = format!("/api/x/{}", "é".repeat(200));
+        let wrong = [("authorization", "Bearer jb_wrong")];
+        assert_eq!(send(&app, "GET", &path, &wrong, "").await.status, StatusCode::UNAUTHORIZED);
+        let text = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(line["target"], format!("GET {}", &path[..MAX_AUDIT_TARGET_LEN - 5]));
     }
 
     /// A login whose audit line can't be written answers 503 and starts no session; a logout's

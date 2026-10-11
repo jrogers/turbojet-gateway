@@ -54,11 +54,17 @@ pub(crate) struct State {
 }
 
 impl State {
-    /// Records `entry` as refused with `error`, within the audit log's budget for refusals, and
-    /// answers `error`; or 503 if the line can't be written.
+    /// Records `entry` as refused with `error` and answers `error`; or 503 if the line can't be
+    /// written. An identified caller's refusal (role known) is always written, anyone else's
+    /// within the audit log's budget for refusals; see [`crate::audit`].
     async fn refused(&self, mut entry: Entry, error: ApiError) -> ApiError {
         entry.result = format!("refused: {}", error.message);
-        match self.audit.record_refusal(&entry).await {
+        let recorded = if entry.role.is_some() {
+            self.audit.record(&entry).await
+        } else {
+            self.audit.record_refusal(&entry).await
+        };
+        match recorded {
             Ok(()) => error,
             Err(e) => audit_failed(&e),
         }
@@ -129,23 +135,22 @@ pub(crate) struct Mutation {
     pub(crate) reason: Option<String>,
 }
 
+/// What an action answers: its answer, and what happened if not simply done, for the audit log's
+/// second line (`unchanged: already blocked`).
+pub(crate) type Outcome<T> = Result<(T, Option<String>), ApiError>;
+
 /// Runs `action`, a mutation by `caller`, once its audit line is written; see [`crate::audit`].
 ///
 /// Refuses it, recording the refusal, if `allowed` is an error (the caller's role or scope, or a
-/// target that doesn't exist) or the reason is missing, blank or too long (400). Then records it
-/// as allowed, runs it, and if it answers an error, records that as a second line, `failed: ...`:
-/// a handler reports an outcome other than done by answering an error. Answers 503, not running
-/// it, if the line can't be written.
-///
-/// The writing and the action run on a task of their own, so a client that gives up midway
-/// can't leave an allowed line without its action, nor an action without its outcome.
+/// target that doesn't exist) or the reason is missing, blank or too long (400). Then runs it as
+/// [`run_audited`] does.
 #[cfg_attr(not(test), expect(dead_code, reason = "the mutation endpoints call it"))]
 pub(crate) async fn audited<T: Send + 'static>(
     state: &State,
     caller: &Caller,
     mutation: Mutation,
     allowed: Result<(), ApiError>,
-    action: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+    action: impl Future<Output = Outcome<T>> + Send + 'static,
 ) -> Result<T, ApiError> {
     let reason = mutation.reason.unwrap_or_default();
     let too_long = reason.len() > MAX_REASON_LEN;
@@ -165,40 +170,51 @@ pub(crate) async fn audited<T: Send + 'static>(
     if let Some(error) = refusal {
         return Err(state.refused(entry, error).await);
     }
-    let audit = state.audit.clone();
+    run_audited(state.audit.clone(), entry, action).await
+}
+
+/// Records `entry` as allowed, runs `action`, and records a second line if it wasn't simply done:
+/// `failed: ...` if it answered an error or panicked, or the outcome it reported. Answers 503,
+/// not running it, if the first line can't be written.
+///
+/// All of it runs on a task of its own, so a client that gives up midway can't leave an allowed
+/// line without its action, nor an action without its outcome.
+pub(crate) async fn run_audited<T: Send + 'static>(
+    audit: Arc<Audit>,
+    mut entry: Entry,
+    action: impl Future<Output = Outcome<T>> + Send + 'static,
+) -> Result<T, ApiError> {
     let run = async move {
         entry.result = "allowed".to_string();
         audit.record(&entry).await.map_err(|e| audit_failed(&e))?;
-        let outcome = action.await;
-        if let Err(failed) = &outcome {
+        // A task of its own too, so a panic in it still gets its outcome line.
+        let outcome = tokio::spawn(action).await.unwrap_or_else(|e| {
+            error!(action = entry.action, "an API action panicked: {e}");
+            Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "panicked"))
+        });
+        let second = match &outcome {
+            Ok((_, note)) => note.clone(),
+            Err(failed) => Some(format!("failed: {}", failed.message)),
+        };
+        if let Some(result) = second {
             entry.time = Utc::now();
-            entry.result = format!("failed: {}", failed.message);
+            entry.result = result;
             if let Err(e) = audit.record(&entry).await {
                 // Done is done: the caller hears what happened, whatever the log.
-                error!(action = entry.action, "cannot write a mutation's outcome to the audit log: {e}");
+                error!(action = entry.action, "cannot write an action's outcome to the audit log: {e}");
             }
         }
-        outcome
+        outcome.map(|(answer, _)| answer)
     };
     tokio::spawn(run).await.unwrap_or_else(|e| {
-        error!("a mutation panicked: {e}");
+        error!("an audited action's task failed: {e}");
         Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "the action failed"))
     })
 }
 
 /// An audit line for `caller` doing `action` to `target`, with no params, reason or result yet.
 pub(crate) fn entry_for(caller: &Caller, action: &str, target: Option<String>) -> Entry {
-    Entry {
-        time: Utc::now(),
-        user: Some(caller.user.clone()),
-        role: Some(caller.role),
-        ip: caller.ip,
-        action: action.to_string(),
-        target,
-        params: serde_json::Value::Null,
-        reason: None,
-        result: String::new(),
-    }
+    Entry::new(Some(caller.user.clone()), Some(caller.role), caller.ip, action, target)
 }
 
 /// The answer, 503, when the audit log can't be written: whatever it was for didn't happen.
@@ -465,13 +481,16 @@ pub(crate) mod tests {
         #[derive(Deserialize)]
         struct Flip {
             reason: Option<String>,
+            /// `fail` answers 409 without flipping; `panic` panics.
+            how: Option<String>,
         }
 
-        /// A test mutation, `POST /test/flip {reason}` [operator]: flips `switch` on, and answers
-        /// 409, not done, if it was on already.
+        /// A test mutation, `POST /test/flip {reason, how}` [operator]: flips `switch` on,
+        /// reporting `unchanged: already on` if it was.
         struct Fixture {
             app: axum::Router,
             switch: Arc<AtomicBool>,
+            audit: Arc<Audit>,
             dir: tempfile::TempDir,
             /// Bearer headers' values: a viewer's, an operator's and an admin's.
             viewer: String,
@@ -503,10 +522,13 @@ pub(crate) mod tests {
                     };
                     let allowed = caller.require(Role::Operator);
                     audited(&state, &caller, mutation, allowed, async move {
-                        if flipped.swap(true, Ordering::SeqCst) {
-                            Err(ApiError::new(StatusCode::CONFLICT, "already on"))
-                        } else {
-                            Ok(StatusCode::NO_CONTENT)
+                        match flip.how.as_deref() {
+                            Some("fail") => Err(ApiError::new(StatusCode::CONFLICT, "told to fail")),
+                            Some("panic") => panic!("told to panic"),
+                            _ if flipped.swap(true, Ordering::SeqCst) => {
+                                Ok((StatusCode::NO_CONTENT, Some("unchanged: already on".to_string())))
+                            }
+                            _ => Ok((StatusCode::NO_CONTENT, None)),
                         }
                     })
                     .await
@@ -517,8 +539,9 @@ pub(crate) mod tests {
                 .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate))
                 .with_state(state.clone());
             let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+            let audit = state.audit.clone();
             let app = router(state).merge(test).layer(axum::extract::connect_info::MockConnectInfo(peer));
-            Fixture { app, switch, dir, viewer, operator, admin }
+            Fixture { app, switch, audit, dir, viewer, operator, admin }
         }
 
         impl Fixture {
@@ -550,7 +573,10 @@ pub(crate) mod tests {
             assert!(!fixture.switch.load(Ordering::SeqCst));
             assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::NO_CONTENT);
             assert!(fixture.switch.load(Ordering::SeqCst));
-            assert_eq!(fixture.flip(&fixture.admin, reason).await, StatusCode::CONFLICT);
+            let how = |how: &str| format!(r#"{{"reason":"testing","how":"{how}"}}"#);
+            assert_eq!(fixture.flip(&fixture.admin, &how("fail")).await, StatusCode::CONFLICT);
+            assert_eq!(fixture.flip(&fixture.admin, reason).await, StatusCode::NO_CONTENT);
+            assert_eq!(fixture.flip(&fixture.admin, &how("panic")).await, StatusCode::INTERNAL_SERVER_ERROR);
 
             let lines = fixture.lines();
             let results: Vec<_> = lines.iter().map(|line| line["result"].as_str().unwrap()).collect();
@@ -563,7 +589,11 @@ pub(crate) mod tests {
                     &format!("refused: the reason is over {MAX_REASON_LEN} bytes"),
                     "allowed",
                     "allowed",
-                    "failed: already on",
+                    "failed: told to fail",
+                    "allowed",
+                    "unchanged: already on",
+                    "allowed",
+                    "failed: panicked",
                 ]
             );
             let allowed = &lines[4];
@@ -578,6 +608,49 @@ pub(crate) mod tests {
             assert_eq!(lines[2]["reason"], "  ");
             assert_eq!(lines[3]["reason"], serde_json::Value::Null);
             assert_eq!(lines[6]["user"], "ada");
+        }
+
+        /// An identified caller's refusal is written even with the refusals' budget spent; an
+        /// unidentified one's then isn't, and still answers its own status.
+        #[tokio::test]
+        async fn only_unidentified_refusals_are_budgeted() {
+            let fixture = fixture();
+            while fixture.audit.spend_refusal(std::time::Instant::now()) {}
+            let reason = r#"{"reason":"testing"}"#;
+            assert_eq!(fixture.flip(&fixture.viewer, reason).await, StatusCode::FORBIDDEN);
+            assert_eq!(fixture.flip("Bearer jb_wrong", reason).await, StatusCode::UNAUTHORIZED);
+            let lines = fixture.lines();
+            let [line] = lines.as_slice() else { panic!("{lines:?}") };
+            assert_eq!(line["user"], "vic");
+        }
+
+        /// A request given up on once its action has started doesn't stop it: the action
+        /// finishes, and its outcome line is written.
+        #[tokio::test]
+        async fn an_action_outlives_its_request() {
+            let fixture = fixture();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let go = Arc::new(tokio::sync::Notify::new());
+            let (started_2, go_2) = (started.clone(), go.clone());
+            let action = async move {
+                started_2.notify_one();
+                go_2.notified().await;
+                Ok(((), Some("unchanged: test".to_string())))
+            };
+            let entry = Entry::new(Some("olga".into()), Some(Role::Operator), [192, 0, 2, 1].into(), "test", None);
+            let request = tokio::spawn(run_audited(fixture.audit.clone(), entry, action));
+            started.notified().await;
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            go.notify_one();
+            for _ in 0..500 {
+                if fixture.lines().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let results: Vec<_> = fixture.lines().iter().map(|line| line["result"].clone()).collect();
+            assert_eq!(results, ["allowed", "unchanged: test"]);
         }
 
         /// A mutation whose line can't be written, the file read-only or its directory gone,
