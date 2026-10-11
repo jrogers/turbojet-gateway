@@ -33,8 +33,8 @@ use turbojet::{
 };
 
 use crate::book::{
-    Alarm, AlarmKind, Book, ClientId, Day, Event, GatewayCancel, Input, OrderDetail, OrderFilter, OrderId, OrderView,
-    Output, RiskView, Scope, ScopeName, Snapshot, Undelivered, VenueId,
+    Alarm, AlarmKind, Book, ClientId, Day, GatewayCancel, GatewayEvent, Input, OrderDetail, OrderFilter, OrderId,
+    OrderView, Output, RiskView, Scope, ScopeName, Snapshot, Undelivered, VenueId,
 };
 use crate::fix::{self, Version};
 use crate::risk;
@@ -101,7 +101,7 @@ pub struct Gateway {
     /// Commits the book's changes, if there's a database: see [`with_writer`](Self::with_writer).
     writer: Option<Writer>,
     /// See [`subscribe`](Self::subscribe).
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<GatewayEvent>,
     /// Order views built for events, to show none are without a listener.
     #[cfg(test)]
     views_built: std::sync::atomic::AtomicUsize,
@@ -465,16 +465,23 @@ impl Gateway {
     }
 
     /// Every order as each step leaves it, blocks, unblocks and alarms, from now on, in the order
-    /// the book made them. Order views are built only while someone listens.
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    /// the book made them. Order views are built only while someone listens. Alarms raised outside
+    /// the book (the startup scan, venue logons) aren't ordered against the book's steps.
+    pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
         self.events.subscribe()
+    }
+
+    /// Whether new orders are rejected because the database is too far behind: see
+    /// [`AlarmKind::GatewayUnavailable`].
+    pub fn unavailable(&self) -> bool {
+        self.lock().book.unavailable()
     }
 
     /// Publishes an alarm the gateway raises outside the book, if anyone listens.
     fn alarm(&self, kind: AlarmKind, text: impl FnOnce() -> String) {
         if self.events.receiver_count() > 0 {
             // An error only once every listener has gone since the check.
-            let _ = self.events.send(Event::Alarm(Alarm { time: self.clock.now(), kind, text: text() }));
+            let _ = self.events.send(GatewayEvent::Alarm(Alarm { time: self.clock.now(), kind, text: text() }));
         }
     }
 
@@ -664,7 +671,7 @@ impl Gateway {
         let views = book.touched_views();
         #[cfg(test)]
         self.views_built.fetch_add(views.len(), Ordering::Relaxed);
-        for event in book.take_events().chain(views.into_iter().map(Event::Order)) {
+        for event in book.take_events().chain(views.into_iter().map(GatewayEvent::Order)) {
             // An error only once every listener has gone since the check.
             let _ = self.events.send(event);
         }
@@ -2630,17 +2637,17 @@ pub(crate) mod tests {
         assert_eq!(unsent(&after), [true]);
     }
 
-    type Events = broadcast::Receiver<crate::book::Event>;
+    type Events = broadcast::Receiver<GatewayEvent>;
 
     /// Every event published so far, without waiting.
-    fn published(events: &mut Events) -> Vec<crate::book::Event> {
+    fn published(events: &mut Events) -> Vec<GatewayEvent> {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
     }
 
     /// The kinds of the alarms published so far.
     fn alarms(events: &mut Events) -> Vec<AlarmKind> {
         let alarms = published(events).into_iter().filter_map(|event| match event {
-            crate::book::Event::Alarm(alarm) => Some(alarm.kind),
+            GatewayEvent::Alarm(alarm) => Some(alarm.kind),
             _ => None,
         });
         alarms.collect()
@@ -2648,7 +2655,7 @@ pub(crate) mod tests {
 
     fn statuses(events: &mut Events) -> Vec<(u64, crate::book::Status)> {
         let views = published(events).into_iter().filter_map(|event| match event {
-            crate::book::Event::Order(view) => Some((view.id.0, view.status)),
+            GatewayEvent::Order(view) => Some((view.id.0, view.status)),
             _ => None,
         });
         views.collect()
@@ -2689,31 +2696,30 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_block_and_an_unblock_are_published_once_each() {
-        use crate::book::Event;
         let gateway = gateway();
         let mut events = gateway.subscribe();
         gateway.block(Scope::All).await;
         gateway.block(Scope::All).await;
         gateway.unblock(Scope::All).await;
         gateway.unblock(Scope::All).await;
-        let want = [Event::Blocked { scope: Scope::All }, Event::Unblocked { scope: Scope::All }];
+        let want = [GatewayEvent::Blocked { scope: Scope::All }, GatewayEvent::Unblocked { scope: Scope::All }];
         assert_eq!(published(&mut events), want);
     }
 
     #[test]
     fn events_are_json_tagged_by_type() {
-        use crate::book::{Alarm, Event};
-        let blocked = serde_json::to_value(Event::Blocked { scope: Scope::All }).unwrap();
+        use crate::book::Alarm;
+        let blocked = serde_json::to_value(GatewayEvent::Blocked { scope: Scope::All }).unwrap();
         assert_eq!(blocked, serde_json::json!({"type": "blocked", "scope": "all"}));
         let alarm = Alarm { time: at("2026-10-11T12:00:00Z"), kind: AlarmKind::StuckCancel, text: "t".into() };
-        let alarm = serde_json::to_value(Event::Alarm(alarm)).unwrap();
+        let alarm = serde_json::to_value(GatewayEvent::Alarm(alarm)).unwrap();
         let want =
             serde_json::json!({"type": "alarm", "time": "2026-10-11T12:00:00Z", "kind": "stuck_cancel", "text": "t"});
         assert_eq!(alarm, want);
         let gateway = gateway();
         book_order(&gateway);
         let view = gateway.lock().book.touched_views().remove(0);
-        let order = serde_json::to_value(Event::Order(view)).unwrap();
+        let order = serde_json::to_value(GatewayEvent::Order(view)).unwrap();
         assert_eq!((&order["type"], &order["id"], &order["order_id"]), (&"order".into(), &1.into(), &"1".into()));
     }
 
@@ -2800,9 +2806,34 @@ pub(crate) mod tests {
         gateway.handle_all([]);
         gateway.handle_all([]);
         assert_eq!(alarms(&mut events), [AlarmKind::GatewayUnavailable]);
+        assert!(gateway.unavailable());
         store.hooks.gate.send_replace(true);
         timeout(Duration::from_secs(5), gateway.committed()).await.expect("not committed");
         gateway.handle_all([]);
-        assert_eq!(alarms(&mut events), [AlarmKind::GatewayUnavailable]);
+        assert_eq!(alarms(&mut events), [AlarmKind::GatewayAvailable]);
+        assert!(!gateway.unavailable());
+    }
+
+    /// The tick notices the database falling behind and catching up with no order coming in.
+    /// Real time, briefly: the writer ages its batches by `std::time::Instant`, which tokio's
+    /// paused clock doesn't move; a zero wait makes any uncommitted batch too old.
+    #[tokio::test]
+    async fn the_tick_raises_gateway_unavailable_and_available_without_traffic() {
+        let (gateway, store) = gateway_with_store(Duration::ZERO).await;
+        let mut events = gateway.subscribe();
+        store.hooks.gate.send_replace(false);
+        gateway.handle(new_order_from("FUNDA", "C1"));
+        let ticks = tokio::spawn(gateway.clone().run_ticks(Duration::from_millis(10)));
+        let next_alarm = async |events: &mut Events| loop {
+            if let GatewayEvent::Alarm(alarm) = events.recv().await.unwrap() {
+                break alarm.kind;
+            }
+        };
+        let raised = timeout(Duration::from_secs(5), next_alarm(&mut events)).await.expect("no alarm");
+        assert_eq!(raised, AlarmKind::GatewayUnavailable);
+        store.hooks.gate.send_replace(true);
+        let cleared = timeout(Duration::from_secs(5), next_alarm(&mut events)).await.expect("no alarm");
+        assert_eq!(cleared, AlarmKind::GatewayAvailable);
+        ticks.abort();
     }
 }

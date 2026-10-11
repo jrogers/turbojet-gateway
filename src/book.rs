@@ -25,8 +25,8 @@ use amend::{Amend, Refused, Terms};
 use persist::Touched;
 pub use persist::{Changes, ClOrdIdRow, OrderRow, Snapshot, Undelivered};
 pub use view::{
-    Alarm, AlarmKind, CancelState, Event, GatewayCancelView, MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderView,
-    RequestKind, RequestView, RiskView, SessionRisk,
+    Alarm, AlarmKind, CancelState, GatewayCancelView, GatewayEvent, MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter,
+    OrderView, RequestKind, RequestView, RiskView, SessionRisk,
 };
 
 /// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
@@ -720,7 +720,7 @@ pub struct Book {
     unavailable: bool,
     /// Blocks, unblocks and alarms since [`take_events`](Self::take_events): rare, so kept whether
     /// or not anyone listens.
-    events: Vec<Event>,
+    events: Vec<GatewayEvent>,
     /// Orphaned replaces (see [`Input::Orphan`]) of orders with a replace pending, by order, to be
     /// made pending once that one is answered, with the client's OrigClOrdID once its redelivered
     /// replace is taken as it (the pending's `cl_ord_id` then the client's): see
@@ -790,20 +790,27 @@ impl Book {
     /// While `unavailable`, new orders are rejected ([`RejectReason::GatewayUnavailable`]): the
     /// gateway's database is too far behind to take more. Cancels, replaces and venue reports
     /// pass, as they take orders off the market or record what a venue did.
-    /// Set after [`set_now`](Self::set_now): a change raises a [`AlarmKind::GatewayUnavailable`].
+    /// Set after [`set_now`](Self::set_now): a change raises [`AlarmKind::GatewayUnavailable`] or
+    /// [`AlarmKind::GatewayAvailable`].
     pub fn set_unavailable(&mut self, unavailable: bool) {
+        const BEHIND: &str = "the database is too far behind: rejecting new orders";
+        const CAUGHT_UP: &str = "the database has caught up: taking new orders again";
         if unavailable == self.unavailable {
             return;
         }
         self.unavailable = unavailable;
-        let text = if unavailable {
-            tracing::error!("the database is too far behind: rejecting new orders");
-            "the database is too far behind: rejecting new orders"
+        if unavailable {
+            tracing::error!("{BEHIND}");
+            self.alarm(AlarmKind::GatewayUnavailable, BEHIND.to_owned());
         } else {
-            tracing::info!("the database has caught up: taking new orders again");
-            "the database has caught up: taking new orders again"
-        };
-        self.alarm(AlarmKind::GatewayUnavailable, text.to_owned());
+            tracing::info!("{CAUGHT_UP}");
+            self.alarm(AlarmKind::GatewayAvailable, CAUGHT_UP.to_owned());
+        }
+    }
+
+    /// Whether new orders are rejected: see [`set_unavailable`](Self::set_unavailable).
+    pub fn unavailable(&self) -> bool {
+        self.unavailable
     }
 
     pub fn router(&self) -> &Router {
@@ -910,14 +917,14 @@ impl Book {
                 if !self.blocked.contains(&scope) {
                     self.blocked.push(scope.clone());
                     self.touched.blocked = true;
-                    self.events.push(Event::Blocked { scope });
+                    self.events.push(GatewayEvent::Blocked { scope });
                 }
             }
             Input::Unblock { scope } => {
                 if self.blocked.contains(&scope) {
                     self.blocked.retain(|blocked| *blocked != scope);
                     self.touched.blocked = true;
-                    self.events.push(Event::Unblocked { scope });
+                    self.events.push(GatewayEvent::Unblocked { scope });
                 }
             }
             Input::DaysStarted { days } => self.days_started(days),

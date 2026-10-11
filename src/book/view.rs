@@ -270,7 +270,7 @@ fn order_id_number<S: serde::Serializer>(id: &OrderId, serializer: S) -> Result<
 /// `{"type":"order", ...}`, `{"type":"blocked","scope":"all"}`, `{"type":"alarm", ...}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Event {
+pub enum GatewayEvent {
     /// An order as it is after a step that changed it.
     Order(OrderView),
     /// Struct variants, not `Blocked(Scope)`: a tag can't go inside a string.
@@ -283,7 +283,7 @@ pub enum Event {
     Alarm(Alarm),
 }
 
-/// Something an operator has to look at, published where it's logged at error.
+/// Something an operator should look at; logged as well.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Alarm {
     pub time: DateTime<Utc>,
@@ -294,9 +294,11 @@ pub struct Alarm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlarmKind {
-    /// The database is too far behind: new orders are rejected. Raised again, its text saying so,
-    /// once they're taken again.
+    /// The database is too far behind: new orders are rejected.
     GatewayUnavailable,
+    /// The database has caught up after [`GatewayUnavailable`](Self::GatewayUnavailable): new
+    /// orders are taken again.
+    GatewayAvailable,
     /// The gateway gave up cancelling an order.
     StuckCancel,
     /// A venue holds a request the database never had, or reports on one.
@@ -321,12 +323,12 @@ impl Book {
     }
 
     /// Events the book's inputs made since the last call: blocks, unblocks and alarms.
-    pub fn take_events(&mut self) -> std::vec::Drain<'_, Event> {
+    pub fn take_events(&mut self) -> std::vec::Drain<'_, GatewayEvent> {
         self.events.drain(..)
     }
 
     /// Records an alarm of `kind` at the inputs' time, for [`take_events`](Self::take_events).
     pub(super) fn alarm(&mut self, kind: AlarmKind, text: String) {
-        self.events.push(Event::Alarm(Alarm { time: self.now, kind, text }));
+        self.events.push(GatewayEvent::Alarm(Alarm { time: self.now, kind, text }));
     }
 }

@@ -238,7 +238,15 @@ impl Gateway {
             self.record_orphans(ids);
             return Ok(false);
         };
-        let Some(msg) = stored(log, newest.seq).await? else { return Ok(false) };
+        let Some(msg) = stored(log, newest.seq).await? else {
+            self.alarm(AlarmKind::Orphan, || {
+                format!(
+                    "venue {venue} holds order {ids:?}, which the database never had and which doesn't read back \
+                     from the venue's store, so it isn't cancelled"
+                )
+            });
+            return Ok(false);
+        };
         let cancel = cancel(&msg, format_compact!("{}C{}", self.id_prefix(), before + 1));
         error!(
             %venue,

@@ -19,7 +19,7 @@ impl Book {
     /// Not applied: someone has to find out from the venue what was filled.
     fn overfill(&mut self, venue: &VenueId, report: &VenueReport, id: OrderId, qty: Decimal) {
         let (downstream, exec_id, cum_qty) = (&report.downstream, &report.exec_id, report.cum_qty);
-        tracing::warn!(%venue, %downstream, %exec_id, %cum_qty, "overfill");
+        tracing::error!(%venue, %downstream, %exec_id, %cum_qty, "overfill");
         let name = &self.orders[&id].name;
         let text =
             format!("venue {venue} reported order {name} filled {cum_qty} of {qty} (ExecID {exec_id}); not applied");
