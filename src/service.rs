@@ -198,10 +198,10 @@ impl Service {
         self.initiators.handle(name)
     }
 
-    /// Rereads the sessions file, and the routes, limits, `day_end` and the API's certificate,
-    /// logging what changed.
-    /// Either file that doesn't load is logged and stays as it was (routes, limits and `day_end`
-    /// together); the routes are checked against the venues the gateway took after the sessions
+    /// Rereads the sessions file, the routes, limits, `day_end`, the API's certificate and its
+    /// users file, logging what changed.
+    /// Each file that doesn't load is logged and stays as it was (routes, limits and `day_end`
+    /// together; a users file that doesn't load is a warning); the routes are checked against the venues the gateway took after the sessions
     /// reload, so a venue added to both files at once can be routed to. A changed schedule or
     /// `day_end` applies from each session's next trading day. Returns what it logged: each file's
     /// changes or why it was kept, and any warning about what was taken.
@@ -223,6 +223,7 @@ impl Service {
             Err(e) => warn!("keeping the sessions file in use: {e}"),
         }
         let mut warnings = Vec::new();
+        warnings.extend(self.reload_users());
         if self.database.is_some()
             && let Err(e) = check_durable(&self.sessions)
         {
@@ -255,6 +256,14 @@ impl Service {
             }
         };
         Reloaded { sessions, config, warnings }
+    }
+
+    /// Rereads the API's users file, returning (and logging) why it was kept, if it was. Whatever
+    /// else the reload refuses: the users file stands alone.
+    fn reload_users(&self) -> Option<String> {
+        let warning = self.api.lock().expect("API lock poisoned").as_ref()?.reload_users()?;
+        warn!("{warning}");
+        Some(warning)
     }
 
     /// Takes the reloaded `[api]`'s certificate, returning (and logging) what waits for a restart.
@@ -512,6 +521,8 @@ mod tests {
             .unwrap()
             .replace("127.0.0.1:8080", "127.0.0.1:0");
         write(&dir, "jetbridge.toml", &jetbridge);
+        let users = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/users.toml")).unwrap();
+        write(&dir, "users.toml", &users);
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         assert_ne!(service.local_addr().port(), 0);
         assert!(tokio::net::TcpStream::connect(service.local_addr()).await.is_ok());
@@ -520,7 +531,34 @@ mod tests {
         serving.abort();
     }
 
+    /// An `[api]` but its `listen`; with it, the test writes `users.toml`.
     const API: &str = "[api]\nusers = \"users.toml\"\naudit = \"audit.jsonl\"\n";
+
+    /// The API's users file must load at start; on reload, one that doesn't load keeps the users
+    /// in use, with a warning, whatever happens to the rest.
+    #[tokio::test]
+    async fn the_users_file_loads_at_start_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
+        let path = dir.path().join("jetbridge.toml");
+        let e = Service::start(&path).await.unwrap_err();
+        assert!(e.to_string().contains("cannot read"), "{e}");
+        write(&dir, "users.toml", "[user.a]\nrole = \"viewer\"\n");
+        let e = Service::start(&path).await.unwrap_err();
+        assert!(e.to_string().contains("users.toml"), "{e}");
+        write(&dir, "users.toml", "");
+        let (service, serving) = Service::start(&path).await.unwrap();
+        assert!(service.reload().warnings.is_empty());
+        write(&dir, "users.toml", "[user.a]\nrole = \"viewer\"\n");
+        write(&dir, "jetbridge.toml", "not toml");
+        let reloaded = service.reload();
+        assert!(reloaded.config.is_err());
+        let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
+        assert!(warning.contains("keeping the users in use"), "{warning}");
+        service.shutdown().await;
+        serving.abort();
+    }
 
     /// The API answers health over a real socket, and shutdown stops it first.
     #[tokio::test]
@@ -528,6 +566,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
+        write(&dir, "users.toml", "");
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         let addr = service.api_addr().unwrap();
         let response = api::tests::request(addr, "GET", "/api/health").await;
@@ -550,6 +589,7 @@ mod tests {
         let config =
             |listen: &str| format!("sessions = \"sessions.toml\"\n{API}listen = \"{listen}\"\nbehind_proxy = true\n");
         write(&dir, "jetbridge.toml", &config("0.0.0.0:8080"));
+        write(&dir, "users.toml", "");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let options = StartOptions { api_listener: Some(listener), ..StartOptions::default() };
@@ -577,6 +617,7 @@ mod tests {
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         let tls = "tls = { cert = \"api.pem\", key = \"api.key\" }\n";
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n{tls}"));
+        write(&dir, "users.toml", "");
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         let addr = service.api_addr().unwrap();
         let health = async |cert: &str| api::tests::request_tls(addr, cert, "/api/health").await;

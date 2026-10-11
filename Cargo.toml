@@ -11,6 +11,17 @@ publish = false
 tls = ["turbojet/tls", "turbojet-config/tls", "dep:tokio-rustls"]
 
 [dependencies]
+# The API's password hashes (argon2id, PHC strings): slow on purpose.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+# The API's tokens and session IDs, base64url.
+base64ct = { version = "1", features = ["alloc"] }
+# Random tokens, session IDs and salts, from the OS.
+getrandom = "0.3"
+# Reading a new user's password without echoing it.
+rpassword = "7"
+# The users file keeps tokens' SHA-256, compared in constant time.
+sha2 = "0.10"
+subtle = "2"
 # By path while the engine API Jetbridge needs is still changing; crates.io once released.
 turbojet = { path = "../turbojet/crates/turbojet" }
 # `tz`: named time zones in session schedules and `day_end`.
@@ -31,7 +42,7 @@ tokio-rustls = { version = "0.26", default-features = false, optional = true }
 # The book's database, as Turbojet's turbojet-sql: `any` so PostgreSQL is a feature away.
 sqlx = { version = "0.8.6", default-features = false, features = ["any", "runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
-toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+toml = { version = "1", default-features = false, features = ["display", "parse", "serde", "std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -39,8 +50,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Self-signed certificates for the TLS test, at Turbojet's version.
 rcgen = "0.14"
 tempfile = "3"
+# Calling the API's router in-process.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # The end-to-end tests' relay between the gateway and a venue.
 tokio = { version = "1", features = ["io-util"] }
+
+# Argon2 is slow on purpose, and unoptimised far slower: each test's password check would take
+# seconds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [lints.rust]
 unsafe_code = "deny"

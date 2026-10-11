@@ -1,0 +1,18 @@
+# The operator API's users: nobody yet. Add them with the binary, which rewrites this file (its
+# comments aren't kept), then reload the gateway (SIGHUP) for them to take effect:
+#
+#   jetbridge user add alice --role operator --clients FUNDA --users users.toml
+#   jetbridge token add alice --users users.toml       # prints the token, once
+#   jetbridge token revoke alice q3Xr --users users.toml
+#   jetbridge user remove alice --users users.toml
+#
+# Each user looks like this (the hashes are written for you):
+#
+# [user.alice]
+# role = "operator"                  # viewer, operator or admin
+# password = "$argon2id$v=19$..."    # argon2 hash of the password
+# clients = ["FUNDA"]                # optional: acts on these CompIDs only
+#
+# [[user.alice.tokens]]
+# id = "q3Xr9a_T"                    # the token's first characters, to revoke it by
+# sha256 = "..."                     # the token's SHA-256; the token itself isn't kept

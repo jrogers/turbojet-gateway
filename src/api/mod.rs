@@ -8,13 +8,13 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::Json;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::serve::ListenerExt;
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -25,7 +25,10 @@ use tracing::{info, warn};
 use crate::config::{Api, Error};
 use crate::service::Service;
 
+mod auth;
 mod listener;
+
+use auth::Auth;
 
 /// How long shutdown waits for requests under way to finish before closing their connections.
 /// The API's requests are quick: a reload, or a cancel waiting for its commit, takes well under
@@ -38,6 +41,7 @@ pub(crate) struct State {
     /// Gone once the service is dropped; see the module documentation.
     #[expect(dead_code, reason = "the endpoints after health reach the gateway and sessions through it")]
     service: Weak<Service>,
+    auth: Arc<Auth>,
 }
 
 /// An error answer, the API's only one: `{"error": message}` with `status`.
@@ -59,10 +63,17 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// The API's routes.
+/// The API's routes. Only health and login are open: every other route goes in `authenticated`,
+/// behind [`auth::authenticate`].
 fn router(state: State) -> axum::Router {
+    let authenticated = axum::Router::new()
+        .route("/api/me", get(auth::me))
+        .route("/api/logout", post(auth::logout))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate));
     axum::Router::new()
         .route("/api/health", get(health))
+        .route("/api/login", post(auth::login))
+        .merge(authenticated)
         .fallback(async |uri: Uri| ApiError::new(StatusCode::NOT_FOUND, format!("no such path: {}", uri.path())))
         .method_not_allowed_fallback(async || ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"))
         .with_state(state)
@@ -86,11 +97,14 @@ pub(crate) struct Bound {
     listener: TcpListener,
     #[cfg(feature = "tls")]
     tls: Option<turbojet::tls::ServerTls>,
+    auth: Arc<Auth>,
 }
 
 impl Bound {
-    /// Binds `config.listen`, or takes `given`, and loads `config.tls`'s certificate and key.
+    /// Binds `config.listen`, or takes `given`, and loads `config.tls`'s certificate and key and
+    /// `config.users`.
     pub(crate) async fn bind(config: &Api, given: Option<std::net::TcpListener>) -> Result<Self, Error> {
+        let auth = Arc::new(Auth::load(config).map_err(Error::new)?);
         #[cfg(feature = "tls")]
         let tls = match &config.tls {
             Some(tls) => {
@@ -113,13 +127,14 @@ impl Bound {
             listener,
             #[cfg(feature = "tls")]
             tls,
+            auth,
         })
     }
 
     /// Serves the API's routes, with handlers reaching `service`.
     pub(crate) fn serve(self, service: Weak<Service>) -> Server {
         let local_addr = self.listener.local_addr().unwrap_or(self.config.listen);
-        let app = router(State { service });
+        let app = router(State { service, auth: self.auth.clone() });
         let (stop, stopped) = oneshot::channel::<()>();
         #[cfg(feature = "tls")]
         let task = match &self.tls {
@@ -134,6 +149,7 @@ impl Bound {
             local_addr,
             #[cfg(feature = "tls")]
             tls: self.tls,
+            auth: self.auth,
             stop,
             task,
         }
@@ -166,6 +182,7 @@ pub(crate) struct Server {
     local_addr: SocketAddr,
     #[cfg(feature = "tls")]
     tls: Option<turbojet::tls::ServerTls>,
+    auth: Arc<Auth>,
     stop: oneshot::Sender<()>,
     task: JoinHandle<io::Result<()>>,
 }
@@ -195,6 +212,12 @@ impl Server {
     /// Stops at once, without waiting: the service is being dropped.
     pub(crate) fn abort(&self) {
         self.task.abort();
+    }
+
+    /// Rereads the users file the API started with, returning a warning if it doesn't load: the
+    /// users in use are kept.
+    pub(crate) fn reload_users(&self) -> Option<String> {
+        self.auth.reload()
     }
 
     /// Takes the certificate and key of `config`, the reloaded `[api]`, and returns warnings: for
@@ -228,7 +251,8 @@ pub(crate) mod tests {
 
     /// The API's routes, and `/test/peer` answering the client's address as handlers see it.
     fn app() -> axum::Router {
-        router(State { service: Weak::new() })
+        let auth = Auth::new(std::path::PathBuf::new(), crate::auth::Users::default(), false, false);
+        router(State { service: Weak::new(), auth: Arc::new(auth) })
             .route("/test/peer", get(async |ConnectInfo(addr): ConnectInfo<SocketAddr>| addr.to_string()))
     }
 

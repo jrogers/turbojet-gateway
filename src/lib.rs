@@ -1,6 +1,7 @@
 //! Jetbridge: a FIX connectivity gateway built on Turbojet.
 
 pub mod api;
+pub mod auth;
 pub mod book;
 pub mod config;
 pub mod edge;
