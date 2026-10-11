@@ -5,9 +5,9 @@ on to it, it logs on to venues, and it routes the clients' orders to the venues 
 reports back, keeping each order's state as it goes.
 
 > [!WARNING]
-> **Early work.** Everything is kept in memory only: a restart forgets every order, every report
-> not yet delivered, operators' blocks and what the risk limits have counted. It hasn't been run
-> against a real venue or client. Read [CAVEATS.md](CAVEATS.md) before relying on it, and don't
+> **Early work.** Without a [database](#database), everything is kept in memory only: a restart
+> forgets every order, every report not yet delivered, operators' blocks and what the risk limits
+> have counted. It hasn't been run against a real venue or client. Read [CAVEATS.md](CAVEATS.md) before relying on it, and don't
 > use it to trade real money without testing it thoroughly yourself. It is provided as is,
 > without warranty of any kind.
 
@@ -29,11 +29,12 @@ reports back, keeping each order's state as it goes.
   then `0EI8001-1` for its first cancel or replace, and its reports carry ExecIDs `0EI8001.1`,
   `0EI8001.2` and so on. Every fill reaches the client as a fill (ExecType
   Trade; Partial fill or Fill on FIX 4.2), whatever the venue called it.
-- **An order counts as received once its venue has it stored.** A client's order, cancel or
-  replace stays in flight on the client's session until the venue's session has stored what it
-  was forwarded as. If the client's connection drops first, the client sends it again when it's
-  back, and the ClOrdID dedupe answers with the order's state. After a restart the book is
-  gone, so a resent order goes to the venue as a new one, possibly a second time (see CAVEATS).
+- **An order counts as received once its venue has it stored**, and, with a database, once its
+  change to the book has committed. A client's order, cancel or replace stays in flight on the
+  client's session until then. If the client's connection drops first, the client sends it again
+  when it's back, and the ClOrdID dedupe answers with the order's state. Without a database, a
+  restart forgets the book, so a resent order goes to the venue as a new one, possibly a second
+  time (see CAVEATS).
 - **Reports held per client.** A report for a client that's disconnected, or reading slowly, waits
   in that client's queue and goes out, in order, once it can take it.
 - **Risk limits** per CompID, checked on each order and replace before it goes to a venue: order
@@ -45,6 +46,8 @@ reports back, keeping each order's state as it goes.
   orders and their ClOrdIDs go, and the session's ClOrdID count and filled notional start again.
 - **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
   cancelled when its session drops and it doesn't log back on in time, and at shutdown.
+- **A database**, optional (SQLite): the book, blocks, risk counts and undelivered reports
+  survive a restart, and the restart sorts out what a crash left half done with the venues.
 - **Reload on SIGHUP** of the routes, the risk limits, `day_end` and the sessions file, keeping connected
   sessions the file still has.
 
@@ -118,6 +121,7 @@ now.
 - `day_end`: when client sessions' trading days end (a schedule's period may end one sooner): see
   [Trading day](#trading-day).
 - `[risk.defaults]` and `[risk.client.COMPID]`: see [Risk limits](#risk-limits).
+- `[database]`: see [Database](#database).
 
 ### sessions.toml
 
@@ -153,7 +157,63 @@ Jetbridge:
   acceptor's `sender_comp_id` unless it sets its own. A venue with another version stops the
   gateway at start; a reload that adds one skips it, with an error logged.
 - Sessions are kept in the `memory` store unless the file says otherwise, so sequence numbers
-  start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them.
+  start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them. With a
+  [database](#database), venues must be kept in one.
+
+## Database
+
+With a `[database]` in `jetbridge.toml`, the book survives a restart: its orders, the ClOrdIDs each
+client has used and the requests sent to venues, operators' blocks, what the risk limits count
+(each session's filled notional, each symbol's last fill price), and the reports not yet delivered
+to clients.
+
+```toml
+[database]
+url = "sqlite:///var/lib/jetbridge/jetbridge.db?mode=rwc"
+```
+
+- `url`: a SQLite database. `?mode=rwc` creates the file if it's missing, with a warning logged
+  that a new, empty database was created; without it, a missing file stops the start, so a
+  mistyped path doesn't start an empty book. A relative path is from the working directory. It's
+  read at start only: a reload that finds it changed logs a warning and keeps the database in use.
+- Without a `[database]`, the gateway keeps everything in memory, and a restart forgets it.
+
+**Behind the hot path.** Orders go to venues and reports to clients without waiting for the
+database; the changes are committed behind them, many at a time. Each message that changed the
+book counts as received by its session only once its change has committed, so a stop before then
+has its sender send it again. A commit is synced to disk.
+
+**Venue sessions need a durable store.** A restart reads each venue's session store, so with a
+database every `[initiator.NAME]` needs a store that survives a restart (`kind = "disk"`, say),
+and its files kept. A start that finds a venue's store has no record of its session while the
+database has orders for that venue stops, saying so.
+
+**What a restart does.** Before any session starts, the gateway restores the book as last
+committed, then reads every request each venue's session stored and compares them with the
+database:
+
+- an order the venue's session stored but the database never recorded (the gateway stopped
+  within a commit of sending it) is cancelled at the venue's next logon, logged as an error. The
+  client sends its order again, and it's booked and sent afresh. An unrecorded cancel cancels its
+  order; an unrecorded replace stays pending on its order, which keeps working.
+- a request the database has, unanswered, that the venue's session never stored is sent at the
+  venue's next logon, marked PossResend(97), unless the venue's session resets its sequence
+  numbers at that logon: then it fails, and the client gets a reject.
+- reports not yet delivered go to their clients again, marked PossResend(97), once they log on.
+  So do reports made again from a message the venue or client sends again because its change
+  hadn't committed: a fill can reach a client twice, under the same ExecID, the second time
+  marked PossResend.
+
+New IDs take a new prefix from the start time, and restored orders keep theirs. Each start waits
+for the next second before taking its prefix, so it takes up to a second longer.
+
+**Gateway unavailable.** While the oldest change not yet committed has waited over a second (the
+database is down, or far behind), new orders are rejected with Text(58) "gateway unavailable"
+(OrdRejReason 0 on FIX 4.2, 99 on FIX 4.4). Cancels, replaces and venue reports keep flowing,
+each held until it commits, and a failing commit is retried with an error logged each time. A
+session stops reading 256 messages past its oldest one waiting.
+
+What recovery doesn't cover is in [CAVEATS.md](CAVEATS.md#database-and-recovery).
 
 ## Risk limits
 
@@ -236,7 +296,8 @@ under way ends when it was going to.
 
 An operator can stop a client trading, with library calls on the running gateway
 (`Service::gateway()`). Each takes a `Scope`: one client session, a CompID (all its sessions,
-including ones that log on later), or everyone.
+including ones that log on later), or everyone. They're async, and with a database they return
+once their change has committed.
 
 - `cancel_all(scope)` blocks the scope and cancels its clients' live orders at their venues, in
   one step. Each client gets an unsolicited Canceled report for each order as its venue confirms
@@ -286,9 +347,10 @@ as one warning with the count per session. Other clients' orders stay working at
 - **Ctrl-C or SIGTERM** logs every client out ("gateway shutting down"), which fires any
   cancel-on-disconnect countdowns under way, and cancels the working orders of clients with cancel
   on disconnect (see above); waits up to 5 seconds for the venues to answer the
-  gateway's cancels; then logs every venue out and exits once they've closed. A second signal
-  exits at once. On the way out it logs how many orders are still
-  open at each venue and how many reports weren't delivered to each client. Both are lost: the open
+  gateway's cancels; then logs every venue out, waits for the last changes to commit to the
+  database, if there is one, and exits. A second signal exits at once. On the way out it logs how
+  many orders are still open at each venue and how many reports weren't delivered to each
+  client. With a database, the next start restores both. Without one, both are lost: the open
   orders stay working at their venues with nothing to report their fills to.
 
 ## Logging
