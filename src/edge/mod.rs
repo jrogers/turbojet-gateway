@@ -334,20 +334,23 @@ impl Gateway {
 
     /// Blocks the clients in `scope`: their new orders are rejected until [`unblock`](Self::unblock)
     /// lifts this scope (see [`Input::Block`]). Their working orders stay; see
-    /// [`cancel_all`](Self::cancel_all). Returns once the block is committed, with a database.
-    /// `false` if `scope` was blocked already, which changes nothing.
+    /// [`cancel_all`](Self::cancel_all). `false` if `scope` was blocked already, which changes
+    /// nothing. Returns once the block is committed, with a database, either way: a block made
+    /// by an earlier call may still be on its way.
     pub async fn block(self: &Arc<Self>, scope: Scope) -> bool {
-        {
+        let changed = {
             let mut state = self.lock();
-            if state.book.blocked().contains(&scope) {
+            let changed = !state.book.blocked().contains(&scope);
+            if changed {
+                warn!(?scope, "blocking clients");
+                self.handle_locked(&mut state, [Input::Block { scope }], None);
+            } else {
                 info!(?scope, "blocked already");
-                return false;
             }
-            warn!(?scope, "blocking clients");
-            self.handle_locked(&mut state, [Input::Block { scope }], None);
-        }
+            changed
+        };
         self.committed().await;
-        true
+        changed
     }
 
     /// The kill switch: blocks the clients in `scope` and cancels their live orders at the
@@ -362,19 +365,21 @@ impl Gateway {
 
     /// Lifts the block of exactly `scope`: a block of a session's CompID, or of everyone, stays.
     /// `false` if `scope` wasn't blocked, which changes nothing. Returns once the unblock is
-    /// committed, with a database.
+    /// committed, with a database, either way, as [`block`](Self::block) does.
     pub async fn unblock(self: &Arc<Self>, scope: Scope) -> bool {
-        {
+        let changed = {
             let mut state = self.lock();
-            if !state.book.blocked().contains(&scope) {
+            let changed = state.book.blocked().contains(&scope);
+            if changed {
+                warn!(?scope, "unblocking clients");
+                self.handle_locked(&mut state, [Input::Unblock { scope }], None);
+            } else {
                 info!(?scope, blocked = ?state.book.blocked(), "nothing to unblock");
-                return false;
             }
-            warn!(?scope, "unblocking clients");
-            self.handle_locked(&mut state, [Input::Unblock { scope }], None);
-        }
+            changed
+        };
         self.committed().await;
-        true
+        changed
     }
 
     /// The gateway's own cancel of one order, as [`cancel_all`](Self::cancel_all) sends for each,
