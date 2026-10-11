@@ -41,13 +41,13 @@ pub const MAX_PASSWORD_LEN: usize = 1024;
 /// A new password's length at least, in bytes: the operator API can stop a client's trading.
 pub const MIN_PASSWORD_LEN: usize = 12;
 
-/// The most memory a password hash may ask argon2 for, in KiB (its `m`): 1 GiB, fifty times the
-/// default. A hash in the users file that asks more, hand-edited, would make every login for it
-/// (and four at once) allocate that much.
-const MAX_HASH_MEMORY_KIB: u32 = 1024 * 1024;
+/// The most memory a password hash may ask argon2 for, in KiB (its `m`): 256 MiB, about thirteen
+/// times the default. A hash in the users file that asks more, hand-edited, would make every login
+/// for it allocate that much, and the API checks four at once: a gigabyte at this ceiling.
+const MAX_HASH_MEMORY_KIB: u32 = 256 * 1024;
 
-/// The most passes a password hash may ask argon2 for (its `t`): ten times the default, at its
-/// memory a few seconds a login at most.
+/// The most passes a password hash may ask argon2 for (its `t`): ten times the default. With the
+/// memory ceiling too, a login takes some seconds of a blocking thread.
 const MAX_HASH_PASSES: u32 = 20;
 
 /// What a token starts with: tells it from a password in a script, or in a leak scan.
@@ -368,7 +368,9 @@ pub fn check_new_password(password: &str) -> Result<(), String> {
 /// Refuses a hash other than argon2id's, or one cheaper than argon2's defaults (which
 /// [`hash_password`] uses): a weak hash is quick to crack if the file leaks, and quicker to check
 /// than an unknown user's, which would tell who exists. Refuses one dearer than
-/// [`MAX_HASH_MEMORY_KIB`] or [`MAX_HASH_PASSES`] too: each login would cost that.
+/// [`MAX_HASH_MEMORY_KIB`] or [`MAX_HASH_PASSES`] too: each login would cost that. A hash dearer
+/// than the defaults but within those is taken, though checking it takes longer than an unknown
+/// user's (checked at the defaults), which tells that user exists.
 fn check_hash(phc: &str) -> Result<(), String> {
     let hash = PasswordHash::new(phc).map_err(|e| format!("not a PHC hash: {e}"))?;
     if hash.algorithm != argon2::Algorithm::Argon2id.ident() {
