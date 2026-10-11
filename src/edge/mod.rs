@@ -2076,6 +2076,8 @@ pub(crate) mod tests {
     /// `messages` as `id`'s session sent them, in `storage`.
     fn store_sent(storage: &MemoryStorage, id: &SessionId, messages: &[Message]) {
         let mut log = storage.open(id).unwrap();
+        // As a session records at its first logon.
+        log.set_created_at(UtcTimestamp::from(DateTime::<Utc>::UNIX_EPOCH)).unwrap();
         for (seq, msg) in (1..).zip(messages) {
             let msg = msg
                 .clone()
@@ -2264,6 +2266,28 @@ pub(crate) mod tests {
         store_sent(&venues, &id(), &[order("SAMESS1")]);
         let error = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap_err();
         assert!(error.to_string().contains("under this start's ID prefix"), "{error}");
+    }
+
+    /// A venue's store with no record of the session (a memory store after a restart) stops the
+    /// start when the database has orders for the venue: its scan would find nothing. One with a
+    /// record, or with no orders to look for, doesn't.
+    #[tokio::test]
+    async fn a_venue_store_with_no_record_of_its_session_stops_the_start() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let fresh = || -> Arc<dyn SessionStorage> { Arc::new(MemoryStorage::new()) };
+        assert!(
+            restarted(&store, "FIRSTS").await.cancel_orphans(&store, vec![(VENUE.into(), id(), fresh())]).await.is_ok()
+        );
+        let gateway = restarted(&store, "SECOND").await;
+        book_order(&gateway);
+        let changes = gateway.lock().book.take_changes();
+        store.write(&[changes]).await.unwrap();
+        let gateway = restarted(&store, "THIRDS").await;
+        let error = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), fresh())]).await.unwrap_err();
+        assert!(error.to_string().contains("no record of the session"), "{error}");
+        let recorded = Arc::new(MemoryStorage::new());
+        store_sent(&recorded, &id(), &[]);
+        assert!(gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), recorded)]).await.is_ok());
     }
 
     /// Our session with the venue, as the gateway's initiator has it.

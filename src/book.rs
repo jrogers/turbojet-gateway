@@ -725,6 +725,11 @@ impl Book {
         self.orders.get(&id)
     }
 
+    /// Whether the book holds an order sent to `venue`.
+    pub fn holds_orders_for(&self, venue: &VenueId) -> bool {
+        self.orders.values().any(|order| order.venue == *venue)
+    }
+
     /// What was sent to a venue under `downstream`, if the book holds it.
     pub fn sent(&self, downstream: &str) -> Option<&Sent> {
         self.downstream.get(downstream)

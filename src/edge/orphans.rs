@@ -132,6 +132,16 @@ impl Gateway {
             let venue: VenueId = venue.as_str().into();
             let in_store = |e: io::Error| io::Error::other(format!("venue {venue}'s store: {e}"));
             let mut log = open(storage.as_ref(), &id).await.map_err(in_store)?;
+            // A store that has never had the session (it records when it was created at its first
+            // logon) can't hold the orders the book has for the venue: a memory store, or one whose
+            // files are gone. Its scan would find nothing, wrongly.
+            if log.created_at().is_none() && self.lock().book.holds_orders_for(&venue) {
+                return Err(in_store(io::Error::other(
+                    "it has no record of the session, though the database has orders for the venue: with a \
+                     [database], a venue's session must be kept in a durable store (kind = \"disk\", say), and \
+                     its files kept",
+                )));
+            }
             let requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
             self.check_prefix(&venue, &requests)?;
             let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
