@@ -502,9 +502,10 @@ impl Gateway {
         let mut reports = Vec::new();
         while let Some(input) = inputs.pop_front() {
             let send_failed = matches!(input, Input::SendFailed { .. });
+            let resent = matches!(input, Input::Unsent { .. });
             state.book.handle(input, &mut outputs);
             for output in outputs.drain(..) {
-                if let Some(failed) = self.send(state, &output, now, ctx.as_deref_mut(), &mut reports) {
+                if let Some(failed) = self.send(state, &output, (now, resent), ctx.as_deref_mut(), &mut reports) {
                     debug_assert!(!send_failed, "SendFailed made venue-bound output");
                     inputs.push_back(failed);
                 }
@@ -560,12 +561,13 @@ impl Gateway {
     /// Sends `output` where it's going, a client's report into `reports` for
     /// [`commit`](Self::commit). `Some` for a venue request its session refused. A venue request
     /// queued holds `ctx`'s message in flight until the venue's session has stored it, so a stop
-    /// before then has the client resend it rather than losing it.
+    /// before then has the client resend it rather than losing it. A venue request `resent`
+    /// (see [`Input::Unsent`]) is marked PossResend(97).
     fn send(
         self: &Arc<Self>,
         state: &State,
         output: &Output,
-        now: UtcTimestamp,
+        (now, resent): (UtcTimestamp, bool),
         ctx: Option<&mut Context<'_>>,
         reports: &mut Vec<(ClientId, Message)>,
     ) -> Option<Input> {
@@ -588,7 +590,10 @@ impl Gateway {
                     text: CompactString::from(text),
                 };
                 let Some(to) = state.venues.get(venue) else { return Some(failed(VENUE_UNAVAILABLE)) };
-                let msg = to.version.venue_message(output, now).expect("a venue-bound output");
+                let mut msg = to.version.venue_message(output, now).expect("a venue-bound output");
+                if resent {
+                    msg.set(tags::POSS_RESEND, true);
+                }
                 match to.session.send(msg) {
                     Ok(receipt) => {
                         self.settle(receipt, venue.clone(), downstream.clone(), ctx.map(Context::hold));

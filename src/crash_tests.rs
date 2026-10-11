@@ -837,7 +837,9 @@ async fn a_crash_before_the_venue_stores_an_order_sends_it_once_after_the_restar
     setup.venue_events.assert_empty();
 
     setup.crash_and_restart().await;
-    let sent: v44::NewOrderSingle = setup.venue_events.parse().await;
+    let msg = setup.venue_events.message().await;
+    assert_eq!(msg.get(tags::POSS_RESEND), Some("Y"));
+    let sent: v44::NewOrderSingle = msg.parse().unwrap();
     assert_eq!(sent.cl_ord_id.as_str(), setup.id(0, "1"));
     setup.venue_send(acked(&sent.cl_ord_id, 100));
     let new = setup.events.execution_report().await;
