@@ -43,7 +43,7 @@ use turbojet_fix44 as v44;
 
 use crate::book::{self, Snapshot, Status};
 use crate::edge::tests::Gated;
-use crate::service::Service;
+use crate::service::{Service, StartOptions};
 use crate::store::Store;
 
 const CLIENT: &str = "FUNDA";
@@ -193,11 +193,15 @@ impl Gateway {
             ("venue".to_string(), gated_disk(&dir.join("venue-store"), venue)),
             ("client".to_string(), gated_disk(&dir.join("client-store"), client)),
         ];
+        // A loaded machine (several suites at once) can take over the 1 s the writer allows a
+        // batch before it rejects new orders as "gateway unavailable": the designed back-pressure,
+        // which these tests aren't about.
+        let options = StartOptions { stores, listener: Some(listener), max_commit_wait: Some(WAIT) };
         let (started, starting) = std::sync::mpsc::channel();
         let (stop, stopped) = oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            let (service, serving) = runtime.block_on(Service::start_with(&path, stores, Some(listener))).unwrap();
+            let (service, serving) = runtime.block_on(Service::start_with(&path, options)).unwrap();
             let service = Arc::new(service);
             started.send((service.clone(), runtime.handle().clone())).unwrap();
             let _ = runtime.block_on(stopped);

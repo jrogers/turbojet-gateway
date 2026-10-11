@@ -94,7 +94,6 @@ impl Writer {
     }
 
     /// Rejects new orders once a batch has waited `max_wait` rather than [`MAX_COMMIT_WAIT`].
-    #[cfg(test)]
     pub(crate) fn with_max_wait(mut self, max_wait: Duration) -> Self {
         self.max_wait = max_wait;
         self

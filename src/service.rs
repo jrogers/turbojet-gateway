@@ -70,23 +70,17 @@ impl Service {
     /// be bound, a venue speaks a FIX version the gateway doesn't convert, or TLS or a venue can't
     /// be set up.
     pub async fn start(path: &Path) -> Result<(Self, Serving), Error> {
-        Self::start_with(path, Vec::new(), None).await
+        Self::start_with(path, StartOptions::default()).await
     }
 
-    /// As [`start`](Self::start), the sessions file also naming `stores` (see
-    /// [`config::load_with_stores`]), and serving clients on `listener` if given, rather than
-    /// binding the file's address: a listener kept open across starts, as socket activation keeps
-    /// one, holds its port while the gateway is down.
-    pub(crate) async fn start_with(
-        path: &Path,
-        stores: Vec<(String, Arc<dyn turbojet::SessionStorage>)>,
-        listener: Option<std::net::TcpListener>,
-    ) -> Result<(Self, Serving), Error> {
+    /// As [`start`](Self::start), with `options`.
+    pub(crate) async fn start_with(path: &Path, options: StartOptions) -> Result<(Self, Serving), Error> {
+        let StartOptions { stores, listener, max_commit_wait } = options;
         let loaded = config::load_with_stores(path, stores)?;
         // First, so a database that won't open stops nothing half-started.
         let (database, writing) = match &loaded.database {
             Some(url) => {
-                let (store, snapshot, writer, writing) = start_writer(url).await?;
+                let (store, snapshot, writer, writing) = start_writer(url, max_commit_wait).await?;
                 (Some((store, snapshot, writer)), Some(writing))
             }
             None => (None, None),
@@ -334,11 +328,30 @@ async fn next_second() -> SystemTime {
     }
 }
 
-/// Opens the database at `url`, loads what the book restores, and starts the book's writer on it.
-async fn start_writer(url: &str) -> Result<(Store, Snapshot, Writer, JoinHandle<()>), Error> {
+/// What [`Service::start_with`] does differently from [`Service::start`].
+#[derive(Default)]
+pub(crate) struct StartOptions {
+    /// Stores the sessions file may name, registered by name (see [`config::load_with_stores`]).
+    pub(crate) stores: Vec<(String, Arc<dyn turbojet::SessionStorage>)>,
+    /// Serves clients on this rather than binding the file's address: a listener kept open across
+    /// starts, as socket activation keeps one, holds its port while the gateway is down.
+    pub(crate) listener: Option<std::net::TcpListener>,
+    /// The writer's [`MAX_COMMIT_WAIT`](crate::edge::writer::MAX_COMMIT_WAIT) instead.
+    pub(crate) max_commit_wait: Option<Duration>,
+}
+
+/// Opens the database at `url`, loads what the book restores, and starts the book's writer on it,
+/// rejecting new orders after `max_commit_wait` if given.
+async fn start_writer(
+    url: &str,
+    max_commit_wait: Option<Duration>,
+) -> Result<(Store, Snapshot, Writer, JoinHandle<()>), Error> {
     let store = Store::open(url).await.map_err(|e| Error::new(e.to_string()))?;
     let snapshot = store.load().await.map_err(|e| Error::new(format!("cannot load the database: {e}")))?;
-    let (writer, writing) = Writer::start(store.clone(), snapshot.next_undelivered_id());
+    let (mut writer, writing) = Writer::start(store.clone(), snapshot.next_undelivered_id());
+    if let Some(max_wait) = max_commit_wait {
+        writer = writer.with_max_wait(max_wait);
+    }
     Ok((store, snapshot, writer, writing))
 }
 
