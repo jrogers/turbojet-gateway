@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use turbojet::{Acceptor, SessionHandle, SessionId};
-use turbojet_config::{Initiators, SessionsFile};
+use turbojet_config::{Changes, Initiators, SessionsFile};
 
 use crate::book::{self, Snapshot};
 use crate::config::{self, Error};
@@ -27,6 +27,23 @@ const SHUTTING_DOWN: &str = "gateway shutting down";
 /// at a venue with no gateway to report its fills is worse than a slower stop; a venue that
 /// doesn't answer in this long isn't going to soon.
 const CANCELS_WAIT: Duration = Duration::from_secs(5);
+
+/// What [`Service::reload`] did with each file: what changed, or why the file was kept as it was.
+#[derive(Debug)]
+pub struct Reloaded {
+    pub sessions: Result<Changes, String>,
+    /// The routes, limits and `day_end`, taken together or not at all.
+    pub config: Result<ConfigSummary, String>,
+}
+
+/// The routes, limits and `day_end` a reload took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSummary {
+    pub routes: usize,
+    /// CompIDs with limits of their own.
+    pub clients: usize,
+    pub day_end: String,
+}
 
 /// The gateway, serving.
 #[derive(Debug)]
@@ -180,9 +197,10 @@ impl Service {
     /// Either file that doesn't load is logged and stays as it was (routes, limits and `day_end`
     /// together); the routes are checked against the venues the gateway took after the sessions
     /// reload, so a venue added to both files at once can be routed to. A changed schedule or
-    /// `day_end` applies from each session's next trading day.
-    pub fn reload(&self) {
-        match self.sessions.reload_all(Some(&self.acceptor), &self.initiators) {
+    /// `day_end` applies from each session's next trading day. Returns what it logged.
+    pub fn reload(&self) -> Reloaded {
+        let sessions = self.sessions.reload_all(Some(&self.acceptor), &self.initiators).map_err(|e| e.to_string());
+        match &sessions {
             Ok(changes) => {
                 info!(
                 added = ?changes.added,
@@ -203,19 +221,29 @@ impl Service {
             error!("the reloaded sessions file loses what a restart needs: {e}");
         }
         let venues = self.set_venues();
-        match config::reload(&self.path, &venues, self.database.as_deref()) {
+        let config = match config::reload(&self.path, &venues, self.database.as_deref()) {
             Ok((router, limits, day_end)) => {
+                let summary = ConfigSummary {
+                    routes: router.rules().len(),
+                    clients: limits.by_comp_id.len(),
+                    day_end: day_end.to_string(),
+                };
                 info!(
-                    routes = router.rules().len(),
-                    clients = limits.by_comp_id.len(),
-                    %day_end,
+                    routes = summary.routes,
+                    clients = summary.clients,
+                    day_end = %summary.day_end,
                     "reloaded the routes, limits and day_end"
                 );
                 self.gateway.set_config(router, limits);
                 self.gateway.set_day_end(day_end);
+                Ok(summary)
             }
-            Err(e) => warn!("keeping the routes, limits and day_end in use: {e}"),
-        }
+            Err(e) => {
+                warn!("keeping the routes, limits and day_end in use: {e}");
+                Err(e.to_string())
+            }
+        };
+        Reloaded { sessions, config }
     }
 
     /// Logs the clients' sessions out, cancels the working orders of those with cancel on
@@ -442,7 +470,9 @@ mod tests {
             &format!("{ACCEPTOR}{listen}{}{}", venue_section("B", "FIX.4.4"), venue_section("C", "FIX.4.3")),
         );
         write(&dir, "jetbridge.toml", &routes_to("B"));
-        service.reload();
+        let reloaded = service.reload();
+        assert_eq!(reloaded.sessions.map(|changes| changes.started), Ok(vec!["B".into(), "C".into()]));
+        assert_eq!(reloaded.config.map(|config| config.routes), Ok(1));
         let to_b = Router::new(vec![Rule {
             client: None,
             ex_destination: None,
@@ -453,7 +483,9 @@ mod tests {
         assert_eq!(service.set_venues(), ["B"]);
 
         write(&dir, "jetbridge.toml", &routes_to("C"));
-        service.reload();
+        let reloaded = service.reload();
+        assert_eq!(reloaded.sessions, Ok(Changes::default()));
+        assert!(reloaded.config.unwrap_err().contains("\"C\""));
         assert_eq!(service.gateway.router(), to_b);
         service.shutdown().await;
         serving.abort();
@@ -473,7 +505,8 @@ mod tests {
         assert_eq!(max_order_qty(), Some(5.into()));
 
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(7)));
-        service.reload();
+        let config = service.reload().config.unwrap();
+        assert_eq!((config.routes, config.clients), (0, 0));
         assert_eq!(max_order_qty(), Some(7.into()));
         write(&dir, "jetbridge.toml", &format!("{}{}", routes_to("NOWHERE"), limit(9)));
         service.reload();

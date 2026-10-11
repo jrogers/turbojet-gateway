@@ -3,10 +3,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
+use serde::{Serialize, Serializer};
 use turbojet::SessionId;
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
@@ -17,10 +19,15 @@ mod amend;
 mod gateway_cancel;
 mod persist;
 mod report;
+mod view;
 
 use amend::{Amend, Refused, Terms};
 use persist::Touched;
 pub use persist::{Changes, ClOrdIdRow, OrderRow, Snapshot, Undelivered};
+pub use view::{
+    CancelState, GatewayCancelView, MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderView, RequestKind, RequestView,
+    RiskView, SessionRisk,
+};
 
 /// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
 /// each with its own ClOrdIDs and reports. Shows as the session, as Turbojet shows it. Cheap to
@@ -50,6 +57,11 @@ impl ClientId {
     pub fn comp_id(&self) -> &str {
         &self.0.comp_id
     }
+
+    /// The session, as it shows: what an operator names the client by.
+    pub fn session(&self) -> &str {
+        &self.0.session
+    }
 }
 
 /// The session, quoted: what the shutdown log's counts per client show.
@@ -62,6 +74,13 @@ impl fmt::Debug for ClientId {
 impl fmt::Display for ClientId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0.session)
+    }
+}
+
+/// As it shows.
+impl Serialize for ClientId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.session)
     }
 }
 
@@ -114,14 +133,16 @@ pub const GATEWAY_UNAVAILABLE: &str = "gateway unavailable";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Side {
     Buy,
     Sell,
     SellShort,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrdType {
     Market,
     Limit,
@@ -149,7 +170,8 @@ pub enum TimeInForce {
     Fok,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     PendingNew,
     New,
@@ -283,6 +305,70 @@ impl Scope {
         }
     }
 }
+
+/// As [`ScopeName`] writes it, which parses back to this scope's name.
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(client) => write!(f, "session:{client}"),
+            Self::CompId(comp_id) => write!(f, "comp:{comp_id}"),
+            Self::All => f.write_str("all"),
+        }
+    }
+}
+
+/// As it shows.
+impl Serialize for Scope {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// A [`Scope`] as an operator writes it: `all`, `comp:COMPID`, or `session:SESSION` with the
+/// client session as it shows. Only the syntax: a session's [`ClientId`] comes from the gateway,
+/// which knows the sessions it has seen ([`Gateway::scope`](crate::edge::Gateway::scope)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeName {
+    Session(String),
+    CompId(CompactString),
+    All,
+}
+
+impl fmt::Display for ScopeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(session) => write!(f, "session:{session}"),
+            Self::CompId(comp_id) => write!(f, "comp:{comp_id}"),
+            Self::All => f.write_str("all"),
+        }
+    }
+}
+
+impl FromStr for ScopeName {
+    type Err = BadScope;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let scope = match text.split_once(':') {
+            _ if text == "all" => Self::All,
+            Some(("comp", comp_id)) if !comp_id.is_empty() => Self::CompId(comp_id.into()),
+            Some(("session", session)) if !session.is_empty() => Self::Session(session.into()),
+            _ => return Err(BadScope(text.into())),
+        };
+        Ok(scope)
+    }
+}
+
+/// Text that isn't a [`ScopeName`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadScope(pub String);
+
+impl fmt::Display for BadScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "scope {:?}: use all, comp:COMPID or session:SESSION", self.0)
+    }
+}
+
+impl std::error::Error for BadScope {}
 
 /// A replace awaiting the venue's answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,7 +583,8 @@ pub struct ClientReport {
 }
 
 /// What an OrderCancelReject answers: ResponseTo(434).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CancelKind {
     Cancel,
     Replace,
@@ -556,7 +643,8 @@ pub enum Output {
 }
 
 /// Who asked for a request we sent a venue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Origin {
     Client,
     /// The gateway's own cancel: it spends none of the client's ClOrdIDs.

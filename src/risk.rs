@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
 use turbojet::fields::{CompactString, Decimal};
 
 use crate::book::{ClientId, OrderId, Side, VenueId};
@@ -224,9 +225,14 @@ impl State {
         }
     }
 
-    #[cfg(test)]
+    /// Every symbol's reference price.
     pub fn references(&self) -> &HashMap<CompactString, Decimal> {
         &self.references
+    }
+
+    /// Each session with live orders or fills in its trading day: its open and filled notional.
+    pub fn sessions(&self) -> impl Iterator<Item = (&ClientId, Decimal, Decimal)> {
+        self.sessions.iter().map(|(client, session)| (client, session.open, session.filled))
     }
 
     /// Sessions that have filled anything in their trading day, and how much.
@@ -334,7 +340,7 @@ impl State {
 }
 
 /// One CompID's limits. `None` (or `false`) is no check.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Limits {
     /// OrderQty(38) at most this.
     pub max_order_qty: Option<Decimal>,

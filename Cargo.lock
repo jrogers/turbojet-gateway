@@ -212,6 +212,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -234,6 +235,7 @@ dependencies = [
  "castaway",
  "cfg-if",
  "itoa",
+ "serde",
  "static_assertions",
  "zmij",
 ]
@@ -767,8 +769,11 @@ name = "jetbridge"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "compact_str",
  "rcgen",
+ "rust_decimal",
  "serde",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
@@ -2225,6 +2230,7 @@ dependencies = [
  "cfg-if",
  "once_cell",
  "rustversion",
+ "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]

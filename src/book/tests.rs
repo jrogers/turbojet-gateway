@@ -3359,3 +3359,182 @@ fn an_unsent_request_answered_since_is_not_sent_again() {
     assert_eq!(cancel_reject(&out).1, CancelKind::Cancel);
     assert_eq!(cancel_reject(&out).2, Status::Filled);
 }
+
+#[test]
+fn scope_names_print_as_they_parse() {
+    for text in ["all", "comp:FUNDA", "session:FIX.4.4:JETBRIDGE->FUNDA/DESK1"] {
+        let name: ScopeName = text.parse().unwrap();
+        assert_eq!(name.to_string(), text);
+    }
+    assert_eq!("comp:FUNDA".parse(), Ok(ScopeName::CompId("FUNDA".into())));
+    // A scope prints as its name does.
+    let session = desk("DESK1");
+    assert_eq!(Scope::Session(session.clone()).to_string(), ScopeName::Session(session.to_string()).to_string());
+    assert_eq!(Scope::CompId("FUNDA".into()).to_string(), "comp:FUNDA");
+    assert_eq!(Scope::All.to_string(), "all");
+}
+
+#[test]
+fn a_scope_name_without_a_known_prefix_or_a_name_is_refused() {
+    for text in ["", "ALL", "comp:", "session:", "client:FUNDA", "FUNDA"] {
+        assert_eq!(text.parse::<ScopeName>(), Err(BadScope(text.into())), "{text:?}");
+    }
+}
+
+/// Order 1 working for DESK1, 2 done for DESK2, 3 working for FUNDB on MSFT.
+fn three_orders() -> Book {
+    let mut book = book();
+    run(&mut book, order_from(&desk("DESK1"), "C1"));
+    run(&mut book, order_from(&desk("DESK2"), "C1"));
+    let mut msft = request("C1");
+    msft.symbol = "MSFT".into();
+    run(&mut book, Input::NewOrder { client: "FUNDB".into(), request: msft, redelivered: false, sent: None });
+    run(&mut book, venue_report("2", Status::Filled, 100, 100));
+    book
+}
+
+fn ids(views: &[OrderView]) -> Vec<u64> {
+    views.iter().map(|view| view.id.0).collect()
+}
+
+#[test]
+fn orders_are_filtered_by_each_field() {
+    let book = three_orders();
+    let all = OrderFilter::default();
+    assert_eq!(ids(&book.orders(&all)), [1, 2, 3]);
+    assert_eq!(ids(&book.orders(&OrderFilter { working: true, ..all.clone() })), [1, 3]);
+    let funda = Scope::CompId("FUNDA".into());
+    assert_eq!(ids(&book.orders(&OrderFilter { client: Some(funda), ..all.clone() })), [1, 2]);
+    let desk2 = Scope::Session(desk("DESK2"));
+    assert_eq!(ids(&book.orders(&OrderFilter { client: Some(desk2), ..all.clone() })), [2]);
+    assert_eq!(ids(&book.orders(&OrderFilter { symbol: Some("MSFT".into()), ..all.clone() })), [3]);
+    assert_eq!(ids(&book.orders(&OrderFilter { status: Some(Status::Filled), ..all.clone() })), [2]);
+    assert!(book.orders(&OrderFilter { venue: Some("LSE".into()), ..all }).is_empty());
+}
+
+#[test]
+fn orders_page_by_order_id_at_most_a_page_at_a_time() {
+    let mut book = three_orders();
+    let first = OrderFilter { limit: Some(2), ..OrderFilter::default() };
+    assert_eq!(ids(&book.orders(&first)), [1, 2]);
+    assert_eq!(ids(&book.orders(&OrderFilter { after: Some(OrderId(2)), ..first })), [3]);
+    // Straight into the book: `run` restores it per input, too slow for a page's worth.
+    for n in 0..MAX_ORDERS_PER_PAGE {
+        let input = order_from(&desk("DESK1"), &format!("P{n}"));
+        book.handle(input, &mut Vec::new());
+    }
+    let page = book.orders(&OrderFilter { limit: Some(usize::MAX), ..OrderFilter::default() });
+    assert_eq!(page.len(), MAX_ORDERS_PER_PAGE);
+    assert_eq!((page[0].id, page[MAX_ORDERS_PER_PAGE - 1].id), (OrderId(1), OrderId(1_000)));
+}
+
+#[test]
+fn an_orders_view_shows_what_is_pending() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    replace(&mut book, "C2", "C1", 50, 11);
+    let view = &book.orders(&OrderFilter::default())[0];
+    assert_eq!((view.order_id.as_str(), view.cl_ord_id.as_str(), view.qty), ("1", "C1", 100.into()));
+    assert_eq!((view.pending_cancel, view.pending_replace, view.gateway_cancel), (false, true, None));
+    cancel_all(&mut book, Scope::All);
+    let view = &book.orders(&OrderFilter::default())[0];
+    assert!(view.pending_cancel);
+    assert_eq!(view.gateway_cancel, Some(GatewayCancelView { state: CancelState::InFlight, tries: 1 }));
+}
+
+#[test]
+fn an_orders_detail_lists_its_requests_in_the_order_sent() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    replace(&mut book, "C2", "C1", 50, 10);
+    run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    cancel_all(&mut book, Scope::All);
+    run(&mut book, cancel_reject_because("1-2", Status::New, 1));
+    let detail = book.order_detail(OrderId(1)).unwrap();
+    assert_eq!(detail.order.cl_ord_id, "C2");
+    assert_eq!(detail.order.gateway_cancel, Some(GatewayCancelView { state: CancelState::Stuck, tries: 1 }));
+    let requests: Vec<_> = detail
+        .requests
+        .iter()
+        .map(|request| (request.downstream.as_str(), request.kind, request.origin, request.cl_ord_id.as_deref()))
+        .collect();
+    assert_eq!(
+        requests,
+        [
+            ("1", RequestKind::New, Origin::Client, Some("C1")),
+            ("1-1", RequestKind::Replace, Origin::Client, Some("C2")),
+            ("1-2", RequestKind::Cancel, Origin::Gateway, None),
+        ]
+    );
+    assert!(book.order_detail(OrderId(2)).is_none());
+}
+
+#[test]
+fn an_order_is_found_by_its_name_or_its_clients_cl_ord_id() {
+    let mut book = book();
+    book.set_prefix("A1".into());
+    new_order(&mut book, "C1");
+    assert_eq!(book.order_named("A11"), Some(OrderId(1)));
+    for name in ["", "A1", "11", "B11", "A11x", "A199999999999999999999"] {
+        assert_eq!(book.order_named(name), None, "{name:?}");
+    }
+    let funda = ClientId::from("FUNDA");
+    assert_eq!(book.order_by_cl_ord_id(&funda, "C1"), Some(OrderId(1)));
+    assert_eq!(book.order_by_cl_ord_id(&funda, "C2"), None);
+    assert_eq!(book.order_by_cl_ord_id(&"FUNDB".into(), "C1"), None);
+}
+
+/// An order restored from an earlier start keeps that start's prefix, so it's no use stripping
+/// this one's.
+#[test]
+fn an_order_from_an_earlier_start_is_found_by_its_name() {
+    let mut earlier = book();
+    earlier.set_prefix("OLD9".into());
+    new_order(&mut earlier, "C1");
+    let mut book = book();
+    book.set_prefix("NEW".into());
+    book.restore(earlier.snapshot());
+    assert_eq!(book.order_named("OLD91"), Some(OrderId(1)));
+}
+
+#[test]
+fn the_risk_view_shows_limits_notionals_references_and_blocks() {
+    let mut book = book();
+    let tight = risk::Limits { max_order_qty: Some(500.into()), ..risk::Limits::default() };
+    let limits =
+        risk::Config { defaults: risk::Limits::default(), by_comp_id: [("FUNDA".into(), tight.clone())].into() };
+    book.set_config(book.router.clone(), limits);
+    new_order(&mut book, "C1");
+    new_order(&mut book, "C2");
+    run(&mut book, venue_report("2", Status::Filled, 100, 100));
+    block(&mut book, Scope::CompId("FUNDB".into()));
+    let view = book.risk_view();
+    assert_eq!(view.by_comp_id, BTreeMap::from([("FUNDA".into(), tight)]));
+    let funda = SessionRisk { client: "FUNDA".into(), open: 1_000.into(), filled: 1_000.into() };
+    assert_eq!(view.sessions, [funda]);
+    assert_eq!(view.references, BTreeMap::from([("AAPL".into(), 10.into())]));
+    assert_eq!(view.blocked, [Scope::CompId("FUNDB".into())]);
+}
+
+/// The JSON the API sends: snake_case names, enums as strings, decimals as exact strings.
+#[test]
+fn views_serialize_as_the_api_sends_them() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    let json = serde_json::to_value(book.order_detail(OrderId(1)).unwrap()).unwrap();
+    assert_eq!(json["order_id"], "1");
+    assert_eq!(json["client"], "FIX.4.4:JETBRIDGE->FUNDA");
+    assert_eq!(
+        (&json["side"], &json["ord_type"], &json["status"]),
+        (&"buy".into(), &"limit".into(), &"pending_new".into())
+    );
+    assert_eq!((&json["qty"], &json["price"]), (&"100".into(), &"10".into()));
+    assert_eq!(json["requests"][0]["kind"], "new");
+    assert!(json.get("id").is_none(), "{json}");
+    let json = serde_json::to_value(book.risk_view()).unwrap();
+    assert_eq!(json["sessions"][0]["open"], "1000");
+    let json = serde_json::to_value(Scope::CompId("FUNDA".into())).unwrap();
+    assert_eq!(json, "comp:FUNDA");
+}

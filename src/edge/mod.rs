@@ -31,7 +31,10 @@ use turbojet::{
     SessionHandle, SessionId, SessionSchedule,
 };
 
-use crate::book::{Book, ClientId, Day, GatewayCancel, Input, OrderId, Output, Scope, Snapshot, Undelivered, VenueId};
+use crate::book::{
+    Book, ClientId, Day, GatewayCancel, Input, OrderDetail, OrderFilter, OrderId, OrderView, Output, RiskView, Scope,
+    ScopeName, Snapshot, Undelivered, VenueId,
+};
 use crate::fix::{self, Version};
 use crate::risk;
 use crate::router::Router;
@@ -77,7 +80,7 @@ impl fmt::Debug for Schedules {
 pub struct Gateway {
     state: Mutex<State>,
     outbox: Outbox,
-    /// Each client session seen since start, made once: see [`client`](Self::client).
+    /// Each client session seen since start, made once: see [`client_of`](Self::client_of).
     clients: Mutex<HashMap<SessionId, ClientId>>,
     /// Clients the store had at the start, by session as it shows, until each logs on: counted
     /// against their CompID's sessions as `clients` are. Locked after `clients`.
@@ -92,6 +95,26 @@ pub struct Gateway {
     /// Commits the book's changes, if there's a database: see [`with_writer`](Self::with_writer).
     writer: Option<Writer>,
 }
+
+/// Why [`Gateway::cancel_order`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelError {
+    /// The book doesn't hold the order: it never did, or it was done and dropped at a roll.
+    UnknownOrder,
+    /// The order is filled, canceled, expired or rejected.
+    Done,
+}
+
+impl fmt::Display for CancelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnknownOrder => "unknown order",
+            Self::Done => "the order is done",
+        })
+    }
+}
+
+impl std::error::Error for CancelError {}
 
 /// What the gateway leaves unfinished at a stop: see [`Gateway::unfinished`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,10 +335,19 @@ impl Gateway {
     /// Blocks the clients in `scope`: their new orders are rejected until [`unblock`](Self::unblock)
     /// lifts this scope (see [`Input::Block`]). Their working orders stay; see
     /// [`cancel_all`](Self::cancel_all). Returns once the block is committed, with a database.
-    pub async fn block(self: &Arc<Self>, scope: Scope) {
-        warn!(?scope, "blocking clients");
-        self.handle_all([Input::Block { scope }]);
+    /// `false` if `scope` was blocked already, which changes nothing.
+    pub async fn block(self: &Arc<Self>, scope: Scope) -> bool {
+        {
+            let mut state = self.lock();
+            if state.book.blocked().contains(&scope) {
+                info!(?scope, "blocked already");
+                return false;
+            }
+            warn!(?scope, "blocking clients");
+            self.handle_locked(&mut state, [Input::Block { scope }], None);
+        }
         self.committed().await;
+        true
     }
 
     /// The kill switch: blocks the clients in `scope` and cancels their live orders at the
@@ -343,6 +375,74 @@ impl Gateway {
         }
         self.committed().await;
         true
+    }
+
+    /// The gateway's own cancel of one order, as [`cancel_all`](Self::cancel_all) sends for each,
+    /// without a block. A stuck cancel starts again with its tries counted afresh, which makes
+    /// this the way to retry one; one in flight is left to finish. Returns once the cancel sent is
+    /// committed, with a database.
+    ///
+    /// # Errors
+    ///
+    /// If the book doesn't hold the order, or it's done.
+    pub async fn cancel_order(self: &Arc<Self>, order: OrderId) -> Result<(), CancelError> {
+        {
+            let mut state = self.lock();
+            let found = state.book.order(order).ok_or(CancelError::UnknownOrder)?;
+            if found.status.is_done() {
+                return Err(CancelError::Done);
+            }
+            warn!(order = %found.name, client = %found.client, "cancelling an order");
+            self.handle_locked(&mut state, [Input::CancelOrder { order }], None);
+        }
+        self.committed().await;
+        Ok(())
+    }
+
+    /// The client whose session shows as `session`, if it has logged on since start or the book
+    /// had it at the start.
+    pub fn client(&self, session: &str) -> Option<ClientId> {
+        let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        // ponytail: a scan of every session; a map by session string if there are many.
+        if let Some(client) = clients.values().find(|client| client.session() == session) {
+            return Some(client.clone());
+        }
+        self.restored.lock().unwrap_or_else(PoisonError::into_inner).get(session).cloned()
+    }
+
+    /// The scope `name` names; `None` for a session the gateway doesn't know (see
+    /// [`client`](Self::client)).
+    pub fn scope(&self, name: &ScopeName) -> Option<Scope> {
+        match name {
+            ScopeName::Session(session) => self.client(session).map(Scope::Session),
+            ScopeName::CompId(comp_id) => Some(Scope::CompId(comp_id.clone())),
+            ScopeName::All => Some(Scope::All),
+        }
+    }
+
+    /// The order whose OrderID(37) is `name`, if the book holds it.
+    pub fn order_id(&self, name: &str) -> Option<OrderId> {
+        self.lock().book.order_named(name)
+    }
+
+    /// The order `client` knows by `cl_ord_id`, if the book holds it.
+    pub fn order_by_cl_ord_id(&self, client: &ClientId, cl_ord_id: &str) -> Option<OrderId> {
+        self.lock().book.order_by_cl_ord_id(client, cl_ord_id)
+    }
+
+    /// A page of the book's orders: see [`Book::orders`].
+    pub fn orders(&self, filter: &OrderFilter) -> Vec<OrderView> {
+        self.lock().book.orders(filter)
+    }
+
+    /// One order and the requests sent for it, if the book holds it.
+    pub fn order(&self, id: OrderId) -> Option<OrderDetail> {
+        self.lock().book.order_detail(id)
+    }
+
+    /// The limits in force and what each session counts against them: see [`Book::risk_view`].
+    pub fn risk(&self) -> RiskView {
+        self.lock().book.risk_view()
     }
 
     /// Completes once every change to the book so far has committed; at once without a database.
@@ -425,7 +525,7 @@ impl Gateway {
     /// The client on the acceptor's session `id`. Made at the session's first logon or message
     /// and kept, so a message costs a lookup and a clone rather than formatting the session. Kept
     /// for every session seen since start, as the outbox and the book keep theirs.
-    fn client(&self, id: &SessionId) -> ClientId {
+    fn client_of(&self, id: &SessionId) -> ClientId {
         // Nothing is left half-changed under this lock, so a panic elsewhere doesn't spoil it.
         let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
         // `admit` (at verify_logon, before any logon or message) has added a live session already,
@@ -745,19 +845,19 @@ impl Application for ClientApp {
     }
 
     fn on_logon(&self, session: &SessionHandle) {
-        self.0.outbox.logged_on(&self.0.client(session.id()), session);
+        self.0.outbox.logged_on(&self.0.client_of(session.id()), session);
     }
 
     /// Cancels the session's working orders at the venues, without a block: the client may log
     /// back on and trade. It hears of each order's end through the outbox, when it's back.
     fn on_cancel_on_disconnect(&self, session: &SessionHandle, ended: Disconnect) {
         warn!(%session, ?ended, "cancelling the orders of a client that didn't come back");
-        let client = self.0.client(session.id());
+        let client = self.0.client_of(session.id());
         self.0.handle(Input::CancelAll { scope: Scope::Session(client) });
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
-        let client = self.0.client(ctx.session_id());
+        let client = self.0.client_of(ctx.session_id());
         let redelivered = ctx.maybe_redelivered() || fix::possibly_resent(msg);
         let mut input = self.0.client_version.client_input(&client, msg, redelivered)?;
         if let Input::NewOrder { redelivered: true, sent, .. } = &mut input {
@@ -1231,12 +1331,64 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn unblock_says_whether_the_scope_was_blocked() {
+    async fn block_and_unblock_say_whether_they_changed_anything() {
         let gateway = gateway();
-        gateway.block(Scope::All).await;
+        assert!(gateway.block(Scope::All).await);
+        assert!(!gateway.block(Scope::All).await);
         assert!(!gateway.unblock(Scope::CompId("FUNDA".into())).await);
         assert!(gateway.unblock(Scope::All).await);
         assert!(gateway.blocked().is_empty());
+    }
+
+    /// A stuck gateway cancel (the venue says it doesn't know the order) starts again with its
+    /// tries counted afresh: here it waits, as the venue isn't connected.
+    #[tokio::test]
+    async fn cancelling_one_order_rearms_a_stuck_cancel() {
+        let gateway = gateway();
+        book_order(&gateway);
+        {
+            let book = &mut gateway.lock().book;
+            book.handle(Input::CancelOrder { order: OrderId(1) }, &mut Vec::new());
+            let refused = Input::VenueCancelReject {
+                venue: VENUE.into(),
+                downstream: "1-1".into(),
+                status: Some(crate::book::Status::New),
+                text: None,
+                reason: Some(1),
+                venue_order_id: None,
+            };
+            book.handle(refused, &mut Vec::new());
+        }
+        assert!(gateway.cancelling()[0].1.stuck);
+        assert_eq!(gateway.cancel_order(OrderId(1)).await, Ok(()));
+        let (_, cancel) = &gateway.cancelling()[0];
+        assert_eq!((cancel.tries, cancel.unsent, cancel.stuck), (0, true, false));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_or_done_order_is_refused() {
+        let gateway = gateway();
+        assert_eq!(gateway.cancel_order(OrderId(1)).await, Err(CancelError::UnknownOrder));
+        // No venue set: rejected, so done.
+        send_order(&gateway, "C1");
+        assert_eq!(gateway.cancel_order(OrderId(1)).await, Err(CancelError::Done));
+        assert!(gateway.cancelling().is_empty());
+    }
+
+    /// A session with a SubID is found by the session as it shows, and names a session scope.
+    #[test]
+    fn a_client_is_found_by_its_session() {
+        let gateway = gateway();
+        let desk1 = desk("DESK1");
+        assert_eq!(logon(&ClientApp(gateway.clone()), &desk1), Ok(()));
+        let shown = desk1.id().to_string();
+        assert_eq!(gateway.client(&shown), Some(ClientId::new(desk1.id())));
+        assert_eq!(gateway.client(&desk("DESK2").id().to_string()), None);
+        let scope = gateway.scope(&format!("session:{shown}").parse().unwrap());
+        assert_eq!(scope, Some(Scope::Session(ClientId::new(desk1.id()))));
+        assert_eq!(scope.unwrap().to_string(), format!("session:{shown}"));
+        assert_eq!(gateway.scope(&"session:FIX.4.4:JETBRIDGE->FUNDB".parse().unwrap()), None);
+        assert_eq!(gateway.scope(&"comp:FUNDB".parse().unwrap()), Some(Scope::CompId("FUNDB".into())));
     }
 
     fn at(time: &str) -> DateTime<Utc> {
@@ -2073,8 +2225,10 @@ pub(crate) mod tests {
         drop(before);
         let gateway = restarted(&store, "NEWNEW").await;
         let app = ClientApp(gateway.clone());
+        // Known before it logs on, so an operator can name it.
+        assert_eq!(gateway.client(&desk("DESK5").id().to_string()), Some(client("DESK5")));
         assert_eq!(logon(&app, &desk("DESK3")), Ok(()));
-        assert_eq!(gateway.client(desk("DESK3").id()), client("DESK3"));
+        assert_eq!(gateway.client_of(desk("DESK3").id()), client("DESK3"));
         // The 16th: DESK3 is counted once, and DAY-ONLY and DONE not at all.
         assert_eq!(logon(&app, &desk("NEW")), Ok(()));
         assert!(logon(&app, &desk("ONE-TOO-MANY")).is_err());

@@ -18,7 +18,7 @@ impl Book {
     }
 
     /// The order's latest cancel, while the venue hasn't answered it.
-    fn outstanding_cancel(&self, order: &Order) -> Option<&Sent> {
+    pub(super) fn outstanding_cancel(&self, order: &Order) -> Option<&Sent> {
         let sent = &self.downstream[order.cancel.as_ref()?];
         (!sent.answered).then_some(sent)
     }
