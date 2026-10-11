@@ -207,8 +207,11 @@ fn write_config(dir: &tempfile::TempDir, options: &Options, venue_port: u16) {
             format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", grace.as_millis())
         })
         .unwrap_or_default();
+    // With a database, a venue's session must be on disk.
+    let store =
+        if *database { "[defaults]\nstore = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n" } else { "" };
     let sessions = format!(
-        r#"
+        r#"{store}
 [acceptor]
 begin_string = "{client_version}"
 sender_comp_id = "{GATEWAY}"

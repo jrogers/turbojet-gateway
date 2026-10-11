@@ -121,6 +121,9 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
     let database = file.database.map(|database| database.url);
+    if database.is_some() {
+        check_durable_venues(&sessions_path)?;
+    }
     Ok(Loaded { router, limits, sessions, version, day_end, database })
 }
 
@@ -188,6 +191,38 @@ pub fn check_venues(path: &Path, router: &Router, venues: &[String]) -> Result<(
     }
     Ok(())
 }
+
+/// With a database, a venue's session must be kept in a durable store: recovery reads what the
+/// session stored to find the requests the database lacks, and the converse, and a `memory` store
+/// starts empty. Checked from the sessions file at `path` as written: `store` in the initiator's
+/// section, else `[defaults]`, else `memory`; a store registered in code counts as durable.
+fn check_durable_venues(path: &Path) -> Result<(), Error> {
+    let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    let file: toml::Table = toml::from_str(&text).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    let default = store_of(file.get("defaults")).unwrap_or(MEMORY_STORE);
+    let kind_of = |store: &str| file.get("store")?.get(store)?.get("kind")?.as_str();
+    let initiators = file.get("initiator").and_then(toml::Value::as_table).into_iter().flatten();
+    for (name, section) in initiators {
+        let store = store_of(Some(section)).unwrap_or(default);
+        if store == MEMORY_STORE || kind_of(store) == Some(MEMORY_STORE) {
+            return Err(Error(format!(
+                "{}: [initiator.{name}]: its session is kept in memory (store {store:?}), but the gateway has a \
+                 [database]: a venue's session needs a durable store (kind = \"disk\", say), which a restart reads \
+                 to recover",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A section's `store`.
+fn store_of(section: Option<&toml::Value>) -> Option<&str> {
+    section?.get("store")?.as_str()
+}
+
+/// turbojet-config's built-in store, and the kind of store that keeps nothing across a restart.
+const MEMORY_STORE: &str = "memory";
 
 /// What's likely a mistake in `router`, though it loads: routes after one that matches every
 /// order, which can never match, and no routes at all, which rejects every order.
@@ -427,8 +462,9 @@ reject = "no route"
 
     #[test]
     fn the_database_url_is_optional_and_its_table_takes_no_other_key() {
+        let sessions = format!("{SESSIONS}store = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n");
         let load_database = |jetbridge: &str| {
-            let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
+            let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", &sessions)]);
             load(&dir.path().join("jetbridge.toml")).unwrap().database
         };
         assert_eq!(load_database("sessions = \"sessions.toml\""), None);
@@ -436,6 +472,25 @@ reject = "no route"
         assert_eq!(load_database(with).as_deref(), Some("sqlite://j.db?mode=rwc"));
         let error = load_error("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db\"\npath = \"x\"");
         assert!(error.contains("unknown field `path`"), "{error}");
+    }
+
+    /// With a database, a venue's session kept in memory, by default or by a store of that kind,
+    /// stops the start; one in a disk store, its own or the defaults', doesn't.
+    #[test]
+    fn with_a_database_a_venue_kept_in_memory_is_an_error() {
+        let jetbridge = "sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"";
+        let load_with = |sessions: &str| {
+            let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", sessions)]);
+            load(&dir.path().join("jetbridge.toml")).map(drop).map_err(|e| e.to_string())
+        };
+        let disk = "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n";
+        let scratch = "[store.scratch]\nkind = \"memory\"\n";
+        for sessions in [SESSIONS.to_string(), format!("{SESSIONS}store = \"scratch\"\n{scratch}")] {
+            let error = load_with(&sessions).unwrap_err();
+            assert!(error.contains("[initiator.NASDAQ]: its session is kept in memory"), "{error}");
+        }
+        assert!(load_with(&format!("{SESSIONS}store = \"disk\"\n{disk}")).is_ok());
+        assert!(load_with(&format!("[defaults]\nstore = \"disk\"\n{disk}{SESSIONS}")).is_ok());
     }
 
     #[test]
