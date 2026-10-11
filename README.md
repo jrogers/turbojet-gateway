@@ -7,9 +7,9 @@ reports back, keeping each order's state as it goes.
 > [!WARNING]
 > **Early work.** Without a [database](#database), everything is kept in memory only: a restart
 > forgets every order, every report not yet delivered, operators' blocks and what the risk limits
-> have counted. It hasn't been run against a real venue or client. Read [CAVEATS.md](CAVEATS.md) before relying on it, and don't
-> use it to trade real money without testing it thoroughly yourself. It is provided as is,
-> without warranty of any kind.
+> have counted. It hasn't been run against a real venue or client. Read [CAVEATS.md](CAVEATS.md)
+> before relying on it, and don't use it to trade real money without testing it thoroughly
+> yourself. It is provided as is, without warranty of any kind.
 
 ## What it does
 
@@ -32,9 +32,9 @@ reports back, keeping each order's state as it goes.
 - **An order counts as received once its venue has it stored**, and, with a database, once its
   change to the book has committed. A client's order, cancel or replace stays in flight on the
   client's session until then. If the client's connection drops first, the client sends it again
-  when it's back, and the ClOrdID dedupe answers with the order's state. Without a database, a
-  restart forgets the book, so a resent order goes to the venue as a new one, possibly a second
-  time (see CAVEATS).
+  when it's back (after a restart too, if its session is kept in a durable store), and the
+  ClOrdID dedupe answers with the order's state. Without a database, a restart forgets the book,
+  so a resent order goes to the venue as a new one, possibly a second time (see CAVEATS).
 - **Reports held per client.** A report for a client that's disconnected, or reading slowly, waits
   in that client's queue and goes out, in order, once it can take it.
 - **Risk limits** per CompID, checked on each order and replace before it goes to a venue: order
@@ -158,7 +158,7 @@ Jetbridge:
   gateway at start; a reload that adds one skips it, with an error logged.
 - Sessions are kept in the `memory` store unless the file says otherwise, so sequence numbers
   start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them. With a
-  [database](#database), venues must be kept in one.
+  [database](#database), the acceptor and every venue must be kept in one.
 
 ## Database
 
@@ -174,19 +174,23 @@ url = "sqlite:///var/lib/jetbridge/jetbridge.db?mode=rwc"
 
 - `url`: a SQLite database. `?mode=rwc` creates the file if it's missing, with a warning logged
   that a new, empty database was created; without it, a missing file stops the start, so a
-  mistyped path doesn't start an empty book. A relative path is from the working directory. It's
+  mistyped path doesn't start an empty book. A relative path is from the working directory, not
+  from this file's directory as `sessions` is. It's
   read at start only: a reload that finds it changed logs a warning and keeps the database in use.
 - Without a `[database]`, the gateway keeps everything in memory, and a restart forgets it.
 
-**Behind the hot path.** Orders go to venues and reports to clients without waiting for the
-database; the changes are committed behind them, many at a time. Each message that changed the
-book counts as received by its session only once its change has committed, so a stop before then
-has its sender send it again. A commit is synced to disk.
+**Orders don't wait for the database.** Orders go to venues and reports to clients without
+waiting for it; the changes are committed in the background, many at a time. Each message that
+changed the book counts as received by its session only once its change has committed, so a stop
+before then has its sender send it again (see below for the stores that takes). A commit is
+synced to disk.
 
-**Venue sessions need a durable store.** A restart reads each venue's session store, so with a
-database every `[initiator.NAME]` needs a store that survives a restart (`kind = "disk"`, say),
-and its files kept. A start that finds a venue's store has no record of its session while the
-database has orders for that venue stops, saying so.
+**Sessions need a durable store.** With a database, the `[acceptor]` and every
+`[initiator.NAME]` need a store that survives a restart (`kind = "disk"`, say), with its files
+kept: a restart reads each venue's store to see what was sent, and a client's messages that
+hadn't committed come back only through its session's stored sequence numbers. Only the venues'
+stores are checked: a start that finds a venue's store has no record of its session while the
+database has live orders, or orders of a client's current day, for that venue stops, saying so.
 
 **What a restart does.** Before any session starts, the gateway restores the book as last
 committed, then reads every request each venue's session stored and compares them with the
