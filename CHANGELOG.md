@@ -14,7 +14,7 @@ Notable changes to Jetbridge.
   and their reports reach the client under its ClOrdIDs with the gateway's OrderIDs and ExecIDs.
   Each of the gateway's IDs starts with a prefix from its start time, so a restart doesn't reuse
   them.
-- An order book in memory: each order's state, ClOrdID dedupe per client (a possible resend is
+- An order book: each order's state, ClOrdID dedupe per client (a possible resend is
   answered with the order's state), one replace pending at a time, stale and resent venue reports
   dropped rather than rolling an order back, overfills refused, and the venue's reject reasons
   passed through in the client's version.
@@ -40,9 +40,34 @@ Notable changes to Jetbridge.
 - A client's order, cancel or replace stays in flight on its session (Turbojet's
   `Context::hold`) until the venue's session has stored what it was forwarded as, so a client
   connection lost before then resends it rather than losing it.
-- A kill switch, as library calls on the gateway: block a client session, a CompID or everyone
-  (new orders rejected; cancels and replaces that don't raise the quantity pass), cancel their
-  orders at the venues, and unblock. The gateway's own cancels are retried when a venue refuses
+- An optional database, `[database] url = "sqlite://...?mode=rwc"` in `jetbridge.toml` (SQLite;
+  a missing file is an error unless the URL asks for it to be created; read at start only). The
+  book's orders, ClOrdIDs and requests sent, operators' blocks, risk counts and the reports not
+  yet delivered are committed behind the hot path, and restored at the next start. Every
+  message that changed the book is held in flight until its change has committed. Without a
+  `[database]` everything stays in memory, as before.
+- Recovery at start: before the venues log on, each venue's session store is read and compared
+  with the database. An order the venue's session stored but the database never recorded is
+  cancelled at the venue's logon, logged as an error; an unrecorded cancel cancels its order,
+  and an unrecorded replace stays pending on its order, Replaced to the client if its
+  redelivered replace matches it, Restated if not. Requests the database has that the venue's
+  session never stored are sent at the venue's logon, marked PossResend, unless the session
+  resets its sequence numbers at that logon, when they fail. Undelivered reports go to their
+  clients again, marked PossResend.
+- New orders are rejected as "gateway unavailable" while the oldest change not yet committed has
+  waited over a second; cancels, replaces and venue reports keep flowing.
+- With a database, a venue's session must be kept in a durable store: a start that finds a
+  venue's store with no record of its session while the database has orders for the venue stops.
+- Each start waits for the next second before taking its ID prefix, so two starts never share
+  one unless the clock goes back.
+- Reports made from a message that may have been handled before a restart are marked
+  PossResend.
+- A venue report that changes nothing (a repeated ack) is dropped rather than forwarded under a
+  new ExecID. DoneForDay is still forwarded.
+- A kill switch, as async library calls on the gateway, which with a database return once their
+  change has committed: block a client session, a CompID or everyone (new orders rejected;
+  cancels and replaces that don't raise the quantity pass), cancel their orders at the venues,
+  and unblock. The gateway's own cancels are retried when a venue refuses
   them (three tries in all), sent when a down venue logs back on, and listed while they're going;
   clients get an unsolicited Canceled report per order.
 - Cancel on disconnect: a client session with `cancel_on_disconnect` in the sessions file has
