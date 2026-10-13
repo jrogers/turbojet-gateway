@@ -2183,7 +2183,7 @@ pub(crate) mod tests {
     }
 
     /// What `gateway`'s book answers `input` with, handled directly: nothing sent or committed.
-    fn book_input(gateway: &Gateway, input: Input) -> Vec<Output> {
+    pub(crate) fn book_input(gateway: &Gateway, input: Input) -> Vec<Output> {
         let mut out = Vec::new();
         gateway.lock().book.handle(input, &mut out);
         out

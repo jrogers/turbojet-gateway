@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -45,7 +46,7 @@ pub struct Reloaded {
 }
 
 /// The routes, limits and `day_end` a reload took.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfigSummary {
     pub routes: usize,
     /// CompIDs with limits of their own.

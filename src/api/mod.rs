@@ -36,6 +36,7 @@ use crate::service::Service;
 mod auth;
 mod listener;
 mod read;
+mod write;
 
 use auth::{Auth, Caller};
 
@@ -107,6 +108,14 @@ fn router(state: State) -> axum::Router {
         .route("/api/orders/{order_id}", get(read::order))
         .route("/api/risk", get(read::risk))
         .route("/api/routes", get(read::routes))
+        .route("/api/sessions/{id}/pause", post(write::pause))
+        .route("/api/sessions/{id}/resume", post(write::resume))
+        .route("/api/sessions/{id}/resend", post(write::resend))
+        .route("/api/orders/{order_id}/cancel", post(write::cancel_order))
+        .route("/api/risk/block", post(write::block))
+        .route("/api/risk/unblock", post(write::unblock))
+        .route("/api/risk/cancel-all", post(write::cancel_all))
+        .route("/api/reload", post(write::reload))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate));
     axum::Router::new()
         .route("/api/health", get(health))
@@ -154,7 +163,6 @@ pub(crate) type Outcome<T> = Result<(T, Option<String>), ApiError>;
 /// Refuses it, recording the refusal, if `allowed` is an error (the caller's role or scope, or a
 /// target that doesn't exist) or the reason is missing, blank or too long (400). Then runs it as
 /// [`run_audited`] does.
-#[cfg_attr(not(test), expect(dead_code, reason = "the mutation endpoints call it"))]
 pub(crate) async fn audited<T: Send + 'static>(
     state: &State,
     caller: &Caller,

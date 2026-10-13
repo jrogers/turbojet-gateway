@@ -246,7 +246,7 @@ pub(super) async fn routes(axum::extract::State(state): AxumState) -> Result<Jso
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -265,16 +265,22 @@ mod tests {
     impl Application for Nothing {}
 
     /// A gateway with client FUNDA logged on, venue NASDAQ down, and order 1 resting for it: the
-    /// API's routes reaching it, a viewer's bearer header, and what keeps them alive.
-    struct Fixture {
-        app: axum::Router,
-        viewer: String,
-        service: Arc<Service>,
+    /// API's routes reaching it, bearer headers for each role, and what keeps them alive.
+    pub(in crate::api) struct Fixture {
+        pub(in crate::api) app: axum::Router,
+        /// Bearer headers' values: a viewer's, an operator's, an operator's scoped to FUNDB, and
+        /// an admin's.
+        pub(in crate::api) viewer: String,
+        pub(in crate::api) operator: String,
+        pub(in crate::api) scoped: String,
+        pub(in crate::api) admin: String,
+        pub(in crate::api) service: Arc<Service>,
         _client: Initiator,
-        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        /// The configuration's, then the audit log's.
+        pub(in crate::api) dirs: (tempfile::TempDir, tempfile::TempDir),
     }
 
-    async fn fixture() -> Fixture {
+    pub(in crate::api) async fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let sessions = "[acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
                         listen = \"127.0.0.1:0\"\n[counterparty.FUNDA]\n[initiator.NASDAQ]\n\
@@ -304,23 +310,29 @@ mod tests {
         crate::edge::tests::book_order(service.gateway());
 
         let mut users = Users::default();
-        users.add("vic", Role::Viewer, Vec::new(), "a password").unwrap();
-        let viewer = format!("Bearer {}", users.add_token("vic").unwrap());
+        let mut bearer = |name: &str, role: Role, clients: &[&str]| {
+            users.add(name, role, clients.iter().map(ToString::to_string).collect(), "a password").unwrap();
+            format!("Bearer {}", users.add_token(name).unwrap())
+        };
+        let viewer = bearer("vic", Role::Viewer, &[]);
+        let operator = bearer("olga", Role::Operator, &[]);
+        let scoped = bearer("sam", Role::Operator, &["FUNDB"]);
+        let admin = bearer("ada", Role::Admin, &[]);
         let (mut state, audit_dir) =
             super::super::tests::state(Arc::new(Auth::new(Default::default(), users, false, false)));
         state.service = Arc::downgrade(&service);
         let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
         let app = super::super::router(state).layer(MockConnectInfo(peer));
-        Fixture { app, viewer, service, _client: client, _dirs: (dir, audit_dir) }
+        Fixture { app, viewer, operator, scoped, admin, service, _client: client, dirs: (dir, audit_dir) }
     }
 
     impl Fixture {
-        async fn get(&self, path: &str) -> Answer {
+        pub(in crate::api) async fn get(&self, path: &str) -> Answer {
             send(&self.app, "GET", path, &[("authorization", &self.viewer)], "").await
         }
 
         /// `GET path`, which must answer 200: its body.
-        async fn ok(&self, path: &str) -> serde_json::Value {
+        pub(in crate::api) async fn ok(&self, path: &str) -> serde_json::Value {
             let answer = self.get(path).await;
             assert_eq!(answer.status, StatusCode::OK, "{path}: {:?}", answer.body);
             answer.body

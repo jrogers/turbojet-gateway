@@ -548,7 +548,6 @@ impl Caller {
 
     /// Whether the caller may act on `target`: an unscoped caller on anything, a scoped one on
     /// its own CompIDs' clients only (so never on [`Scope::All`]).
-    #[cfg_attr(not(test), expect(dead_code, reason = "the mutations check scopes"))]
     pub(crate) fn may_act_on<T: Target + ?Sized>(&self, target: &T) -> bool {
         match &self.clients {
             None => true,
@@ -797,6 +796,14 @@ mod tests {
         ("GET", "/api/orders/JB1"),
         ("GET", "/api/risk"),
         ("GET", "/api/routes"),
+        ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/pause"),
+        ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/resume"),
+        ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/resend"),
+        ("POST", "/api/orders/JB1/cancel"),
+        ("POST", "/api/risk/block"),
+        ("POST", "/api/risk/unblock"),
+        ("POST", "/api/risk/cancel-all"),
+        ("POST", "/api/reload"),
     ];
 
     #[tokio::test]
