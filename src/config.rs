@@ -182,7 +182,18 @@ pub struct Reread {
 /// `venues`. An `[api]` that doesn't load (or breaks the bind rule) refuses the whole file: the
 /// routes, limits and `day_end` in it aren't taken either.
 pub fn reload(path: &Path, venues: &[String], database: Option<&str>) -> Result<Reread, Error> {
-    let file = read(path)?;
+    let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    reread(path, &text, venues, database)
+}
+
+/// As [`reload`], from `text` rather than the file at `path`, which only names it in errors and
+/// is what its relative paths are relative to: how a limit edit checks the text before writing it.
+///
+/// # Errors
+///
+/// As [`reload`].
+pub fn reread(path: &Path, text: &str, venues: &[String], database: Option<&str>) -> Result<Reread, Error> {
+    let file = parse(path, text)?;
     if file.database.as_ref().map(|database| database.url.as_str()) != database {
         warn!(file = %path.display(), "[database] url changed: the gateway keeps its database until the next start");
     }
@@ -375,7 +386,12 @@ struct Route {
 
 fn read(path: &Path) -> Result<File, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    toml::from_str(&text).map_err(|e| Error(format!("{}: {e}", path.display())))
+    parse(path, &text)
+}
+
+/// The file at `path`, whose text is `text`.
+fn parse(path: &Path, text: &str) -> Result<File, Error> {
+    toml::from_str(text).map_err(|e| Error(format!("{}: {e}", path.display())))
 }
 
 impl File {

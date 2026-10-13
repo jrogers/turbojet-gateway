@@ -160,24 +160,7 @@ impl Users {
     ///
     /// Writing, renaming or syncing the directory fails.
     pub fn save(&self, path: &Path) -> io::Result<Option<String>> {
-        let text = toml::to_string(self).map_err(io::Error::other)?;
-        let directory = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        let old = std::fs::metadata(path).ok();
-        if let Some(old) = &old {
-            file.as_file().set_permissions(old.permissions())?;
-        }
-        file.write_all(text.as_bytes())?;
-        file.as_file().sync_all()?;
-        let warning = owner_change(old.as_ref(), &file.as_file().metadata()?);
-        file.persist(path).map_err(|e| e.error)?;
-        // The rename itself is durable once the directory is.
-        #[cfg(unix)]
-        std::fs::File::open(directory)?.sync_all()?;
-        Ok(warning)
+        write_atomically(path, &toml::to_string(self).map_err(io::Error::other)?)
     }
 
     /// User `name`'s new password, their role, clients and tokens kept.
@@ -400,6 +383,34 @@ fn check_hash(phc: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Writes `text` to `path` whole, through a temporary file in its directory renamed over it, so a
+/// reader never sees half a file and a crash leaves the old one or the new. The file keeps its
+/// permissions; a new one is readable by its owner only. Returns a warning if the file's owner
+/// changed: whoever runs this owns the new file. A symlink at `path` is replaced, not followed.
+///
+/// # Errors
+///
+/// Writing, renaming or syncing the directory fails.
+pub(crate) fn write_atomically(path: &Path, text: &str) -> io::Result<Option<String>> {
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    let old = std::fs::metadata(path).ok();
+    if let Some(old) = &old {
+        file.as_file().set_permissions(old.permissions())?;
+    }
+    file.write_all(text.as_bytes())?;
+    file.as_file().sync_all()?;
+    let warning = owner_change(old.as_ref(), &file.as_file().metadata()?);
+    file.persist(path).map_err(|e| e.error)?;
+    // The rename itself is durable once the directory is.
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(warning)
 }
 
 /// A warning if the file a save replaces, `old`, had another owner than the new one.
