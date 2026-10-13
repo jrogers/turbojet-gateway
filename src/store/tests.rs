@@ -636,3 +636,105 @@ async fn unknown_downstreams_are_those_without_a_request_sent() {
     assert!(!unknown.iter().any(|d| ["1", "2-1", "2-2"].contains(&d.as_str())));
     assert!(store.unknown_downstreams(&[]).await.unwrap().is_empty());
 }
+
+/// Order `id` of `client` written in `day`, done or live, with a request sent at `sent_at` and its
+/// ClOrdID.
+fn dated(id: u64, client: &ClientId, day: Option<Day>, done: bool, sent_at: DateTime<Utc>) -> Changes {
+    let mut row = order(id, client, false);
+    row.status = if done { Status::Filled } else { Status::New };
+    let sent = Sent {
+        order: OrderId(id),
+        origin: Origin::Client,
+        cl_ord_id: row.request.cl_ord_id.clone(),
+        orig_cl_ord_id: None,
+        kind: None,
+        answered: true,
+        sent_at,
+    };
+    let cl_ord_id =
+        ClOrdIdRow { client: client.clone(), day, cl_ord_id: row.request.cl_ord_id.clone(), order: OrderId(id) };
+    Changes {
+        orders: vec![OrderRow { order: row, day }],
+        sent: vec![(format!("{id}-1").into(), sent)],
+        cl_ord_ids: vec![cl_ord_id],
+        ..Changes::default()
+    }
+}
+
+/// `client`'s current day is `day`.
+fn current(client: &ClientId, day: Day) -> Changes {
+    Changes { days: vec![(client.clone(), Today { day, began: Some(time(0, 0)) })], ..Changes::default() }
+}
+
+async fn ids(store: &Store, sql: &str) -> Vec<i64> {
+    sqlx::query_scalar(sql).fetch_all(&store.pool).await.unwrap()
+}
+
+/// Pruning deletes only done orders of days ended before the cutoff, with their requests sent and
+/// ClOrdIDs, and keeps live ones, those with no day, a client's current day however old and the
+/// newest order: a load after is the load before. `pruned_through` is the latest request sent of
+/// those pruned, and doesn't move back for a later prune of earlier requests.
+#[tokio::test]
+async fn pruning_deletes_done_orders_of_past_days_and_load_is_unchanged() {
+    let store = memory().await;
+    let (funda, fundb) = (ClientId::from("FUNDA"), ClientId::from("FUNDB"));
+    let (day1, day2, day3) = (Day(time(1, 0)), Day(time(2, 0)), Day(time(3, 0)));
+    let written = [
+        dated(1, &funda, Some(day1), true, time(0, 5)),
+        dated(2, &funda, Some(day1), false, time(0, 6)),
+        // FUNDB's current day, though it ended before the cutoff.
+        dated(3, &fundb, Some(day1), true, time(0, 1)),
+        dated(4, &funda, Some(day2), true, time(1, 7)),
+        dated(5, &funda, Some(day3), true, time(2, 9)),
+        dated(6, &funda, None, true, time(0, 2)),
+        // The newest.
+        dated(7, &funda, Some(day2), true, time(1, 8)),
+        current(&funda, day3),
+        current(&fundb, day1),
+    ];
+    store.write(&written).await.unwrap();
+    let before = store.load().await.unwrap();
+    assert_eq!(store.pruned_through().await.unwrap(), None);
+
+    let cutoff = time(2, 30);
+    assert_eq!(store.prune(cutoff, 10).await.unwrap(), Pruned { orders: 2 });
+    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [2, 3, 5, 6, 7]);
+    assert_eq!(ids(&store, "SELECT order_id FROM sent ORDER BY order_id").await, [2, 3, 5, 6, 7]);
+    assert_eq!(ids(&store, "SELECT order_id FROM cl_ord_ids ORDER BY order_id").await, [2, 3, 5, 6, 7]);
+    assert_eq!(store.load().await.unwrap(), before);
+    assert_eq!(store.pruned_through().await.unwrap(), Some(time(1, 7)));
+    assert_eq!(store.prune(cutoff, 10).await.unwrap(), Pruned { orders: 0 });
+
+    // FUNDB's day moves on: its order of day 1, sent earliest, goes to an earlier cutoff.
+    store.write(&[current(&fundb, day3)]).await.unwrap();
+    assert_eq!(store.prune(time(1, 30), 10).await.unwrap(), Pruned { orders: 1 });
+    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [2, 5, 6, 7]);
+    assert_eq!(store.pruned_through().await.unwrap(), Some(time(1, 7)), "never moves back");
+}
+
+/// Batches run until one is short: a batch of 2 prunes all 5 orders it may.
+#[tokio::test]
+async fn pruning_runs_batches_until_none_are_left() {
+    let store = memory().await;
+    let funda = ClientId::from("FUNDA");
+    let mut written: Vec<Changes> =
+        (1..=6).map(|id| dated(id, &funda, Some(Day(time(1, 0))), true, time(0, u32::try_from(id).unwrap()))).collect();
+    written.push(current(&funda, Day(time(3, 0))));
+    store.write(&written).await.unwrap();
+    assert_eq!(store.prune(time(2, 0), 2).await.unwrap(), Pruned { orders: 5 });
+    assert_eq!(ids(&store, "SELECT id FROM orders").await, [6]);
+    assert_eq!(store.pruned_through().await.unwrap(), Some(time(0, 5)));
+}
+
+/// A database from before the `pruned` table gains it when opened.
+#[tokio::test]
+async fn opening_an_older_database_adds_the_pruned_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("jetbridge.db").display());
+    let store = Store::open(&url).await.unwrap();
+    sqlx::query("DROP TABLE pruned").execute(&store.pool).await.unwrap();
+    store.pool.close().await;
+    let store = Store::open(&url).await.unwrap();
+    assert_eq!(store.pruned_through().await.unwrap(), None);
+    assert_eq!(store.prune(time(2, 0), 1).await.unwrap(), Pruned { orders: 0 });
+}

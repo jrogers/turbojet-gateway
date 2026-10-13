@@ -4,8 +4,8 @@
 //! It also keeps the reports queued for clients that their sessions haven't yet stored, as
 //! `undelivered` rows the gateway adds and deletes (see [`Changes::undelivered`]).
 //!
-//! Orders are never deleted: what the book drops at a day roll stays as history, and `load` reads
-//! only what [`Book::restore`](crate::book::Book::restore) keeps. Values are stored so they read
+//! What the book drops at a day roll stays as history, until [`Store::prune`] deletes it, and
+//! `load` reads only what [`Book::restore`](crate::book::Book::restore) keeps. Values are stored so they read
 //! back exactly: decimals as their text, which keeps the scale; times as RFC 3339 text in UTC with
 //! nanoseconds, one fixed form, so two equal times are equal text; enums as short codes listed
 //! both ways in one list, so renaming a variant can't change what's stored. A client is its
@@ -256,7 +256,124 @@ impl Store {
         let mut seen = std::collections::HashSet::new();
         Ok(downstreams.iter().filter(|d| !known.contains(*d) && seen.insert(*d)).cloned().collect())
     }
+
+    /// Deletes the done orders of trading days that ended before `before`, with their requests
+    /// sent and ClOrdIDs, `batch` orders to a transaction, until none are left. It keeps live
+    /// orders, those with no day, its client's current day however old, and the newest order:
+    /// see `PRUNABLE` for why. What `load` loads is unchanged: it holds none of them. Raises
+    /// [`pruned_through`](Self::pruned_through) to the latest of their requests sent.
+    ///
+    /// # Panics
+    ///
+    /// `batch` is 0 or past 1,000. The book's writer waits on the store's one connection while
+    /// a batch runs, so each is kept short.
+    ///
+    /// # Errors
+    ///
+    /// The database refuses a statement or a commit; batches committed before stay pruned.
+    pub async fn prune(&self, before: DateTime<Utc>, batch: usize) -> io::Result<Pruned> {
+        assert!((1..=1_000).contains(&batch), "a prune batch of {batch} orders: 1 to 1,000");
+        let batch = u64::try_from(batch).expect("at most 1,000");
+        let before = time_text(before);
+        let mut pruned = Pruned { orders: 0 };
+        loop {
+            let orders = self.prune_batch(&before, batch).await?;
+            pruned.orders += orders;
+            if orders < batch {
+                return Ok(pruned);
+            }
+        }
+    }
+
+    /// One transaction of [`prune`](Self::prune): up to `batch` orders, found once into a
+    /// temporary table, as `load`'s `held`. How many it deleted.
+    async fn prune_batch(&self, before: &str, batch: u64) -> io::Result<u64> {
+        let mut transaction = self.pool.begin().await.map_err(database("starting a prune"))?;
+        let connection = &mut *transaction;
+        connection
+            .execute("CREATE TEMPORARY TABLE pruning (id BIGINT PRIMARY KEY)")
+            .await
+            .map_err(database("pruning orders"))?;
+        let orders = sqlx::query(&format!("INSERT INTO pruning (id) {PRUNABLE}"))
+            .bind(before)
+            .bind(signed(batch)?)
+            .execute(&mut *connection)
+            .await
+            .map_err(database("finding orders to prune"))?
+            .rows_affected();
+        let latest: Option<String> =
+            sqlx::query_scalar("SELECT MAX(s.sent_at) FROM pruning p CROSS JOIN sent s WHERE s.order_id = p.id")
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(database("reading the pruned requests' times"))?;
+        for table in ["sent", "cl_ord_ids"] {
+            let sql = format!("DELETE FROM {table} WHERE order_id IN (SELECT id FROM pruning)");
+            connection.execute(sql.as_str()).await.map_err(database("pruning orders"))?;
+        }
+        connection
+            .execute("DELETE FROM orders WHERE id IN (SELECT id FROM pruning)")
+            .await
+            .map_err(database("pruning orders"))?;
+        connection.execute("DROP TABLE pruning").await.map_err(database("pruning orders"))?;
+        if let Some(latest) = latest {
+            let latest = parse_time("sent_at", &latest)?;
+            if pruned_through(connection).await?.is_none_or(|through| through < latest) {
+                let query = sqlx::query(
+                    "INSERT INTO pruned (id, sent_through) VALUES (1, $1) \
+                     ON CONFLICT (id) DO UPDATE SET sent_through = excluded.sent_through",
+                )
+                .bind(time_text(latest));
+                run(connection, query, "recording what was pruned").await?;
+            }
+        }
+        transaction.commit().await.map_err(database("committing a prune"))?;
+        Ok(orders)
+    }
+
+    /// The latest time a request was sent of an order [`prune`](Self::prune) deleted, if it has
+    /// deleted any that had one: a venue may still store a request sent then or before, which the
+    /// store no longer knows. It never moves back.
+    ///
+    /// # Errors
+    ///
+    /// The database refuses the query, or holds a time this build can't read.
+    pub async fn pruned_through(&self) -> io::Result<Option<DateTime<Utc>>> {
+        let mut connection = self.pool.acquire().await.map_err(database("reading what was pruned"))?;
+        pruned_through(&mut connection).await
+    }
 }
+
+async fn pruned_through(connection: &mut AnyConnection) -> io::Result<Option<DateTime<Utc>>> {
+    let through: Option<String> = sqlx::query_scalar("SELECT sent_through FROM pruned")
+        .fetch_optional(connection)
+        .await
+        .map_err(database("reading what was pruned"))?;
+    through.map(|through| parse_time("sent_through", &through)).transpose()
+}
+
+/// What [`Store::prune`] deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    /// Orders deleted, with their requests sent and ClOrdIDs.
+    pub orders: u64,
+}
+
+/// The orders one [`Store::prune`] batch deletes, oldest first, `$1` the cutoff's `time_text`
+/// and `$2` the batch. A day is its end, stored by `time_text`, whose fixed width makes text
+/// order time order. Left alone:
+/// - a live order, which the book holds and a venue may still report on;
+/// - one with no day, as its client had none yet: `load` holds it while its client has no day or
+///   is in its first, and such rows are few, written only before a client's first day;
+/// - the newest order, as `load` takes the next OrderId from `MAX(id)`: pruning it would let a
+///   new order take its ID;
+/// - one of its client's current day, however old, as `load` holds it (see [`HELD`]): a client
+///   gone quiet keeps its day until it's next seen.
+const PRUNABLE: &str = "SELECT o.id FROM orders o
+    WHERE o.live = 0 AND o.day IS NOT NULL AND o.day < $1
+        AND o.id < (SELECT MAX(id) FROM orders)
+        AND NOT EXISTS (SELECT 1 FROM days d WHERE d.client = o.client
+            AND d.client_comp_id = o.client_comp_id AND d.day_end = o.day)
+    ORDER BY o.id LIMIT $2";
 
 /// Downstream ClOrdIDs looked up per query by [`Store::unknown_downstreams`]: under SQLite's
 /// oldest limit of 999 parameters, and PostgreSQL's 65,535.
@@ -392,6 +509,12 @@ const TABLES: &[&str] = &[
         client TEXT NOT NULL,
         client_comp_id TEXT NOT NULL,
         message BYTEA NOT NULL
+    )",
+    // The latest request sent of the orders pruned: see `Store::pruned_through`. `IF NOT EXISTS`
+    // adds it to a database made before it, so the schema version stays.
+    "CREATE TABLE IF NOT EXISTS pruned (
+        id BIGINT PRIMARY KEY CHECK (id = 1),
+        sent_through TEXT NOT NULL
     )",
 ];
 
