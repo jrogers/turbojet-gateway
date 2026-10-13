@@ -97,8 +97,8 @@ impl SessionView {
     }
 }
 
-/// `GET /api/sessions`: the clients' sessions connected now, by ID, then every venue's, connected
-/// or not, by name.
+/// `GET /api/sessions`: the clients' sessions connected now, by ID, then those paused and not
+/// connected, then every venue's, connected or not, by name.
 pub(super) async fn sessions(axum::extract::State(state): AxumState) -> Result<Json<Vec<SessionView>>, ApiError> {
     let service = state.service()?;
     let mut clients = service.client_statuses();
@@ -107,6 +107,11 @@ pub(super) async fn sessions(axum::extract::State(state): AxumState) -> Result<J
         .iter()
         .map(|status| SessionView::new(SessionSide::Client, &status.id, status.paused, Some(status)))
         .collect();
+    // A paused client is logged out, and would otherwise vanish from the list it's resumed from.
+    let mut paused = service.client_paused();
+    paused.retain(|id| !clients.iter().any(|status| &status.id == id));
+    paused.sort_by_cached_key(ToString::to_string);
+    sessions.extend(paused.iter().map(|id| SessionView::new(SessionSide::Client, id, true, None)));
     for name in service.venues() {
         // Gone if a reload stopped it since.
         let Some(handle) = service.venue_session(&name) else { continue };

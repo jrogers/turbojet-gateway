@@ -198,6 +198,11 @@ impl Service {
         self.acceptor.statuses()
     }
 
+    /// The client sessions an operator has paused, connected or not.
+    pub fn client_paused(&self) -> Vec<SessionId> {
+        self.acceptor.paused()
+    }
+
     /// The venues whose initiators are running, by name (`[initiator.NAME]`), in order.
     pub fn venues(&self) -> Vec<String> {
         self.initiators.names()
