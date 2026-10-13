@@ -508,7 +508,6 @@ impl Gateway {
             if !state.book.is_unknown_at_venue(order) {
                 return Err(ResolveError::NotUnknownAtVenue);
             }
-            warn!(order = %found.name, client = %found.client, "resolving an order unknown at its venue");
             self.handle_locked(&mut state, [Input::Resolve { order }], None);
         }
         self.committed().await;

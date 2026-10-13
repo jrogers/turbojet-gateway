@@ -273,7 +273,7 @@ pub(super) async fn request_status(
 }
 
 /// `POST /api/orders/{order_id}/resolve {reason}`: cancels the order whose OrderID(37) is
-/// `order_id`, which its venue has said it doesn't know (see [`Gateway::resolve`]); 202 once the
+/// `order_id`, which its venue has said it doesn't know (see [`Gateway::resolve`]); 204 once the
 /// cancel is committed. 404 if the book doesn't hold the order, 409 if it's done or the venue
 /// hasn't said so.
 pub(super) async fn resolve(
@@ -298,7 +298,7 @@ pub(super) async fn resolve(
             ResolveError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, unknown),
             ResolveError::Done | ResolveError::NotUnknownAtVenue => ApiError::new(StatusCode::CONFLICT, e.to_string()),
         })?;
-        Ok((StatusCode::ACCEPTED, None))
+        Ok((StatusCode::NO_CONTENT, None))
     })
     .await
 }
@@ -1046,7 +1046,7 @@ mod tests {
 
         crate::edge::tests::unknown_at_venue(fixture.service.gateway(), &order);
         assert_eq!(fixture.ok(&format!("/api/orders/{order}")).await["unknown_at_venue"], true);
-        fixture.expect(&resolve, REASON, StatusCode::ACCEPTED).await;
+        fixture.expect(&resolve, REASON, StatusCode::NO_CONTENT).await;
         assert_eq!(fixture.last_result(), "allowed");
         let read = fixture.ok(&format!("/api/orders/{order}")).await;
         assert_eq!((&read["status"], &read["unknown_at_venue"]), (&"canceled".into(), &false.into()));

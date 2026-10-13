@@ -1163,7 +1163,7 @@ async fn an_order_unknown_at_its_venue_is_resolved() {
     assert_eq!(alarm.await.expect("no alarm").kind, AlarmKind::UnknownAtVenue);
 
     let response = post(addr, &path("resolve"), &token, reason).await;
-    assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 204"), "{response}");
     let canceled: v44::ExecutionReport = setup.events.parse().await;
     assert_eq!(
         (canceled.cl_ord_id.as_deref(), canceled.exec_type.known(), canceled.ord_status.known()),
