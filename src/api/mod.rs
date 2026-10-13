@@ -24,7 +24,7 @@ use axum::serve::ListenerExt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -35,6 +35,7 @@ use crate::service::Service;
 
 mod auth;
 mod listener;
+mod live;
 mod read;
 mod write;
 
@@ -52,6 +53,9 @@ pub(crate) struct State {
     service: Weak<Service>,
     auth: Arc<Auth>,
     audit: Arc<Audit>,
+    /// Set once the server is stopping: its graceful shutdown waits for requests, but not for the
+    /// websockets they upgraded to, which watch this to close.
+    stopping: watch::Sender<bool>,
 }
 
 impl State {
@@ -108,6 +112,7 @@ fn router(state: State) -> axum::Router {
         .route("/api/orders/{order_id}", get(read::order))
         .route("/api/risk", get(read::risk))
         .route("/api/routes", get(read::routes))
+        .route("/api/live", get(live::live))
         .route("/api/sessions/{id}/pause", post(write::pause))
         .route("/api/sessions/{id}/resume", post(write::resume))
         .route("/api/sessions/{id}/resend", post(write::resend))
@@ -320,7 +325,8 @@ impl Bound {
     /// Serves the API's routes, with handlers reaching `service`.
     pub(crate) fn serve(self, service: Weak<Service>) -> Server {
         let local_addr = self.listener.local_addr().unwrap_or(self.config.listen);
-        let app = router(State { service, auth: self.auth.clone(), audit: self.audit });
+        let stopping = watch::Sender::new(false);
+        let app = router(State { service, auth: self.auth.clone(), audit: self.audit, stopping: stopping.clone() });
         let (stop, stopped) = oneshot::channel::<()>();
         #[cfg(feature = "tls")]
         let task = match &self.tls {
@@ -337,6 +343,7 @@ impl Bound {
             tls: self.tls,
             auth: self.auth,
             stop,
+            stopping,
             task,
         }
     }
@@ -370,6 +377,8 @@ pub(crate) struct Server {
     tls: Option<turbojet::tls::ServerTls>,
     auth: Arc<Auth>,
     stop: oneshot::Sender<()>,
+    /// See [`State::stopping`].
+    stopping: watch::Sender<bool>,
     task: JoinHandle<io::Result<()>>,
 }
 
@@ -378,8 +387,10 @@ impl Server {
         self.local_addr
     }
 
-    /// Stops accepting, and waits up to [`SHUTDOWN_WAIT`] for the requests under way.
+    /// Stops accepting, closes the websockets, and waits up to [`SHUTDOWN_WAIT`] for the requests
+    /// under way.
     pub(crate) async fn shutdown(self) {
+        self.stopping.send_replace(true);
         let _ = self.stop.send(());
         let mut task = self.task;
         match tokio::time::timeout(SHUTDOWN_WAIT, &mut task).await {
@@ -397,6 +408,7 @@ impl Server {
 
     /// Stops at once, without waiting: the service is being dropped.
     pub(crate) fn abort(&self) {
+        self.stopping.send_replace(true);
         self.task.abort();
     }
 
@@ -440,7 +452,7 @@ pub(crate) mod tests {
     pub(crate) fn state(auth: Arc<Auth>) -> (State, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(Audit::open(&dir.path().join("audit.jsonl")).unwrap());
-        (State { service: Weak::new(), auth, audit }, dir)
+        (State { service: Weak::new(), auth, audit, stopping: watch::Sender::new(false) }, dir)
     }
 
     /// The API's routes, and `/test/peer` answering the client's address as handlers see it.

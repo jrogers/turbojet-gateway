@@ -181,7 +181,7 @@ impl Refusal {
         }
     }
 
-    fn message(self) -> &'static str {
+    pub(super) fn message(self) -> &'static str {
         match self {
             Self::NoCredentials => "log in, or send Authorization: Bearer <token>",
             Self::BadPassword => "wrong user or password",
@@ -390,6 +390,18 @@ impl Auth {
     /// The caller of a request with `headers`, by `method`, from `ip`; see the module
     /// documentation.
     fn authenticate(&self, method: &Method, headers: &HeaderMap, ip: IpAddr) -> Result<Caller, Refused> {
+        self.check(method, headers, ip, true)
+    }
+
+    /// Whether the GET with `headers` that `ip` upgraded to a websocket still authenticates: its
+    /// session hasn't ended, or its token hasn't been revoked. Unlike a request, it doesn't count
+    /// as using the session, so a socket left open doesn't keep its session from idling out.
+    pub(super) fn recheck(&self, headers: &HeaderMap, ip: IpAddr) -> Result<(), Refusal> {
+        self.check(&Method::GET, headers, ip, false).map(drop).map_err(|Refused(refusal, _)| refusal)
+    }
+
+    /// [`authenticate`](Self::authenticate), counting the request as the session's use if `used`.
+    fn check(&self, method: &Method, headers: &HeaderMap, ip: IpAddr, used: bool) -> Result<Caller, Refused> {
         let users = self.users();
         if let Some(value) = headers.get(AUTHORIZATION) {
             // The scheme is case-insensitive (RFC 9110).
@@ -418,7 +430,9 @@ impl Auth {
         if is_websocket(headers) && !self.same_origin(headers) {
             return Err(Refused(Refusal::Origin, Some(session.user.clone())));
         }
-        session.last_seen = now;
+        if used {
+            session.last_seen = now;
+        }
         let reference = SessionRef { id: id.to_string(), csrf: session.csrf.clone() };
         Ok(Caller::new(&session.user, user, ip, Some(reference)))
     }
@@ -823,6 +837,7 @@ mod tests {
         ("GET", "/api/orders/JB1"),
         ("GET", "/api/risk"),
         ("GET", "/api/routes"),
+        ("GET", "/api/live"),
         ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/pause"),
         ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/resume"),
         ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/resend"),
@@ -978,6 +993,20 @@ mod tests {
         assert_eq!(answer.status, StatusCode::NO_CONTENT);
         assert!(answer.headers[SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
         assert_eq!(send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A live socket's recheck doesn't count as using its session, which idles out regardless.
+    #[tokio::test]
+    async fn a_recheck_doesnt_keep_a_session() {
+        let (auth, clock) = auth(users(), false);
+        let app = app(&auth);
+        let (cookie, _) = session(&app, "alice", "secret").await;
+        let headers = HeaderMap::from_iter([(COOKIE, cookie.parse().unwrap())]);
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        clock.pass(SESSION_IDLE - Duration::from_secs(1));
+        assert_eq!(auth.recheck(&headers, ip), Ok(()));
+        clock.pass(Duration::from_secs(1));
+        assert_eq!(auth.recheck(&headers, ip), Err(Refusal::SessionEnded));
     }
 
     /// A user removed, or whose password changed, loses their sessions; a changed role applies at

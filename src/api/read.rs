@@ -15,6 +15,7 @@ use turbojet::{SessionId, SessionStatus};
 use super::{ApiError, State};
 use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
 use crate::router::Target;
+use crate::service::Service;
 
 /// Orders a page of `GET /api/orders` holds without a `limit`: a screenful.
 const ORDERS_PAGE_DEFAULT: usize = 100;
@@ -40,7 +41,7 @@ pub(super) struct SessionView {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum SessionSide {
+pub(super) enum SessionSide {
     Client,
     Venue,
 }
@@ -100,7 +101,11 @@ impl SessionView {
 /// `GET /api/sessions`: the clients' sessions connected now, by ID, then those paused and not
 /// connected, then every venue's, connected or not, by name.
 pub(super) async fn sessions(axum::extract::State(state): AxumState) -> Result<Json<Vec<SessionView>>, ApiError> {
-    let service = state.service()?;
+    Ok(Json(session_views(&*state.service()?)))
+}
+
+/// What [`sessions`] answers.
+pub(super) fn session_views(service: &Service) -> Vec<SessionView> {
     let mut clients = service.client_statuses();
     clients.sort_by_cached_key(|status| status.id.to_string());
     let mut sessions: Vec<_> = clients
@@ -121,7 +126,7 @@ pub(super) async fn sessions(axum::extract::State(state): AxumState) -> Result<J
         view.venue = Some(name);
         sessions.push(view);
     }
-    Ok(Json(sessions))
+    sessions
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,7 +263,6 @@ pub(super) mod tests {
     use super::super::tests::{Answer, send};
     use super::*;
     use crate::auth::{Role, Users};
-    use crate::service::Service;
 
     struct Nothing;
 
@@ -275,6 +279,7 @@ pub(super) mod tests {
         pub(in crate::api) scoped: String,
         pub(in crate::api) admin: String,
         pub(in crate::api) service: Arc<Service>,
+        pub(in crate::api) state: State,
         _client: Initiator,
         /// The configuration's, then the audit log's.
         pub(in crate::api) dirs: (tempfile::TempDir, tempfile::TempDir),
@@ -322,8 +327,8 @@ pub(super) mod tests {
             super::super::tests::state(Arc::new(Auth::new(Default::default(), users, false, false)));
         state.service = Arc::downgrade(&service);
         let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
-        let app = super::super::router(state).layer(MockConnectInfo(peer));
-        Fixture { app, viewer, operator, scoped, admin, service, _client: client, dirs: (dir, audit_dir) }
+        let app = super::super::router(state.clone()).layer(MockConnectInfo(peer));
+        Fixture { app, viewer, operator, scoped, admin, service, state, _client: client, dirs: (dir, audit_dir) }
     }
 
     impl Fixture {

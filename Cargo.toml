@@ -31,7 +31,7 @@ turbojet-config = { path = "../turbojet/crates/turbojet-config", features = ["tz
 turbojet-fix42 = { path = "../turbojet/crates/turbojet-fix42" }
 turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
 # The operator API's HTTP server.
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 # Turbojet's clock and schedules speak chrono's times.
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 # Turbojet's string and decimal types, for their serde impls: the API's views hold them.
@@ -53,6 +53,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rcgen = "0.14"
 # Calling the API's router in-process.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# A websocket client for the live socket's tests, at axum's version.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false }
 # The end-to-end tests' relay between the gateway and a venue.
 tokio = { version = "1", features = ["io-util"] }
 

@@ -11,9 +11,10 @@ use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use turbojet::{Acceptor, SessionHandle, SessionId, SessionSchedule, SessionStatus};
+use turbojet::{Acceptor, SessionEvent, SessionHandle, SessionId, SessionSchedule, SessionStatus};
 use turbojet_config::{Changes, Initiators, SessionsFile};
 
 use crate::api;
@@ -211,6 +212,11 @@ impl Service {
     /// The client sessions an operator has paused, connected or not.
     pub fn client_paused(&self) -> Vec<SessionId> {
         self.acceptor.paused()
+    }
+
+    /// What happens to the client sessions from now on: see [`Acceptor::subscribe`].
+    pub fn client_events(&self) -> broadcast::Receiver<SessionEvent> {
+        self.acceptor.subscribe()
     }
 
     /// The venues whose initiators are running, by name (`[initiator.NAME]`), in order.
