@@ -80,3 +80,15 @@ Notable changes to Jetbridge.
 - SIGHUP reloads the sessions file, the routes, the risk limits and `day_end`, keeping either file if it
   doesn't load; Ctrl-C or SIGTERM logs every session out and says what the stop leaves open.
   Optional TLS (feature `tls`).
+- An operator API, with `[api]` in `jetbridge.toml`: HTTP and JSON on its own port, on loopback
+  unless it has TLS (feature `tls`) or `behind_proxy = true`. Viewers read the sessions, the
+  book's orders (working ones and each client's current day), risk usage and the routes;
+  operators pause, resume and resend sessions, cancel an order and use the kill switch; admins
+  reload and read the audit log. `GET /api/live` is a websocket sending a snapshot, then the
+  orders, blocks, alarms and session events as they happen.
+- Users in a `users` file, edited with `jetbridge user add|passwd|remove` and `jetbridge token
+  add|revoke`: argon2 passwords for a browser session with a CSRF token, or bearer tokens kept
+  hashed, in three roles, optionally limited to some CompIDs. Failed logins are limited per name
+  and per address.
+- An audit log: every change through the API, and every login and logout, as a JSON line synced
+  to disk before it runs, with who, from where, why and what came of it; refusals too.

@@ -40,14 +40,16 @@ reports back, keeping each order's state as it goes.
 - **Risk limits** per CompID, checked on each order and replace before it goes to a venue: order
   quantity, notional, allowed symbols, a price band around the last fill, credit and self-trade
   prevention.
-- **A kill switch**, as library calls: block a client session, a CompID or everyone, and cancel
-  their orders at the venues.
+- **A kill switch**, over the API or as library calls: block a client session, a CompID or
+  everyone, and cancel their orders at the venues.
 - **A trading day** per client session, from its schedule or a daily `day_end`: at its end, done
   orders and their ClOrdIDs go, and the session's ClOrdID count and filled notional start again.
 - **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
   cancelled when its session drops and it doesn't log back on in time, and at shutdown.
 - **A database**, optional (SQLite): the book, blocks, risk counts and undelivered reports
   survive a restart, and the restart sorts out what a crash left half done with the venues.
+- **An operator API**, optional: HTTP and JSON, with local users in three roles, an audit log of
+  every change, and a websocket of the book's and the sessions' changes as they happen.
 - **Reload on SIGHUP** of the routes, the risk limits, `day_end` and the sessions file, keeping connected
   sessions the file still has.
 
@@ -133,8 +135,7 @@ now.
   key }` (PEM, with the `tls` feature) serves HTTPS, and a reload takes a renewed certificate;
   other changes apply at the next start, and an `[api]` that doesn't load refuses the whole
   reload of this file. Off loopback the API refuses to start without `tls`,
-  unless `behind_proxy = true` says a proxy in front terminates TLS. `GET /api/health` answers
-  `{"version": "..."}`.
+  unless `behind_proxy = true` says a proxy in front terminates TLS. See [API](#api).
 
 ### sessions.toml
 
@@ -312,10 +313,10 @@ under way ends when it was going to.
 
 ## Kill switch
 
-An operator can stop a client trading, with library calls on the running gateway
-(`Service::gateway()`). Each takes a `Scope`: one client session, a CompID (all its sessions,
-including ones that log on later), or everyone. They're async, and with a database they return
-once their change has committed.
+An operator can stop a client trading, over the [API](#api) or with library calls on the
+running gateway (`Service::gateway()`). Each takes a `Scope`: one client session, a CompID (all
+its sessions, including ones that log on later), or everyone. They're async, and with a database
+they return once their change has committed.
 
 - `cancel_all(scope)` blocks the scope and cancels its clients' live orders at their venues, in
   one step. Each client gets an unsolicited Canceled report for each order as its venue confirms
@@ -352,6 +353,152 @@ logs on.
 At shutdown the gateway logs its clients out, which starts no countdown, so it cancels the working
 orders of every client session with cancel on disconnect on itself, whatever the trigger, logged
 as one warning with the count per session. Other clients' orders stay working at their venues.
+
+## API
+
+With `[api]` in `jetbridge.toml` (see [Configuration](#jetbridgetoml)), the gateway serves an HTTP
+JSON API for operators: the sessions, the book's orders, risk and routes to read, and the kill
+switch, session controls and reload to act with. Every answer is JSON, an error as
+`{"error": "..."}` with its status.
+
+### Users and tokens
+
+Users are in the `users` file. The binary edits it, rewriting it whole (comments aren't kept), and
+a reload (SIGHUP or `POST /api/reload`) applies the change. Run these as the gateway's user: the
+rewritten file belongs to whoever runs them.
+
+```sh
+jetbridge user add alice --role operator --clients FUNDA --users users.toml   # asks for a password
+jetbridge user passwd alice --users users.toml       # ends alice's sessions
+jetbridge token add alice --users users.toml         # prints the token, once
+jetbridge token revoke alice q3Xr --users users.toml # by its id, or its first characters
+jetbridge user remove alice --users users.toml
+```
+
+- **Roles**: `viewer` reads; `operator` also pauses, resumes and resends sessions, cancels orders,
+  and blocks, unblocks and cancels clients; `admin` also reloads and reads the audit log.
+- **`--clients`** limits a user to acting on those CompIDs' client sessions, orders and scopes. Such
+  a user still reads everything, and can't act on a venue's session or on `all`. Without it a user
+  acts on every client; the API shows its `clients` as `null`.
+- **Passwords** are at least 12 bytes, kept as argon2 hashes. **Tokens** (`jb_...`) are kept as
+  their SHA-256 only, so a lost token is revoked and replaced, not recovered.
+- **Logging in.** A script sends `Authorization: Bearer <token>` on each request. A browser
+  `POST`s `/api/login {"user", "password"}`, which sets a session cookie and answers
+  `{user, role, clients, csrf}`; each request but a GET then carries `X-CSRF-Token: <csrf>` too
+  (`GET /api/me` gives it again). `POST /api/logout` ends the session. A session ends after 8
+  hours unused or 24 hours in all, and when its user is removed or changes password. A change to
+  the users file applies, once reloaded, from the next request.
+- **Failed logins**: five a minute for a user name, or for an address (an IPv6 address counts as
+  its /64), then that name's or address's logins are refused (429) until a minute has passed
+  since its first failure. Tokens aren't limited.
+
+### Endpoints
+
+| Endpoint | Role | Does |
+| --- | --- | --- |
+| `GET /api/health` | none | `{"version"}` |
+| `POST /api/login`, `POST /api/logout`, `GET /api/me` | none, any, any | see above |
+| `GET /api/sessions` | viewer | client sessions connected or paused, then every venue's: status, sequence numbers, activity, `paused` |
+| `GET /api/orders` | viewer | the book's orders: `?client=&venue=&symbol=&status=&working=true&after=&limit=` |
+| `GET /api/orders/{order_id}` | viewer | one order by its OrderID(37), with every request sent for it |
+| `GET /api/risk` | viewer | the limits in force, each session's open and filled notional, reference prices, blocks |
+| `GET /api/routes` | viewer | the routes, in the order they're tried |
+| `GET /api/live` | viewer | a websocket; see [Live events](#live-events) |
+| `POST /api/sessions/{id}/pause` | operator | logs the session out and keeps it out until resumed |
+| `POST /api/sessions/{id}/resume` | operator | lets it log on again |
+| `POST /api/sessions/{id}/resend` | operator | `{from}`: asks the counterparty to send again from that MsgSeqNum; answers the sequence numbers |
+| `POST /api/orders/{order_id}/cancel` | operator | the gateway's own cancel of one order; retries a stuck one |
+| `POST /api/risk/block`, `/unblock` | operator | `{scope}`: see [Kill switch](#kill-switch); answers `{"changed"}` |
+| `POST /api/risk/cancel-all` | operator | `{scope}`: blocks the scope and cancels its orders |
+| `POST /api/reload` | admin | rereads the files, as SIGHUP does, and says what changed |
+| `GET /api/audit` | admin | `?since=&limit=`: the audit log's last entries |
+
+- **Every change needs a reason**: each POST but login and logout takes a JSON body with a
+  non-empty `reason` (up to 1,000 bytes), or is refused (400).
+- **Scopes** are `all`, `comp:COMPID` or `session:SESSION`, a session as `GET /api/sessions` shows
+  it (`session:FIX.4.4:JETBRIDGE->FUNDA`). A session scope names one the gateway has seen.
+- **A session in a path** is its `id` percent-encoded as `encodeURIComponent` does, `>` as `%3E` and
+  a `/` (before a SubID or LocationID) as `%2F`: `/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/pause`.
+  A client session can be acted on while connected or paused; otherwise it's 404.
+- **Orders** come by OrderID in a path, and are paged by their numeric `id`: `GET /api/orders`
+  answers `{orders, next}`, 100 by default and up to 1,000 with `limit`, and `next` is the `after`
+  for the following page (`null` after a short page; a full page may be followed by an empty one).
+  `client` is a scope (a session the gateway hasn't seen gives an empty page); `status` is `new`,
+  `partially_filled`, `filled`, `canceled` and so on. The orders are the book's: working ones and
+  each client's done orders of its current trading day.
+- **What a refusal says**: 401 without valid credentials, 403 for the role or the CSRF token or a
+  target out of a scoped user's CompIDs, 404 for a target that doesn't exist (whatever the user's
+  scope), 409 for an order already done or a resend the session can't make now (not logged on, a
+  resend under way, or `from` not below the next expected).
+- **Reload** answers 200 with what changed in the sessions file, the routes, limits and `day_end`
+  taken, and any warnings; or 422 if either file was kept, saying why and what the other one
+  changed, since that one did apply. Reloads run one at a time, and one sent during shutdown
+  answers 503.
+
+### Live events
+
+`GET /api/live` upgrades to a websocket. Anything but a browser authenticates the upgrade with a
+bearer token; a browser with its session cookie, from a page on the API's own host (its `Origin`
+must name the host it's sent to, over `https` when the cookie is `Secure`). A token is never taken
+in the URL. The socket first sends a snapshot,
+
+```json
+{"type":"snapshot","sessions":[...],"orders":[...],"orders_next":null,"blocked":["comp:FUNDA"],"unavailable":false}
+```
+
+with the sessions as `GET /api/sessions` has them and the working orders, up to 1,000: with a full
+page, `orders_next` is the `after` to read the rest from `GET /api/orders?working=true`. Then
+each change, in the order it happened:
+
+- `{"type":"order", ...}`: an order's whole view, as `GET /api/orders` has it, to put in place of
+  the one held, or add.
+- `{"type":"blocked","scope":...}` and `{"type":"unblocked","scope":...}`.
+- `{"type":"alarm","time","kind","text"}`, `kind` one of `gateway_unavailable`,
+  `gateway_available`, `stuck_cancel`, `orphan`, `overfill`, `unknown_order` and
+  `venue_store_reset`. Each is in the log too.
+- `{"type":"session","side","id","event"}` for the session keyed by `side` (`client` or `venue`)
+  and `id`: `connected`, `logged_on`, `logging_out`, `resend_started`, `resend_finished`,
+  `disconnected`, `paused`, `resumed`, or `refused` with a `reason`.
+
+The first few events may repeat what the snapshot shows. A socket that falls behind skips what it
+missed and gets a new snapshot; one that falls behind again within a second is closed with code
+1013 (too slow: reconnect). The gateway pings every 10 seconds and closes a socket it has heard
+nothing from for 30 seconds (1001); a socket also closes when the gateway stops (1001), and within
+10 seconds of its session ending or its token being revoked (1008). An open socket doesn't count
+as using its session, which still ends after 8 hours unused. 64 sockets may be open at once (503
+past that), 8 of them a user's (429). What the client sends is ignored.
+
+### Where it listens
+
+`listen` on loopback serves plain HTTP. Anywhere else the API needs `tls = { cert, key }`, or
+`behind_proxy = true` for a proxy in front that terminates TLS: the passwords and tokens mustn't
+cross the network in the clear. It serves HTTP/1.1, websockets included. Behind a proxy:
+
+- the client's address, for the login limit and the audit log, is the last `X-Forwarded-For` hop,
+  and a page's `Origin` is checked against `X-Forwarded-Host` if sent, else `Host`. The proxy must
+  set both, overwriting what the client sent;
+- the session cookie is `__Host-jetbridge_session`, `Secure` with `Path=/`, as under TLS (on
+  plain loopback it's `jetbridge_session` with `Path=/api`). The browser sends it to every path on
+  that host name, so give the API a host name of its own.
+
+### Audit log
+
+Every change through the API, and every login and logout, is appended to the `audit` file as one
+JSON line, synced to disk before it runs: a line that can't be written answers 503 and nothing is
+done.
+
+```json
+{"time":"2026-10-11T09:30:00.123456Z","user":"alice","role":"operator","ip":"192.0.2.1","action":"block","target":"comp:FUNDA","params":null,"reason":"runaway algo","result":"allowed"}
+```
+
+`result` is `allowed` or `refused: <why>`. An allowed change that didn't simply get done gets a
+second line: `failed: <why>`, or what happened instead, such as `unchanged: already blocked`.
+Refusals for a user's role, scope or a missing reason are recorded too, and so are failed and
+limited logins, wrong tokens, and wrong CSRF tokens or `Origin`s, at most 120 a minute of these
+(the rest are in the tracing log only). A failed login whose name isn't a user's is recorded as
+`<unknown>`. Reads aren't recorded, nor requests with no credentials or an ended session. The
+file is created readable by its owner only. `GET /api/audit` reads it back, oldest first: the last
+`limit` entries (100 by default, at most 1,000) from `since` (RFC 3339).
 
 ## Signals
 

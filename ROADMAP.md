@@ -6,21 +6,17 @@ knowing about is in [CAVEATS.md](CAVEATS.md).
 
 ## 1. Operator access
 
-Operator actions (block, unblock, cancel all) are library calls on the gateway today.
+The [API](README.md#api) covers sessions, the blotter, risk and the kill switch, reload and the
+audit log. Still to do:
 
-- **HTTP API** (L). JSON over axum on its own port, with a websocket that sends a snapshot of
-  sessions and working orders and then events. Covers sessions (status, pause, resume, sequence
-  numbers), the blotter and one order's messages, risk limits and usage, the kill switch, routing
-  rules with a dry run, config reload, and message log search. Needs:
-  - scopes that parse and print, a client looked up by its session string, and an order cancelled
-    by its OrderID or by (session, ClOrdID);
-  - read access to risk state (each session's open and filled notional, reference prices);
-  - an operator path for stuck gateway cancels;
-  - `block` and `unblock` returning the same shape.
-- **Users, roles and audit** (M). Local users in `users.toml` with argon2 password hashes, API
-  tokens stored hashed, and three roles (viewer, operator, admin), scoped by CompID for blocks and
-  cancels. Every operator call carries who made it and why, and goes to an append-only audit log
-  before it's answered, refusals included.
+- **More of the API** (M). The message log per session, with search; editing the risk limits;
+  a routing dry run (which route an order would take); setting and resetting a session's
+  sequence numbers; and asking a venue for an order's status, which needs the book to send an
+  OrderStatusRequest of its own.
+- **History beyond the current day** (M). The blotter reads the book, which holds each client's
+  current day only; earlier days are in the database but not readable over the API.
+- **Audit log rotation** (S). The file grows for as long as the gateway runs, and reading it back
+  reads it whole.
 - **Console** (L). A React and TypeScript web console in `web/`, built into release builds:
   sessions, blotter, risk with the kill switch, logs, and admin (routing, reload, audit).
 

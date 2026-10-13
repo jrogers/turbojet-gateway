@@ -258,3 +258,40 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   its countdowns: a restart doesn't start them again.
 - A panic in the book stops the process rather than carry on with a book that may be half
   changed.
+
+## Operator API
+
+- Logins are kept in memory: a restart logs everyone out. At most 1,024 are kept; past that, the
+  least recently used ends.
+- Keep a token for the kill switch. Anyone who can reach the API can lock a user name out of
+  password login for a minute with five wrong passwords, and a flood of failed logins from 10,000
+  names, or 10,000 addresses, blocks password logins from new ones until they age out. Tokens
+  aren't limited.
+- The blotter (`GET /api/orders`, `GET /api/orders/{order_id}`) reads the book: working orders and
+  each client's done orders of its current trading day. Earlier days are in the database, if there
+  is one, but not readable over the API.
+- `GET /api/sessions` lists a client session only while it's connected or paused, so a client
+  that has never connected, or disconnected without being paused, isn't listed and can't be
+  paused (404). Pausing logs the session out: it shows as disconnected and paused.
+- The audit log isn't rotated, and `GET /api/audit` reads the whole file each time. A file moved
+  away is created afresh at the next line, and the old one's entries are no longer read back.
+  Lines are written one at a time within the gateway's process only: two processes mustn't share
+  an audit file. A change waits for its line behind any refusals being written, up to 120 a
+  minute of anonymous ones, each synced to disk.
+- A reload answered 422 may have applied half: the file that loaded is in use. The answer says
+  which.
+- Each API connection holds one of 256 slots for as long as it's open, idle or not: there's no
+  idle timeout. Past 256, new connections wait in the kernel's backlog. A live socket holds one
+  too, up to 64 of them.
+- Alarms are sent only to the live sockets open when they're raised; earlier ones are in the log.
+  The alarms of a start's recovery (orphans) come before the API is up, so only the log has them.
+- Behind a proxy, the client's address is whatever the last `X-Forwarded-For` hop says, and a
+  page's host whatever the last `X-Forwarded-Host` says: a proxy that passes the client's own
+  through lets it choose its address for the login limit and the audit log. The proxy must set
+  and overwrite them. A proxy that sends no `X-Forwarded-For` is every client's address, with a
+  warning logged once: every login then shares one limit.
+- Under TLS, or behind a proxy, the session cookie is `__Host-jetbridge_session` with `Path=/`, so
+  the browser sends it to every path on the API's host name: give the API a host name of its own,
+  not a path on a site that serves other pages.
+- A live socket's snapshot holds up to 1,000 working orders; the rest are read from
+  `GET /api/orders`, and may change between the two.
