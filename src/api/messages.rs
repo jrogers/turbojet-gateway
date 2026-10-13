@@ -53,6 +53,11 @@ const CONDITIONS_MAX: usize = 100;
 /// logged as it arrived, a moment before.
 const ORDER_MARGIN: TimeDelta = TimeDelta::minutes(1);
 
+/// How long after the range's end a search still gives a `follow`: a record is stamped as it's
+/// logged and written to its file a moment later (the log's writer gathers for a millisecond),
+/// so one stamped just before the end may not be in the file yet as the end passes.
+const FOLLOW_SLACK: TimeDelta = TimeDelta::seconds(2);
+
 const _: () = assert!(PAGE_DEFAULT <= PAGE_MAX);
 // A page reads a record at least, so paging always moves on.
 const _: () = assert!(SEARCH_BYTES_MAX > 0);
@@ -368,7 +373,7 @@ fn scan(dir: &Path, search: &Search, bytes_max: u64, now: DateTime<Utc>) -> Resu
             return Ok(Page { messages: reading.messages, next: Some(stopped.encode()), follow: None });
         }
     }
-    let ended = search.range.until.is_none_or(|until| until <= now);
+    let ended = search.range.until.is_none_or(|until| until <= now - FOLLOW_SLACK);
     let follow = if ended { None } else { reading.end.map(Cursor::encode) };
     Ok(Page { messages: reading.messages, next: None, follow })
 }
@@ -806,7 +811,8 @@ mod tests {
     }
 
     /// While the range's end is to come, the last page has no `next` but a `follow`, the end of
-    /// what's logged, from which what's logged later is found; once it's come, it has neither.
+    /// what's logged, from which what's logged later is found; once it's come, and
+    /// [`FOLLOW_SLACK`] after it, it has neither.
     #[test]
     fn a_range_not_yet_ended_can_be_followed() {
         let dir = tempfile::tempdir().unwrap();
@@ -814,8 +820,10 @@ mod tests {
         log(dir.path(), &[order(0, "A")]);
         let mut search = Search::new(vec![LogFilter::default()], at(8, 0, 0), None, None, None).unwrap();
         let ids = |page: &Page| page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>();
-        let ended = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0)).unwrap();
+        let ended = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0) + FOLLOW_SLACK).unwrap();
         assert_eq!((ended.next, ended.follow), (None, None));
+        let ending = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0) + TimeDelta::seconds(1)).unwrap();
+        assert!(ending.follow.is_some());
         let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(8, 12, 0)).unwrap();
         assert_eq!(ids(&page), ["A"]);
         assert_eq!(page.next, None);
