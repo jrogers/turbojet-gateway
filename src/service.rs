@@ -428,12 +428,12 @@ impl Service {
         warnings
     }
 
-    /// Waits for a reload under way and refuses later ones, stops pruning, stops the operator API (its requests
-    /// under way finish first, briefly), logs the clients' sessions out, cancels the working
-    /// orders of those with cancel on disconnect (pending countdowns fire as the clients go; the
-    /// shutdown's own Logouts start none), waits for the venues to answer the gateway's cancels,
-    /// logs the venues' sessions out, returning once all have closed, then logs what the stop
-    /// loses. The message log writes what it holds and finishes its last file once the service is
+    /// Waits for a reload under way and refuses later ones, stops pruning, stops the operator API
+    /// (its requests under way finish first, briefly), logs the clients' sessions out, cancels the
+    /// working orders of those with cancel on disconnect (pending countdowns fire as the clients
+    /// go; the shutdown's own Logouts start none), waits for the venues to answer the gateway's
+    /// cancels, logs the venues' sessions out, returning once all have closed, then logs what the
+    /// stop loses. The message log writes what it holds and finishes its last file once the service is
     /// dropped (with the sessions, which hold it too).
     pub async fn shutdown(&self) {
         // A reload under way finishes first; any later one finds the flag and does nothing.
@@ -1299,7 +1299,7 @@ mod tests {
     /// here counting, before its first await. Later runs aren't checked: the paused clock races
     /// ahead of the database, whose run delays the next tick.
     #[tokio::test]
-    async fn pruning_runs_an_hour_after_the_start_and_hourly() {
+    async fn the_first_prune_is_an_hour_after_the_start() {
         use std::sync::atomic::AtomicUsize;
         let store = Store::open("sqlite::memory:").await.unwrap();
         let runs = Arc::new(AtomicUsize::new(0));
