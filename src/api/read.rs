@@ -636,10 +636,11 @@ pub(super) mod tests {
         let page = fixture.ok(&format!("/api/orders?{range}")).await;
         assert_eq!(names(&page), (vec!["A100", "A101", "A102"], &serde_json::Value::Null));
         assert_eq!(page["orders"][0]["created"], "2026-10-01T09:00:00Z");
-        // `to` isn't included; `to` is now by default.
-        let page = fixture.ok("/api/orders?from=2026-10-01T00:00:00Z&to=2026-10-02T09:00:00Z").await;
+        // `from` is included, `to` isn't.
+        let page = fixture.ok("/api/orders?from=2026-10-01T09:00:00Z&to=2026-10-02T09:00:00Z").await;
         assert_eq!(names(&page).0, ["A100"]);
-        assert_eq!(names(&fixture.ok("/api/orders?from=2026-10-02T10:00:00Z").await).0, ["A102"]);
+        let page = fixture.ok("/api/orders?from=2026-10-02T10:00:00Z&to=2026-10-04T00:00:00Z").await;
+        assert_eq!(names(&page).0, ["A102"]);
         assert!(!names(&fixture.ok("/api/orders").await).0.contains(&"A100"));
 
         let found = |query: &'static str| {
@@ -676,30 +677,54 @@ pub(super) mod tests {
         assert_eq!(seen, ["A100", "A101", "A102"]);
     }
 
-    /// A range too long, empty or backwards, `to` alone, an `after` that isn't a range's, or a
-    /// range without a database: 400.
+    /// A range too long, empty or backwards, `to` alone, a time that isn't one, an `after` that
+    /// isn't a range's, or a range without a database: 400, each for its own reason.
     #[tokio::test]
     async fn bad_ranges_are_refused() {
         let fixture = with_history("").await;
-        let from = "from=2026-10-01T00:00:00Z";
+        let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z";
         let id = fixture.ok("/api/orders").await["orders"][0]["id"].as_u64().unwrap();
-        let book_next = format!("{from}&after={id}");
-        for bad in [
-            &format!("{from}&to=2026-11-01T00:00:01Z"),
-            &format!("{from}&to=2026-10-01T00:00:00Z"),
-            &format!("{from}&to=2026-09-30T00:00:00Z"),
-            "to=2026-10-04T00:00:00Z",
-            "from=yesterday",
-            &format!("{from}&after=JB1"),
-            &book_next,
-        ] {
-            assert_eq!(fixture.get(&format!("/api/orders?{bad}")).await.status, StatusCode::BAD_REQUEST, "{bad}");
+        let from = "from=2026-10-01T00:00:00Z";
+        let cases = [
+            (format!("{from}&to=2026-11-01T00:00:01Z"), "a range covers 31 days at most"),
+            (format!("{from}&to=2026-10-01T00:00:00Z"), "from must be before to"),
+            (format!("{from}&to=2026-09-30T00:00:00Z"), "from must be before to"),
+            ("to=2026-10-04T00:00:00Z".to_string(), "to needs from"),
+            (format!("{range}&after=JB1"), "after isn't a next a range of orders gave"),
+            (format!("{range}&after={id}"), "after isn't a next a range of orders gave"),
+        ];
+        for (query, error) in cases {
+            let answer = fixture.get(&format!("/api/orders?{query}")).await;
+            assert_eq!(
+                (answer.status, answer.body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some(error)),
+                "{query}"
+            );
         }
-        fixture.ok(&format!("{}&to=2026-11-01T00:00:00Z", "/api/orders?from=2026-10-01T00:00:00Z")).await;
+        let answer = fixture.get("/api/orders?from=yesterday&to=2026-10-04T00:00:00Z").await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+        assert!(answer.body["error"].as_str().unwrap().contains("from"), "{}", answer.body);
+        // 31 days exactly is taken.
+        fixture.ok(&format!("/api/orders?{from}&to=2026-11-01T00:00:00Z")).await;
 
-        let answer = fixture_with("").await.get(&format!("/api/orders?{from}")).await;
+        let answer = fixture_with("").await.get(&format!("/api/orders?{range}")).await;
         assert_eq!(answer.status, StatusCode::BAD_REQUEST);
         assert_eq!(answer.body["error"], "no [database]: only the current day is kept");
+    }
+
+    /// `to` is now by default: a range from an hour ago is taken, and holds none of the past
+    /// orders; one from an hour ahead is empty, so refused.
+    #[tokio::test]
+    async fn to_is_now_by_default() {
+        let fixture = with_history("").await;
+        let from = |hours| (Utc::now() + TimeDelta::hours(hours)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let page = fixture.ok(&format!("/api/orders?from={}", from(-1))).await;
+        assert!(!names(&page).0.iter().any(|name| name.starts_with("A10")), "{page}");
+        let answer = fixture.get(&format!("/api/orders?from={}", from(1))).await;
+        assert_eq!(
+            (answer.status, answer.body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("from must be before to"))
+        );
     }
 
     /// Risk counts the resting order's session; the routes are the file's.
