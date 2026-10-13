@@ -9,6 +9,8 @@ publish = false
 [features]
 # TLS for the acceptor and initiators, from the sessions file, and for the API.
 tls = ["turbojet/tls", "turbojet-config/tls", "dep:tokio-rustls"]
+# `[message_log] compress`: gzip the message log's finished files.
+gzip = ["turbojet/gzip"]
 
 [dependencies]
 # The API's password hashes (argon2id, PHC strings): slow on purpose.

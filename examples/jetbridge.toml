@@ -29,3 +29,10 @@ credit = 10000000                 # open + filled today + this order
 listen = "127.0.0.1:8080"
 users = "users.toml"              # paths relative to this file
 audit = "audit.jsonl"
+
+# Every message the clients' and venues' sessions receive and send, in files by day, passwords
+# masked. Left out, nothing is logged.
+# [message_log]
+# dir = "log"                     # relative to this file
+# retention = "90d"               # files older are deleted; kept for ever if left out
+# compress = true                 # gzip finished files; needs the `gzip` feature

@@ -33,6 +33,12 @@
 //! audit = "audit.jsonl"           # what they did; relative to this file
 //! tls = { cert = "api.pem", key = "api.key" }  # optional, PEM; needs the `tls` feature
 //! behind_proxy = false            # true: a proxy in front terminates TLS
+//!
+//! [message_log]                   # optional: every message, both sides', in files
+//! dir = "log"                     # relative to this file
+//! file_bytes_max = 268435456      # optional: a new file past this size; 256 MiB if left out
+//! retention = "90d"               # optional: delete files older; a number and s, m, h or d
+//! compress = true                 # optional: gzip finished files; needs the `gzip` feature
 //! ```
 //!
 //! Amounts are TOML integers, floats or strings, read as decimals: a string keeps every digit
@@ -43,6 +49,8 @@
 //! speaking its `begin_string`, and each `[initiator.NAME]` logs on to venue `NAME`. The
 //! `sessions` key is read at start only: a reload rereads the routes and limits, and the sessions
 //! file in use. A reload keeps the `[database]` in use: a changed url is logged, for the next start.
+//! It keeps the `[message_log]` in use too: a changed one is a warning, for the next start. The
+//! log masks passwords.
 //!
 //! A client session's trading day ends at `day_end`, or sooner when its schedule's period (from
 //! the sessions file) ends. `day_end` is a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`,
@@ -54,15 +62,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::NaiveTime;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 use turbojet::fields::Decimal;
 use turbojet::schedule::ScheduleTimeZone;
-use turbojet::{SessionSchedule, SessionStorage};
+use turbojet::{FileLogOptions, FileMessageLog, SessionSchedule, SessionStorage};
 use turbojet_config::SessionsFile;
 
 use crate::fix::Version;
@@ -103,6 +113,8 @@ pub struct Loaded {
     pub database: Option<String>,
     /// The operator API, if the file has `[api]`.
     pub api: Option<Api>,
+    /// The message log, if the file has `[message_log]`: open, and given to the sessions file.
+    pub message_log: Option<MessageLog>,
 }
 
 /// `[api]`: the operator API's server, its paths resolved against the configuration file's
@@ -129,12 +141,43 @@ pub struct ApiTls {
     pub key: PathBuf,
 }
 
-/// Reads the configuration file at `path` and the sessions file it names.
+/// `[message_log]`: where the gateway logs every message its sessions receive and send, its `dir`
+/// resolved against the configuration file's directory.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageLog {
+    pub dir: PathBuf,
+    /// Turbojet's default if left out.
+    pub file_bytes_max: Option<NonZeroU64>,
+    /// Files are kept for ever if left out.
+    #[serde(default, deserialize_with = "retention")]
+    pub retention: Option<Duration>,
+    #[serde(default)]
+    pub compress: bool,
+}
+
+impl MessageLog {
+    /// Opens the log, creating its directory if need be. Passwords are masked: Turbojet's default.
+    fn open(&self) -> std::io::Result<FileMessageLog> {
+        let defaults = FileLogOptions::default();
+        let options = FileLogOptions {
+            file_bytes_max: self.file_bytes_max.map_or(defaults.file_bytes_max, NonZeroU64::get),
+            retention: self.retention,
+            compress: self.compress,
+            ..defaults
+        };
+        FileMessageLog::open(&self.dir, options)
+    }
+}
+
+/// Reads the configuration file at `path` and the sessions file it names, and opens the
+/// `[message_log]`, if any, for the sessions file's sessions.
 ///
 /// # Errors
 ///
 /// Either file can't be read or doesn't load, the sessions file has no `[acceptor]` or one with a
-/// BeginString the gateway doesn't convert, or a route names a venue with no initiator.
+/// BeginString the gateway doesn't convert, a route names a venue with no initiator, or the
+/// message log can't be opened.
 pub fn load(path: &Path) -> Result<Loaded, Error> {
     load_with_stores(path, Vec::new())
 }
@@ -144,9 +187,16 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn SessionStorage>)>) -> Result<Loaded, Error> {
     let file = read(path)?;
     let sessions_path = path.parent().unwrap_or(Path::new(".")).join(&file.sessions);
-    let builder = stores
+    let message_log = file.message_log(path)?;
+    let mut builder = stores
         .into_iter()
         .fold(SessionsFile::builder(&sessions_path), |builder, (name, storage)| builder.with_store(name, storage));
+    if let Some(log) = &message_log {
+        let opened = log
+            .open()
+            .map_err(|e| Error(format!("{}: [message_log] cannot open {}: {e}", path.display(), log.dir.display())))?;
+        builder = builder.with_message_log(Arc::new(opened));
+    }
     let sessions = builder.load().map_err(Error::new)?;
     let Some(base) = sessions.base() else {
         return Err(Error(format!("{}: no [acceptor]: the clients log on to it", sessions_path.display())));
@@ -158,7 +208,7 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
     let day_end = file.day_end(path)?;
     let api = file.api(path)?;
     let database = file.database.map(|database| database.url);
-    Ok(Loaded { router, limits, risk: file.risk, sessions, version, day_end, database, api })
+    Ok(Loaded { router, limits, risk: file.risk, sessions, version, day_end, database, api, message_log })
 }
 
 /// What a reload rereads from the configuration file.
@@ -170,17 +220,20 @@ pub struct Reread {
     pub risk: RiskTables,
     pub day_end: SessionSchedule,
     pub api: Option<Api>,
+    /// Not opened: a reload keeps the log in use.
+    pub message_log: Option<MessageLog>,
 }
 
-/// Reads the routes, limits, `day_end` and `[api]` in the configuration file at `path` again,
+/// Reads the routes, limits, `day_end`, `[api]` and `[message_log]` in the configuration file at `path` again,
 /// checking that each venue the routes name is one of `venues`. A `[database] url` other than
 /// `database`, the one in use, is logged: it applies at the next start.
 ///
 /// # Errors
 ///
-/// As [`load`], for the routes, limits, `day_end` and `[api]`, or a route names a venue not in
-/// `venues`. An `[api]` that doesn't load (or breaks the bind rule) refuses the whole file: the
-/// routes, limits and `day_end` in it aren't taken either.
+/// As [`load`], for the routes, limits, `day_end`, `[api]` and `[message_log]`, or a route names
+/// a venue not in `venues`. An `[api]` that doesn't load (or breaks the bind rule), or a
+/// `[message_log]` that doesn't, refuses the whole file: the routes, limits and `day_end` in it
+/// aren't taken either.
 pub fn reload(path: &Path, venues: &[String], database: Option<&str>) -> Result<Reread, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     reread(path, &text, venues, database, true)
@@ -203,7 +256,8 @@ pub fn reread(path: &Path, text: &str, venues: &[String], database: Option<&str>
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
     let api = file.api(path)?;
-    Ok(Reread { router, limits, risk: file.risk, day_end, api })
+    let message_log = file.message_log(path)?;
+    Ok(Reread { router, limits, risk: file.risk, day_end, api, message_log })
 }
 
 /// `day_end` as written, `HH:MM[:SS] [ZONE]`, as a schedule whose periods run from one end of day
@@ -273,6 +327,7 @@ struct File {
     risk: RiskTables,
     database: Option<Database>,
     api: Option<Api>,
+    message_log: Option<MessageLog>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +440,27 @@ struct Route {
     reject: Option<String>,
 }
 
+/// `[message_log] retention`: a whole number and a unit, `s`, `m`, `h` or `d` (`90d`), as the
+/// sessions file writes its durations, with days added; positive.
+fn retention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Duration>, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    let invalid = || serde::de::Error::custom(format!("invalid duration {text:?} (expected e.g. 12h or 90d)"));
+    let (count, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len()));
+    let count: u64 = count.parse().map_err(|_| invalid())?;
+    let unit_secs: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return Err(invalid()),
+    };
+    match count.checked_mul(unit_secs) {
+        Some(0) => Err(serde::de::Error::custom("retention must be positive; leave it out to keep every file")),
+        Some(secs) => Ok(Some(Duration::from_secs(secs))),
+        None => Err(serde::de::Error::custom(format!("duration {text:?} is too long"))),
+    }
+}
+
 fn read(path: &Path) -> Result<File, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     parse(path, &text)
@@ -421,6 +497,19 @@ impl File {
         let dir = path.parent().unwrap_or(Path::new("."));
         let tls = api.tls.as_ref().map(|tls| ApiTls { cert: dir.join(&tls.cert), key: dir.join(&tls.key) });
         Ok(Some(Api { users: dir.join(&api.users), audit: dir.join(&api.audit), tls, ..api.clone() }))
+    }
+
+    /// `[message_log]`, its `dir` made relative to `path`'s directory, if the build allows it.
+    fn message_log(&self, path: &Path) -> Result<Option<MessageLog>, Error> {
+        let Some(log) = &self.message_log else { return Ok(None) };
+        if log.compress && !cfg!(feature = "gzip") {
+            return Err(Error(format!(
+                "{}: [message_log] compress: this build can't compress; build with the `gzip` feature",
+                path.display()
+            )));
+        }
+        let dir = path.parent().unwrap_or(Path::new(".")).join(&log.dir);
+        Ok(Some(MessageLog { dir, ..log.clone() }))
     }
 
     /// The routes, read from `path`, with their [`warnings`] logged if `log`.
@@ -533,6 +622,51 @@ reject = "no route"
         assert_eq!(load_database(with).as_deref(), Some("sqlite://j.db?mode=rwc"));
         let error = load_error("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db\"\npath = \"x\"");
         assert!(error.contains("unknown field `path`"), "{error}");
+    }
+
+    /// `[message_log]`'s `dir` is relative to the file and required; the rest are optional, checked,
+    /// and no other key is taken. Loading opens the log, creating its directory.
+    #[test]
+    fn the_message_log_section_resolves_its_dir_and_takes_no_other_key() {
+        let jetbridge = "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log/fix\"\n";
+        let files = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
+        let log = load(&files.path().join("jetbridge.toml")).unwrap().message_log.unwrap();
+        let expected =
+            MessageLog { dir: files.path().join("log/fix"), file_bytes_max: None, retention: None, compress: false };
+        assert_eq!(log, expected);
+        assert!(files.path().join("log/fix").is_dir());
+
+        let with = |more: &str| {
+            let dir = dir(&[("jetbridge.toml", format!("{jetbridge}{more}").as_str()), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("jetbridge.toml"))
+                .map(|loaded| loaded.message_log.unwrap())
+                .map_err(|e| e.to_string())
+        };
+        let log = with("file_bytes_max = 1000\nretention = \"90d\"\n").unwrap();
+        assert_eq!(log.file_bytes_max, NonZeroU64::new(1000));
+        assert_eq!(log.retention, Some(Duration::from_secs(90 * 86_400)));
+        assert_eq!(with("retention = \"12h\"").unwrap().retention, Some(Duration::from_secs(12 * 3_600)));
+        for (more, error) in [
+            ("retention = \"90 days\"", "invalid duration \"90 days\""),
+            ("retention = \"d\"", "invalid duration"),
+            ("retention = \"0d\"", "retention must be positive"),
+            ("retention = \"999999999999999999d\"", "too long"),
+            ("file_bytes_max = 0", "nonzero"),
+            ("level = 1", "unknown field `level`"),
+        ] {
+            let error_text = with(more).unwrap_err();
+            assert!(error_text.contains(error), "{more}: {error_text}");
+        }
+        assert!(load_error("sessions = \"sessions.toml\"\n[message_log]\n").contains("missing field `dir`"));
+        let blocked = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS), ("log", "a file")]);
+        let error = load(&blocked.path().join("jetbridge.toml")).unwrap_err().to_string();
+        assert!(error.contains("[message_log] cannot open "), "{error}");
+        let compressed = with("compress = true");
+        if cfg!(feature = "gzip") {
+            assert!(compressed.unwrap().compress);
+        } else {
+            assert!(compressed.unwrap_err().contains("[message_log] compress: this build can't compress"));
+        }
     }
 
     #[test]
