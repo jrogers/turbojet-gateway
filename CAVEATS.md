@@ -54,9 +54,22 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 
 ## Database and recovery
 
-- The database is never pruned: done orders, the requests sent and ClOrdIDs used stay in it as
-  history, so it grows for as long as the gateway trades. A start loads only live orders and
-  each client's current day.
+- Without `[database] retention` the database is never pruned: done orders, the requests sent
+  and ClOrdIDs used stay in it as history, so it grows for as long as the gateway trades. A start
+  loads only live orders and each client's current day.
+- Pruned orders are gone from the database for good, with their requests sent and ClOrdIDs.
+- Done orders with no trading day (booked before their client's first day began) are never
+  pruned, and neither is the table of orphans handled, which is small and grows only by crashes.
+- Orders become prunable a trading day at a time, when their day ended more than the retention
+  ago, and are deleted at the next hourly run: up to an hour late.
+- A run is skipped while work a start found for the venues is pending: orphan cancels waiting or
+  being sent, orphaned replaces waiting, or unsent requests waiting for a venue's logon. A venue
+  that never logs on again holds pruning off, with a warning each hour naming what's pending.
+- With pruning on, the startup orphan scan takes a stored request of an order the database no
+  longer has, sent no later than the latest pruned request plus a minute, as a pruned order's
+  rather than an orphan. That relies on the gateway's clock not stepping forward and then back
+  across a prune: a request sent in the stepped-back time could be taken as pruned, and its order
+  not cancelled at the venue.
 - Reports go to clients as the book makes them, before the change behind them commits. A fill
   whose change hadn't committed when the gateway crashed is redelivered by the venue after the
   restart and reaches the client again, with the same ExecID and PossResend(97)=Y: a client should
@@ -298,10 +311,11 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - `GET /api/sessions` lists a client session only while it's connected or paused, so a client
   that has never connected, or disconnected without being paused, isn't listed and can't be
   paused (404). Pausing logs the session out: it shows as disconnected and paused.
-- The audit log isn't rotated, and `GET /api/audit` reads the whole file each time. A file moved
-  away is created afresh at the next line, and the old one's entries are no longer read back.
+- `GET /api/audit` reads only the days it needs, but each of those days' files whole. Without
+  `audit_retention` the daily files are kept for ever. A file moved away is created afresh at
+  the next line, and the old one's entries are no longer read back.
   Lines are written one at a time within the gateway's process only: two processes mustn't share
-  an audit file. A change waits for its line behind any refusals being written, up to 120 a
+  an audit directory. A change waits for its line behind any refusals being written, up to 120 a
   minute of anonymous ones, each synced to disk.
   Refusals by identified callers aren't budgeted: a token holder posting refused mutations in a
   loop writes one synced line each, and can delay real mutations.
@@ -331,8 +345,15 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   OrderCancelReject isn't. That report is taken so whether the gateway asked or not: it no longer
   rejects the order, or refuses a cancel or replace pending on it.
 - After an `unknown_at_venue` alarm the order stays live, its exposure counted, until an operator
-  resolves it with the venue; there's no API call yet to mark it done. "Unknown" under a ClOrdID a
-  replace has since superseded is only a warning in the log: ask again.
+  settles it with the venue and resolves it (`POST /api/orders/{order_id}/resolve`). "Unknown"
+  under a ClOrdID a replace has since superseded is only a warning in the log: ask again.
+- The mark that lets an order be resolved is kept in memory only: after a restart, ask the venue
+  again before resolving.
+- A resolved order's client hears only the Canceled report: a cancel or replace of its own still
+  outstanding on the order isn't answered separately.
+- A fill a venue reports on an order the book has as done, after a resolve or crossing the
+  venue's own cancel, isn't applied and doesn't reach the client: it raises a
+  `fill_on_done_order` alarm, and someone has to settle it with the venue.
 - The alarm isn't deduplicated: the same "unknown order" answer redelivered (PossDupFlag, after a
   resend) raises it again.
 - Each API connection holds one of 256 slots for as long as it's open; one that moves no bytes for

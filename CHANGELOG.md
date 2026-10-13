@@ -105,3 +105,14 @@ Notable changes to Jetbridge.
   tags and time, and `GET /api/orders/{order_id}/messages` finds an order's messages on both
   sides.
 - A reload that finds `[database]` or `[message_log]` changed says so in its warnings.
+- `POST /api/orders/{order_id}/resolve`: an operator cancels, at the gateway, an order its venue
+  has said it doesn't know, its fills kept and its exposure freed; the client gets Canceled. An
+  order's view has `unknown_at_venue` while it can be resolved.
+- A fill a venue reports on an order the book has as done is no longer dropped silently: it
+  raises a `fill_on_done_order` alarm.
+- The audit log is written in daily files, `audit-YYYY-MM-DD.jsonl` in `[api] audit_dir`, with an
+  optional `audit_retention` deleting old days, and `GET /api/audit` reads only the days it
+  needs. **Breaking:** `[api] audit` is gone, and a file that still sets it doesn't load.
+- `[database] retention`, optional: every hour the gateway deletes the done orders of trading
+  days that ended longer ago than that, with their requests sent and ClOrdIDs. Without it nothing
+  is deleted.

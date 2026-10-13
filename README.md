@@ -47,7 +47,8 @@ reports back, keeping each order's state as it goes.
 - **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
   cancelled when its session drops and it doesn't log back on in time, and at shutdown.
 - **A database**, optional (SQLite): the book, blocks, risk counts and undelivered reports
-  survive a restart, and the restart sorts out what a crash left half done with the venues.
+  survive a restart, and the restart sorts out what a crash left half done with the venues. Old
+  done orders can be pruned from it.
 - **An operator API**, optional: HTTP and JSON, with local users in three roles, an audit log of
   every change, and a websocket of the book's and the sessions' changes as they happen.
   Operators can also ask a venue where an order stands; admins can edit the risk limits and set
@@ -113,7 +114,7 @@ credit = 10000000                 # open + filled today + this order
 [api]
 listen = "127.0.0.1:8080"
 users = "users.toml"              # paths relative to this file
-audit = "audit.jsonl"
+audit_dir = "audit"               # a file a day; audit_retention = "400d" deletes older ones
 
 # Every message the clients' and venues' sessions receive and send, in files by day, passwords
 # masked. Left out, nothing is logged.
@@ -144,11 +145,12 @@ now.
 - `[risk.defaults]` and `[risk.client.COMPID]`: see [Risk limits](#risk-limits).
 - `[database]`: see [Database](#database).
 - `[api]`, optional: the operator API, an HTTP JSON server in the gateway's process. `listen` is
-  an IP address and port; `users` and `audit` are files, relative to this file; `tls = { cert,
-  key }` (PEM, with the `tls` feature) serves HTTPS, and a reload takes a renewed certificate;
-  other changes apply at the next start, and an `[api]` that doesn't load refuses the whole
-  reload of this file. Off loopback the API refuses to start without `tls`,
-  unless `behind_proxy = true` says a proxy in front terminates TLS. See [API](#api).
+  an IP address and port; `users` is a file and `audit_dir` a directory, relative to this file;
+  `audit_retention`, optional, is how long the [audit log](#audit-log)'s daily files are kept;
+  `tls = { cert, key }` (PEM, with the `tls` feature) serves HTTPS, and a reload takes a renewed
+  certificate; other changes apply at the next start, and an `[api]` that doesn't load refuses
+  the whole reload of this file. Off loopback the API refuses to start without `tls`, unless
+  `behind_proxy = true` says a proxy in front terminates TLS. See [API](#api).
 - `[message_log]`, optional: see [Message log](#message-log).
 
 ### sessions.toml
@@ -198,6 +200,7 @@ to clients.
 ```toml
 [database]
 url = "sqlite:///var/lib/jetbridge/jetbridge.db?mode=rwc"
+retention = "400d"
 ```
 
 - `url`: a SQLite database. `?mode=rwc` creates the file if it's missing, with a warning logged
@@ -205,6 +208,9 @@ url = "sqlite:///var/lib/jetbridge/jetbridge.db?mode=rwc"
   mistyped path doesn't start an empty book. A relative path is from the working directory, not
   from this file's directory as `sessions` is. It's
   read at start only: a reload that finds it changed logs a warning and keeps the database in use.
+- `retention`, optional: how long a done order is kept after its trading day ends, written as
+  `[message_log]`'s `retention`, and at least `1d`. Left out, nothing is deleted. A reload takes a
+  changed one. See Pruning, below.
 - Without a `[database]`, the gateway keeps everything in memory, and a restart forgets it.
 
 **Orders don't wait for the database.** Orders go to venues and reports to clients without
@@ -245,6 +251,15 @@ database is down, or far behind), new orders are rejected with Text(58) "gateway
 (OrdRejReason 0 on FIX 4.2, 99 on FIX 4.4). Cancels, replaces and venue reports keep flowing,
 each held until it commits, and a failing commit is retried with an error logged each time. A
 session stops reading 256 messages past its oldest one waiting.
+
+**Pruning.** With a `retention`, the gateway deletes, every hour from an hour after it starts,
+the done orders whose trading day ended longer ago than that, with their requests sent and
+ClOrdIDs, a few at a time so orders and reports aren't held up. It keeps what a restart needs:
+live orders, each client's current trading day however old, the newest order (the next OrderID
+follows it) and any order booked before its client had a trading day. While work a start found
+for the venues is still pending (orphans to cancel, requests to send at a venue's logon), a run is
+skipped with a warning saying what it waits for. The startup log line counts the requests in
+venues' stores that belong to pruned orders as `pruned`.
 
 What recovery doesn't cover is in [CAVEATS.md](CAVEATS.md#database-and-recovery).
 
@@ -423,8 +438,9 @@ jetbridge user remove alice --users users.toml
 ```
 
 - **Roles**: `viewer` reads; `operator` also pauses, resumes and resends sessions, cancels orders
-  and asks venues where they stand, and blocks, unblocks and cancels clients; `admin` also sets and
-  resets sequence numbers, edits the risk limits, reloads and reads the audit log.
+  and asks venues where they stand, resolves orders a venue doesn't know, and blocks, unblocks
+  and cancels clients; `admin` also sets and resets sequence numbers, edits the risk limits,
+  reloads and reads the audit log.
 - **`--clients`** limits a user to acting on those CompIDs' client sessions, orders and scopes,
   and, for an admin, their limit tables. Such a user still reads everything, and can't act on a
   venue's session, on `all`, or on the default limits or a reload, which reach every client.
@@ -462,6 +478,7 @@ jetbridge user remove alice --users users.toml
 | `POST /api/sessions/{id}/resend` | operator | `{from}`: asks the counterparty to send again from that MsgSeqNum; answers the sequence numbers |
 | `POST /api/orders/{order_id}/cancel` | operator | the gateway's own cancel of one order; retries a stuck one |
 | `POST /api/orders/{order_id}/status` | operator | asks the order's venue where it stands; answers 202 |
+| `POST /api/orders/{order_id}/resolve` | operator | cancels, at the gateway, an order its venue doesn't know; answers 204 |
 | `POST /api/risk/block`, `/unblock` | operator | `{scope}`: see [Kill switch](#kill-switch); answers `{"changed"}` |
 | `POST /api/risk/cancel-all` | operator | `{scope}`: blocks the scope and cancels its orders |
 | `POST /api/sessions/{id}/sequence` | admin | `{next_incoming, next_outgoing}`, either or both: sets the session's sequence numbers |
@@ -494,8 +511,15 @@ jetbridge user remove alice --users users.toml
   OrderStatusRequest under the gateway's ClOrdID the venue last acknowledged, and answers 202: the
   venue's answer comes as the order's reports. One showing a fill the gateway missed reaches the
   client as a fill, one that changes nothing is dropped, and one saying the venue doesn't know the
-  order raises an `unknown_at_venue` alarm and leaves the order as it was. Audited as
-  `request_status`.
+  order raises an `unknown_at_venue` alarm and leaves the order as it was, marked: its view has
+  `unknown_at_venue: true` until the venue reports on it after all or it's done. The mark is kept
+  in memory only, so after a restart ask the venue again. Audited as `request_status`.
+- **Resolving an order a venue doesn't know**, `POST /api/orders/{order_id}/resolve`, is the
+  answer to that alarm once it's settled with the venue: the gateway cancels the order itself,
+  keeping its fills and freeing its exposure, and the client gets an unsolicited Canceled with
+  Text(58) "canceled by the gateway: the venue doesn't know the order". It answers 204 once that
+  has committed; 404 for an order the book doesn't hold, and 409 for one that's done or that its
+  venue hasn't said it doesn't know. Audited as `resolve`.
 - **Sequence numbers.** `sequence` takes `next_incoming`, `next_outgoing` or both (numbers from
   1). The outgoing one only moves forward; a logged-on counterparty is told with a gap fill.
   `reset` works only while the session is disconnected: pause it first. For a reset agreed with
@@ -504,12 +528,13 @@ jetbridge user remove alice --users users.toml
   [CAVEATS.md](CAVEATS.md#operator-api) before moving a live session's numbers.
 - **What a refusal says**: 401 without valid credentials, 403 for the role or the CSRF token or a
   target out of a scoped user's CompIDs, 404 for a target that doesn't exist (whatever the user's
-  scope), 409 for an order already done, a status request to a venue that isn't logged on, a
+  scope), 409 for an order already done, a resolve of an order its venue hasn't said it doesn't
+  know, a status request to a venue that isn't logged on, a
   resend the session can't make now (not logged on, a resend under way, or `from` not below the
   next expected), an outgoing sequence number below the next, or a reset while connected.
 - **Reload** answers 200 with what changed in the sessions file, the routes, limits and `day_end`
   taken, and any warnings; or 422 if either file was kept, saying why and what the other one
-  changed, since that one did apply. Its warnings include a changed `[database]` or
+  changed, since that one did apply. Its warnings include a changed `[database] url` or
   `[message_log]`, which waits for a restart. Reloads run one at a time, and one sent during
   shutdown answers 503.
 
@@ -599,8 +624,9 @@ each change, in the order it happened:
 - `{"type":"blocked","scope":...}` and `{"type":"unblocked","scope":...}`.
 - `{"type":"alarm","time","kind","text"}`, `kind` one of `gateway_unavailable`,
   `gateway_available`, `stuck_cancel`, `orphan`, `overfill`, `unknown_order`, `unknown_at_venue`
-  (a venue answered a status request saying it doesn't know a live order) and
-  `venue_store_reset`. Each is in the log too.
+  (a venue answered a status request saying it doesn't know a live order), `fill_on_done_order`
+  (a venue reported a fill on an order the book has as done, after a resolve or crossing the
+  venue's own cancel: not applied) and `venue_store_reset`. Each is in the log too.
 - `{"type":"session","side","id","event"}` for the session keyed by `side` (`client` or `venue`)
   and `id`: `connected`, `logged_on`, `logging_out`, `resend_started`, `resend_finished`,
   `disconnected`, `paused`, `resumed`, or `refused` with a `reason`.
@@ -628,9 +654,9 @@ cross the network in the clear. It serves HTTP/1.1, websockets included. Behind 
 
 ### Audit log
 
-Every change through the API, and every login and logout, is appended to the `audit` file as one
+Every change through the API, and every login and logout, is appended to the audit log as one
 JSON line, synced to disk before it runs: a line that can't be written answers 503 and nothing is
-done.
+done. The lines go in `audit_dir`, a file a day, `audit-YYYY-MM-DD.jsonl` by the entry's UTC date.
 
 ```json
 {"time":"2026-10-11T09:30:00.123456Z","user":"alice","role":"operator","ip":"192.0.2.1","action":"block","target":"comp:FUNDA","params":null,"reason":"runaway algo","result":"allowed"}
@@ -641,9 +667,15 @@ second line: `failed: <why>`, or what happened instead, such as `unchanged: alre
 Refusals for a user's role, scope or a missing reason are recorded too, and so are failed and
 limited logins, wrong tokens, and wrong CSRF tokens or `Origin`s, at most 120 a minute of these
 (the rest are in the tracing log only). A failed login whose name isn't a user's is recorded as
-`<unknown>`. Reads aren't recorded, nor requests with no credentials or an ended session. The
-file is created readable by its owner only. `GET /api/audit` reads it back, oldest first: the last
-`limit` entries (100 by default, at most 1,000) from `since` (RFC 3339).
+`<unknown>`. Reads aren't recorded, nor requests with no credentials or an ended session.
+
+The directory is created readable by its owner only (0700) if missing, and so is each file. With
+`audit_retention` (a whole number and `s`, `m`, `h` or `d`, as `[message_log]`'s `retention`), the
+first line of each day deletes the files of days that ended longer ago than that; other files in
+the directory aren't touched, and a delete that fails is logged as a warning. Left out, the files
+are kept for ever. `audit_dir` and `audit_retention` are read at start only. `GET /api/audit` reads
+it back, oldest first: the last `limit` entries (100 by default, at most 1,000) from `since` (RFC
+3339), reading only the days it needs, newest first.
 
 ## Signals
 
