@@ -840,6 +840,8 @@ mod tests {
         ("GET", "/api/sessions"),
         ("GET", "/api/orders"),
         ("GET", "/api/orders/JB1"),
+        ("GET", "/api/orders/JB1/messages"),
+        ("GET", "/api/messages?since=2026-10-08T00:00:00Z"),
         ("GET", "/api/risk"),
         ("GET", "/api/risk/limits"),
         ("GET", "/api/routes"),

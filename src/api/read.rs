@@ -328,12 +328,17 @@ pub(super) mod tests {
     }
 
     pub(in crate::api) async fn fixture() -> Fixture {
+        fixture_with("").await
+    }
+
+    /// [`fixture`] with `extra` at the end of its `jetbridge.toml`.
+    pub(in crate::api) async fn fixture_with(extra: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let sessions = "[acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
                         listen = \"127.0.0.1:0\"\n[counterparty.FUNDA]\n[initiator.NASDAQ]\n\
                         target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]\n";
         std::fs::write(dir.path().join("sessions.toml"), sessions).unwrap();
-        let config = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n";
+        let config = format!("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n{extra}");
         std::fs::write(dir.path().join("jetbridge.toml"), config).unwrap();
         let (service, _serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
 

@@ -24,7 +24,7 @@ use axum::serve::ListenerExt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -36,6 +36,7 @@ use crate::service::Service;
 mod auth;
 mod listener;
 mod live;
+mod messages;
 mod read;
 mod write;
 
@@ -57,6 +58,8 @@ pub(crate) struct State {
     /// websockets they upgraded to, which watch this to close.
     stopping: watch::Sender<bool>,
     live: Arc<live::Sockets>,
+    /// The message log's searches under way: see [`messages::MAX_SEARCHES`].
+    searches: Arc<Semaphore>,
 }
 
 impl State {
@@ -111,6 +114,8 @@ fn router(state: State) -> axum::Router {
         .route("/api/sessions", get(read::sessions))
         .route("/api/orders", get(read::orders))
         .route("/api/orders/{order_id}", get(read::order))
+        .route("/api/orders/{order_id}/messages", get(messages::order_messages))
+        .route("/api/messages", get(messages::messages))
         .route("/api/risk", get(read::risk))
         .route("/api/risk/limits", get(read::risk_limits))
         .route("/api/routes", get(read::routes))
@@ -340,6 +345,7 @@ impl Bound {
             audit: self.audit,
             stopping: stopping.clone(),
             live: Arc::default(),
+            searches: Arc::new(Semaphore::new(messages::MAX_SEARCHES)),
         });
         let (stop, stopped) = oneshot::channel::<()>();
         #[cfg(feature = "tls")]
@@ -467,7 +473,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(Audit::open(&dir.path().join("audit.jsonl")).unwrap());
         let stopping = watch::Sender::new(false);
-        (State { service: Weak::new(), auth, audit, stopping, live: Arc::default() }, dir)
+        let searches = Arc::new(Semaphore::new(messages::MAX_SEARCHES));
+        (State { service: Weak::new(), auth, audit, stopping, live: Arc::default(), searches }, dir)
     }
 
     /// The API's routes, and `/test/peer` answering the client's address as handlers see it.

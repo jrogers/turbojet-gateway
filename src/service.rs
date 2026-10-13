@@ -209,6 +209,11 @@ impl Service {
         &self.gateway
     }
 
+    /// The message log's directory, with `[message_log]`: what the API searches.
+    pub fn message_log_dir(&self) -> Option<&Path> {
+        self.message_log.as_ref().map(|log| log.dir.as_path())
+    }
+
     /// The book's database, if there is one: the tests' way to its hooks.
     #[cfg_attr(not(test), expect(dead_code, reason = "the tests' way to the store's hooks"))]
     pub(crate) fn store(&self) -> Option<&Store> {

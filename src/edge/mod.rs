@@ -1431,6 +1431,24 @@ pub(crate) mod tests {
         );
     }
 
+    /// The venue's acknowledgement of the order sent as `downstream`, naming it `venue_order_id`.
+    pub(crate) fn acknowledge(gateway: &Gateway, downstream: &str, venue_order_id: &str) {
+        let report = crate::book::VenueReport {
+            downstream: downstream.into(),
+            exec_type: crate::book::ExecType::New,
+            status: Some(crate::book::Status::New),
+            last_qty: 0.into(),
+            last_px: 0.into(),
+            cum_qty: 0.into(),
+            avg_px: 0.into(),
+            exec_id: "E1".into(),
+            text: None,
+            venue_order_id: Some(venue_order_id.into()),
+            ord_rej_reason: None,
+        };
+        gateway.lock().book.handle(Input::VenueReport { venue: VENUE.into(), report }, &mut Vec::new());
+    }
+
     fn unsent(gateway: &Gateway) -> Vec<bool> {
         gateway.cancelling().into_iter().map(|(_, cancel)| cancel.unsent).collect()
     }
