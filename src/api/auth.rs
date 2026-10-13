@@ -440,13 +440,18 @@ impl Auth {
     /// Whether the request's `Origin` is the host it was sent to: the `Host`, or behind a proxy
     /// the last `X-Forwarded-Host` (the proxy's), if sent. Hosts compare without case; a port must
     /// match as written, so a browser's default port left out of one but not the other refuses.
+    /// With a `Secure` cookie (TLS here or at a proxy) the page must be served over `https`, so a
+    /// plain-HTTP page on the same name, spoofed on the network, can't open the socket.
     fn same_origin(&self, headers: &HeaderMap) -> bool {
         let last = |name| headers.get_all(name).iter().next_back().and_then(|value| value.to_str().ok());
         let forwarded = if self.behind_proxy { last("x-forwarded-host") } else { None };
         let host = forwarded.and_then(|hosts| hosts.rsplit(',').next()).or_else(|| last("host"));
         let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok());
         // `scheme://host[:port]`; a page with no origin to tell sends `null`, which has no `://`.
-        let authority = origin.and_then(|origin| origin.split_once("://")).map(|(_, authority)| authority);
+        let authority = origin
+            .and_then(|origin| origin.split_once("://"))
+            .filter(|(scheme, _)| !self.secure || scheme.eq_ignore_ascii_case("https"))
+            .map(|(_, authority)| authority);
         matches!((authority, host), (Some(authority), Some(host)) if authority.eq_ignore_ascii_case(host.trim()))
     }
 
@@ -1322,6 +1327,12 @@ mod tests {
             assert!(!direct.same_origin(&headers(&[("host", "gw.example:8443"), ("origin", origin)])), "{origin}");
         }
         assert!(!direct.same_origin(&headers(&[("host", "gw.example:8443")])));
+        // An origin has no path, not even `/`.
+        assert!(!direct.same_origin(&headers(&[("host", "gw.example"), ("origin", "https://gw.example/")])));
+        let v6 = [("host", "[::1]:8080"), ("origin", "http://[::1]:8080")];
+        assert!(direct.same_origin(&headers(&v6)));
+        // A Secure cookie's page must be https.
+        assert!(!proxied.same_origin(&headers(&v6)));
         let forwarded = [
             ("host", "10.0.0.5:8080"),
             ("x-forwarded-host", "evil.example, gw.example"),
@@ -1329,6 +1340,9 @@ mod tests {
         ];
         assert!(proxied.same_origin(&headers(&forwarded)));
         assert!(!direct.same_origin(&headers(&forwarded)));
+        // A trailing comma leaves an empty last host, which matches nothing; Host isn't tried.
+        let trailing = [("host", "gw.example"), ("x-forwarded-host", "gw.example,"), ("origin", "https://gw.example")];
+        assert!(!proxied.same_origin(&headers(&trailing)));
     }
 
     /// Roles are ordered; a scoped caller acts on its CompIDs' clients only, and never on all.
