@@ -454,7 +454,8 @@ impl Reading<'_> {
 
 /// `file` of `dir`'s records from `start`, or its `.log.gz`'s if it's been compressed since it was
 /// listed (positions hold across compression); `None` for a file deleted since, which only a
-/// cursor's file can't be (400), as can't a `start` past its end.
+/// cursor's file can't be (400), as can't a `start` past its end, and for one this build can't
+/// read.
 fn open(dir: &Path, file: &LogFile, start: u64, from_cursor: bool) -> Result<Option<LogRecords>, ApiError> {
     let mut opened = FileMessageLog::read_from(&file.path, start);
     if !file.compressed && opened.as_ref().is_err_and(|e| e.kind() == ErrorKind::NotFound) {
@@ -468,6 +469,12 @@ fn open(dir: &Path, file: &LogFile, start: u64, from_cursor: bool) -> Result<Opt
         Err(e) if e.kind() == ErrorKind::NotFound && from_cursor => Err(gone()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => Err(bad("after is past the end of its file")),
+        // A .log.gz without the gzip feature (left by an earlier build, or an on_finished hook):
+        // the rest of the log can still be searched.
+        Err(e) if e.kind() == ErrorKind::Unsupported => {
+            warn!("a message log search skips {}: {e}", file.path.display());
+            Ok(None)
+        }
         Err(e) => {
             error!("cannot read the message log's {}: {e}", file.path.display());
             Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot read the message log"))
@@ -808,6 +815,18 @@ mod tests {
         let mut records = open(dir.path(), &plain, first.position(), true).unwrap().unwrap();
         let LogRecord::Message { frame, .. } = records.next().unwrap().unwrap() else { panic!() };
         assert!(String::from_utf8_lossy(&frame).contains("\x0111=B\x01"));
+    }
+
+    /// Without the gzip feature, a `.log.gz` is skipped: the other files are still searched.
+    #[cfg(not(feature = "gzip"))]
+    #[test]
+    fn a_compressed_file_without_gzip_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        log(dir.path(), &[(at(8, 9, 0), Direction::Inbound, Some("FUNDA"), fix(&[(35, "D"), (11, "A")]))]);
+        std::fs::write(dir.path().join("messages-20261008-000001.log.gz"), b"not read").unwrap();
+        let search = Search::new(vec![LogFilter::default()], at(8, 0, 0), None, None, None).unwrap();
+        let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0) + FOLLOW_SLACK).unwrap();
+        assert_eq!(page.messages.len(), 1);
     }
 
     /// While the range's end is to come, the last page has no `next` but a `follow`, the end of
