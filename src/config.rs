@@ -152,7 +152,7 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
         return Err(Error(format!("{}: no [acceptor]: the clients log on to it", sessions_path.display())));
     };
     let version = base.begin_string.parse().map_err(|e| Error(format!("{}: {e}", sessions_path.display())))?;
-    let router = file.router(path)?;
+    let router = file.router(path, true)?;
     check_venues(path, &router, &sessions.initiator_names())?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
@@ -183,21 +183,22 @@ pub struct Reread {
 /// routes, limits and `day_end` in it aren't taken either.
 pub fn reload(path: &Path, venues: &[String], database: Option<&str>) -> Result<Reread, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    reread(path, &text, venues, database)
+    reread(path, &text, venues, database, true)
 }
 
 /// As [`reload`], from `text` rather than the file at `path`, which only names it in errors and
 /// is what its relative paths are relative to: how a limit edit checks the text before writing it.
+/// Logs the warnings `reload` does only if `log`.
 ///
 /// # Errors
 ///
 /// As [`reload`].
-pub fn reread(path: &Path, text: &str, venues: &[String], database: Option<&str>) -> Result<Reread, Error> {
+pub fn reread(path: &Path, text: &str, venues: &[String], database: Option<&str>, log: bool) -> Result<Reread, Error> {
     let file = parse(path, text)?;
-    if file.database.as_ref().map(|database| database.url.as_str()) != database {
+    if log && file.database.as_ref().map(|database| database.url.as_str()) != database {
         warn!(file = %path.display(), "[database] url changed: the gateway keeps its database until the next start");
     }
-    let router = file.router(path)?;
+    let router = file.router(path, log)?;
     check_venues(path, &router, venues)?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
@@ -422,8 +423,8 @@ impl File {
         Ok(Some(Api { users: dir.join(&api.users), audit: dir.join(&api.audit), tls, ..api.clone() }))
     }
 
-    /// The routes, read from `path`, with their [`warnings`] logged.
-    fn router(&self, path: &Path) -> Result<Router, Error> {
+    /// The routes, read from `path`, with their [`warnings`] logged if `log`.
+    fn router(&self, path: &Path, log: bool) -> Result<Router, Error> {
         let mut rules = Vec::with_capacity(self.route.len());
         for (index, route) in self.route.iter().enumerate() {
             let target = match (&route.venue, &route.reject) {
@@ -442,8 +443,10 @@ impl File {
             });
         }
         let router = Router::new(rules);
-        for warning in warnings(&router) {
-            warn!(file = %path.display(), "{warning}");
+        if log {
+            for warning in warnings(&router) {
+                warn!(file = %path.display(), "{warning}");
+            }
         }
         Ok(router)
     }

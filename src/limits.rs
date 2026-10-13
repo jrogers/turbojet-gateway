@@ -51,6 +51,29 @@ impl fmt::Display for EditError {
     }
 }
 
+/// For the log: the table, and the keys set or removed.
+impl fmt::Display for Edit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Set { table, values } => {
+                let (set, removed): (Vec<_>, Vec<_>) = values.iter().partition(|(_, value)| value.is_some());
+                let names = |keys: Vec<&(&str, _)>| keys.iter().map(|(key, _)| *key).collect::<Vec<_>>().join(", ");
+                write!(f, "{table}: set [{}], removed [{}]", names(set), names(removed))
+            }
+            Self::Delete { comp_id } => write!(f, "{}: deleted", Limits::Client(comp_id.clone())),
+        }
+    }
+}
+
+impl fmt::Display for Limits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Defaults => f.write_str("risk.defaults"),
+            Self::Client(comp_id) => write!(f, "risk.client.{comp_id}"),
+        }
+    }
+}
+
 impl Edit {
     /// The values of a request's `set`, `{key: value | null}`: a JSON number or string for an
     /// amount, an array of strings for `symbols`, a boolean for `self_trade`. Whether a value is
@@ -105,8 +128,10 @@ fn value_for(key: &str, value: &serde_json::Value) -> Result<(&'static str, Opti
             Some(symbols.ok_or("symbols: expected an array of strings")?.into())
         }
         ("self_trade", Json::Bool(self_trade)) => Some((*self_trade).into()),
+        // An integer past a TOML integer's range is written as a decimal string, every digit kept.
         (_, Json::Number(number)) if AMOUNTS.contains(&key) => Some(match number.as_i64() {
             Some(integer) => integer.into(),
+            None if number.is_u64() => number.to_string().into(),
             None => number.as_f64().expect("without arbitrary_precision every JSON number is an f64").into(),
         }),
         (_, Json::String(text)) if AMOUNTS.contains(&key) => Some(text.as_str().into()),
@@ -192,6 +217,11 @@ mod tests {
         assert_eq!(values[0].1.as_ref().and_then(toml_edit::Value::as_integer), Some(5));
         assert_eq!(values[2].1.as_ref().and_then(toml_edit::Value::as_str), Some("10.25"));
         assert!(values[3].1.is_none());
+        let edit = set_edit(Limits::Client("FUNDA".into()), serde_json::json!({ "credit": u64::MAX, "symbols": null }));
+        let edit = edit.unwrap();
+        let Edit::Set { values, .. } = &edit else { panic!() };
+        assert_eq!(values[0].1.as_ref().and_then(toml_edit::Value::as_str), Some("18446744073709551615"));
+        assert_eq!(edit.to_string(), "risk.client.FUNDA: set [credit], removed [symbols]");
         for (set, error) in [
             (serde_json::json!({}), "set names no key"),
             (serde_json::json!({ "max_qty": 5 }), "unknown key \"max_qty\""),

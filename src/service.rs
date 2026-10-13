@@ -293,18 +293,17 @@ impl Service {
             return Err(EditError::Stopping);
         }
         let io = |e: io::Error| EditError::Io(format!("{}: {e}", self.path.display()));
-        // The file itself, so a symlink stays one.
-        let path = std::fs::canonicalize(&self.path).map_err(io)?;
-        let text = std::fs::read_to_string(&path).map_err(io)?;
+        let text = std::fs::read_to_string(&self.path).map_err(io)?;
         let edited = limits::apply(&text, edit).map_err(|e| match e {
             EditError::Refused(why) => EditError::Refused(format!("{}: {why}", self.path.display())),
             e => e,
         })?;
         let venues = self.set_venues();
-        let reread = config::reread(&self.path, &edited, &venues, self.database.as_deref())
+        // Quiet: the reload below logs what's worth a warning.
+        let reread = config::reread(&self.path, &edited, &venues, self.database.as_deref(), false)
             .map_err(|e| EditError::Refused(e.to_string()))?;
-        let warning = crate::auth::write_atomically(&path, &edited).map_err(io)?;
-        info!(file = %path.display(), ?edit, "edited the risk limits");
+        let warning = crate::auth::write_atomically(&self.path, &edited).map_err(io)?;
+        info!(file = %self.path.display(), "edited the risk limits: {edit}");
         let mut reloaded = self.reload_locked();
         reloaded.warnings.extend(warning);
         Ok(Edited { table: edit.table_in(&reread.risk), reloaded })
@@ -678,7 +677,7 @@ mod tests {
     /// the file's permissions; edits from many threads at once each land; once stopping, an edit
     /// is refused.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn limit_edits_write_through_a_symlink_one_at_a_time() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

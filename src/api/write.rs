@@ -433,7 +433,8 @@ pub(super) async fn set_client_limits(
 
 /// `DELETE /api/risk/limits/client/{comp_id} {reason}` [admin]: removes the CompID's table from
 /// `jetbridge.toml`, so its sessions get the defaults, and reloads, as [`set_default_limits`]
-/// does; 404 if it has none.
+/// does; 404 if it has none. A PATCH removing every key leaves the table, empty: the client gets
+/// the defaults but still has a table, until this removes it.
 pub(super) async fn delete_client_limits(
     axum::extract::State(state): AxumState,
     caller: Caller,
@@ -449,7 +450,7 @@ pub(super) async fn delete_client_limits(
         .and(parsed)
         .and_then(|()| limits::check_comp_id(&comp_id).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e)))
         .map(|()| Edit::Delete { comp_id: comp_id.clone() });
-    let target = Some(format!("risk.client.{comp_id}"));
+    let target = Some(Limits::Client(comp_id.clone()).to_string());
     let mutation = Mutation { action: "delete_limits", target, params: serde_json::Value::Null, reason: body.reason };
     edit_limits(&state, &caller, mutation, edit).await
 }
