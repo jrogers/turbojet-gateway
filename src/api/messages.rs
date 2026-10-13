@@ -45,8 +45,9 @@ const SEARCH_BYTES_MAX: u64 = 256 * 1024 * 1024;
 /// can't take the threads the gateway's own blocking work (a reload, the users file) needs.
 pub(super) const MAX_SEARCHES: usize = 2;
 
-/// Query parameters a search takes at most: each condition is checked against every record read.
-const MAX_PARAMS: usize = 100;
+/// Sessions, MsgTypes and tags a search gives at most, together: each is checked against every
+/// record read.
+const CONDITIONS_MAX: usize = 100;
 
 /// How long before its first request was sent an order's search starts: the client's order was
 /// logged as it arrived, a moment before.
@@ -249,21 +250,23 @@ impl Search {
 }
 
 /// `GET /api/messages`'s query as a search, or 400: an unknown key, one given twice that can't
-/// be, or a value that doesn't parse.
+/// be, a value empty or that doesn't parse, or more than [`CONDITIONS_MAX`] conditions.
 fn parse(pairs: &[(String, String)]) -> Result<Search, ApiError> {
-    if pairs.len() > MAX_PARAMS {
-        return Err(bad(format!("a search takes {MAX_PARAMS} parameters at most")));
-    }
     let mut filter = LogFilter::default();
     let (mut since, mut until, mut limit, mut after) = (None, None, None, None);
     for (key, value) in pairs {
         match key.as_str() {
+            "session" if value.is_empty() => return Err(bad("session is empty")),
             "session" => filter.sessions.push(value.clone()),
+            "msg_type" if value.split(',').any(str::is_empty) => return Err(bad("msg_type has an empty MsgType")),
             "msg_type" => filter.msg_types.extend(value.split(',').map(str::to_owned)),
             "tag" => {
                 let (tag, wanted) =
                     value.split_once('=').ok_or_else(|| bad(format!("tag {value:?} isn't TAG=VALUE")))?;
                 let tag = tag.parse().map_err(|_| bad(format!("tag {value:?}: {tag:?} isn't a tag number")))?;
+                if wanted.is_empty() {
+                    return Err(bad(format!("tag {value:?} has no value")));
+                }
                 filter.tags.push((tag, vec![wanted.to_owned()]));
             }
             "direction" => {
@@ -280,6 +283,9 @@ fn parse(pairs: &[(String, String)]) -> Result<Search, ApiError> {
             "after" => once(&mut after, key, Cursor::decode(value)?)?,
             _ => return Err(bad(format!("unknown parameter {key}"))),
         }
+    }
+    if filter.sessions.len() + filter.msg_types.len() + filter.tags.len() > CONDITIONS_MAX {
+        return Err(bad(format!("a search takes {CONDITIONS_MAX} sessions, MsgTypes and tags at most")));
     }
     let since = since.ok_or_else(|| bad("since is required"))?;
     Search::new(vec![filter], since, until, limit, after)
@@ -617,7 +623,11 @@ mod tests {
             &format!("{DAY}&tag=x=1"),
             &format!("{DAY}&{DAY}"),
             &format!("{DAY}&colour=red"),
-            &format!("{DAY}{}", "&session=x".repeat(MAX_PARAMS)),
+            &format!("{DAY}&session="),
+            &format!("{DAY}&msg_type="),
+            &format!("{DAY}&msg_type=D,"),
+            &format!("{DAY}&tag=11="),
+            &format!("{DAY}&msg_type={}D", "D,".repeat(CONDITIONS_MAX)),
         ] {
             assert_eq!(fixture.get(&format!("/api/messages?{bad}")).await.status, StatusCode::BAD_REQUEST, "{bad}");
         }
