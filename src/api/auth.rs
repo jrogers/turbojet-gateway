@@ -842,6 +842,7 @@ mod tests {
         ("GET", "/api/orders/JB1"),
         ("GET", "/api/risk"),
         ("GET", "/api/routes"),
+        ("GET", "/api/routes/test?client=FUNDA&symbol=AAPL"),
         ("GET", "/api/live"),
         ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/pause"),
         ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/resume"),

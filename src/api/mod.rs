@@ -113,6 +113,7 @@ fn router(state: State) -> axum::Router {
         .route("/api/orders/{order_id}", get(read::order))
         .route("/api/risk", get(read::risk))
         .route("/api/routes", get(read::routes))
+        .route("/api/routes/test", get(read::route_test))
         .route("/api/live", get(live::live))
         .route("/api/sessions/{id}/pause", post(write::pause))
         .route("/api/sessions/{id}/resume", post(write::resume))

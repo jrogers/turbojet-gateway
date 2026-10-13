@@ -1,11 +1,14 @@
 //! Routing rules: ordered, first match wins. Kept to one function, [`Router::route`], so
 //! failover or code-defined routing can replace it without touching the book.
 
+use serde::Serialize;
 use turbojet::fields::CompactString;
 
 use crate::book::{OrderRequest, VenueId};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized as `{"venue": NAME}` or `{"reject": TEXT}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Target {
     Venue(VenueId),
     /// Reject the order, with this Text(58).
@@ -23,10 +26,10 @@ pub struct Rule {
 }
 
 impl Rule {
-    fn matches(&self, comp_id: &str, request: &OrderRequest) -> bool {
+    fn matches(&self, comp_id: &str, ex_destination: Option<&str>, symbol: &str) -> bool {
         self.client.as_deref().is_none_or(|c| c == comp_id)
-            && self.ex_destination.as_deref().is_none_or(|d| request.ex_destination.as_deref() == Some(d))
-            && self.symbol.as_deref().is_none_or(|s| s == request.symbol.as_str())
+            && self.ex_destination.as_deref().is_none_or(|d| ex_destination == Some(d))
+            && self.symbol.as_deref().is_none_or(|s| s == symbol)
     }
 }
 
@@ -48,7 +51,14 @@ impl Router {
     /// The first rule that matches decides; `None` when none does, which the book rejects as no
     /// route, telling it apart from a rule's own [`Target::Reject`]. `comp_id` is the client's CompID.
     pub fn route(&self, comp_id: &str, request: &OrderRequest) -> Option<Target> {
-        self.rules.iter().find(|rule| rule.matches(comp_id, request)).map(|rule| rule.target.clone())
+        self.route_rule(comp_id, request.ex_destination.as_deref(), &request.symbol)
+            .map(|(_, rule)| rule.target.clone())
+    }
+
+    /// The rule [`route`](Self::route) follows, and its index in [`rules`](Self::rules): from only
+    /// the fields the rules read, for a dry run.
+    pub fn route_rule(&self, comp_id: &str, ex_destination: Option<&str>, symbol: &str) -> Option<(usize, &Rule)> {
+        self.rules.iter().enumerate().find(|(_, rule)| rule.matches(comp_id, ex_destination, symbol))
     }
 }
 
@@ -89,6 +99,7 @@ mod tests {
         ]);
         assert_eq!(router.route("FUNDA", &request("AAPL", Some("XNAS"))), Some(Target::Venue("NASDAQ-A".into())));
         assert_eq!(router.route("FUNDB", &request("AAPL", Some("XNAS"))), Some(Target::Venue("NASDAQ-B".into())));
+        assert_eq!(router.route_rule("FUNDB", Some("XNAS"), "AAPL"), Some((1, &router.rules()[1])));
     }
 
     #[test]

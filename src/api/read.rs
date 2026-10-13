@@ -14,7 +14,7 @@ use turbojet::{SessionId, SessionStatus};
 
 use super::{ApiError, State};
 use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
-use crate::router::Target;
+use crate::router::{Rule, Target};
 use crate::service::Service;
 
 /// Orders a page of `GET /api/orders` holds without a `limit`: a screenful.
@@ -228,27 +228,60 @@ pub(super) struct RouteView {
     reject: Option<CompactString>,
 }
 
+impl From<&Rule> for RouteView {
+    fn from(rule: &Rule) -> Self {
+        let (venue, reject) = match &rule.target {
+            Target::Venue(venue) => (Some(venue.clone()), None),
+            Target::Reject(text) => (None, Some(text.clone())),
+        };
+        Self {
+            client: rule.client.clone(),
+            ex_destination: rule.ex_destination.clone(),
+            symbol: rule.symbol.clone(),
+            venue,
+            reject,
+        }
+    }
+}
+
 /// `GET /api/routes`: the routing rules in force, in the order they're tried.
 pub(super) async fn routes(axum::extract::State(state): AxumState) -> Result<Json<Vec<RouteView>>, ApiError> {
     let router = state.service()?.gateway().router();
-    let routes = router
-        .rules()
-        .iter()
-        .map(|rule| {
-            let (venue, reject) = match &rule.target {
-                Target::Venue(venue) => (Some(venue.clone()), None),
-                Target::Reject(text) => (None, Some(text.clone())),
-            };
-            RouteView {
-                client: rule.client.clone(),
-                ex_destination: rule.ex_destination.clone(),
-                symbol: rule.symbol.clone(),
-                venue,
-                reject,
-            }
-        })
-        .collect();
-    Ok(Json(routes))
+    Ok(Json(router.rules().iter().map(RouteView::from).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RouteTestQuery {
+    /// A CompID, as rules match it.
+    client: CompactString,
+    ex_destination: Option<CompactString>,
+    symbol: CompactString,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct RouteTest {
+    /// The matching rule's index in `GET /api/routes`.
+    rule: Option<usize>,
+    route: Option<RouteView>,
+    /// `None` is the book's "no route" rejection.
+    target: Option<Target>,
+}
+
+/// `GET /api/routes/test?client=&ex_destination=&symbol=`: where the router would send such an
+/// order, and by which rule. Routing only: risk isn't checked.
+pub(super) async fn route_test(
+    axum::extract::State(state): AxumState,
+    query: Result<Query<RouteTestQuery>, QueryRejection>,
+) -> Result<Json<RouteTest>, ApiError> {
+    let Query(query) = query.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let router = state.service()?.gateway().router();
+    let matched = router.route_rule(&query.client, query.ex_destination.as_deref(), &query.symbol);
+    Ok(Json(RouteTest {
+        rule: matched.map(|(index, _)| index),
+        route: matched.map(|(_, rule)| RouteView::from(rule)),
+        target: matched.map(|(_, rule)| rule.target.clone()),
+    }))
 }
 
 #[cfg(test)]
@@ -419,6 +452,37 @@ pub(super) mod tests {
             "client": null, "ex_destination": null, "symbol": null, "venue": "NASDAQ", "reject": null
         });
         assert_eq!(routes, serde_json::json!([route]));
+    }
+
+    /// A dry run names the first rule matching by client, ExDestination or symbol, and its target;
+    /// none matching is null throughout, and `client` and `symbol` are required.
+    #[tokio::test]
+    async fn a_route_test_names_the_first_matching_rule() {
+        let fixture = fixture().await;
+        let config = "sessions = \"sessions.toml\"\n[[route]]\nsymbol = \"MSFT\"\nreject = \"not MSFT\"\n\
+                      [[route]]\nex_destination = \"XNAS\"\nvenue = \"NASDAQ\"\n\
+                      [[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"\n";
+        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), config).unwrap();
+        let service = fixture.service.clone();
+        let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
+        assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);
+
+        let test = async |query: &str| fixture.ok(&format!("/api/routes/test?{query}")).await;
+        // MSFT matches rules 0 and 2: the first wins.
+        let answer = test("client=FUNDA&symbol=MSFT").await;
+        assert_eq!(answer["rule"], 0);
+        assert_eq!(answer["route"]["symbol"], "MSFT");
+        assert_eq!(answer["target"], serde_json::json!({ "reject": "not MSFT" }));
+        let answer = test("client=FUNDB&ex_destination=XNAS&symbol=AAPL").await;
+        assert_eq!(answer["rule"], 1);
+        assert_eq!(answer["target"], serde_json::json!({ "venue": "NASDAQ" }));
+        assert_eq!(test("client=FUNDA&symbol=AAPL").await["rule"], 2);
+        let none = serde_json::json!({ "rule": null, "route": null, "target": null });
+        assert_eq!(test("client=FUNDB&symbol=AAPL").await, none);
+
+        for bad in ["symbol=AAPL", "client=FUNDA", "client=FUNDA&symbol=AAPL&colour=red"] {
+            assert_eq!(fixture.get(&format!("/api/routes/test?{bad}")).await.status, StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     /// Once the service has gone, reads answer 503.
