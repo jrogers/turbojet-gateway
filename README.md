@@ -425,9 +425,10 @@ jetbridge user remove alice --users users.toml
 - **Roles**: `viewer` reads; `operator` also pauses, resumes and resends sessions, cancels orders
   and asks venues where they stand, and blocks, unblocks and cancels clients; `admin` also sets and
   resets sequence numbers, edits the risk limits, reloads and reads the audit log.
-- **`--clients`** limits a user to acting on those CompIDs' client sessions, orders and scopes. Such
-  a user still reads everything, and can't act on a venue's session or on `all`. Without it a user
-  acts on every client; the API shows its `clients` as `null`.
+- **`--clients`** limits a user to acting on those CompIDs' client sessions, orders and scopes,
+  and, for an admin, their limit tables. Such a user still reads everything, and can't act on a
+  venue's session, on `all`, or on the default limits or a reload, which reach every client.
+  Without it a user acts on every client; the API shows its `clients` as `null`.
 - **Passwords** are at least 12 bytes, kept as argon2 hashes. **Tokens** (`jb_...`) are kept as
   their SHA-256 only, so a lost token is revoked and replaced, not recovered.
 - **Logging in.** A script sends `Authorization: Bearer <token>` on each request. A browser
@@ -530,6 +531,8 @@ in force, merged. An admin changes them with a `PATCH` to `/api/risk/limits/defa
   or a value of the wrong type is refused (400).
 - **`DELETE /api/risk/limits/client/{comp_id}`** removes the client's table, so its sessions get
   the defaults; 404 if it has none.
+- **`--clients`** applies: an admin with it edits only those CompIDs' tables (403 for another's).
+  The defaults, like `POST /api/reload`, reach every client, so they need an admin without it.
 - **The file is rewritten.** The gateway reads `jetbridge.toml` afresh, changes only that table,
   keeping the comments and layout elsewhere, checks the result loads, and replaces the file
   whole (the file a symlink points to, keeping its permissions). Then it reloads, as SIGHUP does,

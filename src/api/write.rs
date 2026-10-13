@@ -5,8 +5,9 @@
 //! Each takes a JSON body with a `reason` and runs through [`audited`]: refused, and the refusal
 //! recorded, for the caller's role or scope, a body that doesn't parse, or nothing to act on.
 //!
-//! A scoped operator acts only on its CompIDs' client sessions, orders and scopes: never on a
-//! venue's session, nor on `all`. A session is named as `GET /api/sessions` shows it,
+//! A scoped operator or admin acts only on its CompIDs' client sessions, orders, scopes and limit
+//! tables: never on a venue's session, nor on what reaches every client (`all`, the default
+//! limits, a reload). A session is named as `GET /api/sessions` shows it,
 //! percent-encoded as `encodeURIComponent` does: `>` as `%3E`, and a `/` (before a SubID or
 //! LocationID) as `%2F`, so it stays one segment of the path.
 
@@ -354,7 +355,7 @@ impl From<Changes> for SessionChanges {
     }
 }
 
-/// `POST /api/reload {reason}` [admin]: rereads the files, as SIGHUP does (see
+/// `POST /api/reload {reason}` [unscoped admin]: rereads the files, as SIGHUP does (see
 /// [`Service::reload`]), answering what changed; 422 with why if a file was kept.
 pub(super) async fn reload(
     axum::extract::State(state): AxumState,
@@ -363,7 +364,7 @@ pub(super) async fn reload(
 ) -> Result<Json<ReloadView>, ApiError> {
     let (body, parsed) = parse(body);
     let service = state.service()?;
-    let allowed = caller.require(Role::Admin).and(parsed);
+    let allowed = caller.require(Role::Admin).and(parsed).and_then(|()| unscoped(&caller, "a reload"));
     let mutation = Mutation { action: "reload", target: None, params: serde_json::Value::Null, reason: body.reason };
     let reload = async move {
         let reloaded = tokio::task::spawn_blocking(move || service.reload())
@@ -391,8 +392,8 @@ pub(super) struct EditedView {
     reload: ReloadView,
 }
 
-/// `PATCH /api/risk/limits/defaults {reason, set: {key: value | null}}` [admin]: sets the
-/// defaults' keys, removing those set to `null`, in `jetbridge.toml`, and reloads; see
+/// `PATCH /api/risk/limits/defaults {reason, set: {key: value | null}}` [unscoped admin]: sets
+/// the defaults' keys, removing those set to `null`, in `jetbridge.toml`, and reloads; see
 /// [`Service::edit_limits`]. The keys and their values are the file's: an amount is a JSON number
 /// or a decimal as a string (which keeps every digit), `symbols` an array of strings,
 /// `self_trade` a boolean; 400 for another key or type. 422 with why if the file wouldn't load
@@ -406,13 +407,13 @@ pub(super) async fn set_default_limits(
     body: Body<LimitsBody>,
 ) -> Result<Json<EditedView>, ApiError> {
     let (body, parsed) = parse(body);
-    let allowed = caller.require(Role::Admin).and(parsed);
+    let allowed = caller.require(Role::Admin).and(parsed).and_then(|()| unscoped(&caller, "risk.defaults"));
     set_limits(&state, &caller, Limits::Defaults, "risk.defaults".to_string(), allowed, body).await
 }
 
-/// `PATCH /api/risk/limits/client/{comp_id} {reason, set: {key: value | null}}` [admin]: as
-/// [`set_default_limits`], for the CompID's own table, created if it has none. A key it removes
-/// is the defaults' again.
+/// `PATCH /api/risk/limits/client/{comp_id} {reason, set: {key: value | null}}` [admin of the
+/// CompID]: as [`set_default_limits`], for the CompID's own table, created if it has none. A key
+/// it removes is the defaults' again.
 pub(super) async fn set_client_limits(
     axum::extract::State(state): AxumState,
     caller: Caller,
@@ -426,14 +427,15 @@ pub(super) async fn set_client_limits(
         .require(Role::Admin)
         .and(parsed_id)
         .and(parsed)
-        .and_then(|()| limits::check_comp_id(&comp_id).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e)));
+        .and_then(|()| limits::check_comp_id(&comp_id).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e)))
+        .and_then(|()| in_scope(&caller, &comp_id));
     let target = format!("risk.client.{comp_id}");
     set_limits(&state, &caller, Limits::Client(comp_id), target, allowed, body).await
 }
 
-/// `DELETE /api/risk/limits/client/{comp_id} {reason}` [admin]: removes the CompID's table from
-/// `jetbridge.toml`, so its sessions get the defaults, and reloads, as [`set_default_limits`]
-/// does; 404 if it has none. A PATCH removing every key leaves the table, empty: the client gets
+/// `DELETE /api/risk/limits/client/{comp_id} {reason}` [admin of the CompID]: removes the
+/// CompID's table from `jetbridge.toml`, so its sessions get the defaults, and reloads, as
+/// [`set_default_limits`] does; 404 if it has none. A PATCH removing every key leaves the table, empty: the client gets
 /// the defaults but still has a table, until this removes it.
 pub(super) async fn delete_client_limits(
     axum::extract::State(state): AxumState,
@@ -449,6 +451,7 @@ pub(super) async fn delete_client_limits(
         .and(parsed_id)
         .and(parsed)
         .and_then(|()| limits::check_comp_id(&comp_id).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e)))
+        .and_then(|()| in_scope(&caller, &comp_id))
         .map(|()| Edit::Delete { comp_id: comp_id.clone() });
     let target = Some(Limits::Client(comp_id.clone()).to_string());
     let mutation = Mutation { action: "delete_limits", target, params: serde_json::Value::Null, reason: body.reason };
@@ -676,7 +679,17 @@ where
     audited_on(state, caller, mutation, found, |scope| action(gateway, scope)).await
 }
 
-/// 403 for a scoped operator acting on what isn't theirs.
+/// 403 for a scoped caller acting on another CompID's client.
+fn in_scope(caller: &Caller, comp_id: &str) -> Result<(), ApiError> {
+    if caller.may_act_on(comp_id) { Ok(()) } else { Err(out_of_scope(caller, comp_id)) }
+}
+
+/// 403 for a scoped caller acting on what affects every client, as `all` does: `what`.
+fn unscoped(caller: &Caller, what: &str) -> Result<(), ApiError> {
+    if caller.may_act_on(&Scope::All) { Ok(()) } else { Err(out_of_scope(caller, what)) }
+}
+
+/// 403 for a scoped caller acting on what isn't theirs.
 fn out_of_scope(caller: &Caller, target: &str) -> ApiError {
     let clients = caller.clients.as_deref().unwrap_or_default().join(", ");
     ApiError::new(StatusCode::FORBIDDEN, format!("{} may act only on clients {clients}, not {target}", caller.user))
@@ -1040,6 +1053,29 @@ mod tests {
         assert_eq!(fixture.service.gateway().blocked(), [Scope::CompId("FUNDB".into())]);
         assert!(fixture.service.gateway().cancelling().is_empty());
         assert!(!fixture.service.client_paused().iter().any(|id| id.target_comp_id == "FUNDA"));
+    }
+
+    /// An admin scoped to FUNDB edits FUNDB's limits, and is refused FUNDA's, the defaults and a
+    /// reload, which reach every client as `all` does; the file is left as it was.
+    #[tokio::test]
+    async fn a_scoped_admin_edits_only_its_clients_limits() {
+        let fixture = fixture().await;
+        let as_scoped = async |method: &str, path: &str, body: &str| {
+            fixture.send(method, &fixture.scoped_admin, path, body).await.status
+        };
+        let credit = r#"{"reason":"testing","set":{"credit":5}}"#;
+        let fundb = "/api/risk/limits/client/FUNDB";
+        assert_eq!(as_scoped("PATCH", fundb, credit).await, StatusCode::OK);
+        let config = fixture.config();
+        assert_eq!(as_scoped("PATCH", CLIENT_FUNDA, credit).await, StatusCode::FORBIDDEN);
+        assert_eq!(fixture.last_result(), "refused: abe may act only on clients FUNDB, not FUNDA");
+        assert_eq!(as_scoped("DELETE", CLIENT_FUNDA, REASON).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_scoped("PATCH", DEFAULTS, credit).await, StatusCode::FORBIDDEN);
+        assert_eq!(fixture.last_result(), "refused: abe may act only on clients FUNDB, not risk.defaults");
+        assert_eq!(as_scoped("POST", "/api/reload", REASON).await, StatusCode::FORBIDDEN);
+        assert_eq!(fixture.last_result(), "refused: abe may act only on clients FUNDB, not a reload");
+        assert_eq!(fixture.config(), config);
+        assert_eq!(as_scoped("DELETE", fundb, REASON).await, StatusCode::OK);
     }
 
     /// A reload answers what changed; one whose configuration is refused answers 422 with why,

@@ -314,12 +314,13 @@ pub(super) mod tests {
     /// API's routes reaching it, bearer headers for each role, and what keeps them alive.
     pub(in crate::api) struct Fixture {
         pub(in crate::api) app: axum::Router,
-        /// Bearer headers' values: a viewer's, an operator's, an operator's scoped to FUNDB, and
-        /// an admin's.
+        /// Bearer headers' values: a viewer's, an operator's, an operator's scoped to FUNDB, an
+        /// admin's, and an admin's scoped to FUNDB.
         pub(in crate::api) viewer: String,
         pub(in crate::api) operator: String,
         pub(in crate::api) scoped: String,
         pub(in crate::api) admin: String,
+        pub(in crate::api) scoped_admin: String,
         pub(in crate::api) service: Arc<Service>,
         pub(in crate::api) state: State,
         _client: Initiator,
@@ -370,12 +371,24 @@ pub(super) mod tests {
         let operator = bearer("olga", Role::Operator, &[]);
         let scoped = bearer("sam", Role::Operator, &["FUNDB"]);
         let admin = bearer("ada", Role::Admin, &[]);
+        let scoped_admin = bearer("abe", Role::Admin, &["FUNDB"]);
         let (mut state, audit_dir) =
             super::super::tests::state(Arc::new(Auth::new(Default::default(), users, false, false)));
         state.service = Arc::downgrade(&service);
         let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
         let app = super::super::router(state.clone()).layer(MockConnectInfo(peer));
-        Fixture { app, viewer, operator, scoped, admin, service, state, _client: client, dirs: (dir, audit_dir) }
+        Fixture {
+            app,
+            viewer,
+            operator,
+            scoped,
+            admin,
+            scoped_admin,
+            service,
+            state,
+            _client: client,
+            dirs: (dir, audit_dir),
+        }
     }
 
     impl Fixture {
