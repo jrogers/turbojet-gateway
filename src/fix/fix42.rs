@@ -98,6 +98,7 @@ pub fn venue_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
             let side = side_to_fix(request.side);
             let mut status = fix::OrderStatusRequest::new(downstream.as_str(), request.symbol.as_str(), side);
             status.order_id.clone_from(venue_order_id);
+            status.account.clone_from(&request.account);
             Some(status.to_message())
         }
         Output::Report { .. } | Output::CancelReject { .. } => None,
@@ -1451,6 +1452,7 @@ mod tests {
         let status: fix::OrderStatusRequest = venue_message(&output, time()).unwrap().parse().unwrap();
         assert_eq!((status.cl_ord_id.as_str(), status.order_id.as_deref()), ("7-1", Some("V-9")));
         assert_eq!((status.symbol.as_str(), status.side), ("AAPL", Code::Known(fix::Side::Sell)));
+        assert_eq!(status.account.as_deref(), Some("ACC"));
     }
 
     #[test]

@@ -1351,6 +1351,7 @@ mod tests {
         let status: fix::OrderStatusRequest = venue_message(&output, time()).unwrap().parse().unwrap();
         assert_eq!((status.cl_ord_id.as_str(), status.order_id.as_deref()), ("7-1", Some("V-9")));
         assert_eq!((status.symbol.as_deref(), status.side), (Some("AAPL"), Code::Known(fix::Side::Sell)));
+        assert_eq!(status.account.as_deref(), Some("ACC"));
     }
 
     #[test]
