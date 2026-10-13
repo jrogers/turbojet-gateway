@@ -71,13 +71,13 @@ pub fn client_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
             reject.transact_time = Some(now);
             Some(reject.to_message())
         }
-        Output::NewOrder { .. } | Output::Cancel { .. } | Output::Replace { .. } => None,
+        Output::NewOrder { .. } | Output::Cancel { .. } | Output::Replace { .. } | Output::StatusRequest { .. } => None,
     }
 }
 
-/// The venue's message for `output`: a NewOrderSingle, OrderCancelRequest or
-/// OrderCancelReplaceRequest under the downstream ClOrdIDs. `request.cl_ord_id` is the client's
-/// and never goes to a venue. `None` for client-bound outputs. `now` is TransactTime(60).
+/// The venue's message for `output`: a NewOrderSingle, OrderCancelRequest,
+/// OrderCancelReplaceRequest or OrderStatusRequest under the downstream ClOrdIDs.
+/// `request.cl_ord_id` is the client's and never goes to a venue. `None` for client-bound outputs. `now` is TransactTime(60).
 pub fn venue_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
     match output {
         Output::NewOrder { downstream, request, .. } => Some(new_order_single(downstream, request, now).to_message()),
@@ -93,6 +93,12 @@ pub fn venue_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
         }
         Output::Replace { downstream, orig_downstream, request, venue_order_id, .. } => {
             Some(replace_request(downstream, orig_downstream, request, venue_order_id.as_ref(), now).to_message())
+        }
+        Output::StatusRequest { downstream, request, venue_order_id, .. } => {
+            let side = side_to_fix(request.side);
+            let mut status = fix::OrderStatusRequest::new(downstream.as_str(), request.symbol.as_str(), side);
+            status.order_id.clone_from(venue_order_id);
+            Some(status.to_message())
         }
         Output::Report { .. } | Output::CancelReject { .. } => None,
     }
@@ -1370,7 +1376,7 @@ mod tests {
         OrderRequest { cl_ord_id: CLIENT_CL_ORD_ID.into(), ..request() }
     }
 
-    fn venue_outputs() -> [Output; 3] {
+    fn venue_outputs() -> [Output; 4] {
         [
             Output::NewOrder { venue: venue(), downstream: "7".into(), request: venue_request() },
             Output::Cancel {
@@ -1384,6 +1390,12 @@ mod tests {
                 venue: venue(),
                 downstream: "7-1".into(),
                 orig_downstream: "7".into(),
+                request: venue_request(),
+                venue_order_id: Some("V-9".into()),
+            },
+            Output::StatusRequest {
+                venue: venue(),
+                downstream: "7-1".into(),
                 request: venue_request(),
                 venue_order_id: Some("V-9".into()),
             },
@@ -1419,7 +1431,7 @@ mod tests {
 
     #[test]
     fn a_cancel_names_the_downstream_order_and_the_venues_order_id() {
-        let [_, mut output, _] = venue_outputs();
+        let [_, mut output, ..] = venue_outputs();
         let cancel: fix::OrderCancelRequest = venue_message(&output, time()).unwrap().parse().unwrap();
         assert_eq!((cancel.cl_ord_id.as_str(), cancel.orig_cl_ord_id.as_str()), ("7-2", "7-1"));
         assert_eq!(
@@ -1434,8 +1446,16 @@ mod tests {
     }
 
     #[test]
+    fn a_status_request_names_the_downstream_order_and_the_venues_order_id() {
+        let [.., output] = venue_outputs();
+        let status: fix::OrderStatusRequest = venue_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!((status.cl_ord_id.as_str(), status.order_id.as_deref()), ("7-1", Some("V-9")));
+        assert_eq!((status.symbol.as_str(), status.side), ("AAPL", Code::Known(fix::Side::Sell)));
+    }
+
+    #[test]
     fn a_replace_carries_the_new_terms() {
-        let [_, _, output] = venue_outputs();
+        let [_, _, output, _] = venue_outputs();
         let replace: fix::OrderCancelReplaceRequest = venue_message(&output, time()).unwrap().parse().unwrap();
         assert_eq!((replace.cl_ord_id.as_str(), replace.orig_cl_ord_id.as_str()), ("7-1", "7"));
         assert_eq!(

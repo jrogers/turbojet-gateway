@@ -127,6 +127,29 @@ impl fmt::Display for CancelError {
 
 impl std::error::Error for CancelError {}
 
+/// Why [`Gateway::request_status`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusError {
+    /// As [`CancelError::UnknownOrder`].
+    UnknownOrder,
+    /// As [`CancelError::Done`].
+    Done,
+    /// The order's venue session isn't connected, or its send queue is full.
+    VenueUnavailable,
+}
+
+impl fmt::Display for StatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnknownOrder => "unknown order",
+            Self::Done => "the order is done",
+            Self::VenueUnavailable => "the order's venue isn't logged on or can't take the request",
+        })
+    }
+}
+
+impl std::error::Error for StatusError {}
+
 /// What the gateway leaves unfinished at a stop: see [`Gateway::unfinished`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unfinished {
@@ -416,6 +439,29 @@ impl Gateway {
         }
         self.committed().await;
         Ok(())
+    }
+
+    /// Asks the order's venue where the order stands: see [`Input::VenueStatusRequest`]. Returns
+    /// once the venue's session has queued the request. Nothing is held or written, since nothing
+    /// changes until the venue answers, and nothing waits for a venue that's down: ask again once
+    /// it's up.
+    ///
+    /// # Errors
+    ///
+    /// If the book doesn't hold the order, it's done, or its venue's session can't take the
+    /// request.
+    pub fn request_status(&self, order: OrderId) -> Result<(), StatusError> {
+        let mut state = self.lock();
+        let state = &mut *state;
+        let found = state.book.order(order).ok_or(StatusError::UnknownOrder)?;
+        if found.status.is_done() {
+            return Err(StatusError::Done);
+        }
+        let venue = found.venue.clone();
+        let mut out = Vec::new();
+        state.book.handle(Input::VenueStatusRequest { order }, &mut out);
+        let [output] = <[Output; 1]>::try_from(out).expect("a live order's status request is sent");
+        send_status_request(state.venues.get(&venue), &output, self.clock.now().into())
     }
 
     /// The client whose session shows as `session`, if it has logged on since start or the book
@@ -754,6 +800,14 @@ impl Gateway {
                 reports.push((client.clone(), msg));
                 None
             }
+            // Only `request_status` asks for one, and sends it itself; never failed back to the
+            // book, which recorded nothing to fail.
+            Output::StatusRequest { venue, downstream, .. } => {
+                if let Err(refused) = send_status_request(state.venues.get(venue), output, now) {
+                    warn!(%venue, %downstream, "status request not sent: {refused}");
+                }
+                None
+            }
             Output::NewOrder { venue, downstream, .. }
             | Output::Cancel { venue, downstream, .. }
             | Output::Replace { venue, downstream, .. } => {
@@ -862,6 +916,14 @@ impl Gateway {
             std::process::abort()
         })
     }
+}
+
+/// Sends a status request to venue `to`, if its session is connected and takes it. The receipt
+/// isn't waited on: a request lost is asked again.
+fn send_status_request(to: Option<&Venue>, output: &Output, now: UtcTimestamp) -> Result<(), StatusError> {
+    let to = to.filter(|to| to.session.is_connected()).ok_or(StatusError::VenueUnavailable)?;
+    let msg = to.version.venue_message(output, now).expect("a venue-bound output");
+    to.session.send(msg).map(drop).map_err(|_| StatusError::VenueUnavailable)
 }
 
 /// When `client`'s trading day ends, as of `now`: at the next `day_end`, or sooner, when its
@@ -1445,6 +1507,21 @@ pub(crate) mod tests {
         send_order(&gateway, "C1");
         assert_eq!(gateway.cancel_order(OrderId(1)).await, Err(CancelError::Done));
         assert!(gateway.cancelling().is_empty());
+    }
+
+    /// A status request is refused for an unknown or done order, and for a live one whose venue
+    /// isn't connected, rather than waiting for it.
+    #[tokio::test]
+    async fn a_status_request_is_refused_unknown_done_or_with_the_venue_down() {
+        let gateway = gateway();
+        assert_eq!(gateway.request_status(OrderId(1)), Err(StatusError::UnknownOrder));
+        book_order(&gateway);
+        assert_eq!(gateway.request_status(OrderId(1)), Err(StatusError::VenueUnavailable));
+        let venue = session("FIX.4.4", "VENUE");
+        assert!(gateway.set_venues([(VENUE.into(), venue)]).is_empty());
+        assert_eq!(gateway.request_status(OrderId(1)), Err(StatusError::VenueUnavailable));
+        send_order(&gateway, "C2");
+        assert_eq!(gateway.request_status(OrderId(2)), Err(StatusError::Done));
     }
 
     /// A session with a SubID is found by the session as it shows, and names a session scope.

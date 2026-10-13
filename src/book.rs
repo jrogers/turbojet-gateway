@@ -514,6 +514,16 @@ pub enum Input {
     CancelOrder {
         order: OrderId,
     },
+    /// The gateway asks the order's venue where the order stands, not to be confused with a
+    /// client's `StatusRequest`, which the book answers itself. Sent under the downstream ClOrdID
+    /// the venue last acknowledged ([`Order::downstream`]), not a replace still pending, which the
+    /// venue may not have taken. It changes and records nothing: the venue's answer is handled as
+    /// any report is, a fill the gateway missed reaching the client and one changing nothing
+    /// dropped, and an answer that the venue doesn't know the order raises
+    /// [`AlarmKind::UnknownAtVenue`]. Nothing is sent for an unknown or done order.
+    VenueStatusRequest {
+        order: OrderId,
+    },
     /// The venue's session logged on, or can take requests again: the gateway's cancels that
     /// couldn't be sent to it go now.
     VenueUp {
@@ -644,6 +654,14 @@ pub enum Output {
         venue: VenueId,
         downstream: CompactString,
         orig_downstream: CompactString,
+        request: OrderRequest,
+        venue_order_id: Option<CompactString>,
+    },
+    /// An OrderStatusRequest under the order's current `downstream`: see
+    /// [`Input::VenueStatusRequest`]. `request` carries the side, symbol and account.
+    StatusRequest {
+        venue: VenueId,
+        downstream: CompactString,
         request: OrderRequest,
         venue_order_id: Option<CompactString>,
     },
@@ -882,6 +900,9 @@ impl Book {
             Input::StatusRequest { client, cl_ord_id, side, symbol } => {
                 self.status_request(client, cl_ord_id, side, symbol, out)
             }
+            Input::VenueReport { venue, report } if report::says_unknown_at_venue(&report) => {
+                self.unknown_at_venue(&venue, &report)
+            }
             Input::VenueReport { venue, report } => self.venue_report(&venue, report, out),
             Input::Cancel { client, cl_ord_id, orig_cl_ord_id, side, symbol, redelivered } => {
                 let amend = Amend { client, cl_ord_id, orig_cl_ord_id, kind: CancelKind::Cancel, redelivered };
@@ -910,6 +931,7 @@ impl Book {
             Input::SendFailed { venue, downstream, text } => self.send_failed(&venue, &downstream, text, out),
             Input::CancelAll { scope } => self.cancel_all(&scope, out),
             Input::CancelOrder { order } => self.cancel_order(order, out),
+            Input::VenueStatusRequest { order } => self.venue_status_request(order, out),
             Input::VenueUp { venue } => self.venue_up(&venue, out),
             Input::Unsent { venue, downstream } => self.unsent(&venue, downstream, out),
             Input::Orphan { venue, downstream, replace } => self.orphan(&venue, downstream, replace),
@@ -1154,6 +1176,23 @@ impl Book {
         };
         let report = self.unbooked_report(request, "unknown order".into());
         out.push(Output::Report { client, report });
+    }
+
+    /// See [`Input::VenueStatusRequest`].
+    fn venue_status_request(&self, id: OrderId, out: &mut Vec<Output>) {
+        let Some(order) = self.orders.get(&id) else {
+            return tracing::warn!(order = id.0, "status request for an unknown order");
+        };
+        if order.status.is_done() {
+            return tracing::debug!(order = %order.name, "status request for a done order");
+        }
+        tracing::info!(order = %order.name, downstream = %order.downstream, "asking the venue for an order's status");
+        out.push(Output::StatusRequest {
+            venue: order.venue.clone(),
+            downstream: order.downstream.clone(),
+            request: order.request.clone(),
+            venue_order_id: order.venue_order_id.clone(),
+        });
     }
 
     /// The scopes operators have blocked, in the order they were blocked.

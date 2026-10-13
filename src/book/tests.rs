@@ -695,6 +695,80 @@ fn an_implied_price_is_rounded_to_eight_places() {
     assert_eq!(report.last_px, "12.33333333".parse().unwrap());
 }
 
+/// The downstream ClOrdID the gateway's status request for order 1 names; `None` if it sends none.
+fn venue_status_request(book: &mut Book) -> Option<CompactString> {
+    let before = book.snapshot();
+    let out = run(book, Input::VenueStatusRequest { order: OrderId(1) });
+    // It records nothing: no `Sent`, no new downstream number.
+    assert_eq!(book.snapshot(), before);
+    assert!(book.take_changes().is_empty());
+    match out.as_slice() {
+        [] => None,
+        [Output::StatusRequest { venue, downstream, request, venue_order_id }] => {
+            assert_eq!((venue.as_str(), request.side, request.symbol.as_str()), ("NASDAQ", Side::Buy, "AAPL"));
+            assert_eq!(*venue_order_id, book.order(OrderId(1)).unwrap().venue_order_id);
+            Some(downstream.clone())
+        }
+        _ => panic!("{out:?}"),
+    }
+}
+
+/// The gateway asks under the ClOrdID the venue last acknowledged: the original while a replace is
+/// pending, the replace's once it's accepted. Nothing for an unknown or done order.
+#[test]
+fn a_status_request_names_the_downstream_the_venue_last_acknowledged() {
+    let mut book = book();
+    assert_eq!(venue_status_request(&mut book), None);
+    new_order(&mut book, "C1");
+    assert_eq!(venue_status_request(&mut book).as_deref(), Some("1"));
+    replace(&mut book, "C2", "C1", 80, 11);
+    assert_eq!(venue_status_request(&mut book).as_deref(), Some("1"));
+    run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    assert_eq!(venue_status_request(&mut book).as_deref(), Some("1-1"));
+    run(&mut book, venue_report("1-1", Status::Canceled, 0, 0));
+    assert_eq!(venue_status_request(&mut book), None);
+}
+
+/// The venue's answer is a report like any other: one showing a fill the gateway missed reaches
+/// the client, one showing nothing new doesn't, as the client didn't ask.
+#[test]
+fn a_status_answer_reaches_the_client_only_with_news() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    venue_status_request(&mut book);
+    assert!(run(&mut book, venue_report_as("1", ExecType::Status, Status::New, 0, 0)).is_empty());
+    let out = run(&mut book, venue_report_as("1", ExecType::Status, Status::PartiallyFilled, 0, 40));
+    let [Output::Report { report, .. }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!((report.exec_type, report.last_qty, report.cl_ord_id.as_str()), (ExecType::Trade, 40.into(), "C1"));
+}
+
+/// A venue that doesn't know the order answers Status, Rejected, OrdRejReason 5 (FIX 4.2 and 4.4
+/// alike): an alarm, the order left as it is and the client not told. For a done order, nothing.
+#[test]
+fn a_status_answer_that_the_venue_doesnt_know_the_order_raises_an_alarm() {
+    let unknown = || {
+        let mut input = venue_report_as("1", ExecType::Status, Status::Rejected, 0, 0);
+        let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+        report.ord_rej_reason = Some(5);
+        input
+    };
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    book.take_events().for_each(drop);
+    let before = book.snapshot();
+    assert!(run(&mut book, unknown()).is_empty());
+    assert_eq!(book.snapshot(), before);
+    let events: Vec<GatewayEvent> = book.take_events().collect();
+    let [GatewayEvent::Alarm(alarm)] = events.as_slice() else { panic!("{events:?}") };
+    assert_eq!(alarm.kind, AlarmKind::UnknownAtVenue);
+
+    run(&mut book, venue_report("1", Status::Canceled, 0, 0));
+    assert!(run(&mut book, unknown()).is_empty());
+    assert_eq!(book.take_events().count(), 0);
+}
+
 #[test]
 fn a_replace_ack_with_a_fill_reaches_the_client_as_a_trade() {
     let mut book = book();

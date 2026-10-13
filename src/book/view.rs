@@ -308,6 +308,8 @@ pub enum AlarmKind {
     Overfill,
     /// A venue reported on an order the book doesn't have.
     UnknownOrder,
+    /// A venue answered a status request saying it doesn't know an order the book has live.
+    UnknownAtVenue,
     /// A venue's session reset its store, so requests it never stored failed rather than go again.
     VenueStoreReset,
 }

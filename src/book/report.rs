@@ -8,12 +8,35 @@ use super::{
 /// Text(58) of the restatement telling a client the venue accepted an orphaned replace.
 const ORPHAN_REPLACED: &str = "replaced at the venue by a request sent before the gateway restarted";
 
+/// OrdRejReason(103) Unknown order, 5 in FIX 4.2 and 4.4.
+const UNKNOWN_ORDER: u32 = 5;
+
 impl Book {
     fn unknown_report(&mut self, venue: &VenueId, report: &VenueReport) {
         let (downstream, exec_id) = (&report.downstream, &report.exec_id);
         tracing::warn!(%venue, %downstream, %exec_id, "execution report for an unknown order");
         let text = format!("venue {venue} reported on unknown order {downstream} (ExecID {exec_id})");
         self.alarm(AlarmKind::UnknownOrder, text);
+    }
+
+    /// The venue's answer to [`Input::VenueStatusRequest`](super::Input::VenueStatusRequest) for an
+    /// order it doesn't know. Not applied: the order isn't rejected, the venue has lost it or
+    /// never had it, and someone has to look. A done order it has forgotten is no news.
+    pub(super) fn unknown_at_venue(&mut self, venue: &VenueId, report: &VenueReport) {
+        let Some(sent) = self.downstream.get(&report.downstream) else {
+            return self.unknown_report(venue, report);
+        };
+        let order = &self.orders[&sent.order];
+        let (downstream, exec_id) = (&report.downstream, &report.exec_id);
+        if order.venue != *venue {
+            return tracing::warn!(%venue, %downstream, %exec_id, "unknown-order answer about another venue's order");
+        }
+        if order.status.is_done() {
+            return tracing::debug!(%venue, %downstream, %exec_id, "venue doesn't know a done order");
+        }
+        tracing::error!(%venue, %downstream, %exec_id, order = %order.name, "venue doesn't know a live order");
+        let text = format!("venue {venue} doesn't know live order {} ({downstream}, ExecID {exec_id})", order.name);
+        self.alarm(AlarmKind::UnknownAtVenue, text);
     }
 
     /// Not applied: someone has to find out from the venue what was filled.
@@ -184,6 +207,14 @@ impl Order {
         }
         report
     }
+}
+
+/// Whether `report` is how FIX 4.2 and 4.4 answer a status request for an order the venue doesn't
+/// know: Status, Rejected, Unknown order. See [`Book::unknown_at_venue`].
+pub(super) fn says_unknown_at_venue(report: &VenueReport) -> bool {
+    report.exec_type == ExecType::Status
+        && report.status == Some(Status::Rejected)
+        && report.ord_rej_reason == Some(UNKNOWN_ORDER)
 }
 
 /// Whether a report under a request of `kind` from `origin` answers that request: a client's
