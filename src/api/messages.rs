@@ -199,6 +199,9 @@ async fn run(state: &State, dir: PathBuf, search: Search) -> Result<Json<Page>, 
 struct Search {
     /// Without times: `range` has them.
     filters: Vec<LogFilter>,
+    /// `filters` without their MsgType and tag conditions: a record none of these passes isn't
+    /// decoded.
+    headers: Vec<LogFilter>,
     /// Only the times.
     range: LogFilter,
     limit: usize,
@@ -232,7 +235,16 @@ impl Search {
         let mut range = LogFilter::default();
         range.since = Some(since);
         range.until = Some(until);
-        Ok(Self { filters, range, limit, after })
+        let headers = filters
+            .iter()
+            .map(|filter| {
+                let mut header = filter.clone();
+                header.msg_types.clear();
+                header.tags.clear();
+                header
+            })
+            .collect();
+        Ok(Self { filters, headers, range, limit, after })
     }
 }
 
@@ -443,6 +455,9 @@ fn hit(record: LogRecord, search: &Search) -> Option<Hit> {
     let LogRecord::Message { time, direction, session, frame } = record else { return None };
     // FIXP frames: Jetbridge's sessions are all FIX.
     if !search.range.in_range(time) || !frame.starts_with(b"8=") {
+        return None;
+    }
+    if !search.headers.iter().any(|header| header.matches_message(direction, session.as_deref(), None)) {
         return None;
     }
     let msg = match decode(&frame) {
