@@ -151,14 +151,12 @@ impl Users {
         }
     }
 
-    /// Writes the users to `path` whole, through a temporary file in its directory renamed over
-    /// it, so a reader never sees half a file and a crash leaves the old one or the new. The file
-    /// keeps its permissions; a new one is readable by its owner only. Returns a warning if the
-    /// file's owner changed: whoever runs this owns the new file, so run it as the gateway's user.
+    /// Writes the users to `path` whole, as [`write_atomically`] does: a symlink is followed, and
+    /// the warnings are its. Whoever runs this owns the new file, so run it as the gateway's user.
     ///
     /// # Errors
     ///
-    /// Writing, renaming or syncing the directory fails.
+    /// Resolving the path, writing or renaming fails.
     pub fn save(&self, path: &Path) -> io::Result<Option<String>> {
         write_atomically(path, &toml::to_string(self).map_err(io::Error::other)?)
     }
@@ -386,31 +384,41 @@ fn check_hash(phc: &str) -> Result<(), String> {
 }
 
 /// Writes `text` to `path` whole, through a temporary file in its directory renamed over it, so a
-/// reader never sees half a file and a crash leaves the old one or the new. The file keeps its
+/// reader never sees half a file and a crash leaves the old one or the new. A symlink at `path` is
+/// followed: the file it points to is replaced, and the link stays. The file keeps its
 /// permissions; a new one is readable by its owner only. Returns a warning if the file's owner
-/// changed: whoever runs this owns the new file. A symlink at `path` is replaced, not followed.
+/// changed (whoever runs this owns the new file), or if the directory couldn't be synced once the
+/// file was renamed into place: it's written, but a crash could still bring back the old one.
 ///
 /// # Errors
 ///
-/// Writing, renaming or syncing the directory fails.
+/// Resolving the path, writing or renaming fails: the file is as it was.
 pub(crate) fn write_atomically(path: &Path, text: &str) -> io::Result<Option<String>> {
+    let path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(e),
+    };
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    let old = std::fs::metadata(path).ok();
+    let old = std::fs::metadata(&path).ok();
     if let Some(old) = &old {
         file.as_file().set_permissions(old.permissions())?;
     }
     file.write_all(text.as_bytes())?;
     file.as_file().sync_all()?;
-    let warning = owner_change(old.as_ref(), &file.as_file().metadata()?);
-    file.persist(path).map_err(|e| e.error)?;
-    // The rename itself is durable once the directory is.
+    let mut warnings: Vec<_> = owner_change(old.as_ref(), &file.as_file().metadata()?).into_iter().collect();
+    file.persist(&path).map_err(|e| e.error)?;
+    // The rename itself is durable once the directory is. Past the rename, a failure is a warning:
+    // the file is written.
     #[cfg(unix)]
-    std::fs::File::open(directory)?.sync_all()?;
-    Ok(warning)
+    if let Err(e) = std::fs::File::open(directory).and_then(|directory| directory.sync_all()) {
+        warnings.push(format!("{} is written, but syncing its directory failed: {e}", path.display()));
+    }
+    Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 
 /// A warning if the file a save replaces, `old`, had another owner than the new one.
@@ -622,5 +630,25 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         Users::default().save(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    /// A save through a symlink writes the file it points to, and the link stays.
+    #[cfg(unix)]
+    #[test]
+    fn saving_follows_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("users.toml");
+        std::os::unix::fs::symlink("real.toml", &link).unwrap();
+        // Dangling: the file it names doesn't exist yet, so the link itself is written over.
+        Users::default().save(&link).unwrap();
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(dir.path().join("real.toml"), "").unwrap();
+        std::os::unix::fs::symlink("real.toml", &link).unwrap();
+        let mut users = Users::default();
+        users.add("ada", Role::Admin, Vec::new(), "a long password").unwrap();
+        users.save(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::read_to_string(dir.path().join("real.toml")).unwrap().contains("ada"));
     }
 }
