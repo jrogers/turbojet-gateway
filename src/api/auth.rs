@@ -789,7 +789,7 @@ mod tests {
         (Arc::new(auth), clock)
     }
 
-    /// The API's routes, and the directory of its audit log, `audit.jsonl`.
+    /// The API's routes, and the directory of its audit log.
     struct App {
         router: axum::Router,
         dir: tempfile::TempDir,
@@ -806,7 +806,7 @@ mod tests {
     impl App {
         /// The audit log's lines so far.
         fn audit(&self) -> Vec<serde_json::Value> {
-            let text = std::fs::read_to_string(self.dir.path().join("audit.jsonl")).unwrap();
+            let text = crate::audit::tests::text(self.dir.path());
             text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
         }
     }
@@ -949,7 +949,8 @@ mod tests {
         let api = Api {
             listen: "127.0.0.1:0".parse().unwrap(),
             users: path.clone(),
-            audit: PathBuf::new(),
+            audit_dir: PathBuf::new(),
+            audit_retention: None,
             tls: None,
             behind_proxy: false,
         };
@@ -1229,7 +1230,7 @@ mod tests {
         ];
         assert_eq!((0..lines.len()).map(line).collect::<Vec<_>>(), expected);
         assert_eq!(lines[0]["ip"], "192.0.2.1");
-        let text = std::fs::read_to_string(app.dir.path().join("audit.jsonl")).unwrap();
+        let text = crate::audit::tests::text(app.dir.path());
         let session = cookie.split_once('=').unwrap().1;
         for secret in ["alice secret", "guess", "carol", &csrf, session, &token] {
             assert!(!text.contains(secret), "{secret} in {text}");
@@ -1251,7 +1252,7 @@ mod tests {
         let path = format!("/api/x/{}", "é".repeat(200));
         let wrong = [("authorization", "Bearer jb_wrong")];
         assert_eq!(send(&app, "GET", &path, &wrong, "").await.status, StatusCode::UNAUTHORIZED);
-        let text = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let text = crate::audit::tests::text(dir.path());
         let line: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
         assert_eq!(line["target"], format!("GET {}", &path[..MAX_AUDIT_TARGET_LEN - 5]));
     }
@@ -1263,7 +1264,7 @@ mod tests {
         let (auth, _) = auth(users(), false);
         let app = app(&auth);
         let (cookie, csrf) = session(&app, "alice", "alice secret").await;
-        crate::audit::tests::make_read_only(&app.dir.path().join("audit.jsonl"));
+        let _unwritable = crate::audit::tests::make_unwritable(app.dir.path());
         let answer = login(&app, "bob", "hunter2hunter2").await;
         assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!answer.headers.contains_key(SET_COOKIE));

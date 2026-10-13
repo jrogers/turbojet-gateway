@@ -28,7 +28,7 @@ credit = 10000000                 # open + filled today + this order
 [api]
 listen = "127.0.0.1:8080"
 users = "users.toml"              # paths relative to this file
-audit = "audit.jsonl"
+audit_dir = "audit"               # a file a day; audit_retention = "400d" deletes older ones
 
 # Every message the clients' and venues' sessions receive and send, in files by day, passwords
 # masked. Left out, nothing is logged.

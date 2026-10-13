@@ -788,7 +788,7 @@ mod tests {
 
         /// The audit log's results, in order.
         fn results(&self) -> Vec<String> {
-            let text = std::fs::read_to_string(self.dirs.1.path().join("audit.jsonl")).unwrap_or_default();
+            let text = crate::audit::tests::text(self.dirs.1.path());
             let lines = text.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap());
             lines.map(|line| line["result"].as_str().unwrap().to_string()).collect()
         }
@@ -947,7 +947,7 @@ mod tests {
         };
         let numbers = |body: &serde_json::Value| (body["next_incoming"].as_u64(), body["next_outgoing"].as_u64());
         let last_params = || {
-            let audit = std::fs::read_to_string(fixture.dirs.1.path().join("audit.jsonl")).unwrap();
+            let audit = crate::audit::tests::text(fixture.dirs.1.path());
             serde_json::from_str::<serde_json::Value>(audit.lines().last().unwrap()).unwrap()["params"].clone()
         };
         let (sequence, reset) = (format!("/api/sessions/{FUNDA}/sequence"), format!("/api/sessions/{FUNDA}/reset"));
@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(body["reload"]["config"]["routes"], 1);
         assert_eq!(fixture.config(), format!("{top}\n[risk.defaults]\ncredit = 1000\nsymbols = [\"AAPL\"]\n"));
         assert_eq!(funda().credit, Some(Decimal::from(1000)));
-        let audit = std::fs::read_to_string(fixture.dirs.1.path().join("audit.jsonl")).unwrap();
+        let audit = crate::audit::tests::text(fixture.dirs.1.path());
         let line: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
         assert_eq!((&line["action"], &line["target"]), (&"set_limits".into(), &"risk.defaults".into()));
         assert_eq!(

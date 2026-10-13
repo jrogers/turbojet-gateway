@@ -232,7 +232,7 @@ reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
     // No users yet: a test adds them and reloads.
     let api = if *api {
         std::fs::write(dir.path().join("users.toml"), "").unwrap();
-        "[api]\nlisten = \"127.0.0.1:0\"\nusers = \"users.toml\"\naudit = \"audit.jsonl\"\n"
+        "[api]\nlisten = \"127.0.0.1:0\"\nusers = \"users.toml\"\naudit_dir = \"audit\"\n"
     } else {
         ""
     };
@@ -244,6 +244,14 @@ reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
 /// The gateway's database, with [`Options::database`].
 fn database_url(dir: &tempfile::TempDir) -> String {
     format!("sqlite://{}?mode=rwc", dir.path().join("jetbridge.db").display())
+}
+
+/// The audit log's lines, with [`Options::api`]: its day files, oldest first.
+fn audit_lines(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut days: Vec<_> = std::fs::read_dir(dir.join("audit")).unwrap().map(|file| file.unwrap().path()).collect();
+    days.sort();
+    let text: String = days.iter().map(|path| std::fs::read_to_string(path).unwrap()).collect();
+    text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
 }
 
 struct Options {
@@ -1045,9 +1053,8 @@ async fn the_kill_switch_over_the_api_cancels_a_clients_orders() {
     assert_eq!(canceled.cl_ord_id.as_deref(), Some("C1"));
     assert_eq!(canceled.exec_type, Code::Known(v44::ExecType::Canceled));
 
-    let audit = std::fs::read_to_string(setup.dir.path().join("audit.jsonl")).unwrap();
-    let lines: Vec<serde_json::Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    let [line] = lines.as_slice() else { panic!("{audit}") };
+    let lines = audit_lines(setup.dir.path());
+    let [line] = lines.as_slice() else { panic!("{lines:?}") };
     let target = format!("comp:{CLIENT}");
     assert_eq!(
         (&line["user"], &line["action"], &line["target"], &line["reason"], &line["result"]),
@@ -1176,8 +1183,7 @@ async fn an_order_unknown_at_its_venue_is_resolved() {
     let read = get(addr, &format!("/api/orders/{order}"), &token).await;
     assert_eq!((&read["status"], &read["unknown_at_venue"]), (&"canceled".into(), &false.into()));
 
-    let audit = std::fs::read_to_string(setup.dir.path().join("audit.jsonl")).unwrap();
-    let lines: Vec<serde_json::Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let lines = audit_lines(setup.dir.path());
     let seen: Vec<_> =
         lines.iter().map(|line| (line["action"].as_str(), line["target"].as_str(), line["result"].as_str())).collect();
     let refused = format!("failed: {}", jetbridge::edge::ResolveError::NotUnknownAtVenue);

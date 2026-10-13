@@ -30,7 +30,8 @@
 //! [api]                           # optional: the operator API, an HTTP JSON server
 //! listen = "127.0.0.1:8080"       # an IP address and port
 //! users = "users.toml"            # who may use it; relative to this file
-//! audit = "audit.jsonl"           # what they did; relative to this file
+//! audit_dir = "audit"             # what they did, a file a day; relative to this file
+//! audit_retention = "400d"        # optional: delete days older; as [message_log] retention
 //! tls = { cert = "api.pem", key = "api.key" }  # optional, PEM; needs the `tls` feature
 //! behind_proxy = false            # true: a proxy in front terminates TLS
 //!
@@ -124,8 +125,11 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The users file.
     pub users: PathBuf,
-    /// The audit log.
-    pub audit: PathBuf,
+    /// The audit log's directory.
+    pub audit_dir: PathBuf,
+    /// How long a day's audit file is kept after its day ends; for ever if left out.
+    #[serde(default, deserialize_with = "retention")]
+    pub audit_retention: Option<Duration>,
     pub tls: Option<ApiTls>,
     /// A proxy in front terminates TLS, so a non-loopback `listen` without `tls` is fine.
     #[serde(default)]
@@ -436,13 +440,14 @@ struct Route {
     reject: Option<String>,
 }
 
-/// The longest `[message_log] retention`: longer than any record-keeping rule asks for, and short
-/// enough that the log's date arithmetic can't overflow, so a typo is refused at load and reload
-/// rather than at the next start's open.
+/// The longest `[message_log] retention` or `[api] audit_retention`: longer than any
+/// record-keeping rule asks for, and short enough that the logs' date arithmetic can't overflow,
+/// so a typo is refused at load and reload rather than at the next start's open.
 const RETENTION_MAX: Duration = Duration::from_secs(100 * 366 * 86_400);
 
-/// `[message_log] retention`: a whole number and a unit, `s`, `m`, `h` or `d` (`90d`), as the
-/// sessions file writes its durations, with days added; positive, and at most [`RETENTION_MAX`].
+/// `[message_log] retention` and `[api] audit_retention`: a whole number and a unit, `s`, `m`, `h`
+/// or `d` (`90d`), as the sessions file writes its durations, with days added; positive, and at
+/// most [`RETENTION_MAX`].
 fn retention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Duration>, D::Error> {
     let text = String::deserialize(deserializer)?;
     let invalid = || serde::de::Error::custom(format!("invalid duration {text:?} (expected e.g. 12h or 90d)"));
@@ -499,7 +504,7 @@ impl File {
         }
         let dir = path.parent().unwrap_or(Path::new("."));
         let tls = api.tls.as_ref().map(|tls| ApiTls { cert: dir.join(&tls.cert), key: dir.join(&tls.key) });
-        Ok(Some(Api { users: dir.join(&api.users), audit: dir.join(&api.audit), tls, ..api.clone() }))
+        Ok(Some(Api { users: dir.join(&api.users), audit_dir: dir.join(&api.audit_dir), tls, ..api.clone() }))
     }
 
     /// `[message_log]`, its `dir` made relative to `path`'s directory, if the build allows it.
@@ -865,18 +870,26 @@ self_trade = false
         assert_eq!(reloaded, day_end("17:00").unwrap());
     }
 
-    /// `[api]`'s paths are relative to the file; `listen` is required, unknown keys are errors.
+    /// `[api]`'s paths are relative to the file; `listen` is required, `audit_retention` optional,
+    /// unknown keys are errors.
     #[test]
     fn the_api_section_resolves_its_paths_and_takes_no_other_key() {
         let jetbridge = "sessions = \"sessions.toml\"\n[api]\nlisten = \"127.0.0.1:8080\"\n\
-                         users = \"users.toml\"\naudit = \"log/audit.jsonl\"\n";
+                         users = \"users.toml\"\naudit_dir = \"log/audit\"\n";
         let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
         let api = load(&dir.path().join("jetbridge.toml")).unwrap().api.unwrap();
         assert_eq!(api.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(api.users, dir.path().join("users.toml"));
-        assert_eq!(api.audit, dir.path().join("log/audit.jsonl"));
-        assert_eq!((api.tls, api.behind_proxy), (None, false));
+        assert_eq!(api.audit_dir, dir.path().join("log/audit"));
+        assert_eq!((api.tls, api.behind_proxy, api.audit_retention), (None, false, None));
+        let kept = format!("{jetbridge}audit_retention = \"400d\"\n");
+        let files = self::dir(&[("jetbridge.toml", kept.as_str()), ("sessions.toml", SESSIONS)]);
+        let api = load(&files.path().join("jetbridge.toml")).unwrap().api.unwrap();
+        assert_eq!(api.audit_retention, Some(Duration::from_secs(400 * 86_400)));
+        assert!(load_error(&format!("{jetbridge}audit_retention = \"0d\"")).contains("retention must be positive"));
         assert!(load_error(&format!("{jetbridge}port = 1")).contains("unknown field `port`"));
+        // The single file the audit log was before its daily files: refused, not ignored.
+        assert!(load_error(&format!("{jetbridge}audit = \"audit.jsonl\"")).contains("unknown field `audit`"));
         let without_listen = jetbridge.replace("listen = \"127.0.0.1:8080\"\n", "");
         assert!(load_error(&without_listen).contains("missing field `listen`"));
     }
@@ -886,7 +899,7 @@ self_trade = false
     fn the_api_listens_off_loopback_only_with_tls_or_behind_a_proxy() {
         let api = |listen: &str, more: &str| {
             let jetbridge = format!(
-                "sessions = \"sessions.toml\"\n[api]\nlisten = \"{listen}\"\nusers = \"u\"\naudit = \"a\"\n{more}"
+                "sessions = \"sessions.toml\"\n[api]\nlisten = \"{listen}\"\nusers = \"u\"\naudit_dir = \"a\"\n{more}"
             );
             let dir = dir(&[("jetbridge.toml", &jetbridge), ("sessions.toml", SESSIONS)]);
             load(&dir.path().join("jetbridge.toml")).map(|loaded| loaded.api.unwrap().listen).map_err(|e| e.to_string())

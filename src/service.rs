@@ -673,7 +673,7 @@ mod tests {
     }
 
     /// An `[api]` but its `listen`; with it, the test writes `users.toml`.
-    const API: &str = "[api]\nusers = \"users.toml\"\naudit = \"audit.jsonl\"\n";
+    const API: &str = "[api]\nusers = \"users.toml\"\naudit_dir = \"audit\"\n";
 
     /// The API's users file must load at start; on reload, one that doesn't load keeps the users
     /// in use, with a warning, whatever happens to the rest.
@@ -775,19 +775,20 @@ mod tests {
         serving.abort();
     }
 
-    /// The audit log is opened, or created, at start: one that can't be stops the start.
+    /// The audit log's directory is opened, or created, at start: one that can't be stops the start.
     #[tokio::test]
     async fn the_audit_log_opens_at_start() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         write(&dir, "users.toml", "");
-        let config = API.replace("audit.jsonl", "missing/audit.jsonl");
+        let config = API.replace("\"audit\"", "\"blocked/audit\"");
+        write(&dir, "blocked", "");
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{config}listen = \"127.0.0.1:0\"\n"));
         let e = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
         assert!(e.to_string().contains("cannot open the audit log"), "{e}");
-        std::fs::create_dir(dir.path().join("missing")).unwrap();
+        std::fs::remove_file(dir.path().join("blocked")).unwrap();
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
-        assert!(dir.path().join("missing/audit.jsonl").exists());
+        assert!(dir.path().join("blocked/audit").is_dir());
         service.shutdown().await;
         serving.abort();
     }

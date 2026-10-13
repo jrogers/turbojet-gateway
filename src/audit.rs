@@ -29,10 +29,16 @@
 //! that, nor queue the API's mutations behind fsyncs. A line is at most [`MAX_LINE_LEN`]: one
 //! longer has its params replaced by their length and its strings cut.
 //!
-//! **The file.** It's opened by path for each line, appending, so a file moved away or deleted
-//! (rotated) is created afresh rather than written to unseen; a new file is created readable by its
-//! owner only, and its directory synced. One line is written at a time, on a blocking thread. At
-//! open, a last line cut short (by a crash) is ended, so the next line starts on its own.
+//! **The files.** A day's lines go in `audit-YYYY-MM-DD.jsonl` in the log's directory, the day
+//! being the entry's `time` in UTC, which is what reads filter on. The directory is created
+//! readable by its owner only if missing. A file is opened by path for each line, appending, so a
+//! file moved away or deleted is created afresh rather than written to unseen; a new file is
+//! created readable by its owner only, and its directory synced. One line is written at a time, on
+//! a blocking thread. With a retention, the first line of each day deletes the day files whose
+//! whole day ended longer ago than that; nothing else in the directory is touched. At open, a last
+//! line cut short (by a crash) in the newest day's file is ended, so the next line starts on its
+//! own: a crash tears only the file being written, the newest. A read goes back from the newest
+//! day only as far as it needs.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -42,9 +48,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::auth::Role;
 
@@ -129,13 +135,17 @@ pub(crate) fn cut_at_char(text: &mut String, max: usize) {
     text.truncate(end);
 }
 
-/// The audit log at a path; see the module documentation.
+/// The audit log in a directory; see the module documentation.
 #[derive(Debug)]
 pub struct Audit {
-    path: PathBuf,
+    dir: PathBuf,
+    /// How long after its day ends a day's file is kept; for ever if `None`.
+    retention: Option<TimeDelta>,
     /// Held while a line is written, by the blocking thread writing it: a request given up on
-    /// midway can't let another line in before its own is done.
-    writer: Arc<tokio::sync::Mutex<()>>,
+    /// midway can't let another line in before its own is done. It holds the day last written,
+    /// whose first line deletes the files past the retention; `None` until a line is written, so
+    /// the first after a start deletes them too.
+    writer: Arc<tokio::sync::Mutex<Option<NaiveDate>>>,
     refusals: Mutex<Budget>,
 }
 
@@ -148,44 +158,60 @@ struct Budget {
 }
 
 impl Audit {
-    /// The audit log at `path`, created if missing, a torn last line ended. Warns if others may
-    /// read or write it.
+    /// The audit log in `dir`, created if missing, the newest day's torn last line ended, keeping
+    /// day files `retention` after their day ends (for ever if `None`). Warns if others may read
+    /// or write the directory.
     ///
     /// # Errors
     ///
-    /// It can't be created, opened for appending, or read.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let mut file = open_append(path)?;
-        end_torn_line(path, &mut file)?;
+    /// The directory can't be created or listed, the newest file can't be read or ended, or
+    /// `retention` is too long to count with.
+    pub fn open(dir: &Path, retention: Option<Duration>) -> io::Result<Self> {
+        let retention = retention.map(TimeDelta::from_std).transpose().map_err(io::Error::other)?;
+        create_dir(dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = file.metadata()?.permissions().mode();
+            let mode = std::fs::metadata(dir)?.permissions().mode();
             if mode & 0o077 != 0 {
-                warn!(path = %path.display(), "the audit log is open to others (mode {:o}): chmod 600 it", mode & 0o777);
+                warn!(dir = %dir.display(), "the audit log is open to others (mode {:o}): chmod 700 it", mode & 0o777);
             }
         }
+        if let Some((_, newest)) = day_files(dir)?.pop() {
+            end_torn_line(&newest)?;
+        }
         Ok(Self {
-            path: path.to_path_buf(),
-            writer: Arc::new(tokio::sync::Mutex::new(())),
+            dir: dir.to_path_buf(),
+            retention,
+            writer: Arc::new(tokio::sync::Mutex::new(None)),
             refusals: Mutex::new(Budget { start: Instant::now(), written: 0, skipped: 0 }),
         })
     }
 
-    /// Appends `entry` and syncs it to disk.
+    /// Appends `entry` to its day's file and syncs it to disk. The first line of a day then
+    /// deletes the files past the retention: a failure there is a warning, as the line is written.
     ///
     /// # Errors
     ///
     /// It couldn't be written or synced: the action it records mustn't run.
     pub async fn record(&self, entry: &Entry) -> io::Result<()> {
         let line = entry.line()?;
-        let path = self.path.clone();
-        let turn = self.writer.clone().lock_owned().await;
+        let (time, day) = (entry.time, entry.time.date_naive());
+        let path = self.dir.join(file_name(day));
+        let (dir, retention) = (self.dir.clone(), self.retention);
+        let mut last = self.writer.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
-            let _turn = turn;
             let mut file = open_append(&path)?;
             file.write_all(line.as_bytes())?;
-            file.sync_data()
+            file.sync_data()?;
+            // Only forward: a line stamped just before midnight but written just after is no new day.
+            if last.is_none_or(|last| last < day) {
+                *last = Some(day);
+                if let Some(retention) = retention {
+                    delete_old(&dir, time, retention);
+                }
+            }
+            Ok(())
         })
         .await
         .map_err(io::Error::other)?
@@ -224,47 +250,28 @@ impl Audit {
 
     /// The last `limit` entries (at most [`MAX_READ`]) at or after `since`, in the order written.
     /// Lines that don't parse (one cut short by a crash) or are over [`MAX_LINE_LEN`] are passed
-    /// over. No file yet is no entries.
+    /// over. No directory yet is no entries.
     ///
     /// # Errors
     ///
-    /// The file can't be read.
+    /// The directory or a day's file can't be read.
     pub async fn read(&self, since: Option<DateTime<Utc>>, limit: usize) -> io::Result<Vec<Entry>> {
-        let path = self.path.clone();
+        let dir = self.dir.clone();
         let limit = limit.min(MAX_READ);
         tokio::task::spawn_blocking(move || {
-            let file = match File::open(&path) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                opened => opened?,
-            };
-            // ponytail: scans the whole file each read; an index, or reading from the end, if it
-            // grows large (it isn't rotated yet).
-            let mut reader = BufReader::new(file);
             let mut entries = VecDeque::with_capacity(limit);
-            let mut line = Vec::with_capacity(MAX_LINE_LEN);
-            let most = u64::try_from(MAX_LINE_LEN).expect("a usize fits a u64") + 1;
-            loop {
-                line.clear();
-                if (&mut reader).take(most).read_until(b'\n', &mut line)? == 0 {
+            // ponytail: reads only the days it needs, newest first, but each of them whole; read a
+            // day from its end if one day's file grows large.
+            for (day, path) in day_files(&dir)?.into_iter().rev() {
+                if entries.len() == limit {
                     break;
                 }
-                if line.len() > MAX_LINE_LEN {
-                    // A line of exactly MAX_LINE_LEN + 1 bytes ended in the take: skipping on
-                    // would swallow the next one.
-                    if line.last() != Some(&b'\n') {
-                        reader.skip_until(b'\n')?;
-                    }
-                    continue;
+                // Older days ended sooner still.
+                if since.is_some_and(|since| day_end(day).is_some_and(|end| end <= since)) {
+                    break;
                 }
-                let Ok(entry) = serde_json::from_slice::<Entry>(&line) else { continue };
-                if since.is_some_and(|since| entry.time < since) {
-                    continue;
-                }
-                if entries.len() == limit {
-                    entries.pop_front();
-                }
-                if limit > 0 {
-                    entries.push_back(entry);
+                for entry in read_day(&path, since, limit - entries.len())?.into_iter().rev() {
+                    entries.push_front(entry);
                 }
             }
             debug_assert!(entries.len() <= limit);
@@ -273,6 +280,114 @@ impl Audit {
         .await
         .map_err(io::Error::other)?
     }
+}
+
+/// A day's file's name.
+fn file_name(day: NaiveDate) -> String {
+    format!("audit-{}.jsonl", day.format("%Y-%m-%d"))
+}
+
+/// The day a file's `name` is for, if it's a day's file: exactly as [`file_name`] writes it.
+fn day_of(name: &str) -> Option<NaiveDate> {
+    let day = NaiveDate::parse_from_str(name.strip_prefix("audit-")?.strip_suffix(".jsonl")?, "%Y-%m-%d").ok()?;
+    (file_name(day) == name).then_some(day)
+}
+
+/// When `day` ends, UTC: `None` for the last day chrono counts, which never does.
+fn day_end(day: NaiveDate) -> Option<DateTime<Utc>> {
+    Some(day.succ_opt()?.and_time(NaiveTime::MIN).and_utc())
+}
+
+/// The day files in `dir`, oldest first; none if it's missing. Other files are left out.
+fn day_files(dir: &Path) -> io::Result<Vec<(NaiveDate, PathBuf)>> {
+    let listing = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        listing => listing?,
+    };
+    let mut days = Vec::new();
+    for file in listing {
+        let file = file?;
+        if let Some(day) = file.file_name().to_str().and_then(day_of) {
+            days.push((day, file.path()));
+        }
+    }
+    days.sort_unstable();
+    Ok(days)
+}
+
+/// The last `need` entries at or after `since` in a day's file at `path`; none if it's gone (moved
+/// away, or deleted past the retention, since it was listed).
+fn read_day(path: &Path, since: Option<DateTime<Utc>>, need: usize) -> io::Result<VecDeque<Entry>> {
+    debug_assert!(need > 0);
+    let file = match File::open(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(VecDeque::new()),
+        opened => opened?,
+    };
+    let mut reader = BufReader::new(file);
+    let mut entries = VecDeque::with_capacity(need);
+    let mut line = Vec::with_capacity(MAX_LINE_LEN);
+    let most = u64::try_from(MAX_LINE_LEN).expect("a usize fits a u64") + 1;
+    loop {
+        line.clear();
+        if (&mut reader).take(most).read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.len() > MAX_LINE_LEN {
+            // A line of exactly MAX_LINE_LEN + 1 bytes ended in the take: skipping on would
+            // swallow the next one.
+            if line.last() != Some(&b'\n') {
+                reader.skip_until(b'\n')?;
+            }
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<Entry>(&line) else { continue };
+        if since.is_some_and(|since| entry.time < since) {
+            continue;
+        }
+        if entries.len() == need {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+    debug_assert!(entries.len() <= need);
+    Ok(entries)
+}
+
+/// Deletes the day files in `dir` whose whole day ended more than `retention` before `now`. A
+/// failure is a warning only: the line that called for it is written.
+fn delete_old(dir: &Path, now: DateTime<Utc>, retention: TimeDelta) {
+    let Some(cutoff) = now.checked_sub_signed(retention) else { return };
+    let days = match day_files(dir) {
+        Ok(days) => days,
+        Err(e) => {
+            warn!(dir = %dir.display(), "cannot list the audit log's old days to delete: {e}");
+            return;
+        }
+    };
+    for (day, path) in days {
+        // Oldest first: the rest ended later.
+        if day_end(day).is_none_or(|end| end >= cutoff) {
+            break;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(path = %path.display(), "deleted an audit log day past its retention"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!(path = %path.display(), "cannot delete an audit log day past its retention: {e}"),
+        }
+    }
+}
+
+/// `dir` created owner-only if missing, with its parent synced so it's as durable as its files.
+fn create_dir(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)?;
+    sync_parent(dir)
 }
 
 /// `path` opened for appending, created owner-only if missing, with its directory synced so the
@@ -291,14 +406,7 @@ fn open_append(path: &Path) -> io::Result<File> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => options(false).open(path),
             created => {
                 let file = created?;
-                #[cfg(unix)]
-                {
-                    let directory = match path.parent() {
-                        Some(parent) if !parent.as_os_str().is_empty() => parent,
-                        _ => Path::new("."),
-                    };
-                    File::open(directory)?.sync_all()?;
-                }
+                sync_parent(path)?;
                 Ok(file)
             }
         },
@@ -306,9 +414,25 @@ fn open_append(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Syncs the directory holding `path`, so a name just created there survives a crash. Unix only:
+/// elsewhere a directory can't be opened to sync.
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let directory = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        File::open(directory)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Ends the file's last line, if a crash left it without its newline, so the next line written
 /// isn't glued to it and lost with it.
-fn end_torn_line(path: &Path, file: &mut File) -> io::Result<()> {
+fn end_torn_line(path: &Path) -> io::Result<()> {
     let mut reader = File::open(path)?;
     if reader.metadata()?.len() == 0 {
         return Ok(());
@@ -318,6 +442,7 @@ fn end_torn_line(path: &Path, file: &mut File) -> io::Result<()> {
     reader.read_exact(&mut last)?;
     if last != *b"\n" {
         warn!(path = %path.display(), "the audit log's last line was cut short: ending it");
+        let mut file = open_append(path)?;
         file.write_all(b"\n")?;
         file.sync_data()?;
     }
@@ -342,21 +467,35 @@ pub(crate) mod tests {
         }
     }
 
-    /// Lines are appended, one JSON object each, to a file created owner-only; they read back
-    /// oldest first, from `since`, the last `limit` of them, a torn line passed over.
+    /// The file of `day`, `YYYY-MM-DD`, in `dir`.
+    fn day(dir: &Path, day: &str) -> PathBuf {
+        dir.join(format!("audit-{day}.jsonl"))
+    }
+
+    /// The text of the day files in `dir`, oldest first; empty if there are none.
+    pub(crate) fn text(dir: &Path) -> String {
+        let days = day_files(dir).unwrap();
+        days.iter().map(|(_, path)| std::fs::read_to_string(path).unwrap()).collect()
+    }
+
+    /// Lines are appended, one JSON object each, to a file created owner-only in a directory
+    /// created owner-only; they read back oldest first, from `since`, the last `limit` of them, a
+    /// torn line passed over.
     #[tokio::test]
     async fn lines_append_and_read_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let audit = Audit::open(&path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("audit/log");
+        let audit = Audit::open(&dir, None).unwrap();
         let times = ["2026-10-11T09:00:00Z", "2026-10-11T10:00:00Z", "2026-10-11T11:00:00Z"];
         for time in times {
             audit.record(&entry(time, "allowed")).await.unwrap();
+        }
+        let path = day(&dir, "2026-10-11");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 3);
@@ -375,22 +514,96 @@ pub(crate) mod tests {
         assert!(read(None, 0).await.unwrap().is_empty());
     }
 
-    /// A last line torn by a crash is ended at open, so the next line reads back whole; a
-    /// missing file reads as empty.
+    /// Each day's lines land in its own file, by the entry's time in UTC. A read across days
+    /// returns the last `limit` in order, and doesn't open a day that ended before `since`.
+    #[tokio::test]
+    async fn days_land_in_their_own_files_and_read_back_across_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Audit::open(dir.path(), None).unwrap();
+        let times = [
+            "2026-10-10T09:00:00Z",
+            "2026-10-10T23:59:59Z",
+            "2026-10-11T00:00:00Z",
+            "2026-10-11T10:00:00Z",
+            "2026-10-12T02:00:00+05:00",
+            "2026-10-12T09:00:00Z",
+        ];
+        for time in times {
+            audit.record(&entry(time, "allowed")).await.unwrap();
+        }
+        let lines = |date: &str| std::fs::read_to_string(day(dir.path(), date)).unwrap().lines().count();
+        assert_eq!([lines("2026-10-10"), lines("2026-10-11"), lines("2026-10-12")], [2, 3, 1]);
+        let entries = |times: &[&str]| times.iter().map(|time| entry(time, "allowed")).collect::<Vec<_>>();
+        let read = |since: Option<&str>, limit| audit.read(since.map(|s| s.parse().unwrap()), limit);
+        assert_eq!(read(None, MAX_READ).await.unwrap(), entries(&times));
+        assert_eq!(read(None, 4).await.unwrap(), entries(&times[2..]));
+        assert_eq!(read(None, 2).await.unwrap(), entries(&times[4..]));
+        assert_eq!(read(Some("2026-10-10T12:00:00Z"), 3).await.unwrap(), entries(&times[3..]));
+        assert_eq!(read(Some("2026-10-10T12:00:00Z"), MAX_READ).await.unwrap(), entries(&times[1..]));
+
+        // A line in the 10th's file stamped the 11th would be read, were the file opened.
+        let stray = serde_json::to_string(&entry("2026-10-11T12:00:00Z", "stray")).unwrap();
+        let tenth = day(dir.path(), "2026-10-10");
+        std::fs::write(&tenth, format!("{}{stray}\n", std::fs::read_to_string(&tenth).unwrap())).unwrap();
+        assert_eq!(read(Some("2026-10-11T00:00:00Z"), MAX_READ).await.unwrap(), entries(&times[2..]));
+        assert_eq!(read(Some("2026-10-10T23:59:59Z"), MAX_READ).await.unwrap().len(), 6);
+    }
+
+    /// With a retention, a new day's first line deletes the day files whose whole day ended more
+    /// than the retention before it; other lines, younger days and other files are left alone.
+    #[tokio::test]
+    async fn a_new_day_deletes_the_days_past_the_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", serde_json::to_string(&entry("2026-10-01T09:00:00Z", "allowed")).unwrap());
+        let days = ["audit-2026-10-01.jsonl", "audit-2026-10-08.jsonl", "audit-2026-10-09.jsonl"];
+        let others = ["audit-2026-1-1.jsonl", "audit-2026-10-01.jsonl.gz", "notes.txt"];
+        for name in days.iter().chain(&others) {
+            std::fs::write(dir.path().join(name), &line).unwrap();
+        }
+        let names = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|file| file.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let audit = Audit::open(dir.path(), Some(Duration::from_secs(2 * 86_400))).unwrap();
+        // The 8th ended at the 9th's midnight, over two days before; the 9th's end isn't.
+        audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.unwrap();
+        let with = |kept: &[&str]| {
+            let mut names: Vec<_> = others.iter().chain(kept).map(ToString::to_string).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(), with(&["audit-2026-10-09.jsonl", "audit-2026-10-11.jsonl"]));
+
+        std::fs::write(dir.path().join("audit-2026-10-01.jsonl"), &line).unwrap();
+        audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.unwrap();
+        assert!(dir.path().join("audit-2026-10-01.jsonl").exists());
+        audit.record(&entry("2026-10-12T09:00:00Z", "allowed")).await.unwrap();
+        assert_eq!(names(), with(&["audit-2026-10-11.jsonl", "audit-2026-10-12.jsonl"]));
+    }
+
+    /// A last line torn by a crash, in the newest day's file, is ended at open, so the next line
+    /// reads back whole; an older day's file isn't touched. A missing file reads as empty.
     #[tokio::test]
     async fn a_torn_last_line_is_ended_at_open() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let audit = Audit::open(&path).unwrap();
+        let audit = Audit::open(dir.path(), None).unwrap();
+        audit.record(&entry("2026-10-10T09:00:00Z", "allowed")).await.unwrap();
         audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.unwrap();
-        let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str("{\"time\":\"2026-");
-        std::fs::write(&path, &text).unwrap();
-        let audit = Audit::open(&path).unwrap();
+        let (older, newest) = (day(dir.path(), "2026-10-10"), day(dir.path(), "2026-10-11"));
+        for path in [&older, &newest] {
+            let text = std::fs::read_to_string(path).unwrap();
+            std::fs::write(path, format!("{text}{{\"time\":\"2026-")).unwrap();
+        }
+        let audit = Audit::open(dir.path(), None).unwrap();
+        assert!(!std::fs::read_to_string(&older).unwrap().ends_with('\n'));
         audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.unwrap();
-        let read = audit.read(None, MAX_READ).await.unwrap();
+        let read = audit.read(Some("2026-10-11T00:00:00Z".parse().unwrap()), MAX_READ).await.unwrap();
         assert_eq!(read, [entry("2026-10-11T09:00:00Z", "allowed"), entry("2026-10-11T10:00:00Z", "allowed")]);
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(dir.path()).unwrap();
         assert!(audit.read(None, MAX_READ).await.unwrap().is_empty());
     }
 
@@ -399,8 +612,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn lines_are_bounded() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let audit = Audit::open(&path).unwrap();
+        let path = day(dir.path(), "2026-10-11");
+        let audit = Audit::open(dir.path(), None).unwrap();
         let mut big = entry("2026-10-11T09:00:00Z", "allowed");
         big.params = serde_json::json!({ "text": "x".repeat(MAX_LINE_LEN) });
         big.target = Some("é".repeat(MAX_LINE_LEN));
@@ -422,30 +635,34 @@ pub(crate) mod tests {
         assert_eq!(audit.read(None, MAX_READ).await.unwrap().len(), 1);
     }
 
-    /// A file deleted (or rotated away) is created afresh at the next line.
+    /// A day's file deleted (or moved away) is created afresh at its next line.
     #[tokio::test]
     async fn a_deleted_file_is_created_again() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let audit = Audit::open(&path).unwrap();
+        let path = day(dir.path(), "2026-10-11");
+        let audit = Audit::open(dir.path(), None).unwrap();
         audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.unwrap();
-        std::fs::rename(&path, dir.path().join("audit.jsonl.1")).unwrap();
+        std::fs::rename(&path, dir.path().join("moved.jsonl")).unwrap();
         audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.unwrap();
         assert_eq!(audit.read(None, MAX_READ).await.unwrap(), [entry("2026-10-11T10:00:00Z", "allowed")]);
     }
 
-    /// A file that can't be written, or a directory gone, fails the write; and opening.
+    /// A file that can't be written, or a directory gone, fails the write; a directory that
+    /// can't be created fails opening.
     #[tokio::test]
     async fn a_write_that_fails_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.jsonl");
-        let audit = Audit::open(&path).unwrap();
-        make_read_only(&path);
-        assert!(audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.is_err());
-        assert!(Audit::open(&path).is_err());
-        let gone = dir.path().join("gone");
-        std::fs::create_dir(&gone).unwrap();
-        let audit = Audit::open(&gone.join("audit.jsonl")).unwrap();
+        let audit = Audit::open(dir.path(), None).unwrap();
+        audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.unwrap();
+        let unwritable = make_unwritable(dir.path());
+        assert!(audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.is_err());
+        assert!(audit.record(&entry("2026-10-12T10:00:00Z", "allowed")).await.is_err());
+        drop(unwritable);
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("file"), "").unwrap();
+        assert!(Audit::open(&other.path().join("file/audit"), None).is_err());
+        let gone = other.path().join("gone");
+        let audit = Audit::open(&gone, None).unwrap();
         std::fs::remove_dir_all(&gone).unwrap();
         assert!(audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.is_err());
     }
@@ -454,7 +671,7 @@ pub(crate) mod tests {
     #[test]
     fn refusals_are_written_within_a_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let audit = Audit::open(&dir.path().join("audit.jsonl")).unwrap();
+        let audit = Audit::open(dir.path(), None).unwrap();
         let start = Instant::now();
         for _ in 0..REFUSALS_PER_MINUTE {
             assert!(audit.spend_refusal(start));
@@ -464,9 +681,36 @@ pub(crate) mod tests {
         assert!(audit.spend_refusal(start + Duration::from_secs(60)));
     }
 
-    pub(crate) fn make_read_only(path: &Path) {
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(path, permissions).unwrap();
+    /// Makes the audit log in `dir` unwritable, its files and the directory (so no day's file can
+    /// be created), until the guard returned is dropped, so the directory can be cleaned up.
+    #[must_use]
+    pub(crate) fn make_unwritable(dir: &Path) -> Unwritable<'_> {
+        for file in std::fs::read_dir(dir).unwrap() {
+            set_readonly(&file.unwrap().path(), true).unwrap();
+        }
+        set_readonly(dir, true).unwrap();
+        Unwritable(dir)
+    }
+
+    pub(crate) struct Unwritable<'a>(&'a Path);
+
+    impl Drop for Unwritable<'_> {
+        fn drop(&mut self) {
+            // The test may have removed the directory meanwhile.
+            if set_readonly(self.0, false).is_ok()
+                && let Ok(files) = std::fs::read_dir(self.0)
+            {
+                for file in files.flatten() {
+                    let _ = set_readonly(&file.path(), false);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::permissions_set_readonly_false, reason = "restores what make_unwritable took, in a test")]
+    fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_readonly(readonly);
+        std::fs::set_permissions(path, permissions)
     }
 }

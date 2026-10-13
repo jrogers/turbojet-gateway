@@ -302,12 +302,12 @@ pub(crate) struct Bound {
 
 impl Bound {
     /// Binds `config.listen`, or takes `given`, loads `config.tls`'s certificate and key and
-    /// `config.users`, and opens `config.audit`, creating it if missing. The audit log stays the
+    /// `config.users`, and opens the audit log in `config.audit_dir`, creating it if missing. The audit log stays the
     /// one opened here until a restart.
     pub(crate) async fn bind(config: &Api, given: Option<std::net::TcpListener>) -> Result<Self, Error> {
         let auth = Arc::new(Auth::load(config).map_err(Error::new)?);
-        let audit = Audit::open(&config.audit)
-            .map_err(|e| Error::new(format!("cannot open the audit log {}: {e}", config.audit.display())))?;
+        let audit = Audit::open(&config.audit_dir, config.audit_retention)
+            .map_err(|e| Error::new(format!("cannot open the audit log in {}: {e}", config.audit_dir.display())))?;
         let audit = Arc::new(audit);
         #[cfg(feature = "tls")]
         let tls = match &config.tls {
@@ -472,7 +472,7 @@ pub(crate) mod tests {
     /// as the directory returned.
     pub(crate) fn state(auth: Arc<Auth>) -> (State, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(Audit::open(&dir.path().join("audit.jsonl")).unwrap());
+        let audit = Arc::new(Audit::open(dir.path(), None).unwrap());
         let stopping = watch::Sender::new(false);
         let searches = Arc::new(Semaphore::new(messages::SEARCHES_MAX));
         (State { service: Weak::new(), auth, audit, stopping, live: Arc::default(), searches }, dir)
@@ -528,7 +528,7 @@ pub(crate) mod tests {
 
     mod audited {
         use super::*;
-        use crate::audit::tests::make_read_only;
+        use crate::audit::tests::make_unwritable;
         use crate::auth::Users;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -603,12 +603,8 @@ pub(crate) mod tests {
                 send(&self.app, "POST", "/test/flip", &[("authorization", bearer)], body).await.status
             }
 
-            fn path(&self) -> std::path::PathBuf {
-                self.dir.path().join("audit.jsonl")
-            }
-
             fn lines(&self) -> Vec<serde_json::Value> {
-                let text = std::fs::read_to_string(self.path()).unwrap_or_default();
+                let text = crate::audit::tests::text(self.dir.path());
                 text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
             }
         }
@@ -707,12 +703,12 @@ pub(crate) mod tests {
             assert_eq!(results, ["allowed", "unchanged: test"]);
         }
 
-        /// A mutation whose line can't be written, the file read-only or its directory gone,
+        /// A mutation whose line can't be written, the directory read-only or gone,
         /// answers 503 and doesn't run.
         #[tokio::test]
         async fn a_mutation_whose_line_fails_doesnt_run() {
             let fixture = fixture();
-            make_read_only(&fixture.path());
+            let _unwritable = make_unwritable(fixture.dir.path());
             let reason = r#"{"reason":"testing"}"#;
             assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::SERVICE_UNAVAILABLE);
             assert!(!fixture.switch.load(Ordering::SeqCst));
@@ -728,7 +724,7 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn the_log_reads_back() {
             let fixture = fixture();
-            let audit = Audit::open(&fixture.path()).unwrap();
+            let audit = Audit::open(fixture.dir.path(), None).unwrap();
             for hour in ["09", "10", "11"] {
                 let entry = Entry {
                     time: format!("2026-10-11T{hour}:00:00Z").parse().unwrap(),
