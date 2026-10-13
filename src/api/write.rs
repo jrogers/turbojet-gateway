@@ -26,7 +26,7 @@ use super::{ApiError, Mutation, Outcome, State, audited};
 use crate::auth::Role;
 use crate::book::{OrderId, Scope, ScopeName};
 use crate::config::RiskTable;
-use crate::edge::{CancelError, Gateway, StatusError};
+use crate::edge::{CancelError, Gateway, ResolveError, StatusError};
 use crate::limits::{self, Edit, EditError, Limits};
 use crate::service::{ConfigSummary, Edited, Reloaded, Service};
 
@@ -266,6 +266,37 @@ pub(super) async fn request_status(
         gateway.request_status(order).map_err(|e| match e {
             StatusError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, unknown),
             StatusError::Done | StatusError::VenueUnavailable => ApiError::new(StatusCode::CONFLICT, e.to_string()),
+        })?;
+        Ok((StatusCode::ACCEPTED, None))
+    })
+    .await
+}
+
+/// `POST /api/orders/{order_id}/resolve {reason}`: cancels the order whose OrderID(37) is
+/// `order_id`, which its venue has said it doesn't know (see [`Gateway::resolve`]); 202 once the
+/// cancel is committed. 404 if the book doesn't hold the order, 409 if it's done or the venue
+/// hasn't said so.
+pub(super) async fn resolve(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+    order_id: Id,
+    body: Body<Reason>,
+) -> Result<StatusCode, ApiError> {
+    let (order_id, parsed_id) = parse_id(order_id);
+    let (body, parsed) = parse(body);
+    let gateway = state.service()?.gateway().clone();
+    let found = caller
+        .require(Role::Operator)
+        .and(parsed_id)
+        .and(parsed)
+        .and_then(|()| find_order(&caller, &gateway, order_id.as_deref()));
+    let unknown = format!("no order {}", order_id.as_deref().unwrap_or_default());
+    let mutation =
+        Mutation { action: "resolve", target: order_id, params: serde_json::Value::Null, reason: body.reason };
+    audited_on(&state, &caller, mutation, found, |order| async move {
+        gateway.resolve(order).await.map_err(|e| match e {
+            ResolveError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, unknown),
+            ResolveError::Done | ResolveError::NotUnknownAtVenue => ApiError::new(StatusCode::CONFLICT, e.to_string()),
         })?;
         Ok((StatusCode::ACCEPTED, None))
     })
@@ -805,6 +836,8 @@ mod tests {
             ("POST", format!("/api/orders/{order}/cancel"), REASON, operator, false),
             // The venue never logs on.
             ("POST", format!("/api/orders/{order}/status"), REASON, operator, true),
+            // The venue hasn't said it doesn't know the order.
+            ("POST", format!("/api/orders/{order}/resolve"), REASON, operator, true),
             ("POST", "/api/risk/block".to_string(), funda, operator, false),
             ("POST", "/api/risk/unblock".to_string(), funda, operator, false),
             ("POST", "/api/risk/cancel-all".to_string(), funda, operator, false),
@@ -998,6 +1031,29 @@ mod tests {
         assert_eq!(fixture.last_result(), format!("failed: {}", StatusError::VenueUnavailable));
     }
 
+    /// Resolving an unknown order is 404, and one its venue hasn't said it doesn't know 409,
+    /// recorded as failed with why. Once the venue has, the order is canceled, and no longer
+    /// marked; resolving it again is 409, as it's done.
+    #[tokio::test]
+    async fn orders_resolve() {
+        let fixture = fixture().await;
+        fixture.expect("/api/orders/NOPE1/resolve", REASON, StatusCode::NOT_FOUND).await;
+        assert_eq!(fixture.last_result(), "refused: no order NOPE1");
+        let order = fixture.order_name().await;
+        let resolve = format!("/api/orders/{order}/resolve");
+        fixture.expect(&resolve, REASON, StatusCode::CONFLICT).await;
+        assert_eq!(fixture.last_result(), format!("failed: {}", ResolveError::NotUnknownAtVenue));
+
+        crate::edge::tests::unknown_at_venue(fixture.service.gateway(), &order);
+        assert_eq!(fixture.ok(&format!("/api/orders/{order}")).await["unknown_at_venue"], true);
+        fixture.expect(&resolve, REASON, StatusCode::ACCEPTED).await;
+        assert_eq!(fixture.last_result(), "allowed");
+        let read = fixture.ok(&format!("/api/orders/{order}")).await;
+        assert_eq!((&read["status"], &read["unknown_at_venue"]), (&"canceled".into(), &false.into()));
+        fixture.expect(&resolve, REASON, StatusCode::CONFLICT).await;
+        assert_eq!(fixture.last_result(), format!("failed: {}", ResolveError::Done));
+    }
+
     /// Blocks and unblocks report whether they changed anything; the kill switch blocks and
     /// cancels. A scope that doesn't parse, or names no session, is refused, as is a body that
     /// isn't JSON.
@@ -1049,6 +1105,7 @@ mod tests {
         let order = fixture.order_name().await;
         assert_eq!(as_scoped(&format!("/api/orders/{order}/cancel"), REASON).await, StatusCode::FORBIDDEN);
         assert_eq!(as_scoped(&format!("/api/orders/{order}/status"), REASON).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_scoped(&format!("/api/orders/{order}/resolve"), REASON).await, StatusCode::FORBIDDEN);
         assert_eq!(as_scoped(&format!("/api/sessions/{FUNDA}/pause"), REASON).await, StatusCode::FORBIDDEN);
         let venue = fixture.venue().await;
         assert_eq!(as_scoped(&format!("/api/sessions/{venue}/pause"), REASON).await, StatusCode::FORBIDDEN);

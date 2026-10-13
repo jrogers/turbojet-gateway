@@ -150,6 +150,31 @@ impl fmt::Display for StatusError {
 
 impl std::error::Error for StatusError {}
 
+/// Why [`Gateway::resolve`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    /// As [`CancelError::UnknownOrder`].
+    UnknownOrder,
+    /// As [`CancelError::Done`].
+    Done,
+    /// The order's venue hasn't said it doesn't know it: see [`Book::is_unknown_at_venue`].
+    NotUnknownAtVenue,
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnknownOrder => "unknown order",
+            Self::Done => "the order is done",
+            Self::NotUnknownAtVenue => {
+                "the venue hasn't said it doesn't know the order; ask it first (POST .../status)"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
 /// What the gateway leaves unfinished at a stop: see [`Gateway::unfinished`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unfinished {
@@ -465,6 +490,29 @@ impl Gateway {
         debug_assert!(had_changes || !state.book.has_changes(), "a status request changes nothing");
         let [output] = <[Output; 1]>::try_from(out).expect("a live order's status request is sent");
         send_status_request(state.venues.get(&venue), &output, self.clock.now().into())
+    }
+
+    /// Cancels an order its venue has said it doesn't know: see [`Input::Resolve`]. Returns once
+    /// the cancel is committed, with a database.
+    ///
+    /// # Errors
+    ///
+    /// If the book doesn't hold the order, it's done, or its venue hasn't said it doesn't know it.
+    pub async fn resolve(self: &Arc<Self>, order: OrderId) -> Result<(), ResolveError> {
+        {
+            let mut state = self.lock();
+            let found = state.book.order(order).ok_or(ResolveError::UnknownOrder)?;
+            if found.status.is_done() {
+                return Err(ResolveError::Done);
+            }
+            if !state.book.is_unknown_at_venue(order) {
+                return Err(ResolveError::NotUnknownAtVenue);
+            }
+            warn!(order = %found.name, client = %found.client, "resolving an order unknown at its venue");
+            self.handle_locked(&mut state, [Input::Resolve { order }], None);
+        }
+        self.committed().await;
+        Ok(())
     }
 
     /// The client whose session shows as `session`, if it has logged on since start or the book
@@ -1460,6 +1508,25 @@ pub(crate) mod tests {
         gateway.lock().book.handle(Input::VenueReport { venue: VENUE.into(), report }, &mut Vec::new());
     }
 
+    /// The venue's answer to a status request for the order sent as `downstream`: it doesn't
+    /// know it.
+    pub(crate) fn unknown_at_venue(gateway: &Gateway, downstream: &str) {
+        let report = crate::book::VenueReport {
+            downstream: downstream.into(),
+            exec_type: crate::book::ExecType::Status,
+            status: Some(crate::book::Status::Rejected),
+            last_qty: 0.into(),
+            last_px: 0.into(),
+            cum_qty: 0.into(),
+            avg_px: 0.into(),
+            exec_id: "E-unknown".into(),
+            text: None,
+            venue_order_id: None,
+            ord_rej_reason: Some(5),
+        };
+        gateway.lock().book.handle(Input::VenueReport { venue: VENUE.into(), report }, &mut Vec::new());
+    }
+
     fn unsent(gateway: &Gateway) -> Vec<bool> {
         gateway.cancelling().into_iter().map(|(_, cancel)| cancel.unsent).collect()
     }
@@ -1555,6 +1622,21 @@ pub(crate) mod tests {
         assert_eq!(gateway.request_status(OrderId(1)), Err(StatusError::VenueUnavailable));
         send_order(&gateway, "C2");
         assert_eq!(gateway.request_status(OrderId(2)), Err(StatusError::Done));
+    }
+
+    /// Resolving is refused for an unknown or done order, and for a live one its venue hasn't
+    /// said it doesn't know; once it has, the order is canceled.
+    #[tokio::test]
+    async fn resolving_needs_the_venue_to_have_said_it_doesnt_know_the_order() {
+        let gateway = gateway();
+        assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::UnknownOrder));
+        book_order(&gateway);
+        assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::NotUnknownAtVenue));
+        let name = gateway.order(OrderId(1)).unwrap().order.order_id;
+        unknown_at_venue(&gateway, &name);
+        assert_eq!(gateway.resolve(OrderId(1)).await, Ok(()));
+        assert_eq!(gateway.order(OrderId(1)).unwrap().order.status, crate::book::Status::Canceled);
+        assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::Done));
     }
 
     /// A session with a SubID is found by the session as it shows, and names a session scope.

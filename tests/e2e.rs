@@ -1131,6 +1131,65 @@ async fn a_venue_asked_for_an_orders_status_answers_through_the_book() {
     assert!(page["follow"].is_string(), "{page}");
 }
 
+/// An operator over the API resolves order C1 once its venue, asked where it stands, says it
+/// doesn't know it, not before: the client hears Canceled, and the order reads back canceled and
+/// no longer unknown at the venue.
+#[tokio::test]
+async fn an_order_unknown_at_its_venue_is_resolved() {
+    let mut setup = Setup::with(Options { api: true, ..Options::default() }).await;
+    let token = operator(&setup).await;
+    let mut gateway_events = setup.service.gateway().subscribe();
+    setup.working_order().await;
+    let addr = setup.service.api_addr().unwrap();
+    let order = setup.id("1");
+    let path = |action: &str| format!("/api/orders/{order}/{action}");
+    let reason = r#"{"reason":"venue lost it"}"#;
+    let response = post(addr, &path("resolve"), &token, reason).await;
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+
+    let response = post(addr, &path("status"), &token, reason).await;
+    assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    let _: v44::OrderStatusRequest = setup.venue.events.parse().await;
+    let mut unknown = report(&order, "E-unknown", (v44::ExecType::OrderStatus, v44::OrdStatus::Rejected), (0, 0));
+    unknown.ord_rej_reason = Some(v44::OrdRejReason::UnknownOrder.into());
+    setup.venue.send(unknown.to_message());
+    let alarm = timeout(WAIT, async {
+        loop {
+            if let GatewayEvent::Alarm(alarm) = gateway_events.recv().await.unwrap() {
+                return alarm;
+            }
+        }
+    });
+    assert_eq!(alarm.await.expect("no alarm").kind, AlarmKind::UnknownAtVenue);
+
+    let response = post(addr, &path("resolve"), &token, reason).await;
+    assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    let canceled: v44::ExecutionReport = setup.events.parse().await;
+    assert_eq!(
+        (canceled.cl_ord_id.as_deref(), canceled.exec_type.known(), canceled.ord_status.known()),
+        (Some("C1"), Some(v44::ExecType::Canceled), Some(v44::OrdStatus::Canceled))
+    );
+    assert_eq!(canceled.leaves_qty, Decimal::ZERO);
+    let read = get(addr, &format!("/api/orders/{order}"), &token).await;
+    assert_eq!((&read["status"], &read["unknown_at_venue"]), (&"canceled".into(), &false.into()));
+
+    let audit = std::fs::read_to_string(setup.dir.path().join("audit.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let seen: Vec<_> =
+        lines.iter().map(|line| (line["action"].as_str(), line["target"].as_str(), line["result"].as_str())).collect();
+    let refused = format!("failed: {}", jetbridge::edge::ResolveError::NotUnknownAtVenue);
+    assert_eq!(
+        seen,
+        [
+            // Allowed, then failed: the line before it runs, then its result.
+            (Some("resolve"), Some(&*order), Some("allowed")),
+            (Some("resolve"), Some(&*order), Some(&*refused)),
+            (Some("request_status"), Some(&*order), Some("allowed")),
+            (Some("resolve"), Some(&*order), Some("allowed")),
+        ]
+    );
+}
+
 /// An operator with an API token, the users file reloaded: the token.
 async fn operator(setup: &Setup) -> String {
     let users_path = setup.dir.path().join("users.toml");
