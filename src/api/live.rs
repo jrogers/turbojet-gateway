@@ -5,8 +5,9 @@
 //!
 //! The events are subscribed to before the snapshot is read, so none falls between the two; the
 //! first few may repeat what the snapshot already shows. A socket that falls behind any
-//! channel's capacity gets a new snapshot and carries on, rather than the gateway waiting on it:
-//! the channels bound what a slow socket costs.
+//! channel's capacity skips to the channels' ends and gets a new snapshot, rather than the
+//! gateway waiting on it: the channels bound what a slow socket costs. One that falls behind
+//! again within [`MIN_SNAPSHOT_GAP`] is closed (1013), as it can't keep up.
 //!
 //! The upgrade authenticates as any request does, with the cookie or a bearer token, never a token
 //! in the URL, which proxies log. With the cookie its `Origin` must be the API's own host (see
@@ -28,11 +29,16 @@ use turbojet::{SessionEvent, SessionEventKind};
 
 use super::read::{SessionSide, SessionView, session_views};
 use super::{ApiError, Caller, State};
-use crate::book::{GatewayEvent, MAX_ORDERS_PER_PAGE, OrderFilter, OrderView, Scope};
+use crate::book::{GatewayEvent, MAX_ORDERS_PER_PAGE, OrderView, Scope};
 
 /// How often an open socket checks that its session or token still holds. Checking is a map
 /// lookup; a removed user or a revoked token keeps watching this long at most.
 const RECHECK: Duration = Duration::from_secs(10);
+
+/// The least time between a socket's snapshots. Each walks the book under the gateway's lock, so a
+/// client too slow to keep up mustn't cost one per few thousand events: lagging again sooner
+/// closes its socket.
+const MIN_SNAPSHOT_GAP: Duration = Duration::from_secs(1);
 
 /// How long a send may wait for a client that isn't reading before its socket is dropped, so a
 /// stalled client can't hold its task, and its connection, for ever.
@@ -47,6 +53,16 @@ pub(super) struct Events {
     gateway: broadcast::Receiver<GatewayEvent>,
     clients: broadcast::Receiver<SessionEvent>,
     venues: broadcast::Receiver<SessionEvent>,
+}
+
+impl Events {
+    /// Skips what each channel holds: after a lag, the snapshot shows it, and replaying a backlog
+    /// of thousands of stale events would only make the socket lag again.
+    fn skip_to_ends(&mut self) {
+        self.gateway = self.gateway.resubscribe();
+        self.clients = self.clients.resubscribe();
+        self.venues = self.venues.resubscribe();
+    }
 }
 
 /// Whose socket it is, and what its rechecks authenticate.
@@ -106,6 +122,8 @@ struct SessionChange {
 /// What the socket does next.
 enum Step {
     Send(String),
+    /// A channel lagged: skip to its end and send a snapshot.
+    Snapshot,
     Close(u16, &'static str),
     Nothing,
 }
@@ -116,8 +134,18 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
     info!(user = viewer.user, ip = %viewer.ip, "API live socket opened");
     let mut stopping = state.stopping.subscribe();
     let mut recheck = tokio::time::interval_at(Instant::now() + RECHECK, RECHECK);
-    let mut step = snapshot(&state);
+    let mut last_snapshot: Option<Instant> = None;
+    let mut step = Step::Snapshot;
     let why = loop {
+        if matches!(step, Step::Snapshot) {
+            step = if last_snapshot.is_some_and(|last| last.elapsed() < MIN_SNAPSHOT_GAP) {
+                Step::Close(close_code::AGAIN, "too slow to keep up: reconnect")
+            } else {
+                events.skip_to_ends();
+                last_snapshot = Some(Instant::now());
+                snapshot(&state)
+            };
+        }
         match step {
             Step::Send(text) => {
                 if !matches!(tokio::time::timeout(SEND_WAIT, socket.send(Message::Text(text.into()))).await, Ok(Ok(())))
@@ -130,7 +158,7 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
                 let _ = tokio::time::timeout(SEND_WAIT, socket.send(Message::Close(Some(frame)))).await;
                 break reason;
             }
-            Step::Nothing => {}
+            Step::Snapshot | Step::Nothing => {}
         }
         step = tokio::select! {
             _ = stopping.wait_for(|stopping| *stopping) => Step::Close(close_code::AWAY, "the gateway is stopping"),
@@ -140,17 +168,17 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
             },
             event = events.gateway.recv() => match event {
                 Ok(event) => json(&event),
-                Err(RecvError::Lagged(_)) => snapshot(&state),
+                Err(RecvError::Lagged(_)) => Step::Snapshot,
                 Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
             },
             event = events.clients.recv() => match event {
                 Ok(event) => session_change(SessionSide::Client, &event).map_or(Step::Nothing, |change| json(&change)),
-                Err(RecvError::Lagged(_)) => snapshot(&state),
+                Err(RecvError::Lagged(_)) => Step::Snapshot,
                 Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
             },
             event = events.venues.recv() => match event {
                 Ok(event) => session_change(SessionSide::Venue, &event).map_or(Step::Nothing, |change| json(&change)),
-                Err(RecvError::Lagged(_)) => snapshot(&state),
+                Err(RecvError::Lagged(_)) => Step::Snapshot,
                 Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
             },
             message = socket.recv() => match message {
@@ -165,16 +193,9 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
 /// The snapshot as JSON, or the close if the gateway has gone.
 fn snapshot(state: &State) -> Step {
     let Ok(service) = state.service() else { return Step::Close(close_code::AWAY, "the gateway is stopping") };
-    let gateway = service.gateway();
-    let orders = gateway.orders(&OrderFilter { working: true, ..OrderFilter::default() });
+    let (orders, blocked, unavailable) = service.gateway().working_view();
     let orders_next = if orders.len() == MAX_ORDERS_PER_PAGE { orders.last().map(|order| order.id.0) } else { None };
-    json(&Snapshot {
-        sessions: session_views(&service),
-        orders,
-        orders_next,
-        blocked: gateway.blocked(),
-        unavailable: gateway.unavailable(),
-    })
+    json(&Snapshot { sessions: session_views(&service), orders, orders_next, blocked, unavailable })
 }
 
 fn json(value: &impl Serialize) -> Step {
@@ -332,8 +353,9 @@ mod tests {
         assert_eq!(resumed["event"], "resumed");
     }
 
-    /// A socket that falls behind gets a snapshot, then what's still in the channel: here a
-    /// channel of one, sent two events before the socket reads.
+    /// A socket that falls behind gets a snapshot and skips what the channel held; falling behind
+    /// again within MIN_SNAPSHOT_GAP closes it. Here the channels hold one event, and two are sent
+    /// with no await between them, so the socket's task can't read in between.
     #[tokio::test]
     async fn lag_gives_a_snapshot() {
         let fixture = fixture().await;
@@ -352,11 +374,19 @@ mod tests {
         let (addr, _stop) = serve(axum::Router::new().route("/test/live", route)).await;
         let mut client = connect(addr, "/test/live", &[]).await.unwrap();
         assert_eq!(next_json(&mut client).await["type"], "snapshot");
-        // The test's runtime has one thread: the socket's task can't read between the sends.
-        gateway.send(GatewayEvent::Blocked { scope: Scope::All }).unwrap();
-        gateway.send(GatewayEvent::Unblocked { scope: Scope::All }).unwrap();
+        tokio::time::sleep(MIN_SNAPSHOT_GAP).await;
+        let lag = || {
+            gateway.send(GatewayEvent::Blocked { scope: Scope::All }).unwrap();
+            gateway.send(GatewayEvent::Unblocked { scope: Scope::All }).unwrap();
+        };
+        lag();
         assert_eq!(next_json(&mut client).await["type"], "snapshot");
-        assert_eq!(next_json(&mut client).await["type"], "unblocked");
+        // The `unblocked` the channel held is skipped: the next is the one sent after.
+        gateway.send(GatewayEvent::Blocked { scope: Scope::All }).unwrap();
+        assert_eq!(next_json(&mut client).await["type"], "blocked");
+        lag();
+        let tungstenite::Message::Close(Some(frame)) = next(&mut client).await else { panic!("not closed") };
+        assert_eq!(u16::from(frame.code), close_code::AGAIN);
     }
 
     /// Stopping the server closes the socket, saying why.

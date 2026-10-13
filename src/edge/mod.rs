@@ -477,6 +477,14 @@ impl Gateway {
         self.lock().book.unavailable()
     }
 
+    /// The working orders (a page at most: see [`Book::orders`]), the scopes blocked, and whether
+    /// new orders are rejected, read together: a live view's snapshot.
+    pub fn working_view(&self) -> (Vec<OrderView>, Vec<Scope>, bool) {
+        let state = self.lock();
+        let orders = state.book.orders(&OrderFilter { working: true, ..OrderFilter::default() });
+        (orders, state.book.blocked().to_vec(), state.book.unavailable())
+    }
+
     /// Publishes an alarm the gateway raises outside the book, if anyone listens.
     fn alarm(&self, kind: AlarmKind, text: impl FnOnce() -> String) {
         if self.events.receiver_count() > 0 {
