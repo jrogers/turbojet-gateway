@@ -248,6 +248,8 @@ impl Search {
         let headers = filters
             .iter()
             .map(|filter| {
+                // LogFilter's conditions that need the message decoded are its MsgTypes and
+                // tags: one Turbojet adds must be cleared here too.
                 let mut header = filter.clone();
                 header.msg_types.clear();
                 header.tags.clear();
