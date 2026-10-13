@@ -162,7 +162,8 @@ pub(crate) type Outcome<T> = Result<(T, Option<String>), ApiError>;
 ///
 /// Refuses it, recording the refusal, if `allowed` is an error (the caller's role or scope, or a
 /// target that doesn't exist) or the reason is missing, blank or too long (400). Then runs it as
-/// [`run_audited`] does.
+/// [`run_audited`] does. A handler answers 503 before it, unrecorded, once the gateway is
+/// stopping.
 pub(crate) async fn audited<T: Send + 'static>(
     state: &State,
     caller: &Caller,

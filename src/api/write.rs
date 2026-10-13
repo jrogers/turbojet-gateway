@@ -60,7 +60,8 @@ pub(super) async fn pause(
 ) -> Result<StatusCode, ApiError> {
     let (body, parsed) = parse(body);
     let mutation = Mutation { action: "pause", target: Some(id), params: serde_json::Value::Null, reason: body.reason };
-    on_session(&state, &caller, mutation, parsed, |session| async move {
+    on_session(&state, &caller, mutation, parsed, |session, ()| async move {
+        // Best effort: another pause or resume may come between the check and the act.
         let note = session.is_paused().then(|| "unchanged: already paused".to_string());
         // The reason is the operator's, not the counterparty's to read.
         session.pause(None);
@@ -79,7 +80,8 @@ pub(super) async fn resume(
     let (body, parsed) = parse(body);
     let mutation =
         Mutation { action: "resume", target: Some(id), params: serde_json::Value::Null, reason: body.reason };
-    on_session(&state, &caller, mutation, parsed, |session| async move {
+    on_session(&state, &caller, mutation, parsed, |session, ()| async move {
+        // Best effort, as pause's.
         let note = (!session.is_paused()).then(|| "unchanged: not paused".to_string());
         session.resume();
         Ok((StatusCode::NO_CONTENT, note))
@@ -105,12 +107,11 @@ pub(super) async fn resend(
 ) -> Result<Json<Numbers>, ApiError> {
     let (body, parsed) = parse(body);
     let from = body.from;
-    let parsed = parsed
-        .and_then(|()| from.map(|_| ()).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "a resend needs from")));
+    let parsed =
+        parsed.and_then(|()| from.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "a resend needs from")));
     let params = serde_json::json!({ "from": from });
     let mutation = Mutation { action: "resend", target: Some(id), params, reason: body.reason };
-    on_session(&state, &caller, mutation, parsed, |session| async move {
-        let from = from.expect("checked before it's allowed");
+    on_session(&state, &caller, mutation, parsed, |session, from| async move {
         let numbers = session.request_resend(from).await.map_err(|e| match e {
             SequenceError::Storage(e) => {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("the session store failed: {e}"))
@@ -251,19 +252,24 @@ pub(super) async fn reload(
     audited(&state, &caller, mutation, allowed, reload).await
 }
 
-/// A reload's answer: all of it taken, or 422 saying which file was kept and why, which half was
-/// taken, and the warnings.
+/// A reload's answer: all of it taken, or 422 (see [`partly_kept`]).
 fn answer(reloaded: Reloaded) -> Outcome<Json<ReloadView>> {
     let Reloaded { sessions, config, warnings } = reloaded;
-    let (sessions, config) = match (sessions, config) {
-        (Ok(sessions), Ok(config)) => {
-            return Ok((Json(ReloadView { sessions: sessions.into(), config, warnings }), None));
-        }
-        (sessions, config) => (sessions, config),
-    };
+    match (sessions, config) {
+        (Ok(changes), Ok(config)) => Ok((Json(ReloadView { sessions: changes.into(), config, warnings }), None)),
+        (sessions, config) => Err(partly_kept(sessions, config, warnings)),
+    }
+}
+
+/// 422 saying which file was kept and why, what the other half took, and the warnings.
+fn partly_kept(
+    sessions: Result<Changes, String>,
+    config: Result<ConfigSummary, String>,
+    warnings: Vec<String>,
+) -> ApiError {
     let mut why = Vec::new();
     match sessions {
-        Ok(_) => why.push("took the sessions file".to_string()),
+        Ok(changes) => why.push(format!("took the sessions file ({})", changed(changes))),
         Err(e) => why.push(format!("kept the sessions file: {e}")),
     }
     match config {
@@ -271,7 +277,28 @@ fn answer(reloaded: Reloaded) -> Outcome<Json<ReloadView>> {
         Err(e) => why.push(format!("kept the routes, limits and day_end: {e}")),
     }
     why.extend(warnings);
-    Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, why.join("; ")))
+    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, why.join("; "))
+}
+
+/// What a sessions file taken changed, for a 422's message and so the audit line: `added FUNDB;
+/// stopped LSE`, or `nothing changed`.
+fn changed(changes: Changes) -> String {
+    let SessionChanges { added, changed, removed, logged_out, started, reconfigured, stopped } = changes.into();
+    let lists = [
+        ("added", added),
+        ("changed", changed),
+        ("removed", removed),
+        ("logged out", logged_out),
+        ("started", started),
+        ("reconfigured", reconfigured),
+        ("stopped", stopped),
+    ];
+    let lists: Vec<_> = lists
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(what, names)| format!("{what} {}", names.join(", ")))
+        .collect();
+    if lists.is_empty() { "nothing changed".to_string() } else { lists.join("; ") }
 }
 
 /// The body, or its default and why it's refused (400).
@@ -300,14 +327,14 @@ where
     }
 }
 
-/// A session mutation [operator]: `action` on the session `mutation.target` names, once `parsed`
-/// (the body, checked) holds and the caller may act on it.
-async fn on_session<T, A>(
+/// A session mutation [operator]: `action` on the session `mutation.target` names, with what
+/// `parsed` (the body, checked) holds, once the caller may act on it.
+async fn on_session<P, T, A>(
     state: &State,
     caller: &Caller,
     mutation: Mutation,
-    parsed: Result<(), ApiError>,
-    action: impl FnOnce(SessionHandle) -> A,
+    parsed: Result<P, ApiError>,
+    action: impl FnOnce(SessionHandle, P) -> A,
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
@@ -315,11 +342,11 @@ where
 {
     let service = state.service()?;
     let id = mutation.target.as_deref().expect("a session mutation names its session");
-    let found = caller.require(Role::Operator).and(parsed).and_then(|()| {
+    let found = caller.require(Role::Operator).and(parsed).and_then(|parsed| {
         let session = find_session(&service, id)?;
-        if caller.may_act_on(&session) { Ok(session.handle()) } else { Err(out_of_scope(caller, id)) }
+        if caller.may_act_on(&session) { Ok((session.handle(), parsed)) } else { Err(out_of_scope(caller, id)) }
     });
-    audited_on(state, caller, mutation, found, action).await
+    audited_on(state, caller, mutation, found, |(session, parsed)| action(session, parsed)).await
 }
 
 /// A session as the mutations find it.
@@ -469,8 +496,9 @@ mod tests {
 
     /// Every endpoint as each role calls it: no one (401), a viewer (403), an operator, an
     /// operator scoped to FUNDB (403: FUNDA's session, order and CompID, and the venue), and an
-    /// admin; a reload is an admin's only. An allowed call answers success, or 409 (a second
-    /// resend while the first is under way). Pausing FUNDA comes last, as it logs FUNDA out.
+    /// admin; a reload is an admin's only. An allowed call answers success, or on a row marked so,
+    /// 409 (a second resend while the first is under way). Pausing FUNDA comes last, as it logs
+    /// FUNDA out.
     #[tokio::test]
     async fn every_endpoint_by_role() {
         let fixture = fixture().await;
@@ -480,15 +508,15 @@ mod tests {
         let admin = [none, forbidden, forbidden, forbidden, None];
         let funda = r#"{"reason":"testing","scope":"comp:FUNDA"}"#;
         let rows = [
-            (format!("/api/sessions/{FUNDA}/resend"), r#"{"reason":"testing","from":1}"#, operator),
-            (format!("/api/orders/{order}/cancel"), REASON, operator),
-            ("/api/risk/block".to_string(), funda, operator),
-            ("/api/risk/unblock".to_string(), funda, operator),
-            ("/api/risk/cancel-all".to_string(), funda, operator),
-            (format!("/api/sessions/{venue}/pause"), REASON, operator),
-            (format!("/api/sessions/{venue}/resume"), REASON, operator),
-            ("/api/reload".to_string(), REASON, admin),
-            (format!("/api/sessions/{FUNDA}/pause"), REASON, operator),
+            (format!("/api/sessions/{FUNDA}/resend"), r#"{"reason":"testing","from":1}"#, operator, true),
+            (format!("/api/orders/{order}/cancel"), REASON, operator, false),
+            ("/api/risk/block".to_string(), funda, operator, false),
+            ("/api/risk/unblock".to_string(), funda, operator, false),
+            ("/api/risk/cancel-all".to_string(), funda, operator, false),
+            (format!("/api/sessions/{venue}/pause"), REASON, operator, false),
+            (format!("/api/sessions/{venue}/resume"), REASON, operator, false),
+            ("/api/reload".to_string(), REASON, admin, false),
+            (format!("/api/sessions/{FUNDA}/pause"), REASON, operator, false),
         ];
         let callers = [
             ("no one", ""),
@@ -497,13 +525,13 @@ mod tests {
             ("scoped", &fixture.scoped),
             ("admin", &fixture.admin),
         ];
-        for (path, body, wants) in rows {
+        for (path, body, wants, conflict) in rows {
             for ((caller, bearer), want) in callers.iter().zip(wants) {
                 let answer = fixture.post(bearer, &path, body).await;
                 match want {
                     Some(want) => assert_eq!(answer.status, want, "{path} as {caller}: {}", answer.body),
                     None => assert!(
-                        answer.status.is_success() || answer.status == StatusCode::CONFLICT,
+                        answer.status.is_success() || (conflict && answer.status == StatusCode::CONFLICT),
                         "{path} as {caller}: {} {}",
                         answer.status,
                         answer.body
@@ -583,7 +611,8 @@ mod tests {
         crate::edge::tests::book_input(gateway, Input::VenueReport { venue: "NASDAQ".into(), report });
         assert_eq!(gateway.order(OrderId(1)).unwrap().order.status, Status::Canceled);
         fixture.expect(&cancel, REASON, StatusCode::CONFLICT).await;
-        assert_eq!(fixture.results()[fixture.results().len() - 2..], ["allowed", "failed: the order is done"]);
+        let results = fixture.results();
+        assert_eq!(results[results.len() - 2..], ["allowed", "failed: the order is done"]);
     }
 
     /// Blocks and unblocks report whether they changed anything; the kill switch blocks and
@@ -658,12 +687,14 @@ mod tests {
         assert_eq!(answer.body["config"]["routes"], 1);
         assert_eq!(answer.body["warnings"], serde_json::json!([]));
 
+        std::fs::write(dir.join("sessions.toml"), format!("{sessions}[counterparty.FUNDC]\n")).unwrap();
         let config = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NOWHERE\"\n";
         std::fs::write(dir.join("jetbridge.toml"), config).unwrap();
         let answer = fixture.post(&fixture.admin, "/api/reload", REASON).await;
         assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", answer.body);
         let error = answer.body["error"].as_str().unwrap();
-        assert!(error.starts_with("took the sessions file; kept the routes, limits and day_end: "), "{error}");
+        let took = "took the sessions file (added FUNDC; removed FUNDB); kept the routes, limits and day_end: ";
+        assert!(error.starts_with(took), "{error}");
         assert_eq!(fixture.last_result(), format!("failed: {error}"));
     }
 }
