@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use chrono::TimeZone;
 
 use super::*;
-use crate::book::{Book, ExecType, Input, Output, VenueReport};
+use crate::book::{Book, CancelState, ExecType, GatewayCancelView, Input, Output, RequestKind, VenueReport};
 use crate::router::{Router, Rule, Target};
 
 async fn memory() -> Store {
@@ -464,6 +464,13 @@ async fn a_book_restored_from_the_store_is_the_book_restored_from_its_changes() 
     step(&mut restarted, vec![report(gateway_cancel, ExecType::Canceled, Status::Canceled, 0, 40)]).await;
     assert_eq!(restarted.order(OrderId(3)).unwrap().status, Status::Canceled);
     assert_eq!(store.load().await.unwrap().next_order_id, 6);
+    // History shows the orders the book holds as the book does.
+    for view in restarted.orders(&crate::book::OrderFilter::default()) {
+        assert_eq!(store.order(&view.order_id).await.unwrap(), restarted.order_detail(view.id), "{view:?}");
+    }
+    let mut stored = store.orders(&created_in(DateTime::UNIX_EPOCH, DateTime::<Utc>::MAX_UTC)).await.unwrap();
+    stored.retain(|view| restarted.order(view.id).is_some());
+    assert_eq!(stored, restarted.orders(&crate::book::OrderFilter::default()));
 }
 
 /// The store loads `written` as restoring it keeps, and both restore the same book.
@@ -795,4 +802,195 @@ async fn pruning_keeps_an_old_days_order_sent_since_the_cutoff() {
     assert_eq!(store.prune(cutoff + chrono::Duration::nanoseconds(1), 10).await.unwrap(), Pruned { orders: 1 });
     assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [3]);
     assert_eq!(store.pruned_through().await.unwrap(), Some(cutoff));
+}
+
+/// Every stored order created in `from..to`, the other fields unset.
+fn created_in(from: DateTime<Utc>, to: DateTime<Utc>) -> StoredOrders {
+    StoredOrders {
+        from,
+        to,
+        client: None,
+        venue: None,
+        symbol: None,
+        status: None,
+        working: false,
+        after: None,
+        limit: None,
+    }
+}
+
+async fn ids_of(store: &Store, query: StoredOrders) -> Vec<u64> {
+    store.orders(&query).await.unwrap().iter().map(|view| view.id.0).collect()
+}
+
+/// `hour` o'clock on `day` days after 2026-10-10.
+fn on(day: i64, hour: u32) -> DateTime<Utc> {
+    time(hour, 0) + chrono::Duration::days(day)
+}
+
+/// Orders 1 to 6 over three days, of two sessions of FUNDA and one of FUNDB, two venues and two
+/// symbols, done and live, 3 and 4 created at one time. Returns the second FUNDA session.
+async fn history(store: &Store) -> ClientId {
+    let (funda, fundb) = (ClientId::from("FUNDA"), ClientId::from("FUNDB"));
+    let funda_42 = ClientId::new(&turbojet::SessionId::new("FIX.4.2", "JETBRIDGE", "FUNDA"));
+    let orders = [
+        (1, &funda, on(0, 9), false, "NASDAQ", "AAPL"),
+        (2, &fundb, on(0, 10), true, "NYSE", "MSFT"),
+        (3, &funda_42, on(1, 9), true, "NASDAQ", "MSFT"),
+        (4, &funda, on(1, 9), false, "NYSE", "AAPL"),
+        (5, &fundb, on(2, 9), false, "NASDAQ", "AAPL"),
+        (6, &funda, on(2, 11), true, "NASDAQ", "AAPL"),
+    ];
+    let written: Vec<Changes> = orders
+        .into_iter()
+        .map(|(id, client, sent_at, done, venue, symbol)| {
+            let mut changes = dated(id, client, None, done, sent_at);
+            let order = &mut changes.orders[0].order;
+            (order.venue, order.request.symbol) = (venue.into(), symbol.into());
+            changes
+        })
+        .collect();
+    store.write(&written).await.unwrap();
+    funda_42
+}
+
+/// Past orders read back by their creation, `from` inclusive and `to` not, and by each filter:
+/// a session is that session only, a CompID each of its sessions.
+#[tokio::test]
+async fn stored_orders_are_read_by_creation_and_filters() {
+    let store = memory().await;
+    let funda_42 = history(&store).await;
+    let all = created_in(on(0, 0), on(3, 0));
+    assert_eq!(ids_of(&store, all.clone()).await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(ids_of(&store, created_in(on(1, 0), on(2, 0))).await, [3, 4]);
+    assert_eq!(ids_of(&store, created_in(on(0, 9), on(2, 11))).await, [1, 2, 3, 4, 5], "to is exclusive");
+    assert!(ids_of(&store, created_in(on(3, 0), on(4, 0))).await.is_empty());
+    // Bounds past four-digit years, whose text would sort wrongly, are as good as no bound.
+    assert_eq!(ids_of(&store, created_in(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC)).await.len(), 6);
+    let with = |change: &dyn Fn(&mut StoredOrders)| {
+        let mut query = all.clone();
+        change(&mut query);
+        query
+    };
+    let funda = ClientId::from("FUNDA");
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::Session(funda.clone())))).await, [1, 4, 6]);
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::Session(funda_42.clone())))).await, [3]);
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::CompId("FUNDA".into())))).await, [1, 3, 4, 6]);
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::All))).await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(ids_of(&store, with(&|q| q.venue = Some("NYSE".into()))).await, [2, 4]);
+    assert_eq!(ids_of(&store, with(&|q| q.symbol = Some("MSFT".into()))).await, [2, 3]);
+    assert_eq!(ids_of(&store, with(&|q| q.status = Some(Status::Filled))).await, [2, 3, 6]);
+    assert_eq!(ids_of(&store, with(&|q| q.working = true)).await, [1, 4, 5]);
+    let narrow = with(&|q| {
+        q.client = Some(Scope::CompId("FUNDA".into()));
+        q.venue = Some("NASDAQ".into());
+        q.working = true;
+    });
+    assert_eq!(ids_of(&store, narrow).await, [1]);
+    let views = store.orders(&all).await.unwrap();
+    assert_eq!(views[2].created, on(1, 9));
+    assert_eq!(views[2].client, funda_42);
+    assert_eq!(views[2].order_id, "A3");
+}
+
+/// Pages of 2, each from the last of the one before, walk the range in (created, OrderId) order,
+/// each order once: 3 and 4, created at one time, on one page or split across two.
+#[tokio::test]
+async fn stored_orders_page_by_creation_then_order_id() {
+    let store = memory().await;
+    history(&store).await;
+    for (from, expected) in [(on(0, 0), vec![1, 2, 3, 4, 5, 6]), (on(0, 10), vec![2, 3, 4, 5, 6])] {
+        let mut query = created_in(from, on(3, 0));
+        query.limit = Some(2);
+        let mut walked = Vec::new();
+        loop {
+            let page = store.orders(&query).await.unwrap();
+            assert!(page.len() <= 2);
+            let Some(last) = page.last() else { break };
+            query.after = Some((last.created, last.id));
+            walked.extend(page.iter().map(|view| view.id.0));
+        }
+        assert_eq!(walked, expected);
+    }
+}
+
+/// A replaced order with its cancel outstanding shows once, created at its original request, its
+/// replace and cancel pending; its detail has every request in the order sent, ties by
+/// downstream, and is what the page shows. Once the cancel is answered, it's no longer pending.
+#[tokio::test]
+async fn a_replaced_order_shows_once_with_every_request() {
+    let store = memory().await;
+    let funda = ClientId::from("FUNDA");
+    // `order(.., true)` has a pending replace, `cancel` 7-3 and the gateway's cancel.
+    let row = OrderRow { order: order(7, &funda, true), day: None };
+    let request = |kind, origin, sent_at| Sent {
+        order: OrderId(7),
+        origin,
+        cl_ord_id: "C7".into(),
+        orig_cl_ord_id: None,
+        kind,
+        answered: false,
+        sent_at,
+    };
+    let sent = vec![
+        ("7-1".into(), request(None, Origin::Client, on(0, 9))),
+        ("7-3".into(), request(Some(CancelKind::Cancel), Origin::Gateway, on(0, 11))),
+        ("7-2".into(), request(Some(CancelKind::Replace), Origin::Client, on(0, 11))),
+    ];
+    store.write(&[Changes { orders: vec![row], sent: sent.clone(), ..Changes::default() }]).await.unwrap();
+    let views = store.orders(&created_in(on(0, 0), on(1, 0))).await.unwrap();
+    let [view] = views.as_slice() else { panic!("{views:?}") };
+    assert_eq!(view.created, on(0, 9));
+    assert!(view.pending_cancel);
+    assert!(view.pending_replace);
+    assert_eq!(view.gateway_cancel, Some(GatewayCancelView { state: CancelState::Waiting, tries: 2 }));
+    assert!(!view.unknown_at_venue);
+    assert!(ids_of(&store, created_in(on(0, 10), on(1, 0))).await.is_empty(), "not created at its replace");
+
+    let detail = store.order("A7").await.unwrap().unwrap();
+    assert_eq!(&detail.order, view);
+    assert_eq!(detail.venue_order_id.as_deref(), Some("V9"));
+    let requests: Vec<_> = detail.requests.iter().map(|r| (r.downstream.as_str(), r.kind, r.sent_at)).collect();
+    assert_eq!(
+        requests,
+        [
+            ("7-1", RequestKind::New, on(0, 9)),
+            ("7-2", RequestKind::Replace, on(0, 11)),
+            ("7-3", RequestKind::Cancel, on(0, 11))
+        ]
+    );
+    assert_eq!(detail.requests[2].cl_ord_id, None, "the gateway's own");
+    assert_eq!(detail.requests[1].cl_ord_id.as_deref(), Some("C7"));
+    assert_eq!(store.order("A8").await.unwrap(), None);
+
+    let answered = Sent { answered: true, ..sent[1].1.clone() };
+    store.write(&[Changes { sent: vec![("7-3".into(), answered)], ..Changes::default() }]).await.unwrap();
+    assert!(!store.order("A7").await.unwrap().unwrap().order.pending_cancel);
+}
+
+/// Past orders are read along the `sent_new` range, in its order, every filter and the cursor
+/// set or none: the orders and the cancels each by key, nothing scanned and no sort.
+#[tokio::test]
+async fn stored_orders_read_by_creation_without_sorting() {
+    let store = memory().await;
+    let bare = created_in(on(0, 0), on(1, 0));
+    let full = StoredOrders {
+        client: Some(Scope::Session("FUNDA".into())),
+        venue: Some("NASDAQ".into()),
+        symbol: Some("AAPL".into()),
+        status: Some(Status::New),
+        working: true,
+        after: Some((on(0, 1), OrderId(3))),
+        limit: Some(2),
+        ..bare.clone()
+    };
+    for query in [bare, full] {
+        let (sql, _) = stored_orders_sql(&query);
+        let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(&store.pool).await.unwrap();
+        let plan: Vec<String> = plan.iter().map(|row| row.try_get("detail").unwrap()).collect();
+        assert!(plan[0].starts_with("SEARCH s USING INDEX sent_new (sent_at>? AND sent_at<?)"), "{plan:?}");
+        assert!(plan.iter().any(|step| step.starts_with("SEARCH o USING INDEX sqlite_autoindex_orders_1 (id=?)")));
+        assert!(plan.iter().any(|step| step.starts_with("SEARCH c USING INDEX sqlite_autoindex_sent_1")));
+        assert!(!plan.iter().any(|step| step.starts_with("SCAN") || step.contains("TEMP B-TREE")), "{plan:?}");
+    }
 }

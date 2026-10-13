@@ -8,7 +8,7 @@ use serde::Serialize;
 use turbojet::fields::{CompactString, Decimal, format_compact};
 
 use super::{
-    Book, CancelKind, ClientId, GatewayCancel, OrdType, Order, OrderId, Origin, Scope, Side, Status, VenueId,
+    Book, CancelKind, ClientId, GatewayCancel, OrdType, Order, OrderId, Origin, Scope, Sent, Side, Status, VenueId,
     limit_price,
 };
 use crate::risk::Limits;
@@ -191,14 +191,7 @@ impl Book {
         let requests = names
             .filter_map(|downstream| {
                 let sent = self.downstream.get(&downstream)?;
-                let kind = match sent.kind {
-                    None => RequestKind::New,
-                    Some(CancelKind::Cancel) => RequestKind::Cancel,
-                    Some(CancelKind::Replace) => RequestKind::Replace,
-                };
-                let cl_ord_id = (sent.origin == Origin::Client).then(|| sent.cl_ord_id.clone());
-                let (origin, sent_at, answered) = (sent.origin, sent.sent_at, sent.answered);
-                Some(RequestView { downstream, kind, origin, cl_ord_id, sent_at, answered })
+                Some(request_view(downstream, sent))
             })
             .collect();
         Some(OrderDetail { order: self.view(order), venue_order_id: order.venue_order_id.clone(), requests })
@@ -245,27 +238,54 @@ impl Book {
     }
 
     fn view(&self, order: &Order) -> OrderView {
-        OrderView {
-            id: order.id,
-            order_id: order.name.clone(),
-            client: order.client.clone(),
-            cl_ord_id: order.request.cl_ord_id.clone(),
-            venue: order.venue.clone(),
-            symbol: order.request.symbol.clone(),
-            side: order.request.side,
-            ord_type: order.request.ord_type,
-            qty: order.request.qty,
-            price: limit_price(order.request.ord_type, order.request.price),
-            cum_qty: order.cum_qty,
-            avg_px: order.avg_px,
-            status: order.status,
-            pending_cancel: self.outstanding_cancel(order).is_some(),
-            pending_replace: order.pending.is_some(),
-            gateway_cancel: order.gateway_cancel.as_ref().map(GatewayCancelView::from),
-            unknown_at_venue: self.unknown_at_venue.contains(&order.id),
-            created: self.downstream.get(&order.name).expect("an order's original request is recorded").sent_at,
-        }
+        let created = self.downstream.get(&order.name).expect("an order's original request is recorded").sent_at;
+        let pending_cancel = self.outstanding_cancel(order).is_some();
+        order_view(order, pending_cancel, self.unknown_at_venue.contains(&order.id), created)
     }
+}
+
+/// `order` as a blotter shows it. Free of the book, as the store's history
+/// ([`Store::orders`](crate::store::Store::orders)) shows orders the book no longer holds:
+/// `pending_cancel` (whether the order's `cancel` is unanswered), `unknown_at_venue` and `created`
+/// (its original request's `sent_at`) are read from the book's maps or the database by the caller.
+pub(crate) fn order_view(
+    order: &Order,
+    pending_cancel: bool,
+    unknown_at_venue: bool,
+    created: DateTime<Utc>,
+) -> OrderView {
+    OrderView {
+        id: order.id,
+        order_id: order.name.clone(),
+        client: order.client.clone(),
+        cl_ord_id: order.request.cl_ord_id.clone(),
+        venue: order.venue.clone(),
+        symbol: order.request.symbol.clone(),
+        side: order.request.side,
+        ord_type: order.request.ord_type,
+        qty: order.request.qty,
+        price: limit_price(order.request.ord_type, order.request.price),
+        cum_qty: order.cum_qty,
+        avg_px: order.avg_px,
+        status: order.status,
+        pending_cancel,
+        pending_replace: order.pending.is_some(),
+        gateway_cancel: order.gateway_cancel.as_ref().map(GatewayCancelView::from),
+        unknown_at_venue,
+        created,
+    }
+}
+
+/// The request sent under `downstream`, as [`OrderDetail`] shows it.
+pub(crate) fn request_view(downstream: CompactString, sent: &Sent) -> RequestView {
+    let kind = match sent.kind {
+        None => RequestKind::New,
+        Some(CancelKind::Cancel) => RequestKind::Cancel,
+        Some(CancelKind::Replace) => RequestKind::Replace,
+    };
+    let cl_ord_id = (sent.origin == Origin::Client).then(|| sent.cl_ord_id.clone());
+    let (origin, sent_at, answered) = (sent.origin, sent.sent_at, sent.answered);
+    RequestView { downstream, kind, origin, cl_ord_id, sent_at, answered }
 }
 
 fn order_id_number<S: serde::Serializer>(id: &OrderId, serializer: S) -> Result<S::Ok, S::Error> {

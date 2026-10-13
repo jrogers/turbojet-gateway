@@ -28,6 +28,7 @@ pub use view::{
     Alarm, AlarmKind, CancelState, GatewayCancelView, GatewayEvent, MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter,
     OrderView, RequestKind, RequestView, RiskView, SessionRisk,
 };
+pub(crate) use view::{order_view, request_view};
 
 /// A client session: two sessions of one CompID (with different SubIDs, say) are two clients,
 /// each with its own ClOrdIDs and reports. Shows as the session, as Turbojet shows it. Cheap to

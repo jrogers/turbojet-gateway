@@ -19,15 +19,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyConnection, AnyPool, Executor, Row};
 use tracing::warn;
 use turbojet::fields::{CompactString, Decimal};
 
 use crate::book::{
-    CancelKind, Changes, ClOrdIdRow, ClientId, Day, GatewayCancel, OrdType, Order, OrderId, OrderRequest, OrderRow,
-    Origin, Pending, Scope, Sent, Side, Snapshot, Status, TimeInForce, Today, Undelivered,
+    CancelKind, Changes, ClOrdIdRow, ClientId, Day, GatewayCancel, MAX_ORDERS_PER_PAGE, OrdType, Order, OrderDetail,
+    OrderId, OrderRequest, OrderRow, OrderView, Origin, Pending, Scope, Sent, Side, Snapshot, Status, TimeInForce,
+    Today, Undelivered, VenueId, order_view, request_view,
 };
 
 /// The schema this build reads and writes. A database of another is refused, not migrated.
@@ -344,6 +345,169 @@ impl Store {
             .map_err(database("reading what was pruned"))?;
         through.map(|through| parse_time("sent_through", &through)).transpose()
     }
+
+    /// The orders created (their original request sent) in `query.from..query.to` and matching
+    /// its other fields, by creation time, then OrderId, as the database has them: done orders the
+    /// book has dropped, until [`prune`](Self::prune) deletes them, and those it holds, as last
+    /// written. Read from the cursor along the `sent_new` range, in its order, not all of history;
+    /// the other fields are checked row by row.
+    ///
+    /// # Errors
+    ///
+    /// The database refuses the query, or holds a value this build can't read.
+    pub async fn orders(&self, query: &StoredOrders) -> io::Result<Vec<OrderView>> {
+        let (sql, values) = stored_orders_sql(query);
+        let query = values.iter().fold(sqlx::query(&sql), |query, value| match value {
+            Value::Text(text) => query.bind(text.as_str()),
+            Value::Integer(integer) => query.bind(*integer),
+        });
+        let rows = query.fetch_all(&self.pool).await.map_err(database("reading past orders"))?;
+        rows.iter()
+            .map(|row| {
+                let row = Columns(row);
+                stored_view(&order_row(&row)?.order, &row, row.time("created")?)
+            })
+            .collect()
+    }
+
+    /// The order whose OrderID(37) is `name`, from history as [`orders`](Self::orders) reads
+    /// it, with every request sent for it, in the order they were sent.
+    ///
+    /// # Errors
+    ///
+    /// The database refuses a query, or holds a value this build can't read or an order without
+    /// its original request.
+    pub async fn order(&self, name: &str) -> io::Result<Option<OrderDetail>> {
+        // One transaction, so the order and its requests are of the same commit, as in `load`.
+        let mut transaction = self.pool.begin().await.map_err(database("starting to read an order"))?;
+        let row = sqlx::query(
+            "SELECT o.*, c.answered AS cancel_answered FROM orders o \
+             LEFT JOIN sent c ON c.downstream = o.cancel WHERE o.name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database("reading an order"))?;
+        let Some(row) = row else { return Ok(None) };
+        let row = Columns(&row);
+        let order = order_row(&row)?.order;
+        let sent_rows = sqlx::query("SELECT * FROM sent WHERE order_id = $1 ORDER BY sent_at, downstream")
+            .bind(signed(order.id.0)?)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(database("reading an order's requests"))?;
+        transaction.commit().await.map_err(database("ending an order's read"))?;
+        let mut requests = Vec::with_capacity(sent_rows.len());
+        let mut created = None;
+        for sent_row in &sent_rows {
+            let sent_row = Columns(sent_row);
+            let request = sent(&sent_row)?;
+            if request.kind.is_none() {
+                created = Some(request.sent_at);
+            }
+            requests.push(request_view(sent_row.compact("downstream")?, &request));
+        }
+        let created = created.ok_or_else(|| unreadable("sent", &order.name, "no original request for the order"))?;
+        let view = stored_view(&order, &row, created)?;
+        Ok(Some(OrderDetail { order: view, venue_order_id: order.venue_order_id, requests }))
+    }
+}
+
+/// Which orders [`Store::orders`] returns: those created in `from..to` matching every other field
+/// set, by creation time, then OrderId. As [`OrderFilter`](crate::book::OrderFilter), over history.
+#[derive(Debug, Clone)]
+pub struct StoredOrders {
+    /// When the order's original request was sent, from `from` up to but not including `to`.
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    /// A client session, or every session of a CompID.
+    pub client: Option<Scope>,
+    pub venue: Option<VenueId>,
+    pub symbol: Option<CompactString>,
+    pub status: Option<Status>,
+    /// Only orders not yet done.
+    pub working: bool,
+    /// Only orders after this one, by creation time then OrderId: the last of the previous page,
+    /// its [`OrderView::created`] and [`OrderView::id`]. Creation times can tie.
+    pub after: Option<(DateTime<Utc>, OrderId)>,
+    /// At most this many, and never more than [`MAX_ORDERS_PER_PAGE`]; `None` is that many.
+    pub limit: Option<usize>,
+}
+
+/// A value bound to a query built at run time.
+enum Value {
+    Text(String),
+    Integer(i64),
+}
+
+/// The SQL of [`Store::orders`] and its values, bound in order: only the filters set are in the
+/// WHERE, and no value is formatted into the SQL. `kind IS NULL` picks each order's original
+/// request, its one `sent` row without a cancel or replace's kind, and lets SQLite take the
+/// partial `sent_new`; `CROSS JOIN` keeps it going from that range to the orders, as `HELD`.
+/// Ordered by `s.order_id`, not the equal `o.id`, which the index doesn't have: SQLite would sort
+/// each run of one time. The cursor's time is a lower bound too, so a later page starts its range
+/// there, not at `from`.
+fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
+    let mut sql = String::from(
+        "SELECT o.*, s.sent_at AS created, c.answered AS cancel_answered \
+         FROM sent s CROSS JOIN orders o LEFT JOIN sent c ON c.downstream = o.cancel \
+         WHERE s.kind IS NULL AND s.sent_at >= $1 AND s.sent_at < $2 AND o.id = s.order_id",
+    );
+    let mut values = vec![Value::Text(bound_text(query.from)), Value::Text(bound_text(query.to))];
+    if let Some((created, id)) = &query.after {
+        // Past `i64::MAX`, no stored OrderId is after it.
+        let id = i64::try_from(id.0).unwrap_or(i64::MAX);
+        sql.push_str(" AND s.sent_at >= $3 AND (s.sent_at > $3 OR s.order_id > $4)");
+        values.extend([Value::Text(bound_text(*created)), Value::Integer(id)]);
+    }
+    // Appends `condition`, its `$` the placeholder of `value`, the next one.
+    let mut and = |condition: &str, value: Value| {
+        values.push(value);
+        sql.push_str(" AND ");
+        sql.push_str(&condition.replace('$', &format!("${}", values.len())));
+    };
+    match &query.client {
+        Some(Scope::Session(client)) => {
+            and("o.client = $", Value::Text(client.to_string()));
+            and("o.client_comp_id = $", Value::Text(client.comp_id().to_string()));
+        }
+        Some(Scope::CompId(comp_id)) => and("o.client_comp_id = $", Value::Text(comp_id.to_string())),
+        Some(Scope::All) | None => {}
+    }
+    if let Some(venue) = &query.venue {
+        and("o.venue = $", Value::Text(venue.to_string()));
+    }
+    if let Some(symbol) = &query.symbol {
+        and("o.symbol = $", Value::Text(symbol.to_string()));
+    }
+    if let Some(status) = query.status {
+        and("o.status = $", Value::Text(status.code().to_string()));
+    }
+    if query.working {
+        sql.push_str(" AND o.live = 1");
+    }
+    let limit = query.limit.unwrap_or(MAX_ORDERS_PER_PAGE).min(MAX_ORDERS_PER_PAGE);
+    values.push(Value::Integer(i64::try_from(limit).expect("at most MAX_ORDERS_PER_PAGE")));
+    sql.push_str(&format!(" ORDER BY s.sent_at, s.order_id LIMIT ${}", values.len()));
+    (sql, values)
+}
+
+/// `time_text` of `time` within the years 0 to 9999, where its text is fixed-width, so text order
+/// is time order: a bound outside them, such as `DateTime::MAX_UTC` for no end, is as good as
+/// their end. The book's times are its clock's, well inside.
+fn bound_text(time: DateTime<Utc>) -> String {
+    let first = Utc.with_ymd_and_hms(0, 1, 1, 0, 0, 0).single().expect("a valid time");
+    let last = Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).single().expect("a valid time")
+        + chrono::Duration::nanoseconds(999_999_999);
+    time_text(time.clamp(first, last))
+}
+
+/// An order read from history as a blotter shows it: [`order_view`] from its row, which has the
+/// answer to its `cancel` as `cancel_answered`. Not `Book::view`, which reads the book's maps.
+/// `unknown_at_venue` is false: the mark is the book's, in memory only.
+fn stored_view(order: &Order, row: &Columns<'_>, created: DateTime<Utc>) -> io::Result<OrderView> {
+    let answered: Option<i64> = row.0.try_get("cancel_answered").map_err(|e| undecodable("cancel_answered", e))?;
+    Ok(order_view(order, answered == Some(0), false, created))
 }
 
 /// What [`Store::prune`] deleted.
@@ -473,6 +637,11 @@ const TABLES: &[&str] = &[
         sent_at TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS sent_order_id ON sent (order_id)",
+    // `Store::orders` reads orders by when they were created: only the original requests (no
+    // `kind`), one per order, in its order; with `order_id`, as two can be sent at one time, so
+    // SQLite needn't sort those. `IF NOT EXISTS` adds it to a database made before it, so the
+    // schema version stays.
+    "CREATE INDEX IF NOT EXISTS sent_new ON sent (sent_at, order_id) WHERE kind IS NULL",
     // Orphaned venue requests handled: see `Changes::orphans`.
     "CREATE TABLE IF NOT EXISTS orphans (downstream TEXT PRIMARY KEY)",
     "CREATE TABLE IF NOT EXISTS cl_ord_ids (
