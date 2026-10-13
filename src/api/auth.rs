@@ -831,7 +831,7 @@ mod tests {
         (cookie, answer.body["csrf"].as_str().unwrap().to_string())
     }
 
-    /// The routes behind authentication: Tasks 6 to 8 add theirs. Each answers 401 without
+    /// The routes behind authentication, each with a method it takes. Each answers 401 without
     /// credentials; only health and login don't need them.
     const AUTHENTICATED: &[(&str, &str)] = &[
         ("GET", "/api/me"),
@@ -855,6 +855,9 @@ mod tests {
         ("POST", "/api/risk/block"),
         ("POST", "/api/risk/unblock"),
         ("POST", "/api/risk/cancel-all"),
+        ("PATCH", "/api/risk/limits/defaults"),
+        ("PATCH", "/api/risk/limits/client/FUNDA"),
+        ("DELETE", "/api/risk/limits/client/FUNDA"),
         ("POST", "/api/reload"),
     ];
 
