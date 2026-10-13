@@ -634,6 +634,10 @@ mod tests {
         let files = FileMessageLog::files(&dir).unwrap();
         let sixth = files.iter().find(|file| file.day == at(6, 0, 0).date_naive()).unwrap();
         std::fs::set_permissions(&sixth.path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway, so the test proves nothing there.
+        if std::fs::File::open(&sixth.path).is_ok() {
+            return;
+        }
         assert_eq!(ids("since=2026-10-07T00:00:00Z").await, ["B"]);
         assert_eq!(ids("since=2026-10-08T00:00:00Z").await, ["C"]);
         // The 6th's file is read for a range touching it.
