@@ -64,7 +64,9 @@ type AxumState = axum::extract::State<State>;
 pub(super) struct Page {
     messages: Vec<Hit>,
     /// The `after` for the next page; `None` once the range is read to its end. A page cut short
-    /// by the byte budget may hold no hits and still have a `next`.
+    /// by the byte budget may hold no hits and still have a `next`. While the range's end is
+    /// still to come, the end of what's logged so far is a `next` too, for a caller following the
+    /// log (unless no file of the range is there yet, or the last one read ends in a bad record).
     next: Option<String>,
 }
 
@@ -184,7 +186,7 @@ async fn run(state: &State, dir: PathBuf, search: Search) -> Result<Json<Page>, 
     })?;
     let scanned = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        scan(&dir, &search, SEARCH_BYTES_MAX)
+        scan(&dir, &search, SEARCH_BYTES_MAX, Utc::now())
     })
     .await;
     scanned
@@ -346,8 +348,8 @@ impl Cursor {
 
 /// Reads the files of `dir` that `search`'s range may be in, from its cursor, until it has a page
 /// of hits or has read `bytes_max`: see the module documentation. A cursor that isn't at a record
-/// of one of those files is refused (400).
-fn scan(dir: &Path, search: &Search, bytes_max: u64) -> Result<Page, ApiError> {
+/// of one of those files is refused (400). `now` says whether the range's end has come.
+fn scan(dir: &Path, search: &Search, bytes_max: u64, now: DateTime<Utc>) -> Result<Page, ApiError> {
     let files: Vec<LogFile> = list(dir)?.into_iter().filter(|file| search.range.covers_day(file.day)).collect();
     let (first, start) = match search.after {
         None => (0, 0),
@@ -356,7 +358,7 @@ fn scan(dir: &Path, search: &Search, bytes_max: u64) -> Result<Page, ApiError> {
             (index.ok_or_else(gone)?, cursor.position)
         }
     };
-    let mut reading = Reading { dir, search, bytes_max, bytes: 0, messages: Vec::new() };
+    let mut reading = Reading { dir, search, bytes_max, bytes: 0, messages: Vec::new(), end: None };
     for (index, file) in files.iter().enumerate().skip(first) {
         let from_cursor = index == first && search.after.is_some();
         let start = if index == first { start } else { 0 };
@@ -364,7 +366,9 @@ fn scan(dir: &Path, search: &Search, bytes_max: u64) -> Result<Page, ApiError> {
             return Ok(Page { messages: reading.messages, next: Some(stopped.encode()) });
         }
     }
-    Ok(Page { messages: reading.messages, next: None })
+    let ended = search.range.until.is_none_or(|until| until <= now);
+    let next = if ended { None } else { reading.end.map(Cursor::encode) };
+    Ok(Page { messages: reading.messages, next })
 }
 
 /// The log's files, oldest first. While a file is being compressed, both its `.log` and its
@@ -393,6 +397,9 @@ struct Reading<'a> {
     /// Read so far, before compression: what the records read took up in their files.
     bytes: u64,
     messages: Vec<Hit>,
+    /// Where the last file read ended, if it ended cleanly: a cursor past which there's nothing
+    /// yet.
+    end: Option<Cursor>,
 }
 
 impl Reading<'_> {
@@ -409,13 +416,18 @@ impl Reading<'_> {
                 return Ok(Some(Cursor { day: file.day, number: file.number, position }));
             }
             let record = match records.next() {
-                None => break,
+                None => {
+                    self.end = Some(Cursor { day: file.day, number: file.number, position });
+                    break;
+                }
                 Some(Ok(record)) => record,
                 // Not at a record: a position the caller made up.
                 Some(Err(_)) if first && start > 0 => return Err(bad("after isn't at a record of its file")),
                 // The reader stops at a bad record: the rest of the file can't be found.
                 Some(Err(e)) => {
                     warn!("a message log search stops reading {} at a bad record: {e}", file.path.display());
+                    // A cursor at it would be refused.
+                    self.end = None;
                     break;
                 }
             };
@@ -715,7 +727,7 @@ mod tests {
             let mut search = Search::new(vec![filter], at(8, 0, 0), None, None, None).unwrap();
             let mut pages = Vec::new();
             loop {
-                let page = scan(dir.path(), &search, bytes_max).unwrap();
+                let page = scan(dir.path(), &search, bytes_max, at(9, 0, 0)).unwrap();
                 let ids = page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>();
                 search.after = page.next.map(|next| Cursor::decode(&next).unwrap());
                 pages.push((ids, search.after.map(|cursor| cursor.position)));
@@ -781,7 +793,7 @@ mod tests {
         assert_eq!(FileMessageLog::files(dir.path()).unwrap().len(), 2);
         let search = Search::new(vec![LogFilter::default()], at(8, 0, 0), None, None, None).unwrap();
         let ids = |page: Page| page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(scan(dir.path(), &search, SEARCH_BYTES_MAX).unwrap()), ["A", "B"]);
+        assert_eq!(ids(scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0)).unwrap()), ["A", "B"]);
 
         let mut first = FileMessageLog::read(&plain.path).unwrap();
         first.next().unwrap().unwrap();
@@ -789,6 +801,28 @@ mod tests {
         let mut records = open(dir.path(), &plain, first.position(), true).unwrap().unwrap();
         let LogRecord::Message { frame, .. } = records.next().unwrap().unwrap() else { panic!() };
         assert!(String::from_utf8_lossy(&frame).contains("\x0111=B\x01"));
+    }
+
+    /// While the range's end is to come, the last page's `next` is the end of what's logged, from
+    /// which what's logged later is found; once it's come, the last page has none.
+    #[test]
+    fn a_range_not_yet_ended_can_be_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let order = |minute, id| (at(8, 9, minute), Direction::Inbound, Some("FUNDA"), fix(&[(35, "D"), (11, id)]));
+        log(dir.path(), &[order(0, "A")]);
+        let mut search = Search::new(vec![LogFilter::default()], at(8, 0, 0), None, None, None).unwrap();
+        let ids = |page: &Page| page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>();
+        assert_eq!(scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0)).unwrap().next, None);
+        let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(8, 12, 0)).unwrap();
+        assert_eq!(ids(&page), ["A"]);
+        search.after = Some(Cursor::decode(page.next.as_ref().unwrap()).unwrap());
+        let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(8, 12, 0)).unwrap();
+        assert!(page.messages.is_empty());
+        assert_eq!(page.next, search.after.map(Cursor::encode));
+        log(dir.path(), &[order(1, "B")]);
+        let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(8, 12, 0)).unwrap();
+        assert_eq!(ids(&page), ["B"]);
+        assert!(page.next.is_some());
     }
 
     /// Past [`MAX_SEARCHES`] under way, a search is 503; once one ends, they run again.
