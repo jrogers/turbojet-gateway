@@ -364,12 +364,18 @@ pub struct Pruned {
 /// - the newest order, as `load` takes the next OrderId from `MAX(id)`: pruning it would let a
 ///   new order take its ID;
 /// - one of its client's current day, however old, as `load` holds it (see [`HELD`]): a client
-///   gone quiet keeps its day until it's next seen.
+///   gone quiet keeps its day until it's next seen;
+/// - one with a request sent at or after the cutoff. A row's day is its client's when last
+///   written, which for a quiet client can be old while a request was sent lately, and
+///   `Input::Unsent` stamps `sent_at` again. So [`Store::pruned_through`] stays before the cutoff,
+///   which the orphan scan relies on (see `PRUNED_SLACK`). Each order's requests are found by
+///   `sent_order_id`.
 const PRUNABLE: &str = "SELECT o.id FROM orders o
     WHERE +o.live = 0 AND o.day IS NOT NULL AND o.day < $1
         AND o.id < (SELECT MAX(id) FROM orders)
         AND NOT EXISTS (SELECT 1 FROM days d WHERE d.client = o.client
             AND d.client_comp_id = o.client_comp_id AND d.day_end = o.day)
+        AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.order_id = o.id AND s.sent_at >= $1)
     ORDER BY o.day LIMIT $2";
 
 /// Downstream ClOrdIDs looked up per query by [`Store::unknown_downstreams`]: under SQLite's

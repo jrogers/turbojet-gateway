@@ -60,8 +60,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - Pruned orders are gone from the database for good, with their requests sent and ClOrdIDs.
 - Done orders with no trading day (booked before their client's first day began) are never
   pruned, and neither is the table of orphans handled, which is small and grows only by crashes.
-- Orders become prunable a trading day at a time, when their day ended more than the retention
-  ago, and are deleted at the next hourly run: up to an hour late.
+- Orders become prunable a trading day at a time, when their day ended, and their last request
+  was sent, more than the retention ago, and are deleted at the next hourly run: up to an hour
+  late.
 - A run is skipped while work a start found for the venues is pending: orphan cancels waiting or
   being sent, orphaned replaces waiting, or unsent requests waiting for a venue's logon. A venue
   that never logs on again holds pruning off, with a warning each hour naming what's pending.

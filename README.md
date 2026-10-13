@@ -253,8 +253,8 @@ each held until it commits, and a failing commit is retried with an error logged
 session stops reading 256 messages past its oldest one waiting.
 
 **Pruning.** With a `retention`, the gateway deletes, every hour from an hour after it starts,
-the done orders whose trading day ended longer ago than that, with their requests sent and
-ClOrdIDs, a few at a time so orders and reports aren't held up. It keeps what a restart needs:
+the done orders whose trading day ended, and whose requests were sent, longer ago than that,
+with their requests sent and ClOrdIDs, a few at a time, so the book's writes wait only briefly. It keeps what a restart needs:
 live orders, each client's current trading day however old, the newest order (the next OrderID
 follows it) and any order booked before its client had a trading day. While work a start found
 for the venues is still pending (orphans to cancel, requests to send at a venue's logon), a run is

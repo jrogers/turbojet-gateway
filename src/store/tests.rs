@@ -770,5 +770,29 @@ async fn pruning_reads_by_day() {
     let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {PRUNABLE}")).fetch_all(&store.pool).await.unwrap();
     let plan: Vec<String> = plan.iter().map(|row| row.try_get("detail").unwrap()).collect();
     assert!(plan.iter().any(|step| step.starts_with("SEARCH o USING INDEX orders_day")), "{plan:?}");
+    assert!(plan.iter().any(|step| step.starts_with("SEARCH s USING INDEX sent_order_id")), "{plan:?}");
     assert!(!plan.iter().any(|step| step.contains("orders_live") || step.contains("TEMP B-TREE")), "{plan:?}");
+}
+
+/// A done order of an old day with a request sent at or after the cutoff, as a quiet client's or
+/// one sent again can be, is kept, so `pruned_through` stays before the cutoff; a later cutoff
+/// prunes it.
+#[tokio::test]
+async fn pruning_keeps_an_old_days_order_sent_since_the_cutoff() {
+    let store = memory().await;
+    let funda = ClientId::from("FUNDA");
+    let cutoff = time(2, 0);
+    let written = [
+        dated(1, &funda, Some(Day(time(1, 0))), true, cutoff),
+        dated(2, &funda, Some(Day(time(1, 0))), true, time(0, 5)),
+        dated(3, &funda, Some(Day(time(3, 0))), false, time(2, 30)),
+        current(&funda, Day(time(3, 0))),
+    ];
+    store.write(&written).await.unwrap();
+    assert_eq!(store.prune(cutoff, 10).await.unwrap(), Pruned { orders: 1 });
+    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [1, 3]);
+    assert_eq!(store.pruned_through().await.unwrap(), Some(time(0, 5)));
+    assert_eq!(store.prune(cutoff + chrono::Duration::nanoseconds(1), 10).await.unwrap(), Pruned { orders: 1 });
+    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [3]);
+    assert_eq!(store.pruned_through().await.unwrap(), Some(cutoff));
 }
