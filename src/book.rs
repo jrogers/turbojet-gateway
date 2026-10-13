@@ -520,7 +520,8 @@ pub enum Input {
     /// venue may not have taken. It changes and records nothing: the venue's answer is handled as
     /// any report is, a fill the gateway missed reaching the client and one changing nothing
     /// dropped, and an answer that the venue doesn't know the order raises
-    /// [`AlarmKind::UnknownAtVenue`]. Nothing is sent for an unknown or done order.
+    /// [`AlarmKind::UnknownAtVenue`], the order staying live, its exposure counted, until an
+    /// operator resolves it. Nothing is sent for an unknown or done order.
     VenueStatusRequest {
         order: OrderId,
     },

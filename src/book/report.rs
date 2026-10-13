@@ -21,7 +21,9 @@ impl Book {
 
     /// The venue's answer to [`Input::VenueStatusRequest`](super::Input::VenueStatusRequest) for an
     /// order it doesn't know. Not applied: the order isn't rejected, the venue has lost it or
-    /// never had it, and someone has to look. A done order it has forgotten is no news.
+    /// never had it, and someone has to look; until then the order stays live here, its exposure
+    /// counted. A done order it has forgotten is no news, nor is an answer under a ClOrdID a
+    /// replace has since superseded (asked before the venue accepted it).
     pub(super) fn unknown_at_venue(&mut self, venue: &VenueId, report: &VenueReport) {
         let Some(sent) = self.downstream.get(&report.downstream) else {
             return self.unknown_report(venue, report);
@@ -33,6 +35,10 @@ impl Book {
         }
         if order.status.is_done() {
             return tracing::debug!(%venue, %downstream, %exec_id, "venue doesn't know a done order");
+        }
+        if *downstream != order.downstream {
+            let current = &order.downstream;
+            return tracing::warn!(%venue, %downstream, %exec_id, %current, "venue doesn't know a superseded ClOrdID");
         }
         tracing::error!(%venue, %downstream, %exec_id, order = %order.name, "venue doesn't know a live order");
         let text = format!("venue {venue} doesn't know live order {} ({downstream}, ExecID {exec_id})", order.name);

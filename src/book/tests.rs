@@ -698,10 +698,12 @@ fn an_implied_price_is_rounded_to_eight_places() {
 /// The downstream ClOrdID the gateway's status request for order 1 names; `None` if it sends none.
 fn venue_status_request(book: &mut Book) -> Option<CompactString> {
     let before = book.snapshot();
-    let out = run(book, Input::VenueStatusRequest { order: OrderId(1) });
-    // It records nothing: no `Sent`, no new downstream number.
-    assert_eq!(book.snapshot(), before);
+    // Not through `run`, which takes the changes: it records nothing, no `Sent`, no new
+    // downstream number.
+    let mut out = Vec::new();
+    book.handle(Input::VenueStatusRequest { order: OrderId(1) }, &mut out);
     assert!(book.take_changes().is_empty());
+    assert_eq!(book.snapshot(), before);
     match out.as_slice() {
         [] => None,
         [Output::StatusRequest { venue, downstream, request, venue_order_id }] => {
@@ -744,11 +746,12 @@ fn a_status_answer_reaches_the_client_only_with_news() {
 }
 
 /// A venue that doesn't know the order answers Status, Rejected, OrdRejReason 5 (FIX 4.2 and 4.4
-/// alike): an alarm, the order left as it is and the client not told. For a done order, nothing.
+/// alike): an alarm, the order left as it is and the client not told. Under a superseded ClOrdID,
+/// or for a done order, nothing.
 #[test]
 fn a_status_answer_that_the_venue_doesnt_know_the_order_raises_an_alarm() {
-    let unknown = || {
-        let mut input = venue_report_as("1", ExecType::Status, Status::Rejected, 0, 0);
+    let unknown = |downstream: &str| {
+        let mut input = venue_report_as(downstream, ExecType::Status, Status::Rejected, 0, 0);
         let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
         report.ord_rej_reason = Some(5);
         input
@@ -757,15 +760,27 @@ fn a_status_answer_that_the_venue_doesnt_know_the_order_raises_an_alarm() {
     new_order(&mut book, "C1");
     run(&mut book, venue_report("1", Status::New, 0, 0));
     book.take_events().for_each(drop);
-    let before = book.snapshot();
-    assert!(run(&mut book, unknown()).is_empty());
-    assert_eq!(book.snapshot(), before);
+    let (before, risk) = (book.snapshot(), book.risk_view());
+    let mut out = Vec::new();
+    book.handle(unknown("1"), &mut out);
+    assert!(out.is_empty());
+    assert!(book.take_changes().is_empty());
+    assert_eq!((book.snapshot(), book.risk_view()), (before, risk));
     let events: Vec<GatewayEvent> = book.take_events().collect();
     let [GatewayEvent::Alarm(alarm)] = events.as_slice() else { panic!("{events:?}") };
     assert_eq!(alarm.kind, AlarmKind::UnknownAtVenue);
 
-    run(&mut book, venue_report("1", Status::Canceled, 0, 0));
-    assert!(run(&mut book, unknown()).is_empty());
+    // Asked under 1, answered after a replace to 1-1 was accepted: the venue knows the order by
+    // 1-1 now, so no alarm.
+    replace(&mut book, "C2", "C1", 80, 11);
+    run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    assert!(run(&mut book, unknown("1")).is_empty());
+    assert_eq!(book.take_events().count(), 0);
+    assert!(run(&mut book, unknown("1-1")).is_empty());
+    assert_eq!(book.take_events().count(), 1);
+
+    run(&mut book, venue_report("1-1", Status::Canceled, 0, 0));
+    assert!(run(&mut book, unknown("1-1")).is_empty());
     assert_eq!(book.take_events().count(), 0);
 }
 
