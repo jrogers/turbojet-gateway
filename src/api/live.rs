@@ -13,13 +13,18 @@
 //! in the URL, which proxies log. With the cookie its `Origin` must be the API's own host (see
 //! [`auth`](super::auth)). The socket closes when the server stops, and within [`RECHECK`] of its
 //! session ending or its token being revoked. Like other reads, it isn't audited.
+//!
+//! Each socket holds one of the API's connections for as long as it's open, so there are at most
+//! [`MAX_LIVE_SOCKETS`] (503 past that) and [`MAX_LIVE_SOCKETS_PER_USER`] for a user (429).
 
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Serialize;
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -34,6 +39,16 @@ use crate::book::{GatewayEvent, MAX_ORDERS_PER_PAGE, OrderView, Scope};
 /// How often an open socket checks that its session or token still holds. Checking is a map
 /// lookup; a removed user or a revoked token keeps watching this long at most.
 const RECHECK: Duration = Duration::from_secs(10);
+
+/// Live sockets open at once. Each holds one of the API's 256 connections for as long as it's
+/// open, so this leaves most for requests, and still allows a console for every operator.
+const MAX_LIVE_SOCKETS: usize = 64;
+
+/// Live sockets a user may have open at once: a few consoles, not a script that never closes
+/// its sockets taking every one.
+const MAX_LIVE_SOCKETS_PER_USER: usize = 8;
+
+const _: () = assert!(MAX_LIVE_SOCKETS_PER_USER <= MAX_LIVE_SOCKETS);
 
 /// The least time between a socket's snapshots. Each walks the book under the gateway's lock, so a
 /// client too slow to keep up mustn't cost one per few thousand events: lagging again sooner
@@ -65,6 +80,63 @@ impl Events {
     }
 }
 
+/// The live sockets open, in all and by user.
+#[derive(Debug, Default)]
+pub(super) struct Sockets(Mutex<Counts>);
+
+#[derive(Debug, Default)]
+struct Counts {
+    total: usize,
+    /// Users with a socket open, and how many: never a zero.
+    by_user: HashMap<String, usize>,
+}
+
+/// An open socket, counted in its [`Sockets`] until dropped.
+pub(super) struct Counted {
+    sockets: Arc<Sockets>,
+    user: String,
+}
+
+impl Sockets {
+    /// Counts a socket for `user`, or refuses it: 503 if [`MAX_LIVE_SOCKETS`] are open, 429 if
+    /// `user` has [`MAX_LIVE_SOCKETS_PER_USER`].
+    fn open(self: &Arc<Self>, user: &str) -> Result<Counted, ApiError> {
+        let mut counts = self.lock();
+        let counts = &mut *counts;
+        if counts.total >= MAX_LIVE_SOCKETS {
+            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "too many live sockets open: try later"));
+        }
+        let mine = counts.by_user.entry(user.to_string()).or_default();
+        if *mine >= MAX_LIVE_SOCKETS_PER_USER {
+            let message = format!("{user} has {MAX_LIVE_SOCKETS_PER_USER} live sockets open already");
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, message));
+        }
+        *mine += 1;
+        counts.total += 1;
+        debug_assert!(counts.by_user.len() <= counts.total);
+        Ok(Counted { sockets: self.clone(), user: user.to_string() })
+    }
+
+    /// The counts. A panic while they were held can't have left them half-changed: each change is
+    /// made whole before anything that could panic.
+    fn lock(&self) -> MutexGuard<'_, Counts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        let mut counts = self.sockets.lock();
+        let counts = &mut *counts;
+        let mine = counts.by_user.get_mut(&self.user).expect("a counted socket's user is counted");
+        *mine -= 1;
+        if *mine == 0 {
+            counts.by_user.remove(&self.user);
+        }
+        counts.total -= 1;
+    }
+}
+
 /// Whose socket it is, and what its rechecks authenticate.
 pub(super) struct Viewer {
     user: String,
@@ -82,6 +154,7 @@ pub(super) async fn live(
 ) -> Result<Response, ApiError> {
     let upgrade = upgrade.map_err(|e| ApiError::new(e.status(), e.body_text()))?;
     let service = state.service()?;
+    let counted = state.live.open(&caller.user)?;
     let events = Events {
         gateway: service.gateway().subscribe(),
         clients: service.client_events(),
@@ -89,7 +162,8 @@ pub(super) async fn live(
     };
     let viewer = Viewer { user: caller.user, ip: caller.ip, headers };
     let upgrade = upgrade.max_message_size(MAX_RECEIVED_LEN).max_frame_size(MAX_RECEIVED_LEN);
-    Ok(upgrade.on_upgrade(move |socket| run(socket, state, events, viewer)))
+    // A client that goes before the upgrade completes drops the closure, and with it the count.
+    Ok(upgrade.on_upgrade(move |socket| run(socket, state, events, viewer, counted)))
 }
 
 #[derive(Debug, Serialize)]
@@ -129,8 +203,8 @@ enum Step {
 }
 
 /// Sends a snapshot and then events until the server stops, the client goes, or the viewer's
-/// credentials no longer hold.
-async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Viewer) {
+/// credentials no longer hold; `_counted` stops counting the socket when it returns.
+async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Viewer, _counted: Counted) {
     info!(user = viewer.user, ip = %viewer.ip, "API live socket opened");
     let mut stopping = state.stopping.subscribe();
     let mut recheck = tokio::time::interval_at(Instant::now() + RECHECK, RECHECK);
@@ -369,7 +443,8 @@ mod tests {
         let take = Arc::new(move || (events.lock().unwrap().take().unwrap(), viewer.lock().unwrap().take().unwrap()));
         let route = axum::routing::get(async move |upgrade: WebSocketUpgrade| {
             let (events, viewer) = take();
-            upgrade.on_upgrade(move |socket| run(socket, state, events, viewer))
+            let counted = state.live.open(&viewer.user).unwrap();
+            upgrade.on_upgrade(move |socket| run(socket, state, events, viewer, counted))
         });
         let (addr, _stop) = serve(axum::Router::new().route("/test/live", route)).await;
         let mut client = connect(addr, "/test/live", &[]).await.unwrap();
@@ -387,6 +462,35 @@ mod tests {
         lag();
         let tungstenite::Message::Close(Some(frame)) = next(&mut client).await else { panic!("not closed") };
         assert_eq!(u16::from(frame.code), close_code::AGAIN);
+    }
+
+    /// A user may have MAX_LIVE_SOCKETS_PER_USER sockets open, 429 past that; there may be
+    /// MAX_LIVE_SOCKETS in all, 503 past that. A socket closed is no longer counted.
+    #[tokio::test]
+    async fn live_sockets_are_capped() {
+        let fixture = fixture().await;
+        let (addr, _stop) = serve(fixture.app.clone()).await;
+        let mut open = Vec::new();
+        for _ in 0..MAX_LIVE_SOCKETS_PER_USER {
+            open.push(connect(addr, "/api/live", &[("authorization", &fixture.viewer)]).await.unwrap());
+        }
+        let Err(tungstenite::Error::Http(answer)) =
+            connect(addr, "/api/live", &[("authorization", &fixture.viewer)]).await
+        else {
+            panic!("over the cap per user")
+        };
+        assert_eq!(answer.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(connect(addr, "/api/live", &[("authorization", &fixture.operator)]).await.is_ok());
+
+        let sockets = Arc::new(Sockets::default());
+        let mut counted: Vec<_> =
+            (0..MAX_LIVE_SOCKETS).map(|n| sockets.open(&format!("user{}", n % 9)).unwrap()).collect();
+        assert_eq!(sockets.open("someone").err().unwrap().status, StatusCode::SERVICE_UNAVAILABLE);
+        counted.pop();
+        assert!(sockets.open("someone").is_ok());
+        drop(counted);
+        assert_eq!(sockets.lock().total, 0);
+        assert!(sockets.lock().by_user.is_empty());
     }
 
     /// Stopping the server closes the socket, saying why.

@@ -56,6 +56,7 @@ pub(crate) struct State {
     /// Set once the server is stopping: its graceful shutdown waits for requests, but not for the
     /// websockets they upgraded to, which watch this to close.
     stopping: watch::Sender<bool>,
+    live: Arc<live::Sockets>,
 }
 
 impl State {
@@ -326,7 +327,13 @@ impl Bound {
     pub(crate) fn serve(self, service: Weak<Service>) -> Server {
         let local_addr = self.listener.local_addr().unwrap_or(self.config.listen);
         let stopping = watch::Sender::new(false);
-        let app = router(State { service, auth: self.auth.clone(), audit: self.audit, stopping: stopping.clone() });
+        let app = router(State {
+            service,
+            auth: self.auth.clone(),
+            audit: self.audit,
+            stopping: stopping.clone(),
+            live: Arc::default(),
+        });
         let (stop, stopped) = oneshot::channel::<()>();
         #[cfg(feature = "tls")]
         let task = match &self.tls {
@@ -452,7 +459,8 @@ pub(crate) mod tests {
     pub(crate) fn state(auth: Arc<Auth>) -> (State, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(Audit::open(&dir.path().join("audit.jsonl")).unwrap());
-        (State { service: Weak::new(), auth, audit, stopping: watch::Sender::new(false) }, dir)
+        let stopping = watch::Sender::new(false);
+        (State { service: Weak::new(), auth, audit, stopping, live: Arc::default() }, dir)
     }
 
     /// The API's routes, and `/test/peer` answering the client's address as handlers see it.
