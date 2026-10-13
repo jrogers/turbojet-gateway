@@ -84,6 +84,8 @@ pub struct OrderView {
 pub struct OrderDetail {
     #[serde(flatten)]
     pub order: OrderView,
+    /// The venue's OrderID(37), once a report has given it.
+    pub venue_order_id: Option<CompactString>,
     /// In the order they were sent.
     pub requests: Vec<RequestView>,
 }
@@ -197,7 +199,7 @@ impl Book {
                 Some(RequestView { downstream, kind, origin, cl_ord_id, sent_at, answered })
             })
             .collect();
-        Some(OrderDetail { order: self.view(order), requests })
+        Some(OrderDetail { order: self.view(order), venue_order_id: order.venue_order_id.clone(), requests })
     }
 
     /// The order whose OrderID(37) is `name`, if the book holds it. Restored orders keep an
