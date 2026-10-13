@@ -131,15 +131,9 @@ pub(super) async fn order_messages(
 ) -> Result<Json<Page>, ApiError> {
     let UrlPath(order_id) = order_id.map_err(|e| bad(e.body_text()))?;
     let Query(query) = query.map_err(|e| bad(e.body_text()))?;
-    let service = state.service()?;
-    let dir = log_dir(&service)?;
-    let gateway = service.gateway();
-    let detail = gateway
-        .order_id(&order_id)
-        .and_then(|id| gateway.order(id))
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no order {order_id}")))?;
-    let venue = service.venue_session(&detail.order.venue).map(|venue| venue.id().to_string());
-    drop(service);
+    let dir = log_dir(&*state.service()?)?;
+    let detail = super::read::find_detail(&state, &order_id).await?;
+    let venue = state.service()?.venue_session(&detail.order.venue).map(|venue| venue.id().to_string());
     let after = query.after.as_deref().map(Cursor::decode).transpose()?;
     let created = detail.order.created;
     let since = created.checked_sub_signed(ORDER_MARGIN).unwrap_or(created);
@@ -316,7 +310,7 @@ fn time(key: &str, value: &str) -> Result<DateTime<Utc>, ApiError> {
         .map_err(|e| bad(format!("{key} {value:?} isn't an RFC 3339 time: {e}")))
 }
 
-fn bad(message: impl Into<String>) -> ApiError {
+pub(super) fn bad(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, message)
 }
 
@@ -525,7 +519,7 @@ mod tests {
     use chrono::TimeZone;
     use turbojet::{Clock, FileLogOptions, MessageLog, SessionId};
 
-    use super::super::read::tests::{Fixture, fixture_with};
+    use super::super::read::tests::{Fixture, fixture_with, past, with_history};
     use super::*;
 
     /// A record to log: when, which way, the session's CompID (`None` for none yet) and the frame.
@@ -940,5 +934,30 @@ mod tests {
         log(&dir, &[msg(at(86_400), Direction::Inbound, client, &[(35, "D"), (11, "N1")])]);
         let page = fixture.ok(&format!("{path}?after={follow}")).await;
         assert_eq!(page["messages"], serde_json::json!([]));
+    }
+
+    /// A past order the book has dropped, from the database: its messages are searched from its
+    /// creation, days ago, to the end of what's logged in its range.
+    #[tokio::test]
+    async fn a_past_orders_messages() {
+        let fixture = with_history("[message_log]\ndir = \"log\"\n").await;
+        let dir = fixture.dirs.0.path().join("log");
+        let created = past(2);
+        let at = |minutes| created + TimeDelta::minutes(minutes);
+        let (client, venue) = (Some("FUNDA"), Some("NASDAQ"));
+        log(
+            &dir,
+            &[
+                (at(0), Direction::Inbound, client, fix(&[(35, "D"), (11, "C101")])),
+                (at(0), Direction::Outbound, venue, fix(&[(35, "D"), (11, "101-1")])),
+                (at(1), Direction::Inbound, client, fix(&[(35, "D"), (11, "C100")])),
+                (at(2), Direction::Inbound, venue, fix(&[(35, "8"), (11, "101-1")])),
+            ],
+        );
+        let page = fixture.ok("/api/orders/A101/messages").await;
+        let found: Vec<_> = page["messages"].as_array().unwrap().iter().map(|hit| hit["msg_type"].clone()).collect();
+        assert_eq!(found, ["D", "D", "8"]);
+        assert_eq!((&page["next"], &page["follow"]), (&serde_json::Value::Null, &serde_json::Value::Null));
+        assert_eq!(fixture.get("/api/orders/A999/messages").await.status, StatusCode::NOT_FOUND);
     }
 }

@@ -2,24 +2,38 @@
 //! may read, so being behind `authenticate` is the only check; reads aren't audited.
 //!
 //! The orders are the book's: the working ones and each client's done orders of its current day.
+//! With a time range, or an order the book doesn't hold, they're the database's: every order kept
+//! until pruned.
+
+use std::ops::Range;
 
 use axum::Json;
 use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
-use chrono::{DateTime, Utc};
+use base64ct::{Base64UrlUnpadded, Encoding};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::error;
 use turbojet::fields::CompactString;
 use turbojet::{SessionId, SessionStatus};
 
+use super::messages::bad;
 use super::{ApiError, State};
-use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
+use crate::book::{
+    ClientId, MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, Scope, ScopeName, Status,
+};
 use crate::config::RiskTables;
 use crate::router::{Rule, Target};
 use crate::service::Service;
+use crate::store::StoredOrders;
 
 /// Orders a page of `GET /api/orders` holds without a `limit`: a screenful.
 const ORDERS_PAGE_DEFAULT: usize = 100;
+
+/// The longest time range `GET /api/orders` reads from the database: a page under a filter few
+/// orders match may read every order of its range before it's full, so the range bounds that.
+const HISTORY_RANGE_MAX: TimeDelta = TimeDelta::days(31);
 
 const _: () = assert!(ORDERS_PAGE_DEFAULT <= MAX_ORDERS_PER_PAGE);
 
@@ -140,8 +154,12 @@ pub(super) struct OrdersQuery {
     status: Option<Status>,
     #[serde(default)]
     working: bool,
-    /// The previous page's `next`.
-    after: Option<u64>,
+    /// Created from (RFC 3339): with it, the orders are the database's.
+    from: Option<DateTime<Utc>>,
+    /// Created before (RFC 3339), now by default; only with `from`.
+    to: Option<DateTime<Utc>>,
+    /// The previous page's `next`: a number from the book, a cursor from the database.
+    after: Option<String>,
     limit: Option<usize>,
 }
 
@@ -150,26 +168,46 @@ pub(super) struct OrdersPage {
     orders: Vec<OrderView>,
     /// The `after` for the next page; `None` when this page is short. A full page may be followed
     /// by an empty one.
-    next: Option<u64>,
+    next: Option<Next>,
 }
 
-/// `GET /api/orders?client=&venue=&symbol=&status=&working=&after=&limit=`: the book's orders
-/// matching every filter given, by OrderId, `limit` at a time (by default [`ORDERS_PAGE_DEFAULT`],
-/// at most [`MAX_ORDERS_PER_PAGE`]). `after` and `next` are the numeric `id`, not the wire
-/// OrderID, so a cursor holds when its order leaves the book.
+/// A page's `next`: the book's are numbers, the database's strings.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum Next {
+    Id(u64),
+    Cursor(String),
+}
+
+/// `GET /api/orders?client=&venue=&symbol=&status=&working=&from=&to=&after=&limit=`: the orders
+/// matching every filter given, `limit` at a time (by default [`ORDERS_PAGE_DEFAULT`], at most
+/// [`MAX_ORDERS_PER_PAGE`]).
+///
+/// Without `from`, they're the book's, by OrderId. `after` and `next` are then the numeric `id`,
+/// not the wire OrderID, so a cursor holds when its order leaves the book.
+///
+/// With `from` (RFC 3339; `to` is now by default, and needs `from`), they're the database's
+/// created in `from..to`, a range of [`HISTORY_RANGE_MAX`] at most, by creation, then `id`: the
+/// orders of past days too, until pruned, as last written. `after` and `next` are then an opaque
+/// string. A range without `[database]` is 400. Its `client` may name a session not connected now.
 pub(super) async fn orders(
     axum::extract::State(state): AxumState,
     query: Result<Query<OrdersQuery>, QueryRejection>,
 ) -> Result<Json<OrdersPage>, ApiError> {
-    let Query(query) = query.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let Query(query) = query.map_err(|e| bad(e.body_text()))?;
     let limit = query.limit.unwrap_or(ORDERS_PAGE_DEFAULT);
     if !(1..=MAX_ORDERS_PER_PAGE).contains(&limit) {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, format!("limit must be 1 to {MAX_ORDERS_PER_PAGE}")));
+        return Err(bad(format!("limit must be 1 to {MAX_ORDERS_PER_PAGE}")));
     }
     let client = match &query.client {
-        Some(text) => {
-            Some(text.parse::<ScopeName>().map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?)
-        }
+        Some(text) => Some(text.parse::<ScopeName>().map_err(|e| bad(e.to_string()))?),
+        None => None,
+    };
+    if let Some(range) = range(query.from, query.to, Utc::now())? {
+        return stored_orders(&state, query, client, range, limit).await;
+    }
+    let after = match &query.after {
+        Some(text) => Some(OrderId(text.parse().map_err(|_| bad("after isn't a page's next"))?)),
         None => None,
     };
     let service = state.service()?;
@@ -188,29 +226,124 @@ pub(super) async fn orders(
         symbol: query.symbol,
         status: query.status,
         working: query.working,
-        after: query.after.map(OrderId),
+        after,
         limit: Some(limit),
     };
     let orders = gateway.orders(&filter);
     // Whether more match isn't known without a walk past the page: a full page may be the last.
-    let next = if orders.len() == limit { orders.last().map(|order| order.id.0) } else { None };
+    let next = if orders.len() == limit { orders.last().map(|order| Next::Id(order.id.0)) } else { None };
     Ok(Json(OrdersPage { orders, next }))
 }
 
+/// `from..to` of [`orders`], `None` without `from` or `to`, or 400.
+fn range(
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<Option<Range<DateTime<Utc>>>, ApiError> {
+    let (from, to) = match (from, to) {
+        (None, None) => return Ok(None),
+        (None, Some(_)) => return Err(bad("to needs from")),
+        (Some(from), to) => (from, to.unwrap_or(now)),
+    };
+    if from >= to {
+        return Err(bad("from must be before to"));
+    }
+    if to - from > HISTORY_RANGE_MAX {
+        return Err(bad(format!("a range covers {} days at most", HISTORY_RANGE_MAX.num_days())));
+    }
+    Ok(Some(from..to))
+}
+
+/// [`orders`] from the database, created in `range`.
+async fn stored_orders(
+    state: &State,
+    query: OrdersQuery,
+    client: Option<ScopeName>,
+    range: Range<DateTime<Utc>>,
+    limit: usize,
+) -> Result<Json<OrdersPage>, ApiError> {
+    let after = query.after.as_deref().map(decode_after).transpose()?;
+    let store = state.service()?.store().cloned().ok_or_else(|| bad("no [database]: only the current day is kept"))?;
+    let stored = StoredOrders {
+        from: range.start,
+        to: range.end,
+        client: client.map(stored_scope),
+        venue: query.venue,
+        symbol: query.symbol,
+        status: query.status,
+        working: query.working,
+        after,
+        limit: Some(limit),
+    };
+    let orders = store.orders(&stored).await.map_err(database_failed)?;
+    let next = if orders.len() == limit { orders.last().map(|order| Next::Cursor(encode_after(order))) } else { None };
+    Ok(Json(OrdersPage { orders, next }))
+}
+
+/// The scope `name` names, without the gateway: a past session may not be connected now, or
+/// known since the restart. The database matches a session by its name alone; the CompID is the
+/// name's target, as a [`SessionId`] shows it.
+fn stored_scope(name: ScopeName) -> Scope {
+    match name {
+        ScopeName::Session(session) => {
+            let target = session.split_once("->").map_or("", |(_, target)| target);
+            let comp_id = target.split(['/', ':']).next().unwrap_or_default().into();
+            Scope::Session(ClientId::from_parts(session, comp_id))
+        }
+        ScopeName::CompId(comp_id) => Scope::CompId(comp_id),
+        ScopeName::All => Scope::All,
+    }
+}
+
+/// A database page's `next`: its last order's `<created>/<id>` (RFC 3339), in base64url: opaque,
+/// so callers pass it back rather than build one.
+fn encode_after(order: &OrderView) -> String {
+    let text = format!("{}/{}", order.created.to_rfc3339_opts(SecondsFormat::Nanos, true), order.id.0);
+    Base64UrlUnpadded::encode_string(text.as_bytes())
+}
+
+fn decode_after(text: &str) -> Result<(DateTime<Utc>, OrderId), ApiError> {
+    let forged = || bad("after isn't a next a range of orders gave");
+    let bytes = Base64UrlUnpadded::decode_vec(text).map_err(|_| forged())?;
+    let text = String::from_utf8(bytes).map_err(|_| forged())?;
+    let (created, id) = text.split_once('/').ok_or_else(forged)?;
+    let created = DateTime::parse_from_rfc3339(created).map_err(|_| forged())?.to_utc();
+    Ok((created, OrderId(id.parse().map_err(|_| forged())?)))
+}
+
+/// A database read's failure, logged: 500.
+fn database_failed(e: std::io::Error) -> ApiError {
+    error!("an API read of the database failed: {e}");
+    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot read the database")
+}
+
 /// `GET /api/orders/{order_id}`: the order whose OrderID(37) is `order_id`, with every request sent
-/// for it; 404 if the book doesn't hold it.
+/// for it; 404 if neither the book nor the database holds it.
 pub(super) async fn order(
     axum::extract::State(state): AxumState,
     order_id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<OrderDetail>, ApiError> {
-    let Path(order_id) = order_id.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
-    let service = state.service()?;
-    let gateway = service.gateway();
-    gateway
-        .order_id(&order_id)
-        .and_then(|id| gateway.order(id))
-        .map(Json)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no order {order_id}")))
+    let Path(order_id) = order_id.map_err(|e| bad(e.body_text()))?;
+    find_detail(&state, &order_id).await.map(Json)
+}
+
+/// The order whose OrderID(37) is `order_id`, the book's or else the database's; 404 if neither
+/// holds it.
+pub(super) async fn find_detail(state: &State, order_id: &str) -> Result<OrderDetail, ApiError> {
+    let store = {
+        let service = state.service()?;
+        let gateway = service.gateway();
+        if let Some(detail) = gateway.order_id(order_id).and_then(|id| gateway.order(id)) {
+            return Ok(detail);
+        }
+        service.store().cloned()
+    };
+    let stored = match store {
+        Some(store) => store.order(order_id).await.map_err(database_failed)?,
+        None => None,
+    };
+    stored.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no order {order_id}")))
 }
 
 /// `GET /api/risk`: the limits in force, each session's notionals, the reference prices and the
@@ -335,9 +468,11 @@ pub(super) mod tests {
     /// [`fixture`] with `extra` at the end of its `jetbridge.toml`.
     pub(in crate::api) async fn fixture_with(extra: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let sessions = "[acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
-                        listen = \"127.0.0.1:0\"\n[counterparty.FUNDA]\n[initiator.NASDAQ]\n\
-                        target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]\n";
+        // Durable, as `[database]` needs.
+        let sessions = "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n\
+                        [acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
+                        listen = \"127.0.0.1:0\"\n[counterparty.FUNDA]\nstore = \"disk\"\n[initiator.NASDAQ]\n\
+                        target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]\nstore = \"disk\"\n";
         std::fs::write(dir.path().join("sessions.toml"), sessions).unwrap();
         let config = format!("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n{extra}");
         std::fs::write(dir.path().join("jetbridge.toml"), config).unwrap();
@@ -464,6 +599,107 @@ pub(super) mod tests {
         let answer = fixture.get("/api/orders/%FF").await;
         assert_eq!(answer.status, StatusCode::BAD_REQUEST);
         assert!(answer.body["error"].is_string(), "{}", answer.body);
+    }
+
+    /// A fixture with an in-memory database holding orders 100 to 102 of FUNDA, done, created
+    /// 1, 2 and 3 October 2026 at 09:00 UTC: the book doesn't hold them.
+    pub(in crate::api) async fn with_history(extra: &str) -> Fixture {
+        let fixture = fixture_with(&format!("[database]\nurl = \"sqlite::memory:\"\n{extra}")).await;
+        let client = ClientId::from("FUNDA");
+        let written: Vec<_> =
+            (100..=102).map(|id| crate::store::tests::dated(id, &client, None, true, past(id - 99))).collect();
+        fixture.service.store().unwrap().write(&written).await.unwrap();
+        fixture
+    }
+
+    /// 09:00 UTC on `day` October 2026.
+    pub(in crate::api) fn past(day: u64) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 10, day.try_into().unwrap(), 9, 0, 0).unwrap()
+    }
+
+    /// The OrderIDs of a page, and its `next`.
+    fn names(page: &serde_json::Value) -> (Vec<&str>, &serde_json::Value) {
+        (
+            page["orders"].as_array().unwrap().iter().map(|order| order["order_id"].as_str().unwrap()).collect(),
+            &page["next"],
+        )
+    }
+
+    /// With a range, the orders are the database's, those the book has dropped too, by creation;
+    /// without, the book's alone. A session not connected is still found, and a past order's
+    /// detail too.
+    #[tokio::test]
+    async fn a_range_reads_past_orders_from_the_database() {
+        let fixture = with_history("").await;
+        let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z";
+        let page = fixture.ok(&format!("/api/orders?{range}")).await;
+        assert_eq!(names(&page), (vec!["A100", "A101", "A102"], &serde_json::Value::Null));
+        assert_eq!(page["orders"][0]["created"], "2026-10-01T09:00:00Z");
+        // `to` isn't included; `to` is now by default.
+        let page = fixture.ok("/api/orders?from=2026-10-01T00:00:00Z&to=2026-10-02T09:00:00Z").await;
+        assert_eq!(names(&page).0, ["A100"]);
+        assert_eq!(names(&fixture.ok("/api/orders?from=2026-10-02T10:00:00Z").await).0, ["A102"]);
+        assert!(!names(&fixture.ok("/api/orders").await).0.contains(&"A100"));
+
+        let found = |query: &'static str| {
+            let fixture = &fixture;
+            async move { names(&fixture.ok(&format!("/api/orders?{range}&{query}")).await).0.len() }
+        };
+        assert_eq!(found("client=session:FIX.4.4:JETBRIDGE-%3EFUNDA&status=filled&venue=NASDAQ").await, 3);
+        assert_eq!(found("client=comp:FUNDA&symbol=AAPL").await, 3);
+        for missed in ["client=comp:FUNDB", "client=session:FIX.4.2:JETBRIDGE-%3EFUNDA", "working=true", "symbol=MSFT"]
+        {
+            assert_eq!(found(missed).await, 0, "{missed}");
+        }
+
+        let detail = fixture.ok("/api/orders/A101").await;
+        assert_eq!(detail["order_id"], "A101");
+        assert_eq!(detail["requests"][0]["kind"], "new");
+        assert_eq!(fixture.get("/api/orders/A999").await.status, StatusCode::NOT_FOUND);
+    }
+
+    /// A range pages by its opaque `next`, to a page that isn't full.
+    #[tokio::test]
+    async fn a_range_pages_by_its_cursor() {
+        let fixture = with_history("").await;
+        let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z&limit=1";
+        let mut seen = Vec::new();
+        let mut after = String::new();
+        loop {
+            let page = fixture.ok(&format!("/api/orders?{range}{after}")).await;
+            let (page_names, next) = names(&page);
+            seen.extend(page_names.iter().map(ToString::to_string));
+            let Some(next) = next.as_str() else { break };
+            after = format!("&after={next}");
+        }
+        assert_eq!(seen, ["A100", "A101", "A102"]);
+    }
+
+    /// A range too long, empty or backwards, `to` alone, an `after` that isn't a range's, or a
+    /// range without a database: 400.
+    #[tokio::test]
+    async fn bad_ranges_are_refused() {
+        let fixture = with_history("").await;
+        let from = "from=2026-10-01T00:00:00Z";
+        let id = fixture.ok("/api/orders").await["orders"][0]["id"].as_u64().unwrap();
+        let book_next = format!("{from}&after={id}");
+        for bad in [
+            &format!("{from}&to=2026-11-01T00:00:01Z"),
+            &format!("{from}&to=2026-10-01T00:00:00Z"),
+            &format!("{from}&to=2026-09-30T00:00:00Z"),
+            "to=2026-10-04T00:00:00Z",
+            "from=yesterday",
+            &format!("{from}&after=JB1"),
+            &book_next,
+        ] {
+            assert_eq!(fixture.get(&format!("/api/orders?{bad}")).await.status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        fixture.ok(&format!("{}&to=2026-11-01T00:00:00Z", "/api/orders?from=2026-10-01T00:00:00Z")).await;
+
+        let answer = fixture_with("").await.get(&format!("/api/orders?{from}")).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+        assert_eq!(answer.body["error"], "no [database]: only the current day is kept");
     }
 
     /// Risk counts the resting order's session; the routes are the file's.

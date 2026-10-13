@@ -229,8 +229,7 @@ impl Service {
         self.message_log.as_ref().map(|log| log.dir.as_path())
     }
 
-    /// The book's database, if there is one: the tests' way to its hooks.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the tests' way to the store's hooks"))]
+    /// The book's database, if there is one: what the API reads past orders from.
     pub(crate) fn store(&self) -> Option<&Store> {
         self.store.as_ref()
     }
