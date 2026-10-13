@@ -850,6 +850,7 @@ mod tests {
         ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/sequence"),
         ("POST", "/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/reset"),
         ("POST", "/api/orders/JB1/cancel"),
+        ("POST", "/api/orders/JB1/status"),
         ("POST", "/api/risk/block"),
         ("POST", "/api/risk/unblock"),
         ("POST", "/api/risk/cancel-all"),

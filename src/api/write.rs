@@ -1,6 +1,6 @@
 //! The API's mutations [operator; sequence numbers and a reload, admin]: sessions paused, resumed,
-//! asked to resend and their sequence numbers set or reset, orders cancelled, clients blocked,
-//! unblocked and cancelled, and the configuration reloaded.
+//! asked to resend and their sequence numbers set or reset, orders cancelled or their venues asked
+//! where they stand, clients blocked, unblocked and cancelled, and the configuration reloaded.
 //! Each takes a JSON body with a `reason` and runs through [`audited`]: refused, and the refusal
 //! recorded, for the caller's role or scope, a body that doesn't parse, or nothing to act on.
 //!
@@ -22,8 +22,8 @@ use turbojet_config::Changes;
 use super::auth::{Caller, Target};
 use super::{ApiError, Mutation, Outcome, State, audited};
 use crate::auth::Role;
-use crate::book::{Scope, ScopeName};
-use crate::edge::{CancelError, Gateway};
+use crate::book::{OrderId, Scope, ScopeName};
+use crate::edge::{CancelError, Gateway, StatusError};
 use crate::service::{ConfigSummary, Reloaded, Service};
 
 type AxumState = axum::extract::State<State>;
@@ -219,12 +219,11 @@ pub(super) async fn cancel_order(
     let (order_id, parsed_id) = parse_id(order_id);
     let (body, parsed) = parse(body);
     let gateway = state.service()?.gateway().clone();
-    let found = caller.require(Role::Operator).and(parsed_id).and(parsed).and_then(|()| {
-        let order_id = order_id.as_deref().expect("guarded by parsed_id");
-        let order = gateway.order_id(order_id).and_then(|id| gateway.order(id));
-        let order = order.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no order {order_id}")))?;
-        if caller.may_act_on(&order.order.client) { Ok(order.order.id) } else { Err(out_of_scope(&caller, order_id)) }
-    });
+    let found = caller
+        .require(Role::Operator)
+        .and(parsed_id)
+        .and(parsed)
+        .and_then(|()| find_order(&caller, &gateway, order_id.as_deref()));
     let mutation =
         Mutation { action: "cancel_order", target: order_id, params: serde_json::Value::Null, reason: body.reason };
     audited_on(&state, &caller, mutation, found, |order| async move {
@@ -235,6 +234,45 @@ pub(super) async fn cancel_order(
         Ok((StatusCode::NO_CONTENT, None))
     })
     .await
+}
+
+/// `POST /api/orders/{order_id}/status {reason}`: asks the venue of the order whose OrderID(37)
+/// is `order_id` where it stands (see [`Gateway::request_status`]); 202 once sent, as the answer
+/// comes later, if at all, as the order's reports. 404 if the book doesn't hold the order, 409 if
+/// it's done or its venue isn't logged on.
+pub(super) async fn request_status(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+    order_id: Id,
+    body: Body<Reason>,
+) -> Result<StatusCode, ApiError> {
+    let (order_id, parsed_id) = parse_id(order_id);
+    let (body, parsed) = parse(body);
+    let gateway = state.service()?.gateway().clone();
+    let found = caller
+        .require(Role::Operator)
+        .and(parsed_id)
+        .and(parsed)
+        .and_then(|()| find_order(&caller, &gateway, order_id.as_deref()));
+    let mutation =
+        Mutation { action: "request_status", target: order_id, params: serde_json::Value::Null, reason: body.reason };
+    audited_on(&state, &caller, mutation, found, |order| async move {
+        gateway.request_status(order).map_err(|e| match e {
+            StatusError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, e.to_string()),
+            StatusError::Done | StatusError::VenueUnavailable => ApiError::new(StatusCode::CONFLICT, e.to_string()),
+        })?;
+        Ok((StatusCode::ACCEPTED, None))
+    })
+    .await
+}
+
+/// The order whose OrderID(37) is `order_id` (`Some`, once parsed), if the book holds it and the
+/// caller may act on its client.
+fn find_order(caller: &Caller, gateway: &Gateway, order_id: Option<&str>) -> Result<OrderId, ApiError> {
+    let order_id = order_id.expect("guarded by parse_id");
+    let order = gateway.order_id(order_id).and_then(|id| gateway.order(id));
+    let order = order.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no order {order_id}")))?;
+    if caller.may_act_on(&order.order.client) { Ok(order.order.id) } else { Err(out_of_scope(caller, order_id)) }
 }
 
 /// Whether a block or unblock changed anything.
@@ -601,6 +639,8 @@ mod tests {
         let rows = [
             (format!("/api/sessions/{FUNDA}/resend"), r#"{"reason":"testing","from":1}"#, operator, true),
             (format!("/api/orders/{order}/cancel"), REASON, operator, false),
+            // The venue never logs on.
+            (format!("/api/orders/{order}/status"), REASON, operator, true),
             ("/api/risk/block".to_string(), funda, operator, false),
             ("/api/risk/unblock".to_string(), funda, operator, false),
             ("/api/risk/cancel-all".to_string(), funda, operator, false),
@@ -761,6 +801,18 @@ mod tests {
         assert_eq!(results[results.len() - 2..], ["allowed", "failed: the order is done"]);
     }
 
+    /// A status request for an unknown order is 404; for a live one whose venue isn't logged on,
+    /// 409, recorded as failed with why.
+    #[tokio::test]
+    async fn orders_status() {
+        let fixture = fixture().await;
+        fixture.expect("/api/orders/NOPE1/status", REASON, StatusCode::NOT_FOUND).await;
+        assert_eq!(fixture.last_result(), "refused: no order NOPE1");
+        let order = fixture.order_name().await;
+        fixture.expect(&format!("/api/orders/{order}/status"), REASON, StatusCode::CONFLICT).await;
+        assert_eq!(fixture.last_result(), format!("failed: {}", StatusError::VenueUnavailable));
+    }
+
     /// Blocks and unblocks report whether they changed anything; the kill switch blocks and
     /// cancels. A scope that doesn't parse, or names no session, is refused, as is a body that
     /// isn't JSON.
@@ -811,6 +863,7 @@ mod tests {
         assert_eq!(as_scoped("/api/risk/cancel-all", &scope("comp:FUNDA")).await, StatusCode::FORBIDDEN);
         let order = fixture.order_name().await;
         assert_eq!(as_scoped(&format!("/api/orders/{order}/cancel"), REASON).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_scoped(&format!("/api/orders/{order}/status"), REASON).await, StatusCode::FORBIDDEN);
         assert_eq!(as_scoped(&format!("/api/sessions/{FUNDA}/pause"), REASON).await, StatusCode::FORBIDDEN);
         let venue = fixture.venue().await;
         assert_eq!(as_scoped(&format!("/api/sessions/{venue}/pause"), REASON).await, StatusCode::FORBIDDEN);
