@@ -26,6 +26,7 @@
 //!
 //! [database]                      # optional: without it, the book is kept in memory only
 //! url = "sqlite://jetbridge.db?mode=rwc"  # `mode=rwc` creates the file
+//! retention = "400d"               # optional: delete done orders older; a number and s, m, h or d
 //!
 //! [api]                           # optional: the operator API, an HTTP JSON server
 //! listen = "127.0.0.1:8080"       # an IP address and port
@@ -49,8 +50,13 @@
 //! The sessions file is Turbojet's (`turbojet-config`): its `[acceptor]` serves the clients, all
 //! speaking its `begin_string`, and each `[initiator.NAME]` logs on to venue `NAME`. The
 //! `sessions` key is read at start only: a reload rereads the routes and limits, and the sessions
-//! file in use. A reload keeps the `[database]` and the `[message_log]` in use: a changed one is a
-//! warning, for the next start. The log masks passwords.
+//! file in use. A reload keeps the `[database] url` and the `[message_log]` in use: a changed one
+//! is a warning, for the next start. It takes a changed `[database] retention`. The log masks
+//! passwords.
+//!
+//! With `[database] retention`, the gateway deletes, hourly, the done orders of trading days that
+//! ended longer ago than that, with their rows; without it, nothing is deleted. It must be at
+//! least a day.
 //!
 //! A client session's trading day ends at `day_end`, or sooner when its schedule's period (from
 //! the sessions file) ends. `day_end` is a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`,
@@ -111,6 +117,9 @@ pub struct Loaded {
     pub day_end: SessionSchedule,
     /// The `[database]` URL the book is kept in, if any: read at start only.
     pub database: Option<String>,
+    /// `[database] retention`: how long after its trading day ends a done order is kept; for
+    /// ever if left out. At least [`DATABASE_RETENTION_MIN`].
+    pub retention: Option<Duration>,
     /// The operator API, if the file has `[api]`.
     pub api: Option<Api>,
     /// The message log, if the file has `[message_log]`: open, and given to the sessions file.
@@ -207,8 +216,8 @@ pub(crate) fn load(path: &Path, stores: Vec<(String, Arc<dyn SessionStorage>)>) 
     };
     let version = base.begin_string.parse().map_err(|e| Error(format!("{}: {e}", sessions_path.display())))?;
     check_venues(path, &router, &sessions.initiator_names())?;
-    let database = file.database.map(|database| database.url);
-    Ok(Loaded { router, limits, risk: file.risk, sessions, version, day_end, database, api, message_log })
+    let (database, retention) = file.database(path)?;
+    Ok(Loaded { router, limits, risk: file.risk, sessions, version, day_end, database, retention, api, message_log })
 }
 
 /// What a reload rereads from the configuration file.
@@ -224,9 +233,11 @@ pub struct Reread {
     pub message_log: Option<MessageLog>,
     /// Not opened: a reload keeps the database in use.
     pub database: Option<String>,
+    /// Taken: see [`Loaded::retention`].
+    pub retention: Option<Duration>,
 }
 
-/// Reads the routes, limits, `day_end`, `[api]`, `[message_log]` and `[database] url` in the
+/// Reads the routes, limits, `day_end`, `[api]`, `[message_log]` and `[database]` in the
 /// configuration file at `path` again, checking that each venue the routes name is one of
 /// `venues`.
 ///
@@ -256,8 +267,8 @@ pub fn reread(path: &Path, text: &str, venues: &[String], log: bool) -> Result<R
     let day_end = file.day_end(path)?;
     let api = file.api(path)?;
     let message_log = file.message_log(path)?;
-    let database = file.database.map(|database| database.url);
-    Ok(Reread { router, limits, risk: file.risk, day_end, api, message_log, database })
+    let (database, retention) = file.database(path)?;
+    Ok(Reread { router, limits, risk: file.risk, day_end, api, message_log, database, retention })
 }
 
 /// `day_end` as written, `HH:MM[:SS] [ZONE]`, as a schedule whose periods run from one end of day
@@ -334,7 +345,14 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct Database {
     url: String,
+    #[serde(default, deserialize_with = "retention")]
+    retention: Option<Duration>,
 }
+
+/// The shortest `[database] retention`: a pruned order's requests are then over a day older than
+/// any orphan a start finds, which is what lets the orphan scan take requests sent no later than
+/// [`Store::pruned_through`](crate::store::Store::pruned_through) for a pruned order's.
+pub const DATABASE_RETENTION_MIN: Duration = Duration::from_secs(86_400);
 
 /// `[risk]` as written: the API shows it so (`GET /api/risk/limits`), the client tables as
 /// `clients`.
@@ -440,14 +458,15 @@ struct Route {
     reject: Option<String>,
 }
 
-/// The longest `[message_log] retention` or `[api] audit_retention`: longer than any
-/// record-keeping rule asks for, and short enough that the logs' date arithmetic can't overflow,
-/// so a typo is refused at load and reload rather than at the next start's open.
+/// The longest `[message_log] retention`, `[api] audit_retention` or `[database] retention`:
+/// longer than any record-keeping rule asks for, and short enough that the logs' and the prune's
+/// date arithmetic can't overflow, so a typo is refused at load and reload rather than at the next
+/// start's open.
 const RETENTION_MAX: Duration = Duration::from_secs(100 * 366 * 86_400);
 
-/// `[message_log] retention` and `[api] audit_retention`: a whole number and a unit, `s`, `m`, `h`
-/// or `d` (`90d`), as the sessions file writes its durations, with days added; positive, and at
-/// most [`RETENTION_MAX`].
+/// `[message_log] retention`, `[api] audit_retention` and `[database] retention`: a whole number
+/// and a unit, `s`, `m`, `h` or `d` (`90d`), as the sessions file writes its durations, with days
+/// added; positive, and at most [`RETENTION_MAX`].
 fn retention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Duration>, D::Error> {
     let text = String::deserialize(deserializer)?;
     let invalid = || serde::de::Error::custom(format!("invalid duration {text:?} (expected e.g. 12h or 90d)"));
@@ -484,6 +503,18 @@ impl File {
     fn day_end(&self, path: &Path) -> Result<SessionSchedule, Error> {
         day_end(self.day_end.as_deref().unwrap_or("00:00 UTC"))
             .map_err(|e| Error(format!("{}: day_end: {e}", path.display())))
+    }
+
+    /// `[database]`'s URL and retention, the retention at least [`DATABASE_RETENTION_MIN`].
+    fn database(&self, path: &Path) -> Result<(Option<String>, Option<Duration>), Error> {
+        let Some(database) = &self.database else { return Ok((None, None)) };
+        if database.retention.is_some_and(|retention| retention < DATABASE_RETENTION_MIN) {
+            return Err(Error(format!(
+                "{}: [database] retention: at least 1d, so no orphaned order is taken for a pruned one",
+                path.display()
+            )));
+        }
+        Ok((Some(database.url.clone()), database.retention))
     }
 
     /// `[api]`, its paths made relative to `path`'s directory, if the build and the bind rule
@@ -634,6 +665,35 @@ reject = "no route"
         assert_eq!(load_database(with).as_deref(), Some("sqlite://j.db?mode=rwc"));
         let error = load_error("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db\"\npath = \"x\"");
         assert!(error.contains("unknown field `path`"), "{error}");
+    }
+
+    /// `[database] retention` is optional, read as `[message_log]`'s, and at least a day, at load
+    /// and reload.
+    #[test]
+    fn the_database_retention_is_optional_and_at_least_a_day() {
+        let jetbridge =
+            |more: &str| format!("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"\n{more}");
+        let retention = |more: &str| {
+            let dir = dir(&[("jetbridge.toml", &jetbridge(more)), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("jetbridge.toml")).map(|loaded| loaded.retention).map_err(|e| e.to_string())
+        };
+        assert_eq!(retention(""), Ok(None));
+        assert_eq!(retention("retention = \"400d\""), Ok(Some(Duration::from_secs(400 * 86_400))));
+        assert_eq!(retention("retention = \"24h\""), Ok(Some(DATABASE_RETENTION_MIN)));
+        for (more, error) in [
+            ("retention = \"400 days\"", "invalid duration \"400 days\""),
+            ("retention = \"0d\"", "retention must be positive"),
+            ("retention = \"23h\"", "[database] retention: at least 1d"),
+            ("retention = \"86399s\"", "[database] retention: at least 1d"),
+        ] {
+            let error_text = retention(more).unwrap_err();
+            assert!(error_text.contains(error), "{more}: {error_text}");
+        }
+        let path = Path::new("jetbridge.toml");
+        let reread = |more: &str| reread(path, &jetbridge(more), &[], false).map(|reread| reread.retention);
+        assert_eq!(reread("retention = \"2d\"").unwrap(), Some(Duration::from_secs(2 * 86_400)));
+        let error = reread("retention = \"1h\"").unwrap_err().to_string();
+        assert!(error.contains("[database] retention: at least 1d"), "{error}");
     }
 
     /// `[message_log]`'s `dir` is relative to the file and required; the rest are optional, checked,

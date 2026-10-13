@@ -200,6 +200,9 @@ struct State {
     /// Cancels for orders a venue's session sent that the store never booked, by venue, to send
     /// at its next logon: see [`orphans`].
     orphan_cancels: HashMap<VenueId, Vec<orphans::OrphanCancel>>,
+    /// Those cancels sent, waiting for the venue's session to store them, before their orders
+    /// are recorded or the cancels queued again.
+    orphan_cancels_sending: usize,
     /// Those orders' downstream ClOrdIDs, and their cancels': the venue's reports under them are
     /// logged, not handed to the book.
     orphan_ids: HashSet<CompactString>,
@@ -225,6 +228,7 @@ impl Gateway {
             day_end: SessionSchedule::daily(NaiveTime::MIN, NaiveTime::MIN),
             schedules: Schedules(Arc::new(|_| None)),
             orphan_cancels: HashMap::new(),
+            orphan_cancels_sending: 0,
             orphan_ids: HashSet::new(),
             unsent: HashMap::new(),
         };
@@ -2831,6 +2835,35 @@ pub(crate) mod tests {
         let state = gateway.lock();
         let [orphan] = state.orphan_cancels[VENUE].as_slice() else { panic!() };
         assert_eq!(orphan.cancel.get(tags::ORIG_CL_ORD_ID), Some("OLDOLD4"));
+    }
+
+    /// A prune run deletes the done orders of days ended `retention` before now; without a
+    /// retention it does nothing, and while orphan work is pending it skips the run.
+    #[tokio::test]
+    async fn a_prune_run_needs_a_retention_and_no_orphan_work_pending() {
+        use crate::store::tests::{current, dated};
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let at = |minutes: i64| DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::minutes(minutes);
+        let funda = crate::book::ClientId::from("FUNDA");
+        let (day1, day3) = (crate::book::Day(at(60)), crate::book::Day(at(180)));
+        let (old, newest) = (dated(1, &funda, Some(day1), true, at(5)), dated(2, &funda, Some(day1), true, at(8)));
+        store.write(&[old, newest, current(&funda, day3)]).await.unwrap();
+        let gateway = restarted(&store, "NEWNEW").await;
+        let (day, now) = (Duration::from_secs(86_400), at(120) + chrono::Duration::days(1));
+
+        assert_eq!(gateway.prune_once(&store, None, now).await, None);
+        gateway.lock().orphan_cancels_sending = 1;
+        assert!(gateway.orphans_pending());
+        gateway.lock().orphan_cancels_sending = 0;
+        let unsent = orphans::Unsent { downstreams: vec!["1".into()], next_outgoing: 1 };
+        gateway.lock().unsent.insert(VENUE.into(), unsent);
+        assert_eq!(gateway.prune_once(&store, Some(day), now).await, None);
+        assert_eq!(store.pruned_through().await.unwrap(), None);
+
+        gateway.lock().unsent.clear();
+        assert!(!gateway.orphans_pending());
+        assert_eq!(gateway.prune_once(&store, Some(day), now).await, Some(1));
+        assert_eq!(store.pruned_through().await.unwrap(), Some(at(5)));
     }
 
     /// Our session with the venue, as the gateway's initiator has it.

@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::{Duration, SystemTime};
 
+use chrono::Utc;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 use turbojet::{Acceptor, SessionEvent, SessionHandle, SessionId, SessionSchedule, SessionStatus};
 use turbojet_config::{Changes, Initiators, SessionsFile};
@@ -35,6 +37,12 @@ const SHUTTING_DOWN: &str = "gateway shutting down";
 /// at a venue with no gateway to report its fills is worse than a slower stop; a venue that
 /// doesn't answer in this long isn't going to soon.
 const CANCELS_WAIT: Duration = Duration::from_secs(5);
+
+/// How often the database is pruned, with `[database] retention`, the first time this long after
+/// the start: a start isn't slowed, and its orphans are found by then (see
+/// [`Gateway::orphans_pending`]). Orders become prunable a trading day at a time, so an hour late
+/// keeps them an hour longer, no more.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3_600);
 
 /// What [`Service::reload`] did with each file: what changed, or why the file was kept as it
 /// was; and what it took but warns about.
@@ -84,6 +92,10 @@ pub struct Service {
     retrying: JoinHandle<()>,
     /// The book's writer, with a database: aborted when the service is dropped.
     writing: Option<JoinHandle<()>>,
+    /// [`prune_hourly`], with a database: aborted at shutdown, or when the service is dropped.
+    pruning: Option<JoinHandle<()>>,
+    /// The `[database] retention` in force: set at start and by each reload, read by `pruning`.
+    retention: Arc<Mutex<Option<Duration>>>,
     /// The database, if there is one.
     store: Option<Store>,
     /// The operator API, with `[api]`: set once the acceptor serves, taken at shutdown.
@@ -101,8 +113,8 @@ pub struct Service {
 impl Drop for Service {
     fn drop(&mut self) {
         self.retrying.abort();
-        if let Some(writing) = &self.writing {
-            writing.abort();
+        for task in [&self.writing, &self.pruning].into_iter().flatten() {
+            task.abort();
         }
         if let Ok(Some(api)) = self.api.get_mut() {
             api.abort();
@@ -154,6 +166,8 @@ impl Service {
         let initiators = sessions.initiators(Arc::new(VenueApp(gateway.clone()))).map_err(Error::new)?;
         let acceptor = sessions.acceptor(Arc::new(ClientApp(gateway.clone()))).expect("load checked [acceptor]");
         let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
+        let retention = Arc::new(Mutex::new(loaded.retention));
+        let pruning = store.clone().map(|store| tokio::spawn(prune_hourly(gateway.clone(), store, retention.clone())));
         let service = Self {
             path: path.to_path_buf(),
             gateway,
@@ -165,6 +179,8 @@ impl Service {
             message_log: loaded.message_log,
             retrying,
             writing,
+            pruning,
+            retention,
             store,
             api: Mutex::new(None),
             risk: Mutex::new(loaded.risk),
@@ -348,7 +364,7 @@ impl Service {
         }
         let venues = self.set_venues();
         let config = match config::reload(&self.path, &venues) {
-            Ok(config::Reread { router, limits, risk, day_end, api, message_log, database }) => {
+            Ok(config::Reread { router, limits, risk, day_end, api, message_log, database, retention }) => {
                 let summary = ConfigSummary {
                     routes: router.rules().len(),
                     clients: limits.by_comp_id.len(),
@@ -363,6 +379,7 @@ impl Service {
                 self.gateway.set_config(router, limits);
                 *self.risk.lock().unwrap_or_else(PoisonError::into_inner) = risk;
                 self.gateway.set_day_end(day_end);
+                *self.retention.lock().unwrap_or_else(PoisonError::into_inner) = retention;
                 warnings.extend(self.reload_api(api.as_ref()));
                 warnings.extend(self.needing_restart(message_log.as_ref(), database.as_deref()));
                 Ok(summary)
@@ -445,6 +462,9 @@ impl Service {
             warn!(cancelling = ?self.gateway.cancelling(), "stopping without the venues' answer to these cancels");
         }
         self.retrying.abort();
+        if let Some(pruning) = &self.pruning {
+            pruning.abort();
+        }
         self.initiators.shutdown(Some(SHUTTING_DOWN)).await;
         // What the last messages changed, before the process goes. A database that's down holds
         // this up; a second signal exits (see the binary).
@@ -539,6 +559,20 @@ async fn start_gateway(
             .map_err(|e| Error::new(format!("cannot look for orphaned venue requests: {e}")))?;
     }
     Ok(gateway)
+}
+
+/// Every [`PRUNE_INTERVAL`] from an interval after the start, prunes `store` by the `retention`
+/// in force then: see [`Gateway::prune_once`].
+async fn prune_hourly(gateway: Arc<Gateway>, store: Store, retention: Arc<Mutex<Option<Duration>>>) {
+    let mut interval = tokio::time::interval(PRUNE_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick is at once.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let retention = *retention.lock().unwrap_or_else(PoisonError::into_inner);
+        gateway.prune_once(&store, retention, Utc::now()).await;
+    }
 }
 
 /// The clients' listener: `given`, or one bound to the sessions file's address.
@@ -1234,6 +1268,32 @@ mod tests {
     async fn back_to_back_starts_take_different_prefixes() {
         let first = next_second().await;
         assert_ne!(book::start_prefix(first), book::start_prefix(next_second().await));
+    }
+
+    /// With a database, the pruning task runs, by the `[database] retention` in force: a reload
+    /// changes it without a warning, one under a day is refused, and taking it out stops pruning.
+    #[tokio::test]
+    async fn a_reload_changes_the_retention_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
+        let config = |more: &str| format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n{more}");
+        write(&dir, "jetbridge.toml", &config("retention = \"400d\"\n"));
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let retention = || *service.retention.lock().unwrap();
+        assert!(service.pruning.is_some());
+        assert_eq!(retention(), Some(Duration::from_secs(400 * 86_400)));
+        write(&dir, "jetbridge.toml", &config("retention = \"2d\"\n"));
+        assert!(service.reload().unwrap().warnings.is_empty());
+        assert_eq!(retention(), Some(Duration::from_secs(2 * 86_400)));
+        write(&dir, "jetbridge.toml", &config("retention = \"1h\"\n"));
+        assert!(service.reload().unwrap().config.is_err());
+        assert_eq!(retention(), Some(Duration::from_secs(2 * 86_400)));
+        write(&dir, "jetbridge.toml", &config(""));
+        assert!(service.reload().unwrap().config.is_ok());
+        assert_eq!(retention(), None);
+        service.shutdown().await;
+        serving.abort();
     }
 
     /// A database with rows in it is restored from at the next start: here a block.

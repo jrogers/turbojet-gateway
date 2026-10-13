@@ -378,12 +378,13 @@ impl Gateway {
             return;
         };
         let now = UtcTimestamp::from(self.clock.now());
-        let mut unsent = Vec::new();
+        let (mut unsent, mut sending) = (Vec::new(), 0);
         for orphan in cancels {
             let cl_ord_id = orphan.cancel.get(tags::CL_ORD_ID);
             match to.session.send(orphan.cancel.clone().with(tags::TRANSACT_TIME, now)) {
                 Ok(receipt) => {
                     info!(%venue, cl_ord_id, chain = ?orphan.chain, "sent the cancel of an orphaned order");
+                    sending += 1;
                     self.settle_orphan_cancel(receipt, venue.clone(), orphan);
                 }
                 Err(e) => {
@@ -392,6 +393,7 @@ impl Gateway {
                 }
             }
         }
+        state.orphan_cancels_sending += sending;
         if !unsent.is_empty() {
             state.orphan_cancels.insert(venue.clone(), unsent);
         }
@@ -414,6 +416,7 @@ impl Gateway {
                     gateway.lock().orphan_cancels.entry(venue).or_default().push(orphan);
                 }
             }
+            gateway.lock().orphan_cancels_sending -= 1;
         });
     }
 
@@ -432,7 +435,51 @@ impl Gateway {
         self.alarm(AlarmKind::Orphan, || format!("venue {venue} reported on orphaned request {downstream}"));
         true
     }
+
+    /// Whether orphan work a start found is pending: orphaned orders whose cancels the venues'
+    /// sessions haven't stored yet, orphaned replaces waiting, or requests to send at a venue's
+    /// logon. Pruning checks it, as `PRUNED_SLACK` needs: until handled, an orphan isn't
+    /// recorded, and were a prune to raise [`Store::pruned_through`] past it and the gateway then
+    /// stop, the next start would take it for a pruned order's.
+    pub fn orphans_pending(&self) -> bool {
+        let state = self.lock();
+        !state.orphan_cancels.is_empty()
+            || state.orphan_cancels_sending > 0
+            || !state.unsent.is_empty()
+            || state.book.orphans_waiting()
+    }
+
+    /// Deletes from `store` the done orders of trading days that ended `retention` before `now`
+    /// (see [`Store::prune`]). Does nothing without a `retention`, and skips the run while
+    /// [orphan work is pending](Self::orphans_pending); waits first for what's recorded to
+    /// commit, the orphans handled with it. Logs what it did, an error included, which waits for
+    /// the next run. Returns the orders deleted, if it ran and didn't fail.
+    pub async fn prune_once(&self, store: &Store, retention: Option<Duration>, now: DateTime<Utc>) -> Option<u64> {
+        let retention = retention?;
+        if self.orphans_pending() {
+            info!("not pruning the database: orphaned venue requests are still being handled");
+            return None;
+        }
+        self.committed().await;
+        let before = now - chrono::Duration::from_std(retention).expect("the config keeps retention to 100 years");
+        match store.prune(before, PRUNE_BATCH).await {
+            Ok(pruned) => {
+                if pruned.orders > 0 {
+                    info!(orders = pruned.orders, %before, "pruned the done orders of trading days ended before");
+                }
+                Some(pruned.orders)
+            }
+            Err(e) => {
+                warn!(%before, "pruning the database failed; again at the next run: {e}");
+                None
+            }
+        }
+    }
 }
+
+/// Orders [`Gateway::prune_once`] deletes to a transaction: the store's one connection is the
+/// book's writer's too, which waits while a batch runs, so each is kept short.
+pub const PRUNE_BATCH: usize = 200;
 
 /// Opens session `id`'s log in `storage`.
 async fn open(storage: &dyn SessionStorage, id: &SessionId) -> io::Result<Box<dyn SessionLog>> {

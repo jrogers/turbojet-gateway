@@ -188,6 +188,12 @@ impl Book {
         self.orphaned_replaces.values().any(|(pending, _)| pending.downstream == downstream)
     }
 
+    /// Whether any orphaned replace waits for the replace pending before it: not recorded until
+    /// it's made pending.
+    pub fn orphans_waiting(&self) -> bool {
+        !self.orphaned_replaces.is_empty()
+    }
+
     /// Makes orphaned replaces pending whose orders' pending replaces have been answered: after
     /// every input, and a walk of none but at a start.
     pub(super) fn promote_orphaned_replaces(&mut self) {
