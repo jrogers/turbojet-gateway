@@ -1022,7 +1022,11 @@ async fn the_kill_switch_over_the_api_cancels_a_clients_orders() {
     users.add("olga", Role::Operator, Vec::new(), "a long enough password").unwrap();
     let token = users.add_token("olga").unwrap();
     users.save(&users_path).unwrap();
-    setup.service.reload();
+    let service = setup.service.clone();
+    let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().expect("not shutting down");
+    assert!(reloaded.sessions.is_ok(), "{:?}", reloaded.sessions.err());
+    assert!(reloaded.config.is_ok(), "{:?}", reloaded.config.err());
+    assert!(reloaded.warnings.is_empty(), "{:?}", reloaded.warnings);
     setup.working_order().await;
 
     let body = format!(r#"{{"scope":"comp:{CLIENT}","reason":"runaway algo"}}"#);
