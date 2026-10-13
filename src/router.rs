@@ -1,5 +1,6 @@
-//! Routing rules: ordered, first match wins. Kept to one function, [`Router::route`], so
-//! failover or code-defined routing can replace it without touching the book.
+//! Routing rules: ordered, first match wins. Kept to one function, [`Router::route_rule`] (which
+//! [`Router::route`] wraps), so failover or code-defined routing can replace it without touching
+//! the book, and the API's dry run follows it.
 
 use serde::Serialize;
 use turbojet::fields::CompactString;

@@ -269,7 +269,7 @@ pub(super) struct RouteTest {
 }
 
 /// `GET /api/routes/test?client=&ex_destination=&symbol=`: where the router would send such an
-/// order, and by which rule. Routing only: risk isn't checked.
+/// order, and by which rule. Routing only: blocks, ClOrdID limits and risk aren't checked.
 pub(super) async fn route_test(
     axum::extract::State(state): AxumState,
     query: Result<Query<RouteTestQuery>, QueryRejection>,
