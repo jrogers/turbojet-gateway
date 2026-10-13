@@ -1155,12 +1155,15 @@ async fn an_order_unknown_at_its_venue_is_resolved() {
     setup.venue.send(unknown.to_message());
     let alarm = timeout(WAIT, async {
         loop {
-            if let GatewayEvent::Alarm(alarm) = gateway_events.recv().await.unwrap() {
-                return alarm;
+            match gateway_events.recv().await {
+                Ok(GatewayEvent::Alarm(alarm)) if alarm.kind == AlarmKind::UnknownAtVenue => return,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("the gateway's events closed"),
+                // Other events, and a lag: the alarm may be yet to come.
+                _ => {}
             }
         }
     });
-    assert_eq!(alarm.await.expect("no alarm").kind, AlarmKind::UnknownAtVenue);
+    alarm.await.expect("no unknown_at_venue alarm");
 
     let response = post(addr, &path("resolve"), &token, reason).await;
     assert!(response.starts_with("HTTP/1.1 204"), "{response}");

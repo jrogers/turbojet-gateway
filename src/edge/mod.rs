@@ -1631,8 +1631,8 @@ pub(crate) mod tests {
         assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::UnknownOrder));
         book_order(&gateway);
         assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::NotUnknownAtVenue));
-        let name = gateway.order(OrderId(1)).unwrap().order.order_id;
-        unknown_at_venue(&gateway, &name);
+        let downstream = gateway.order(OrderId(1)).unwrap().requests[0].downstream.clone();
+        unknown_at_venue(&gateway, &downstream);
         assert_eq!(gateway.resolve(OrderId(1)).await, Ok(()));
         assert_eq!(gateway.order(OrderId(1)).unwrap().order.status, crate::book::Status::Canceled);
         assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::Done));

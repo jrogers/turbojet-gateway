@@ -1044,7 +1044,9 @@ mod tests {
         fixture.expect(&resolve, REASON, StatusCode::CONFLICT).await;
         assert_eq!(fixture.last_result(), format!("failed: {}", ResolveError::NotUnknownAtVenue));
 
-        crate::edge::tests::unknown_at_venue(fixture.service.gateway(), &order);
+        let gateway = fixture.service.gateway();
+        let downstream = gateway.order(OrderId(1)).unwrap().requests[0].downstream.clone();
+        crate::edge::tests::unknown_at_venue(gateway, &downstream);
         assert_eq!(fixture.ok(&format!("/api/orders/{order}")).await["unknown_at_venue"], true);
         fixture.expect(&resolve, REASON, StatusCode::NO_CONTENT).await;
         assert_eq!(fixture.last_result(), "allowed");
