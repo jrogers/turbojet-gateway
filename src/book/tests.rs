@@ -745,17 +745,19 @@ fn a_status_answer_reaches_the_client_only_with_news() {
     assert_eq!((report.exec_type, report.last_qty, report.cl_ord_id.as_str()), (ExecType::Trade, 40.into(), "C1"));
 }
 
-/// A venue that doesn't know the order answers Status, Rejected, OrdRejReason 5 (FIX 4.2 and 4.4
-/// alike): an alarm, the order left as it is and the client not told. Under a superseded ClOrdID,
-/// or for a done order, nothing.
+/// How a venue that doesn't know the order answers a status request under `downstream`: Status,
+/// Rejected, OrdRejReason 5 (FIX 4.2 and 4.4 alike).
+fn unknown(downstream: &str) -> Input {
+    let mut input = venue_report_as(downstream, ExecType::Status, Status::Rejected, 0, 0);
+    let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
+    report.ord_rej_reason = Some(5);
+    input
+}
+
+/// A venue that doesn't know the order: an alarm, the order left as it is and the client not
+/// told. Under a superseded ClOrdID, or for a done order, nothing.
 #[test]
 fn a_status_answer_that_the_venue_doesnt_know_the_order_raises_an_alarm() {
-    let unknown = |downstream: &str| {
-        let mut input = venue_report_as(downstream, ExecType::Status, Status::Rejected, 0, 0);
-        let Input::VenueReport { report, .. } = &mut input else { unreachable!() };
-        report.ord_rej_reason = Some(5);
-        input
-    };
     let mut book = book();
     new_order(&mut book, "C1");
     run(&mut book, venue_report("1", Status::New, 0, 0));
@@ -782,6 +784,186 @@ fn a_status_answer_that_the_venue_doesnt_know_the_order_raises_an_alarm() {
     run(&mut book, venue_report("1-1", Status::Canceled, 0, 0));
     assert!(run(&mut book, unknown("1-1")).is_empty());
     assert_eq!(book.take_events().count(), 0);
+}
+
+/// The venue's "unknown order" marks the order, in memory only: the blotter shows it, and a
+/// restored book doesn't have it, as the store never sees it.
+#[test]
+fn a_venue_not_knowing_the_order_marks_it_until_a_restart() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    assert!(!book.is_unknown_at_venue(OrderId(1)));
+    run(&mut book, unknown("1"));
+    assert!(book.is_unknown_at_venue(OrderId(1)));
+    let views = book.orders(&OrderFilter::default());
+    assert!(views[0].unknown_at_venue, "{views:?}");
+    let restored = restored(&book);
+    assert_eq!(restored.snapshot(), book.snapshot());
+    assert!(!restored.is_unknown_at_venue(OrderId(1)));
+    assert!(!restored.orders(&OrderFilter::default())[0].unknown_at_venue);
+}
+
+/// The venue reporting on the order after all unmarks it: a repeat of its ack, as asking again
+/// gets, or a fill.
+#[test]
+fn a_report_from_the_venue_unmarks_an_order_it_said_it_didnt_know() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    run(&mut book, unknown("1"));
+    assert!(run(&mut book, venue_report_as("1", ExecType::Status, Status::New, 0, 0)).is_empty());
+    assert!(!book.is_unknown_at_venue(OrderId(1)));
+    run(&mut book, unknown("1"));
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    assert!(!book.is_unknown_at_venue(OrderId(1)));
+}
+
+/// A stale resend that also repeats where the order stands leaves the mark: the order's own
+/// PendingReplace for a second replace, resent under the first's downstream, which is answered.
+#[test]
+fn a_stale_resend_repeating_the_orders_state_leaves_it_marked() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    replace(&mut book, "C2", "C1", 80, 11);
+    run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
+    replace(&mut book, "C3", "C2", 70, 11);
+    run(&mut book, venue_report("1-2", Status::PendingReplace, 0, 0));
+    run(&mut book, unknown("1-1"));
+    assert!(book.is_unknown_at_venue(OrderId(1)));
+    assert!(run(&mut book, venue_report("1-1", Status::PendingReplace, 0, 0)).is_empty());
+    assert!(book.is_unknown_at_venue(OrderId(1)));
+}
+
+/// A status answer under the order's current ClOrdID is the venue holding the order, even when
+/// the book drops it as behind: here a New while the order awaits its cancel.
+#[test]
+fn a_stale_status_answer_under_the_current_downstream_unmarks_the_order() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    cancel(&mut book, "C2", "C1");
+    run(&mut book, venue_report("1-1", Status::PendingCancel, 0, 0));
+    run(&mut book, unknown("1"));
+    assert!(book.is_unknown_at_venue(OrderId(1)));
+    let answer = venue_report_as("1", ExecType::Status, Status::New, 0, 0);
+    let Input::VenueReport { report, .. } = &answer else { unreachable!() };
+    assert!(stale(book.order(OrderId(1)).unwrap(), false, report));
+    assert!(run(&mut book, answer).is_empty());
+    assert!(!book.is_unknown_at_venue(OrderId(1)));
+}
+
+/// A mark goes with its order however the order ends, here a send that failed before the venue
+/// acknowledged it, a path that never looks at the mark.
+#[test]
+fn a_marked_order_ending_by_any_path_is_unmarked() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, unknown("1"));
+    assert!(book.is_unknown_at_venue(OrderId(1)));
+    run(&mut book, Input::SendFailed { venue: "NASDAQ".into(), downstream: "1".into(), text: "down".into() });
+    assert_eq!(book.order(OrderId(1)).unwrap().status, Status::Rejected);
+    assert!(!book.is_unknown_at_venue(OrderId(1)));
+}
+
+/// `Resolve` and what it took, not through `run`: a restored book has no mark, so it does nothing.
+fn resolve(book: &mut Book, order: OrderId) -> (Vec<Output>, Changes) {
+    let mut out = Vec::new();
+    book.handle(Input::Resolve { order }, &mut out);
+    let changes = book.take_changes();
+    book.mirror.apply(changes.clone());
+    (out, changes)
+}
+
+/// Resolving an order a venue doesn't know cancels it: the client hears Canceled with its fills,
+/// its exposure goes, and its request to the venue is settled, so a restart doesn't send it again.
+#[test]
+fn resolving_an_order_unknown_at_its_venue_cancels_it_keeping_its_fills() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    run(&mut book, unknown("1"));
+    assert_ne!(book.risk_view().sessions[0].open, Decimal::ZERO);
+    let (out, changes) = resolve(&mut book, OrderId(1));
+    let [Output::Report { client, report }] = out.as_slice() else { panic!("{out:?}") };
+    assert_eq!(*client, ClientId::from("FUNDA"));
+    assert_eq!(
+        (report.exec_type, report.status, report.cl_ord_id.as_str()),
+        (ExecType::Canceled, Status::Canceled, "C1")
+    );
+    assert_eq!((report.cum_qty, report.avg_px, report.leaves_qty), (40.into(), 10.into(), Decimal::ZERO));
+    assert_eq!(report.text.as_deref(), Some(report::RESOLVED));
+    assert_eq!(book.risk_view().sessions[0].open, Decimal::ZERO);
+    assert!(!book.is_unknown_at_venue(OrderId(1)));
+    let [row] = changes.orders.as_slice() else { panic!("{changes:?}") };
+    assert_eq!((row.order.status, row.order.cum_qty), (Status::Canceled, 40.into()));
+    let sent: Vec<(&str, bool)> =
+        changes.sent.iter().map(|(downstream, sent)| (downstream.as_str(), sent.answered)).collect();
+    assert_eq!(sent, [("1", true)]);
+    assert!(book.unanswered(&"NASDAQ".into()).is_empty());
+    assert_eq!(restored(&book).snapshot(), book.snapshot());
+}
+
+/// A venue that finds the order after all and fills it, once it's resolved: the fill isn't
+/// applied, and an alarm says someone has to settle it.
+#[test]
+fn a_fill_on_a_resolved_order_raises_an_alarm() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    run(&mut book, unknown("1"));
+    resolve(&mut book, OrderId(1));
+    book.take_events().for_each(drop);
+    assert!(run(&mut book, venue_report("1", Status::PartiallyFilled, 20, 60)).is_empty());
+    assert_eq!(book.order(OrderId(1)).unwrap().cum_qty, Decimal::from(40));
+    let events: Vec<GatewayEvent> = book.take_events().collect();
+    let [GatewayEvent::Alarm(alarm)] = events.as_slice() else { panic!("{events:?}") };
+    assert_eq!(alarm.kind, AlarmKind::FillOnDoneOrder);
+    assert_eq!(alarm.text, "venue NASDAQ reported done order 1 filled 60 (ExecID V1); not applied");
+    // A resend at or below the order's CumQty is no news.
+    run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
+    assert_eq!(book.take_events().count(), 0);
+}
+
+/// A pending replace and the gateway's own cancel end with the order, their requests settled.
+#[test]
+fn resolving_an_order_ends_its_pending_replace_and_gateway_cancel() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    replace(&mut book, "C2", "C1", 80, 11);
+    run(&mut book, Input::CancelOrder { order: OrderId(1) });
+    run(&mut book, unknown("1"));
+    let (_, changes) = resolve(&mut book, OrderId(1));
+    let order = book.order(OrderId(1)).unwrap();
+    assert_eq!((order.status, order.pending.is_none(), order.gateway_cancel.is_none()), (Status::Canceled, true, true));
+    let mut sent: Vec<(&str, bool)> =
+        changes.sent.iter().map(|(downstream, sent)| (downstream.as_str(), sent.answered)).collect();
+    sent.sort_unstable();
+    assert_eq!(sent, [("1", true), ("1-1", true), ("1-2", true)]);
+    let view = &book.orders(&OrderFilter::default())[0];
+    assert_eq!((view.pending_cancel, view.pending_replace), (false, false));
+}
+
+/// `Resolve` for an order not marked, done, or not in the book changes nothing.
+#[test]
+fn resolving_an_order_not_unknown_at_its_venue_does_nothing() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    new_order(&mut book, "C2");
+    run(&mut book, venue_report("2", Status::New, 0, 0));
+    run(&mut book, unknown("2"));
+    run(&mut book, venue_report("2", Status::Canceled, 0, 0));
+    assert!(!book.is_unknown_at_venue(OrderId(2)));
+    for id in [OrderId(1), OrderId(2), OrderId(99)] {
+        let before = book.snapshot();
+        let (out, changes) = resolve(&mut book, id);
+        assert!(out.is_empty(), "{id:?}: {out:?}");
+        assert!(changes.is_empty(), "{id:?}: {changes:?}");
+        assert_eq!(book.snapshot(), before);
+    }
 }
 
 #[test]

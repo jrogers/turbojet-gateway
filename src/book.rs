@@ -521,8 +521,18 @@ pub enum Input {
     /// any report is, a fill the gateway missed reaching the client and one changing nothing
     /// dropped, and an answer that the venue doesn't know the order raises
     /// [`AlarmKind::UnknownAtVenue`], the order staying live, its exposure counted, until an
-    /// operator resolves it. Nothing is sent for an unknown or done order.
+    /// operator resolves it ([`Input::Resolve`]). Nothing is sent for an unknown or done order.
     VenueStatusRequest {
+        order: OrderId,
+    },
+    /// An operator's answer to [`AlarmKind::UnknownAtVenue`]: the venue doesn't know the order, so
+    /// nothing will end it there, and the gateway cancels it itself, its fills kept and its
+    /// exposure freed. The client hears Canceled under the order's current ClOrdID, as for a
+    /// venue's unsolicited cancel: a cancel or replace of its own still outstanding isn't answered
+    /// separately. Only for a live order a venue has said it doesn't know since the gateway
+    /// started and hasn't reported on since ([`Book::is_unknown_at_venue`]); for any other it
+    /// does nothing.
+    Resolve {
         order: OrderId,
     },
     /// The venue's session logged on, or can take requests again: the gateway's cancels that
@@ -746,6 +756,11 @@ pub struct Book {
     /// `adopt_orphaned_replace`. Not stored: a restart before then finds the orphan again in the
     /// venue's store.
     orphaned_replaces: HashMap<OrderId, (Pending, Option<CompactString>)>,
+    /// Live orders a venue has said it doesn't know (see [`Book::unknown_at_venue`]), which an
+    /// operator may [`Input::Resolve`]: unmarked when the venue reports on the order after all, or
+    /// the order is done. An OrderCancelReject or an overfill report leaves the mark, to be safe:
+    /// an operator asks again. Not stored: after a restart the operator asks the venue again.
+    unknown_at_venue: HashSet<OrderId>,
     /// The time of the inputs being handled: see [`set_now`](Self::set_now).
     now: DateTime<Utc>,
     /// Every change taken in the tests, as a store would hold them.
@@ -776,6 +791,7 @@ impl Book {
             unavailable: false,
             events: Vec::new(),
             orphaned_replaces: HashMap::new(),
+            unknown_at_venue: HashSet::new(),
             now: DateTime::UNIX_EPOCH,
             #[cfg(test)]
             mirror: Snapshot::default(),
@@ -862,6 +878,12 @@ impl Book {
         self.orders.get(&id)
     }
 
+    /// Whether a venue has said it doesn't know the live order, so an operator may
+    /// [`Input::Resolve`] it.
+    pub fn is_unknown_at_venue(&self, id: OrderId) -> bool {
+        self.unknown_at_venue.contains(&id)
+    }
+
     /// Whether the book holds an order sent to `venue`.
     pub fn holds_orders_for(&self, venue: &VenueId) -> bool {
         self.orders.values().any(|order| order.venue == *venue)
@@ -933,6 +955,7 @@ impl Book {
             Input::CancelAll { scope } => self.cancel_all(&scope, out),
             Input::CancelOrder { order } => self.cancel_order(order, out),
             Input::VenueStatusRequest { order } => self.venue_status_request(order, out),
+            Input::Resolve { order } => self.resolve(order, out),
             Input::VenueUp { venue } => self.venue_up(&venue, out),
             Input::Unsent { venue, downstream } => self.unsent(&venue, downstream, out),
             Input::Orphan { venue, downstream, replace } => self.orphan(&venue, downstream, replace),
@@ -953,6 +976,8 @@ impl Book {
             Input::DaysStarted { days } => self.days_started(days),
         }
         self.promote_orphaned_replaces();
+        // However the order got there: a mark is for a live order only.
+        self.unknown_at_venue.retain(|id| self.orders.get(id).is_some_and(|order| !order.status.is_done()));
         #[cfg(debug_assertions)]
         self.check();
     }
@@ -1019,6 +1044,10 @@ impl Book {
                 !self.downstream.contains_key(&waiting.downstream),
                 "a waiting orphaned replace isn't recorded yet"
             );
+        }
+        for id in &self.unknown_at_venue {
+            let order = self.orders.get(id).expect("an order marked unknown at its venue is held");
+            assert!(!order.status.is_done(), "done order {id:?} is marked unknown at its venue");
         }
         for (client, &used) in &self.used {
             let indexed = self.index.keys().filter(|(owner, _)| owner == client).count();

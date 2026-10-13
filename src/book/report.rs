@@ -8,6 +8,10 @@ use super::{
 /// Text(58) of the restatement telling a client the venue accepted an orphaned replace.
 const ORPHAN_REPLACED: &str = "replaced at the venue by a request sent before the gateway restarted";
 
+/// Text(58) of the Canceled report for an order an operator resolved: see
+/// [`Input::Resolve`](super::Input::Resolve).
+pub(super) const RESOLVED: &str = "canceled by the gateway: the venue doesn't know the order";
+
 /// OrdRejReason(103) Unknown order, 5 in FIX 4.2 and 4.4.
 const UNKNOWN_ORDER: u32 = 5;
 
@@ -42,7 +46,28 @@ impl Book {
         }
         tracing::error!(%venue, %downstream, %exec_id, order = %order.name, "venue doesn't know a live order");
         let text = format!("venue {venue} doesn't know live order {} ({downstream}, ExecID {exec_id})", order.name);
+        self.unknown_at_venue.insert(order.id);
         self.alarm(AlarmKind::UnknownAtVenue, text);
+    }
+
+    /// See [`Input::Resolve`](super::Input::Resolve). The order's requests the venue never
+    /// answered never will be, so they're settled, and a restart doesn't send them again.
+    pub(super) fn resolve(&mut self, id: OrderId, out: &mut Vec<Output>) {
+        if !self.unknown_at_venue.remove(&id) {
+            return tracing::debug!(order = id.0, "resolve for an order not marked unknown at its venue");
+        }
+        for (downstream, sent) in self.downstream.iter_mut().filter(|(_, sent)| sent.order == id && !sent.answered) {
+            sent.answered = true;
+            self.touched.sent.insert(downstream.clone());
+        }
+        let order = self.orders.get_mut(&id).expect("an order marked unknown at its venue is live");
+        tracing::warn!(order = %order.name, "canceled by an operator: unknown at its venue");
+        order.set_status(Status::Canceled);
+        self.risk.track(id, order.exposure());
+        self.touched.orders.insert(id);
+        let mut report = order.report(&order.request.cl_ord_id.clone(), ExecType::Canceled);
+        report.text = Some(RESOLVED.into());
+        out.push(Output::Report { client: order.client.clone(), report });
     }
 
     /// Not applied: someone has to find out from the venue what was filled.
@@ -73,16 +98,10 @@ impl Book {
             return self.resume_gateway_cancel(id, out);
         }
         let Sent { order: id, origin, cl_ord_id, orig_cl_ord_id, kind, answered, sent_at: _ } = sent;
-        let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
-        if order.venue != *venue {
-            return tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");
-        }
-        if let Some(changed) = dropped(venue, order, answered, &mut report) {
-            if changed {
-                self.touched.orders.insert(id);
-            }
+        if self.report_dropped(venue, id, answered, &mut report) {
             return;
         }
+        let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
         // A fill whose status is behind (PartiallyFilled sent before a cancel the order now
         // awaits, say) applies keeping the order's status, as a report without one would: it
         // then accepts and settles nothing.
@@ -102,6 +121,8 @@ impl Book {
             return self.overfill(venue, &report, id, qty);
         }
         self.touched.orders.insert(id);
+        // The venue knows the order after all.
+        self.unknown_at_venue.remove(&id);
         order.record_venue_order_id(report.venue_order_id.take(), accepted);
         if accepted {
             // The downstream the replace supersedes is settled like any other: its late reports
@@ -143,6 +164,45 @@ impl Book {
         let answers = answers_request.then_some((cl_ord_id, orig_cl_ord_id));
         let client_report = order.client_report(answers, report, rejected, (rise, price));
         out.push(Output::Report { client: order.client.clone(), report: client_report });
+    }
+
+    /// Whether `report` isn't applied to order `id`: it's about another venue's order, or it's
+    /// [`dropped`], keeping a VenueOrderID it gives the order. A repeat of where the order stands
+    /// is the venue knowing the order after all, and so is a status answer under its current
+    /// ClOrdID (asking again gets one), stale or not; another stale report may be a resend from
+    /// before the venue lost it. A fill on a done order is raised as an alarm.
+    fn report_dropped(&mut self, venue: &VenueId, id: OrderId, answered: bool, report: &mut VenueReport) -> bool {
+        let order = self.orders.get_mut(&id).expect("downstream ClOrdIDs point at booked orders");
+        if order.venue != *venue {
+            tracing::warn!(%venue, downstream = %report.downstream, exec_id = %report.exec_id, "execution report for another venue's order");
+            return true;
+        }
+        let Some(why) = dropped(venue, order, answered, report) else {
+            return false;
+        };
+        if why != Dropped::Stale || (report.exec_type == ExecType::Status && report.downstream == order.downstream) {
+            self.unknown_at_venue.remove(&id);
+        }
+        match why {
+            Dropped::Repeat { changed: true } => {
+                self.touched.orders.insert(id);
+            }
+            Dropped::Stale if order.status.is_done() && report.cum_qty > order.cum_qty => {
+                self.fill_on_done_order(venue, report, id);
+            }
+            Dropped::Repeat { changed: false } | Dropped::Stale => {}
+        }
+        true
+    }
+
+    /// Not applied: the order is done here (resolved, or a fill crossed the venue's cancel), and
+    /// someone has to settle the fill with the venue.
+    fn fill_on_done_order(&mut self, venue: &VenueId, report: &VenueReport, id: OrderId) {
+        let (downstream, exec_id, cum_qty) = (&report.downstream, &report.exec_id, report.cum_qty);
+        tracing::error!(%venue, %downstream, %exec_id, %cum_qty, "fill on a done order");
+        let name = &self.orders[&id].name;
+        let text = format!("venue {venue} reported done order {name} filled {cum_qty} (ExecID {exec_id}); not applied");
+        self.alarm(AlarmKind::FillOnDoneOrder, text);
     }
 }
 
@@ -251,9 +311,19 @@ pub(super) fn stale(order: &Order, answered: bool, report: &VenueReport) -> bool
         || (report.cum_qty == order.cum_qty && (report.last_qty > Decimal::ZERO || behind(order, answered, report)))
 }
 
+/// Why [`dropped`] dropped a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropped {
+    Stale,
+    /// `changed`: the report gave the order the VenueOrderID it lacked.
+    Repeat {
+        changed: bool,
+    },
+}
+
 /// `Some` if `report` is dropped, logged: [`stale`], or it [`repeats`] what the order has, its
-/// VenueOrderID taken if the order had none, with whether that changed the order.
-fn dropped(venue: &VenueId, order: &mut Order, answered: bool, report: &mut VenueReport) -> Option<bool> {
+/// VenueOrderID taken if the order had none.
+fn dropped(venue: &VenueId, order: &mut Order, answered: bool, report: &mut VenueReport) -> Option<Dropped> {
     let (downstream, exec_id) = (&report.downstream, &report.exec_id);
     if stale(order, answered, report) {
         // A restatement is the venue changing the order: losing one needs a look.
@@ -262,7 +332,7 @@ fn dropped(venue: &VenueId, order: &mut Order, answered: bool, report: &mut Venu
         } else {
             tracing::debug!(%venue, %downstream, %exec_id, "stale execution report dropped");
         }
-        return Some(false);
+        return Some(Dropped::Stale);
     }
     if !repeats(order, report) {
         return None;
@@ -270,7 +340,7 @@ fn dropped(venue: &VenueId, order: &mut Order, answered: bool, report: &mut Venu
     tracing::debug!(%venue, %downstream, %exec_id, "execution report changing nothing dropped");
     let known = order.venue_order_id.is_some();
     order.record_venue_order_id(report.venue_order_id.take(), false);
-    Some(!known && order.venue_order_id.is_some())
+    Some(Dropped::Repeat { changed: !known && order.venue_order_id.is_some() })
 }
 
 /// Whether `report` changes nothing: under the order's current downstream ClOrdID, at its

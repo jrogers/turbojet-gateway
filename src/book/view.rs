@@ -75,6 +75,8 @@ pub struct OrderView {
     /// A replace the venue hasn't answered.
     pub pending_replace: bool,
     pub gateway_cancel: Option<GatewayCancelView>,
+    /// A venue said it doesn't know the order; an operator may resolve it.
+    pub unknown_at_venue: bool,
     /// When the order was sent to its venue.
     pub created: DateTime<Utc>,
 }
@@ -260,6 +262,7 @@ impl Book {
             pending_cancel: self.outstanding_cancel(order).is_some(),
             pending_replace: order.pending.is_some(),
             gateway_cancel: order.gateway_cancel.as_ref().map(GatewayCancelView::from),
+            unknown_at_venue: self.unknown_at_venue.contains(&order.id),
             created: self.downstream.get(&order.name).expect("an order's original request is recorded").sent_at,
         }
     }
@@ -312,6 +315,9 @@ pub enum AlarmKind {
     UnknownOrder,
     /// A venue answered a status request saying it doesn't know an order the book has live.
     UnknownAtVenue,
+    /// A venue reported a fill on an order the book has as done: not applied; someone has to
+    /// settle it with the venue.
+    FillOnDoneOrder,
     /// A venue's session reset its store, so requests it never stored failed rather than go again.
     VenueStoreReset,
 }
