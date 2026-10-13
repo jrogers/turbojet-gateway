@@ -242,12 +242,18 @@ pub(super) async fn reload(
     let service = state.service()?;
     let allowed = caller.require(Role::Admin).and(parsed);
     let mutation = Mutation { action: "reload", target: None, params: serde_json::Value::Null, reason: body.reason };
-    audited(&state, &caller, mutation, allowed, async move { reloaded(service.reload()) }).await
+    let reload = async move {
+        let reloaded = tokio::task::spawn_blocking(move || service.reload())
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("the reload failed: {e}")))?;
+        answer(reloaded)
+    };
+    audited(&state, &caller, mutation, allowed, reload).await
 }
 
 /// A reload's answer: all of it taken, or 422 saying which file was kept and why, which half was
 /// taken, and the warnings.
-fn reloaded(reloaded: Reloaded) -> Outcome<Json<ReloadView>> {
+fn answer(reloaded: Reloaded) -> Outcome<Json<ReloadView>> {
     let Reloaded { sessions, config, warnings } = reloaded;
     let (sessions, config) = match (sessions, config) {
         (Ok(sessions), Ok(config)) => {

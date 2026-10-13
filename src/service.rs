@@ -74,6 +74,9 @@ pub struct Service {
     store: Option<Store>,
     /// The operator API, with `[api]`: set once the acceptor serves, taken at shutdown.
     api: Mutex<Option<api::Server>>,
+    /// Held for the whole of a reload: SIGHUP and the API can each start one, and only the
+    /// sessions file's half locks itself, so an older jetbridge.toml could land over a newer one.
+    reloading: Mutex<()>,
 }
 
 impl Drop for Service {
@@ -144,6 +147,7 @@ impl Service {
             writing,
             store,
             api: Mutex::new(None),
+            reloading: Mutex::new(()),
         };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
@@ -221,7 +225,12 @@ impl Service {
     /// reload, so a venue added to both files at once can be routed to. A changed schedule or
     /// `day_end` applies from each session's next trading day. Returns what it logged: each file's
     /// changes or why it was kept, and any warning about what was taken.
+    ///
+    /// One reload runs at a time, the others waiting: call it off the async workers
+    /// (`spawn_blocking`).
     pub fn reload(&self) -> Reloaded {
+        // Nothing panics while holding it but a reload's own bug; the next reload goes ahead.
+        let _reloading = self.reloading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let sessions = self.sessions.reload_all(Some(&self.acceptor), &self.initiators).map_err(|e| e.to_string());
         match &sessions {
             Ok(changes) => {
@@ -572,6 +581,25 @@ mod tests {
         assert!(reloaded.config.is_err());
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
         assert!(warning.contains("keeping the users in use"), "{warning}");
+        service.shutdown().await;
+        serving.abort();
+    }
+
+    /// One reload waits for another to finish, so the older file can't land over the newer.
+    #[tokio::test]
+    async fn reloads_run_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"\n");
+        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let held = service.reloading.lock().unwrap();
+        let reloading = service.clone();
+        let reload = tokio::task::spawn_blocking(move || reloading.reload());
+        // A blocking sleep: the guard can't be held across an await.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!reload.is_finished());
+        drop(held);
+        assert!(reload.await.unwrap().config.is_ok());
         service.shutdown().await;
         serving.abort();
     }

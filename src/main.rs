@@ -233,7 +233,11 @@ fn reload_on_hangup(service: Arc<Service>) -> tokio::task::JoinHandle<()> {
             return;
         };
         while hangup.recv().await.is_some() {
-            service.reload();
+            // Off the async workers: it reads files, and waits for a reload the API started.
+            let service = service.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || service.reload()).await {
+                warn!("the reload failed: {e}");
+            }
         }
     });
     #[cfg(not(unix))]
