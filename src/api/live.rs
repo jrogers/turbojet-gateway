@@ -55,6 +55,11 @@ const _: () = assert!(MAX_LIVE_SOCKETS_PER_USER <= MAX_LIVE_SOCKETS);
 /// closes its socket.
 const MIN_SNAPSHOT_GAP: Duration = Duration::from_secs(1);
 
+/// Pings, one each [`RECHECK`], a client may leave unanswered before its socket is closed: on a
+/// quiet gateway nothing else is sent, and a peer gone without a word would otherwise hold its
+/// connection until its session ends, or for ever with a token.
+const MAX_SILENT_TICKS: u32 = 3;
+
 /// How long a send may wait for a client that isn't reading before its socket is dropped, so a
 /// stalled client can't hold its task, and its connection, for ever.
 const SEND_WAIT: Duration = Duration::from_secs(30);
@@ -195,7 +200,7 @@ struct SessionChange {
 
 /// What the socket does next.
 enum Step {
-    Send(String),
+    Send(Message),
     /// A channel lagged: skip to its end and send a snapshot.
     Snapshot,
     Close(u16, &'static str),
@@ -208,6 +213,8 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
     info!(user = viewer.user, ip = %viewer.ip, "API live socket opened");
     let mut stopping = state.stopping.subscribe();
     let mut recheck = tokio::time::interval_at(Instant::now() + RECHECK, RECHECK);
+    // Its pongs, at least, every RECHECK.
+    let mut last_received = Instant::now();
     let mut last_snapshot: Option<Instant> = None;
     let mut step = Step::Snapshot;
     let why = loop {
@@ -221,9 +228,8 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
             };
         }
         match step {
-            Step::Send(text) => {
-                if !matches!(tokio::time::timeout(SEND_WAIT, socket.send(Message::Text(text.into()))).await, Ok(Ok(())))
-                {
+            Step::Send(message) => {
+                if !matches!(tokio::time::timeout(SEND_WAIT, socket.send(message)).await, Ok(Ok(()))) {
                     break "the client stopped reading";
                 }
             }
@@ -237,8 +243,11 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
         step = tokio::select! {
             _ = stopping.wait_for(|stopping| *stopping) => Step::Close(close_code::AWAY, "the gateway is stopping"),
             _ = recheck.tick() => match state.auth.recheck(&viewer.headers, viewer.ip) {
-                Ok(()) => Step::Nothing,
                 Err(refusal) => Step::Close(close_code::POLICY, refusal.message()),
+                Ok(()) if last_received.elapsed() >= RECHECK * MAX_SILENT_TICKS => {
+                    Step::Close(close_code::AWAY, "no answer to pings")
+                }
+                Ok(()) => Step::Send(Message::Ping(Default::default())),
             },
             event = events.gateway.recv() => match event {
                 Ok(event) => json(&event),
@@ -256,7 +265,10 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
                 Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
             },
             message = socket.recv() => match message {
-                Some(Ok(_)) => Step::Nothing,
+                Some(Ok(_)) => {
+                    last_received = Instant::now();
+                    Step::Nothing
+                }
                 None | Some(Err(_)) => break "the client went",
             },
         };
@@ -273,7 +285,8 @@ fn snapshot(state: &State) -> Step {
 }
 
 fn json(value: &impl Serialize) -> Step {
-    Step::Send(serde_json::to_string(value).expect("the views serialize: their maps have string keys"))
+    let text = serde_json::to_string(value).expect("the views serialize: their maps have string keys");
+    Step::Send(Message::Text(text.into()))
 }
 
 /// `event` as the socket sends it; `None` for a kind newer than this code, which isn't sent.
