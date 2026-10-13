@@ -302,8 +302,8 @@ pub(crate) struct Bound {
 
 impl Bound {
     /// Binds `config.listen`, or takes `given`, loads `config.tls`'s certificate and key and
-    /// `config.users`, and opens the audit log in `config.audit_dir`, creating it if missing. The audit log stays the
-    /// one opened here until a restart.
+    /// `config.users`, and opens the audit log in `config.audit_dir`, creating it if missing. The
+    /// audit log stays the one opened here until a restart.
     pub(crate) async fn bind(config: &Api, given: Option<std::net::TcpListener>) -> Result<Self, Error> {
         let auth = Arc::new(Auth::load(config).map_err(Error::new)?);
         let audit = Audit::open(&config.audit_dir, config.audit_retention)
@@ -708,11 +708,13 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn a_mutation_whose_line_fails_doesnt_run() {
             let fixture = fixture();
-            let _unwritable = make_unwritable(fixture.dir.path());
             let reason = r#"{"reason":"testing"}"#;
-            assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::SERVICE_UNAVAILABLE);
-            assert!(!fixture.switch.load(Ordering::SeqCst));
-            assert!(fixture.lines().is_empty());
+            if let Some(unwritable) = make_unwritable(fixture.dir.path()) {
+                assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::SERVICE_UNAVAILABLE);
+                assert!(!fixture.switch.load(Ordering::SeqCst));
+                assert!(fixture.lines().is_empty());
+                drop(unwritable);
+            }
 
             std::fs::remove_dir_all(fixture.dir.path()).unwrap();
             assert_eq!(fixture.flip(&fixture.operator, reason).await, StatusCode::SERVICE_UNAVAILABLE);

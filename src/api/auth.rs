@@ -1264,7 +1264,7 @@ mod tests {
         let (auth, _) = auth(users(), false);
         let app = app(&auth);
         let (cookie, csrf) = session(&app, "alice", "alice secret").await;
-        let _unwritable = crate::audit::tests::make_unwritable(app.dir.path());
+        let Some(_unwritable) = crate::audit::tests::make_unwritable(app.dir.path()) else { return };
         let answer = login(&app, "bob", "hunter2hunter2").await;
         assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!answer.headers.contains_key(SET_COOKIE));

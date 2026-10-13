@@ -36,9 +36,10 @@
 //! created readable by its owner only, and its directory synced. One line is written at a time, on
 //! a blocking thread. With a retention, the first line of each day deletes the day files whose
 //! whole day ended longer ago than that; nothing else in the directory is touched. At open, a last
-//! line cut short (by a crash) in the newest day's file is ended, so the next line starts on its
-//! own: a crash tears only the file being written, the newest. A read goes back from the newest
-//! day only as far as it needs.
+//! line cut short (by a crash) in the newest two days' files is ended, so the next line starts on
+//! its own: a crash tears only the file being written, the newest, or the day before's when a line
+//! stamped just before midnight waited behind one stamped just after. A read goes back from the
+//! newest day only as far as it needs.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -158,13 +159,13 @@ struct Budget {
 }
 
 impl Audit {
-    /// The audit log in `dir`, created if missing, the newest day's torn last line ended, keeping
-    /// day files `retention` after their day ends (for ever if `None`). Warns if others may read
-    /// or write the directory.
+    /// The audit log in `dir`, created if missing, the newest two days' torn last lines ended,
+    /// keeping day files `retention` after their day ends (for ever if `None`). Warns if others
+    /// may read or write the directory.
     ///
     /// # Errors
     ///
-    /// The directory can't be created or listed, the newest file can't be read or ended, or
+    /// The directory can't be created or listed, a file to end can't be read or ended, or
     /// `retention` is too long to count with.
     pub fn open(dir: &Path, retention: Option<Duration>) -> io::Result<Self> {
         let retention = retention.map(TimeDelta::from_std).transpose().map_err(io::Error::other)?;
@@ -177,8 +178,8 @@ impl Audit {
                 warn!(dir = %dir.display(), "the audit log is open to others (mode {:o}): chmod 700 it", mode & 0o777);
             }
         }
-        if let Some((_, newest)) = day_files(dir)?.pop() {
-            end_torn_line(&newest)?;
+        for (_, path) in day_files(dir)?.iter().rev().take(2) {
+            end_torn_line(path)?;
         }
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -248,7 +249,8 @@ impl Audit {
         false
     }
 
-    /// The last `limit` entries (at most [`MAX_READ`]) at or after `since`, in the order written.
+    /// The last `limit` entries (at most [`MAX_READ`]) at or after `since`, in the order written
+    /// within a day, days oldest first.
     /// Lines that don't parse (one cut short by a crash) or are over [`MAX_LINE_LEN`] are passed
     /// over. No directory yet is no entries.
     ///
@@ -583,26 +585,35 @@ pub(crate) mod tests {
         assert!(dir.path().join("audit-2026-10-01.jsonl").exists());
         audit.record(&entry("2026-10-12T09:00:00Z", "allowed")).await.unwrap();
         assert_eq!(names(), with(&["audit-2026-10-11.jsonl", "audit-2026-10-12.jsonl"]));
+        // A line stamped the day before the last written is no new day.
+        std::fs::write(dir.path().join("audit-2026-10-01.jsonl"), &line).unwrap();
+        audit.record(&entry("2026-10-11T23:59:59Z", "allowed")).await.unwrap();
+        assert!(dir.path().join("audit-2026-10-01.jsonl").exists());
     }
 
-    /// A last line torn by a crash, in the newest day's file, is ended at open, so the next line
-    /// reads back whole; an older day's file isn't touched. A missing file reads as empty.
+    /// A last line torn by a crash, in the newest two days' files, is ended at open, so the next
+    /// line reads back whole: the day before's too, as a line stamped just before midnight may be
+    /// written after one stamped just after. An older day's file isn't touched. A missing
+    /// directory reads as empty.
     #[tokio::test]
     async fn a_torn_last_line_is_ended_at_open() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Audit::open(dir.path(), None).unwrap();
-        audit.record(&entry("2026-10-10T09:00:00Z", "allowed")).await.unwrap();
-        audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.unwrap();
-        let (older, newest) = (day(dir.path(), "2026-10-10"), day(dir.path(), "2026-10-11"));
-        for path in [&older, &newest] {
+        for time in ["2026-10-09T09:00:00Z", "2026-10-10T09:00:00Z", "2026-10-11T09:00:00Z"] {
+            audit.record(&entry(time, "allowed")).await.unwrap();
+        }
+        let ninth = day(dir.path(), "2026-10-09");
+        for path in [&ninth, &day(dir.path(), "2026-10-10"), &day(dir.path(), "2026-10-11")] {
             let text = std::fs::read_to_string(path).unwrap();
             std::fs::write(path, format!("{text}{{\"time\":\"2026-")).unwrap();
         }
         let audit = Audit::open(dir.path(), None).unwrap();
-        assert!(!std::fs::read_to_string(&older).unwrap().ends_with('\n'));
+        assert!(!std::fs::read_to_string(&ninth).unwrap().ends_with('\n'));
+        audit.record(&entry("2026-10-10T23:59:59Z", "allowed")).await.unwrap();
         audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.unwrap();
-        let read = audit.read(Some("2026-10-11T00:00:00Z".parse().unwrap()), MAX_READ).await.unwrap();
-        assert_eq!(read, [entry("2026-10-11T09:00:00Z", "allowed"), entry("2026-10-11T10:00:00Z", "allowed")]);
+        let read = audit.read(Some("2026-10-10T00:00:00Z".parse().unwrap()), MAX_READ).await.unwrap();
+        let times = ["2026-10-10T09:00:00Z", "2026-10-10T23:59:59Z", "2026-10-11T09:00:00Z", "2026-10-11T10:00:00Z"];
+        assert_eq!(read, times.map(|time| entry(time, "allowed")));
         std::fs::remove_dir_all(dir.path()).unwrap();
         assert!(audit.read(None, MAX_READ).await.unwrap().is_empty());
     }
@@ -654,10 +665,11 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit = Audit::open(dir.path(), None).unwrap();
         audit.record(&entry("2026-10-11T09:00:00Z", "allowed")).await.unwrap();
-        let unwritable = make_unwritable(dir.path());
-        assert!(audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.is_err());
-        assert!(audit.record(&entry("2026-10-12T10:00:00Z", "allowed")).await.is_err());
-        drop(unwritable);
+        if let Some(unwritable) = make_unwritable(dir.path()) {
+            assert!(audit.record(&entry("2026-10-11T10:00:00Z", "allowed")).await.is_err());
+            assert!(audit.record(&entry("2026-10-12T10:00:00Z", "allowed")).await.is_err());
+            drop(unwritable);
+        }
         let other = tempfile::tempdir().unwrap();
         std::fs::write(other.path().join("file"), "").unwrap();
         assert!(Audit::open(&other.path().join("file/audit"), None).is_err());
@@ -683,13 +695,21 @@ pub(crate) mod tests {
 
     /// Makes the audit log in `dir` unwritable, its files and the directory (so no day's file can
     /// be created), until the guard returned is dropped, so the directory can be cleaned up.
+    /// `None` if it's still writable, as for root, which permissions don't stop: the test proves
+    /// nothing there.
     #[must_use]
-    pub(crate) fn make_unwritable(dir: &Path) -> Unwritable<'_> {
+    pub(crate) fn make_unwritable(dir: &Path) -> Option<Unwritable<'_>> {
         for file in std::fs::read_dir(dir).unwrap() {
             set_readonly(&file.unwrap().path(), true).unwrap();
         }
         set_readonly(dir, true).unwrap();
-        Unwritable(dir)
+        let unwritable = Unwritable(dir);
+        let probe = dir.join("probe");
+        if File::create(&probe).is_ok() {
+            std::fs::remove_file(&probe).unwrap();
+            return None;
+        }
+        Some(unwritable)
     }
 
     pub(crate) struct Unwritable<'a>(&'a Path);
