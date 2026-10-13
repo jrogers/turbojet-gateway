@@ -639,7 +639,7 @@ async fn unknown_downstreams_are_those_without_a_request_sent() {
 
 /// Order `id` of `client` written in `day`, done or live, with a request sent at `sent_at` and its
 /// ClOrdID.
-fn dated(id: u64, client: &ClientId, day: Option<Day>, done: bool, sent_at: DateTime<Utc>) -> Changes {
+pub(crate) fn dated(id: u64, client: &ClientId, day: Option<Day>, done: bool, sent_at: DateTime<Utc>) -> Changes {
     let mut row = order(id, client, false);
     row.status = if done { Status::Filled } else { Status::New };
     let sent = Sent {
@@ -662,7 +662,7 @@ fn dated(id: u64, client: &ClientId, day: Option<Day>, done: bool, sent_at: Date
 }
 
 /// `client`'s current day is `day`.
-fn current(client: &ClientId, day: Day) -> Changes {
+pub(crate) fn current(client: &ClientId, day: Day) -> Changes {
     Changes { days: vec![(client.clone(), Today { day, began: Some(time(0, 0)) })], ..Changes::default() }
 }
 

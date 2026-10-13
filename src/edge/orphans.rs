@@ -18,6 +18,10 @@
 //! Each orphan is recorded once handled (see [`Changes::orphans`]), so a restart doesn't take it
 //! again.
 //!
+//! A venue's store may still hold requests of orders [`Store::prune`] has deleted, whose
+//! ClOrdIDs the database no longer knows. Those sent no later than [`Store::pruned_through`], with
+//! a minute's slack, aren't looked up as orphans: they're counted as pruned, and left alone.
+//!
 //! The scan also finds the converse: requests the database has as sent, unanswered, that the
 //! venue's session never stored, so never sent (the gateway stopped after their change committed,
 //! before the session stored them). They go at the venue's next logon as they were
@@ -68,7 +72,17 @@ pub struct Orphans {
     pub amendments: usize,
     /// Requests the database has that the venues' sessions never stored, to send at their logons.
     pub unsent: usize,
+    /// Requests sent no later than the orders pruned from the database, with a minute's slack,
+    /// not looked up: the pruned orders', and any of orders the book holds sent as early.
+    pub pruned: usize,
 }
+
+/// How long after [`Store::pruned_through`] a stored request's SendingTime(52) may be and still
+/// be taken for a pruned order's: that time is the book's, and Turbojet stamps SendingTime a
+/// little later, as it encodes. Safe because an orphan was sent just before the last stop, and a
+/// pruned order's requests in a run before it, over a day before, retention being at least a day
+/// (orphans of earlier stops were handled and recorded at their starts).
+pub(super) const PRUNED_SLACK: Duration = Duration::from_secs(60);
 
 /// Requests the database has as sent that a venue's session never stored, waiting for its logon:
 /// see [`Gateway::unsent_inputs`].
@@ -101,6 +115,8 @@ struct Request {
     seq: u64,
     kind: Kind,
     cl_ord_id: CompactString,
+    /// Its SendingTime(52), if it reads.
+    sent: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +144,7 @@ impl Gateway {
         venues: Vec<(String, SessionId, Arc<dyn SessionStorage>)>,
     ) -> io::Result<Orphans> {
         let mut found = Orphans::default();
+        let pruned_through = store.pruned_through().await?.map(|through| through + PRUNED_SLACK);
         for (venue, id, storage) in venues {
             let venue: VenueId = venue.as_str().into();
             let in_store = |e: io::Error| io::Error::other(format!("venue {venue}'s store: {e}"));
@@ -142,11 +159,18 @@ impl Gateway {
                      its files kept",
                 )));
             }
-            let requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
+            let mut requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
             self.check_prefix(&venue, &requests)?;
-            let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
+            let stored: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
             let created = log.created_at().map(DateTime::<Utc>::from);
-            found.unsent += self.find_unsent(&venue, &ids, created, log.next_outgoing());
+            found.unsent += self.find_unsent(&venue, &stored, created, log.next_outgoing());
+            // After find_unsent, which needs every stored request: one of a held order may be as
+            // old as a pruned order's. Of a pruned order, all its requests are this old, its
+            // amends included.
+            let before = requests.len();
+            requests.retain(|request| !request.sent.zip(pruned_through).is_some_and(|(sent, through)| sent <= through));
+            found.pruned += before - requests.len();
+            let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
             let chains = chains(requests);
             ids.extend(chains.keys().cloned());
             let unknown: HashSet<CompactString> = store.unknown_downstreams(&ids).await?.into_iter().collect();
@@ -166,6 +190,7 @@ impl Gateway {
             orders = found.orders,
             amendments = found.amendments,
             unsent = found.unsent,
+            pruned = found.pruned,
             "looked for venue requests the database lacks, and the converse"
         );
         Ok(found)
@@ -462,7 +487,12 @@ fn request(seq: u64, msg: &Message) -> Option<Request> {
         _ => return None,
     };
     let cl_ord_id = msg.get(tags::CL_ORD_ID)?;
-    issued(cl_ord_id).then(|| Request { seq, kind, cl_ord_id: cl_ord_id.into() })
+    issued(cl_ord_id).then(|| Request {
+        seq,
+        kind,
+        cl_ord_id: cl_ord_id.into(),
+        sent: msg.opt_field::<UtcTimestamp>(tags::SENDING_TIME).ok().flatten().map(DateTime::from),
+    })
 }
 
 /// `requests` by their order's root ClOrdID, each order's in store order.

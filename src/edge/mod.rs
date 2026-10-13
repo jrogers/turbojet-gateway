@@ -2550,19 +2550,21 @@ pub(crate) mod tests {
         assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err(), "sent twice");
     }
 
-    /// `messages` as `id`'s session sent them, in `storage`.
+    /// `messages` as `id`'s session sent them, in `storage`, sent now unless they say when.
     fn store_sent(storage: &MemoryStorage, id: &SessionId, messages: &[Message]) {
         let mut log = storage.open(id).unwrap();
         // As a session records at its first logon.
         log.set_created_at(UtcTimestamp::from(DateTime::<Utc>::UNIX_EPOCH)).unwrap();
         for (seq, msg) in (1..).zip(messages) {
+            let sending_time =
+                msg.get(tags::SENDING_TIME).map_or_else(|| UtcTimestamp::now().to_string(), str::to_owned);
             let msg = msg
                 .clone()
                 .with(tags::BEGIN_STRING, "FIX.4.4")
                 .with(tags::MSG_SEQ_NUM, seq)
                 .with(tags::SENDER_COMP_ID, id.sender_comp_id.as_str())
                 .with(tags::TARGET_COMP_ID, id.target_comp_id.as_str())
-                .with(tags::SENDING_TIME, UtcTimestamp::now());
+                .with(tags::SENDING_TIME, sending_time);
             log.record_outgoing(seq, Some(&codec::encode(&msg).unwrap())).unwrap();
         }
     }
@@ -2619,7 +2621,7 @@ pub(crate) mod tests {
         store_sent(&venues, &id(), &[orphan, order("OLDOLD2"), order("FOREIGN1")]);
 
         let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues.clone())]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 3, orders: 1, amendments: 0, unsent: 0 });
+        assert_eq!(found, Orphans { scanned: 3, orders: 1, amendments: 0, unsent: 0, pruned: 0 });
         let (addr, mut events) = venue_expecting(4).await;
         let venue_store: Arc<dyn SessionStorage> = venues.clone();
         start_venue(&gateway, &addr, venues);
@@ -2678,7 +2680,7 @@ pub(crate) mod tests {
         (replace.symbol, replace.order_qty, replace.price) = (Some("AAPL".into()), Some(200.into()), Some(10.into()));
         store_sent(&venues, &id(), &[order("OLDOLD5"), replace.to_message()]);
         let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 2, orders: 1, amendments: 0, unsent: 0 });
+        assert_eq!(found, Orphans { scanned: 2, orders: 1, amendments: 0, unsent: 0, pruned: 0 });
         let state = gateway.lock();
         let [orphan] = state.orphan_cancels[VENUE].as_slice() else { panic!() };
         assert_eq!(orphan.cancel.get(tags::ORIG_CL_ORD_ID), Some("OLDOLD5-1"));
@@ -2767,6 +2769,50 @@ pub(crate) mod tests {
         assert!(gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), recorded)]).await.is_ok());
     }
 
+    /// Requests a venue's session stored of an order the database has since pruned aren't
+    /// orphans, though the database no longer knows them, even stamped a little after the book's
+    /// send time; an orphan sent past that slack still is.
+    #[tokio::test]
+    async fn requests_of_pruned_orders_arent_orphans() {
+        use crate::store::tests::{current, dated};
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let at = |minutes: i64| DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::minutes(minutes);
+        let funda = crate::book::ClientId::from("FUNDA");
+        let (day1, day3) = (crate::book::Day(at(60)), crate::book::Day(at(180)));
+        let mut pruned = dated(1, &funda, Some(day1), true, at(5));
+        pruned.sent[0].0 = "OLDOLD1".into();
+        let mut amend = pruned.sent[0].clone();
+        (amend.0, amend.1.sent_at) = ("OLDOLD1-1".into(), at(7));
+        pruned.sent.push(amend);
+        // The newest order, which pruning keeps.
+        let mut kept = dated(2, &funda, Some(day1), true, at(8));
+        kept.sent[0].0 = "OLDOLD2".into();
+        store.write(&[pruned, kept, current(&funda, day3)]).await.unwrap();
+        assert_eq!(store.prune(at(120), 10).await.unwrap().orders, 1);
+        assert_eq!(store.pruned_through().await.unwrap(), Some(at(7)));
+
+        let gateway = restarted(&store, "NEWNEW").await;
+        let venues = Arc::new(MemoryStorage::new());
+        let stamped = |msg: Message, at: DateTime<Utc>| msg.with(tags::SENDING_TIME, UtcTimestamp::from(at));
+        let late = chrono::Duration::seconds(30);
+        let cancel = v44::OrderCancelRequest::new("OLDOLD1", "OLDOLD1-1", v44::Side::Buy, UtcTimestamp::now());
+        store_sent(
+            &venues,
+            &id(),
+            &[
+                stamped(order("OLDOLD1"), at(5) + late),
+                stamped(cancel.to_message(), at(7) + late),
+                stamped(order("OLDOLD2"), at(10)),
+                stamped(order("OLDOLD3"), at(7) + orphans::PRUNED_SLACK + chrono::Duration::milliseconds(1)),
+            ],
+        );
+        let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap();
+        assert_eq!(found, Orphans { scanned: 4, orders: 1, amendments: 0, unsent: 0, pruned: 2 });
+        let state = gateway.lock();
+        let [orphan] = state.orphan_cancels[VENUE].as_slice() else { panic!() };
+        assert_eq!(orphan.cancel.get(tags::ORIG_CL_ORD_ID), Some("OLDOLD3"));
+    }
+
     /// Our session with the venue, as the gateway's initiator has it.
     fn id() -> SessionId {
         SessionId::new("FIX.4.4", "JETBRIDGE", "VENUE")
@@ -2795,7 +2841,7 @@ pub(crate) mod tests {
         orphan.symbol = Some("AAPL".into());
         store_sent(&venues, &id, &[orphan.to_message()]);
         let found = after.cancel_orphans(&store, vec![(VENUE.into(), id, venues.clone())]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 1, orders: 0, amendments: 1, unsent: 0 });
+        assert_eq!(found, Orphans { scanned: 1, orders: 0, amendments: 1, unsent: 0, pruned: 0 });
         assert_eq!(unsent(&after), [true]);
         after.committed().await;
         assert!(store.unknown_downstreams(&["OLDOLD1-1".into()]).await.unwrap().is_empty(), "recorded");
