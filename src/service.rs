@@ -219,6 +219,12 @@ impl Service {
         self.acceptor.subscribe()
     }
 
+    /// What happens to the venues' sessions from now on, those a reload starts later included:
+    /// see [`Initiators::subscribe`].
+    pub fn venue_events(&self) -> broadcast::Receiver<SessionEvent> {
+        self.initiators.subscribe()
+    }
+
     /// The venues whose initiators are running, by name (`[initiator.NAME]`), in order.
     pub fn venues(&self) -> Vec<String> {
         self.initiators.names()

@@ -1,10 +1,10 @@
 //! `GET /api/live` [viewer]: a websocket of what changes, for a console. It sends a snapshot,
 //! `{"type":"snapshot", sessions, orders, orders_next, blocked, unavailable}`, then each event as
 //! it happens: the gateway's (`order`, `blocked`, `unblocked` and `alarm`; see [`GatewayEvent`])
-//! and the client sessions' (`session`). What the client sends is ignored.
+//! and the client and venue sessions' (`session`). What the client sends is ignored.
 //!
 //! The events are subscribed to before the snapshot is read, so none falls between the two; the
-//! first few may repeat what the snapshot already shows. A socket that falls behind either
+//! first few may repeat what the snapshot already shows. A socket that falls behind any
 //! channel's capacity gets a new snapshot and carries on, rather than the gateway waiting on it:
 //! the channels bound what a slow socket costs.
 //!
@@ -46,6 +46,7 @@ const MAX_RECEIVED_LEN: usize = 4_096;
 pub(super) struct Events {
     gateway: broadcast::Receiver<GatewayEvent>,
     clients: broadcast::Receiver<SessionEvent>,
+    venues: broadcast::Receiver<SessionEvent>,
 }
 
 /// Whose socket it is, and what its rechecks authenticate.
@@ -65,7 +66,11 @@ pub(super) async fn live(
 ) -> Result<Response, ApiError> {
     let upgrade = upgrade.map_err(|e| ApiError::new(e.status(), e.body_text()))?;
     let service = state.service()?;
-    let events = Events { gateway: service.gateway().subscribe(), clients: service.client_events() };
+    let events = Events {
+        gateway: service.gateway().subscribe(),
+        clients: service.client_events(),
+        venues: service.venue_events(),
+    };
     let viewer = Viewer { user: caller.user, ip: caller.ip, headers };
     let upgrade = upgrade.max_message_size(MAX_RECEIVED_LEN).max_frame_size(MAX_RECEIVED_LEN);
     Ok(upgrade.on_upgrade(move |socket| run(socket, state, events, viewer)))
@@ -140,6 +145,11 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
             },
             event = events.clients.recv() => match event {
                 Ok(event) => session_change(SessionSide::Client, &event).map_or(Step::Nothing, |change| json(&change)),
+                Err(RecvError::Lagged(_)) => snapshot(&state),
+                Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
+            },
+            event = events.venues.recv() => match event {
+                Ok(event) => session_change(SessionSide::Venue, &event).map_or(Step::Nothing, |change| json(&change)),
                 Err(RecvError::Lagged(_)) => snapshot(&state),
                 Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
             },
@@ -306,6 +316,22 @@ mod tests {
         until(&mut client, |message| message["event"] == "logged_on").await;
     }
 
+    /// A venue's session arrives too: NASDAQ, down, paused and resumed.
+    #[tokio::test]
+    async fn a_venues_session_arrives() {
+        let fixture = fixture().await;
+        let (mut client, _addr, _stop) = open(&fixture).await;
+        next_json(&mut client).await;
+        let handle = fixture.service.venue_session("NASDAQ").unwrap();
+        handle.pause(None);
+        let paused = until(&mut client, |message| message["type"] == "session").await;
+        let id = handle.id().to_string();
+        assert_eq!(paused, serde_json::json!({ "type": "session", "side": "venue", "id": id, "event": "paused" }));
+        handle.resume();
+        let resumed = until(&mut client, |message| message["type"] == "session").await;
+        assert_eq!(resumed["event"], "resumed");
+    }
+
     /// A socket that falls behind gets a snapshot, then what's still in the channel: here a
     /// channel of one, sent two events before the socket reads.
     #[tokio::test]
@@ -313,7 +339,9 @@ mod tests {
         let fixture = fixture().await;
         let (gateway, _) = broadcast::channel(1);
         let (clients, _) = broadcast::channel(1);
-        let events = Mutex::new(Some(Events { gateway: gateway.subscribe(), clients: clients.subscribe() }));
+        let (venues, _) = broadcast::channel(1);
+        let events = Events { gateway: gateway.subscribe(), clients: clients.subscribe(), venues: venues.subscribe() };
+        let events = Mutex::new(Some(events));
         let (state, headers) = (fixture.state.clone(), HeaderMap::new());
         let viewer = Mutex::new(Some(Viewer { user: "vic".into(), ip: [127, 0, 0, 1].into(), headers }));
         let take = Arc::new(move || (events.lock().unwrap().take().unwrap(), viewer.lock().unwrap().take().unwrap()));
