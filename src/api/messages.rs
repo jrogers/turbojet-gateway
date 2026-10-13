@@ -330,11 +330,7 @@ impl Cursor {
 /// of hits or has read `bytes_max`: see the module documentation. A cursor that isn't at a record
 /// of one of those files is refused (400).
 fn scan(dir: &Path, search: &Search, bytes_max: u64) -> Result<Page, ApiError> {
-    let files = FileMessageLog::files(dir).map_err(|e| {
-        error!("cannot list the message log {}: {e}", dir.display());
-        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot list the message log")
-    })?;
-    let files: Vec<LogFile> = files.into_iter().filter(|file| search.range.covers_day(file.day)).collect();
+    let files: Vec<LogFile> = list(dir)?.into_iter().filter(|file| search.range.covers_day(file.day)).collect();
     let (first, start) = match search.after {
         None => (0, 0),
         Some(cursor) => {
@@ -342,7 +338,7 @@ fn scan(dir: &Path, search: &Search, bytes_max: u64) -> Result<Page, ApiError> {
             (index.ok_or_else(gone)?, cursor.position)
         }
     };
-    let mut reading = Reading { search, bytes_max, bytes: 0, messages: Vec::new() };
+    let mut reading = Reading { dir, search, bytes_max, bytes: 0, messages: Vec::new() };
     for (index, file) in files.iter().enumerate().skip(first) {
         let from_cursor = index == first && search.after.is_some();
         let start = if index == first { start } else { 0 };
@@ -353,6 +349,19 @@ fn scan(dir: &Path, search: &Search, bytes_max: u64) -> Result<Page, ApiError> {
     Ok(Page { messages: reading.messages, next: None })
 }
 
+/// The log's files, oldest first. While a file is being compressed, both its `.log` and its
+/// `.log.gz` are there: it's kept once, as the `.log.gz` (whole once it's there: it's renamed into
+/// place), or as the `.log` without the gzip feature, which can't read the other.
+fn list(dir: &Path) -> Result<Vec<LogFile>, ApiError> {
+    let mut files = FileMessageLog::files(dir).map_err(|e| {
+        error!("cannot list the message log {}: {e}", dir.display());
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot list the message log")
+    })?;
+    files.sort_by_key(|file| (file.day, file.number, file.compressed != cfg!(feature = "gzip")));
+    files.dedup_by_key(|file| (file.day, file.number));
+    Ok(files)
+}
+
 /// A cursor whose file isn't among the range's, or has gone (deleted for its age) since.
 fn gone() -> ApiError {
     bad("after names no file of this search's range: start again")
@@ -360,6 +369,7 @@ fn gone() -> ApiError {
 
 /// A scan under way.
 struct Reading<'a> {
+    dir: &'a Path,
     search: &'a Search,
     bytes_max: u64,
     /// Read so far, before compression: what the records read took up in their files.
@@ -371,7 +381,7 @@ impl Reading<'_> {
     /// Reads `file` from `start`, and where to carry on from if the page ends in it. `from_cursor`:
     /// `start` is the caller's, so a file gone or a bad first record is the cursor's fault.
     fn file(&mut self, file: &LogFile, start: u64, from_cursor: bool) -> Result<Option<Cursor>, ApiError> {
-        let Some(mut records) = open(file, start, from_cursor)? else { return Ok(None) };
+        let Some(mut records) = open(self.dir, file, start, from_cursor)? else { return Ok(None) };
         let mut first = true;
         loop {
             let position = records.position();
@@ -405,10 +415,18 @@ impl Reading<'_> {
     }
 }
 
-/// `file`'s records from `start`; `None` for a file deleted since it was listed, which only a
+/// `file` of `dir`'s records from `start`, or its `.log.gz`'s if it's been compressed since it was
+/// listed (positions hold across compression); `None` for a file deleted since, which only a
 /// cursor's file can't be (400), as can't a `start` past its end.
-fn open(file: &LogFile, start: u64, from_cursor: bool) -> Result<Option<LogRecords>, ApiError> {
-    match FileMessageLog::read_from(&file.path, start) {
+fn open(dir: &Path, file: &LogFile, start: u64, from_cursor: bool) -> Result<Option<LogRecords>, ApiError> {
+    let mut opened = FileMessageLog::read_from(&file.path, start);
+    if !file.compressed && opened.as_ref().is_err_and(|e| e.kind() == ErrorKind::NotFound) {
+        let again = list(dir)?.into_iter().find(|again| (again.day, again.number) == (file.day, file.number));
+        if let Some(again) = again {
+            opened = FileMessageLog::read_from(&again.path, start);
+        }
+    }
+    match opened {
         Ok(records) => Ok(Some(records)),
         Err(e) if e.kind() == ErrorKind::NotFound && from_cursor => Err(gone()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -466,12 +484,17 @@ mod tests {
 
     /// Logs `records` to `dir` as one file, of their day: they must share one.
     fn log(dir: &Path, records: &[Logged<'_>]) {
+        log_to(dir, false, records);
+    }
+
+    /// [`log`], the file compressed if `compress`.
+    fn log_to(dir: &Path, compress: bool, records: &[Logged<'_>]) {
         let now = Arc::new(Mutex::new(records[0].0));
         let clock = Clock::from_fn({
             let now = now.clone();
             move || *now.lock().unwrap()
         });
-        let log = FileMessageLog::open(dir, FileLogOptions { clock, ..FileLogOptions::default() }).unwrap();
+        let log = FileMessageLog::open(dir, FileLogOptions { clock, compress, ..FileLogOptions::default() }).unwrap();
         for (time, direction, comp_id, frame) in records {
             *now.lock().unwrap() = *time;
             let session = comp_id.map(|comp_id| SessionId::new("FIX.4.4", "JETBRIDGE", comp_id));
@@ -707,6 +730,36 @@ mod tests {
             let answer = fixture.get(&format!("/api/messages?{DAY}&after={forged}")).await;
             assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{forged}: {:?}", answer.body);
         }
+    }
+
+    /// A file being compressed, there as both `.log` and `.log.gz`, is read once; one compressed
+    /// once listed is read as its `.log.gz`, from a position in the `.log`.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn a_file_compressed_meanwhile_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = [
+            (at(8, 9, 0), Direction::Inbound, Some("FUNDA"), fix(&[(35, "D"), (11, "A")])),
+            (at(8, 9, 1), Direction::Inbound, Some("FUNDA"), fix(&[(35, "D"), (11, "B")])),
+        ];
+        log(dir.path(), &records);
+        let [plain] = FileMessageLog::files(dir.path()).unwrap().try_into().unwrap();
+        // The same records compressed, elsewhere (opening a log compresses the files there).
+        let elsewhere = tempfile::tempdir().unwrap();
+        log_to(elsewhere.path(), true, &records);
+        let [compressed] = FileMessageLog::files(elsewhere.path()).unwrap().try_into().unwrap();
+        std::fs::copy(&compressed.path, dir.path().join(compressed.path.file_name().unwrap())).unwrap();
+        assert_eq!(FileMessageLog::files(dir.path()).unwrap().len(), 2);
+        let search = Search::new(vec![LogFilter::default()], at(8, 0, 0), None, None, None).unwrap();
+        let ids = |page: Page| page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(scan(dir.path(), &search, SEARCH_BYTES_MAX).unwrap()), ["A", "B"]);
+
+        let mut first = FileMessageLog::read(&plain.path).unwrap();
+        first.next().unwrap().unwrap();
+        std::fs::remove_file(&plain.path).unwrap();
+        let mut records = open(dir.path(), &plain, first.position(), true).unwrap().unwrap();
+        let LogRecord::Message { frame, .. } = records.next().unwrap().unwrap() else { panic!() };
+        assert!(String::from_utf8_lossy(&frame).contains("\x0111=B\x01"));
     }
 
     /// Past [`MAX_SEARCHES`] under way, a search is 503; once one ends, they run again.
