@@ -458,8 +458,11 @@ impl Gateway {
             return Err(StatusError::Done);
         }
         let venue = found.venue.clone();
-        let mut out = Vec::new();
+        // Not through `handle_locked`: its failed sends go back to the book as `SendFailed`, which
+        // under the order's own ClOrdID would reject it, and there's nothing to commit.
+        let (had_changes, mut out) = (state.book.has_changes(), Vec::new());
         state.book.handle(Input::VenueStatusRequest { order }, &mut out);
+        debug_assert!(had_changes || !state.book.has_changes(), "a status request changes nothing");
         let [output] = <[Output; 1]>::try_from(out).expect("a live order's status request is sent");
         send_status_request(state.venues.get(&venue), &output, self.clock.now().into())
     }
@@ -803,6 +806,7 @@ impl Gateway {
             // Only `request_status` asks for one, and sends it itself; never failed back to the
             // book, which recorded nothing to fail.
             Output::StatusRequest { venue, downstream, .. } => {
+                debug_assert!(false, "only request_status asks for a status request");
                 if let Err(refused) = send_status_request(state.venues.get(venue), output, now) {
                     warn!(%venue, %downstream, "status request not sent: {refused}");
                 }

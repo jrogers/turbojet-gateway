@@ -66,7 +66,8 @@ pub fn client_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
 
 /// The venue's message for `output`: a NewOrderSingle, OrderCancelRequest,
 /// OrderCancelReplaceRequest or OrderStatusRequest under the downstream ClOrdIDs.
-/// `request.cl_ord_id` is the client's and never goes to a venue. `None` for client-bound outputs. `now` is TransactTime(60).
+/// `request.cl_ord_id` is the client's and never goes to a venue. `None` for client-bound
+/// outputs. `now` is TransactTime(60), for those that carry one.
 pub fn venue_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
     match output {
         Output::NewOrder { downstream, request, .. } => Some(new_order_single(downstream, request, now).to_message()),

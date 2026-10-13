@@ -193,7 +193,25 @@ impl Touched {
     }
 }
 
+impl Touched {
+    fn is_empty(&self) -> bool {
+        let Self { orders, sent, cl_ord_ids, days, blocked, references, filled } = self;
+        orders.is_empty()
+            && sent.is_empty()
+            && cl_ord_ids.is_empty()
+            && days.is_empty()
+            && !blocked
+            && references.is_empty()
+            && filled.is_empty()
+    }
+}
+
 impl Book {
+    /// Whether [`take_changes`](Self::take_changes) would return any, without taking them.
+    pub fn has_changes(&self) -> bool {
+        !self.touched.is_empty() || !self.flushed.is_empty()
+    }
+
     /// The records changed since the last call, copied as they are now; empty when nothing was.
     pub fn take_changes(&mut self) -> Changes {
         let mut changes = std::mem::take(&mut self.flushed);
