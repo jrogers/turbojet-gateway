@@ -238,11 +238,11 @@ impl Service {
     /// Rereads the sessions file, the routes, limits, `day_end`, the API's certificate and its
     /// users file, logging what changed.
     /// Each file that doesn't load is logged and stays as it was (routes, limits and `day_end`
-    /// together; a users file that doesn't load is a warning); the routes are checked against the venues the gateway took after the sessions
-    /// reload, so a venue added to both files at once can be routed to. A changed schedule or
-    /// `day_end` applies from each session's next trading day. Returns what it logged: each file's
-    /// changes or why it was kept, and any warning about what was taken. `None`, doing nothing,
-    /// once shutdown has started.
+    /// together; a users file that doesn't load is a warning); the routes are checked against the
+    /// venues the gateway took after the sessions reload, so a venue added to both files at once
+    /// can be routed to. A changed schedule or `day_end` applies from each session's next trading
+    /// day. Returns what it logged: each file's changes or why it was kept, and any warning about
+    /// what was taken. `None`, doing nothing, once shutdown has started.
     ///
     /// One reload runs at a time, the others waiting: call it off the async workers
     /// (`spawn_blocking`).
@@ -329,8 +329,9 @@ impl Service {
     /// Waits for a reload under way and refuses later ones, stops the operator API (its requests
     /// under way finish first, briefly), logs the clients' sessions out, cancels the working
     /// orders of those with cancel on disconnect (pending countdowns fire as the clients go; the
-    /// shutdown's own Logouts start none), waits for the venues to answer the gateway's cancels, logs the venues' sessions out,
-    /// returning once all have closed, then logs what the stop loses.
+    /// shutdown's own Logouts start none), waits for the venues to answer the gateway's cancels,
+    /// logs the venues' sessions out, returning once all have closed, then logs what the stop
+    /// loses.
     pub async fn shutdown(&self) {
         // A reload under way finishes first; any later one finds the flag and does nothing.
         self.stopping.store(true, Ordering::SeqCst);

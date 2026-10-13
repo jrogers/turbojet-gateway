@@ -184,9 +184,9 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// No such user, or the password is empty or too long.
+    /// No such user, or the password is too short or too long.
     pub fn set_password(&mut self, name: &str, password: &str) -> Result<(), String> {
-        check_password(password)?;
+        check_new_password(password)?;
         let user = self.user.get_mut(name).ok_or_else(|| format!("no user {name:?}"))?;
         user.password = hash_password(password);
         Ok(())
@@ -206,14 +206,14 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// The name isn't one a user may have, the user exists, the password is empty or too long,
-    /// or a client is empty. No `clients` means all.
+    /// The name isn't one a user may have, the user exists, the password is too short or too
+    /// long, or a client is empty. No `clients` means all.
     pub fn add(&mut self, name: &str, role: Role, clients: Vec<String>, password: &str) -> Result<(), String> {
         check_name(name)?;
         if self.user.contains_key(name) {
             return Err(format!("user {name:?} exists: remove it first, or change its password with user passwd"));
         }
-        check_password(password)?;
+        check_new_password(password)?;
         if clients.iter().any(String::is_empty) {
             return Err("an empty client CompID".to_string());
         }
@@ -497,7 +497,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.toml");
         let mut users = Users::load_or_new(&path).unwrap();
-        users.add("alice", Role::Operator, vec!["FUNDA".to_string()], "secret").unwrap();
+        users.add("alice", Role::Operator, vec!["FUNDA".to_string()], "alice secret").unwrap();
         assert!(users.add("alice", Role::Admin, Vec::new(), "x").is_err());
         assert!(users.add("bob", Role::Admin, Vec::new(), "").is_err());
         let token = users.add_token("alice").unwrap();
@@ -507,8 +507,8 @@ mod tests {
 
         let mut users = Users::load(&path).unwrap();
         let alice = users.get("alice").unwrap();
-        assert!(verify_password(&alice.password, "secret"));
-        assert!(!verify_password(&alice.password, "Secret"));
+        assert!(verify_password(&alice.password, "alice secret"));
+        assert!(!verify_password(&alice.password, "Alice secret"));
         assert_eq!(users.by_token(&token).map(|(name, _)| name), Some("alice"));
         assert_eq!(users.by_token("jb_nope"), None);
 
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn revoking_by_an_ambiguous_prefix_is_refused() {
         let mut users = Users::default();
-        users.add("a", Role::Viewer, Vec::new(), "pw").unwrap();
+        users.add("a", Role::Viewer, Vec::new(), "a long password").unwrap();
         let tokens = [
             Token { id: "abcd1111".into(), sha256: String::new() },
             Token { id: "abcd2222".into(), sha256: String::new() },
@@ -542,7 +542,7 @@ mod tests {
         let text = format!("[user.a]\nrole = \"viewer\"\npassword = \"{hash}\"\nclients = []\n");
         assert!(text.parse::<Users>().unwrap_err().contains("leave clients out"));
         let mut users = Users::default();
-        users.add("a", Role::Viewer, Vec::new(), "pw").unwrap();
+        users.add("a", Role::Viewer, Vec::new(), "a long password").unwrap();
         assert_eq!(users.get("a").unwrap().clients, None);
         assert!(!toml::to_string(&users).unwrap().contains("clients"));
     }
@@ -571,8 +571,8 @@ mod tests {
     #[test]
     fn a_token_hash_used_twice_is_refused() {
         let mut users = Users::default();
-        users.add("a", Role::Viewer, Vec::new(), "pw").unwrap();
-        users.add("b", Role::Viewer, Vec::new(), "pw").unwrap();
+        users.add("a", Role::Viewer, Vec::new(), "a long password").unwrap();
+        users.add("b", Role::Viewer, Vec::new(), "a long password").unwrap();
         users.add_token("a").unwrap();
         let copy = users.get("a").unwrap().tokens.clone();
         users.user.get_mut("b").unwrap().tokens = copy;
@@ -593,6 +593,8 @@ mod tests {
         assert!(users.by_token(&token).is_some());
         assert!(users.set_password("b", "new password").is_err());
         assert!(users.set_password("a", &"x".repeat(MAX_PASSWORD_LEN + 1)).is_err());
+        assert!(users.set_password("a", "short").is_err());
+        assert!(users.add("b", Role::Viewer, Vec::new(), "short").is_err());
         assert!(check_new_password("short").is_err());
         assert!(check_new_password(&"x".repeat(MIN_PASSWORD_LEN)).is_ok());
     }

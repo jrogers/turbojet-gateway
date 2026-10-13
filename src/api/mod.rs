@@ -540,7 +540,7 @@ pub(crate) mod tests {
         fn fixture() -> Fixture {
             let mut users = Users::default();
             let mut bearer = |name: &str, role: Role| {
-                users.add(name, role, Vec::new(), "a password").unwrap();
+                users.add(name, role, Vec::new(), "a long password").unwrap();
                 format!("Bearer {}", users.add_token(name).unwrap())
             };
             let (viewer, operator, admin) =

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::Path;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use turbojet::{SequenceError, SessionHandle};
@@ -27,6 +27,7 @@ use crate::service::{ConfigSummary, Reloaded, Service};
 
 type AxumState = axum::extract::State<State>;
 type Body<B> = Result<Json<B>, JsonRejection>;
+type Id = Result<Path<String>, PathRejection>;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,11 +56,13 @@ pub(super) struct ScopeBody {
 pub(super) async fn pause(
     axum::extract::State(state): AxumState,
     caller: Caller,
-    Path(id): Path<String>,
+    id: Id,
     body: Body<Reason>,
 ) -> Result<StatusCode, ApiError> {
+    let (id, parsed_id) = parse_id(id);
     let (body, parsed) = parse(body);
-    let mutation = Mutation { action: "pause", target: Some(id), params: serde_json::Value::Null, reason: body.reason };
+    let parsed = parsed_id.and(parsed);
+    let mutation = Mutation { action: "pause", target: id, params: serde_json::Value::Null, reason: body.reason };
     on_session(&state, &caller, mutation, parsed, |session, ()| async move {
         // Best effort: another pause or resume may come between the check and the act.
         let note = session.is_paused().then(|| "unchanged: already paused".to_string());
@@ -74,12 +77,13 @@ pub(super) async fn pause(
 pub(super) async fn resume(
     axum::extract::State(state): AxumState,
     caller: Caller,
-    Path(id): Path<String>,
+    id: Id,
     body: Body<Reason>,
 ) -> Result<StatusCode, ApiError> {
+    let (id, parsed_id) = parse_id(id);
     let (body, parsed) = parse(body);
-    let mutation =
-        Mutation { action: "resume", target: Some(id), params: serde_json::Value::Null, reason: body.reason };
+    let parsed = parsed_id.and(parsed);
+    let mutation = Mutation { action: "resume", target: id, params: serde_json::Value::Null, reason: body.reason };
     on_session(&state, &caller, mutation, parsed, |session, ()| async move {
         // Best effort, as pause's.
         let note = (!session.is_paused()).then(|| "unchanged: not paused".to_string());
@@ -102,15 +106,17 @@ pub(super) struct Numbers {
 pub(super) async fn resend(
     axum::extract::State(state): AxumState,
     caller: Caller,
-    Path(id): Path<String>,
+    id: Id,
     body: Body<Resend>,
 ) -> Result<Json<Numbers>, ApiError> {
+    let (id, parsed_id) = parse_id(id);
     let (body, parsed) = parse(body);
+    let parsed = parsed_id.and(parsed);
     let from = body.from;
     let parsed =
         parsed.and_then(|()| from.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "a resend needs from")));
     let params = serde_json::json!({ "from": from });
-    let mutation = Mutation { action: "resend", target: Some(id), params, reason: body.reason };
+    let mutation = Mutation { action: "resend", target: id, params, reason: body.reason };
     on_session(&state, &caller, mutation, parsed, |session, from| async move {
         let numbers = session.request_resend(from).await.map_err(|e| match e {
             SequenceError::Storage(e) => {
@@ -130,22 +136,20 @@ pub(super) async fn resend(
 pub(super) async fn cancel_order(
     axum::extract::State(state): AxumState,
     caller: Caller,
-    Path(order_id): Path<String>,
+    order_id: Id,
     body: Body<Reason>,
 ) -> Result<StatusCode, ApiError> {
+    let (order_id, parsed_id) = parse_id(order_id);
     let (body, parsed) = parse(body);
     let gateway = state.service()?.gateway().clone();
-    let found = caller.require(Role::Operator).and(parsed).and_then(|()| {
-        let order = gateway.order_id(&order_id).and_then(|id| gateway.order(id));
+    let found = caller.require(Role::Operator).and(parsed_id).and(parsed).and_then(|()| {
+        let order_id = order_id.as_deref().expect("guarded by parsed_id");
+        let order = gateway.order_id(order_id).and_then(|id| gateway.order(id));
         let order = order.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no order {order_id}")))?;
-        if caller.may_act_on(&order.order.client) { Ok(order.order.id) } else { Err(out_of_scope(&caller, &order_id)) }
+        if caller.may_act_on(&order.order.client) { Ok(order.order.id) } else { Err(out_of_scope(&caller, order_id)) }
     });
-    let mutation = Mutation {
-        action: "cancel_order",
-        target: Some(order_id),
-        params: serde_json::Value::Null,
-        reason: body.reason,
-    };
+    let mutation =
+        Mutation { action: "cancel_order", target: order_id, params: serde_json::Value::Null, reason: body.reason };
     audited_on(&state, &caller, mutation, found, |order| async move {
         gateway.cancel_order(order).await.map_err(|e| match e {
             CancelError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, e.to_string()),
@@ -302,6 +306,14 @@ fn changed(changes: Changes) -> String {
     if lists.is_empty() { "nothing changed".to_string() } else { lists.join("; ") }
 }
 
+/// The path's ID, or why it didn't decode, refused as a body that doesn't parse is.
+fn parse_id(id: Id) -> (Option<String>, Result<(), ApiError>) {
+    match id {
+        Ok(Path(id)) => (Some(id), Ok(())),
+        Err(e) => (None, Err(ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))),
+    }
+}
+
 /// The body, or its default and why it's refused (400).
 fn parse<B: Default>(body: Body<B>) -> (B, Result<(), ApiError>) {
     match body {
@@ -342,8 +354,8 @@ where
     A: Future<Output = Outcome<T>> + Send + 'static,
 {
     let service = state.service()?;
-    let id = mutation.target.as_deref().expect("a session mutation names its session");
     let found = caller.require(Role::Operator).and(parsed).and_then(|parsed| {
+        let id = mutation.target.as_deref().expect("a parsed session mutation names its session");
         let session = find_session(&service, id)?;
         if caller.may_act_on(&session) { Ok((session.handle(), parsed)) } else { Err(out_of_scope(caller, id)) }
     });
@@ -584,11 +596,17 @@ mod tests {
     }
 
     /// A cancel goes to the book, which starts the gateway's cancel; an order unknown is 404,
-    /// one done 409, recorded as failed.
+    /// one done 409, recorded as failed. An ID that isn't UTF-8 is refused, and recorded.
     #[tokio::test]
     async fn orders_cancel() {
         let fixture = fixture().await;
         fixture.expect("/api/orders/NOPE1/cancel", REASON, StatusCode::NOT_FOUND).await;
+        let body = fixture.expect("/api/orders/%FF/cancel", REASON, StatusCode::BAD_REQUEST).await;
+        assert!(body["error"].is_string(), "{body}");
+        assert!(fixture.last_result().starts_with("refused: "), "{}", fixture.last_result());
+        let body = fixture.expect("/api/sessions/%FF/pause", REASON, StatusCode::BAD_REQUEST).await;
+        assert!(body["error"].is_string(), "{body}");
+        assert!(fixture.last_result().starts_with("refused: "), "{}", fixture.last_result());
         let order = fixture.order_name().await;
         let cancel = format!("/api/orders/{order}/cancel");
         fixture.expect(&cancel, REASON, StatusCode::NO_CONTENT).await;

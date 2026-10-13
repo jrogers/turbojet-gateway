@@ -4,7 +4,7 @@
 //! The orders are the book's: the working ones and each client's done orders of its current day.
 
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
@@ -200,8 +200,9 @@ pub(super) async fn orders(
 /// for it; 404 if the book doesn't hold it.
 pub(super) async fn order(
     axum::extract::State(state): AxumState,
-    Path(order_id): Path<String>,
+    order_id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<OrderDetail>, ApiError> {
+    let Path(order_id) = order_id.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
     let service = state.service()?;
     let gateway = service.gateway();
     gateway
@@ -316,7 +317,7 @@ pub(super) mod tests {
 
         let mut users = Users::default();
         let mut bearer = |name: &str, role: Role, clients: &[&str]| {
-            users.add(name, role, clients.iter().map(ToString::to_string).collect(), "a password").unwrap();
+            users.add(name, role, clients.iter().map(ToString::to_string).collect(), "a long password").unwrap();
             format!("Bearer {}", users.add_token(name).unwrap())
         };
         let viewer = bearer("vic", Role::Viewer, &[]);
@@ -400,6 +401,10 @@ pub(super) mod tests {
         assert_eq!(detail["order_id"], name.as_str());
         assert_eq!(detail["requests"][0]["kind"], "new");
         assert_eq!(fixture.get("/api/orders/NOPE1").await.status, StatusCode::NOT_FOUND);
+        // Not UTF-8: a JSON 400.
+        let answer = fixture.get("/api/orders/%FF").await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+        assert!(answer.body["error"].is_string(), "{}", answer.body);
     }
 
     /// Risk counts the resting order's session; the routes are the file's.

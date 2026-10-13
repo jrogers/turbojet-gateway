@@ -369,7 +369,7 @@ rewritten file belongs to whoever runs them.
 
 ```sh
 jetbridge user add alice --role operator --clients FUNDA --users users.toml   # asks for a password
-jetbridge user passwd alice --users users.toml       # ends alice's sessions
+jetbridge user passwd alice --users users.toml       # ends alice's sessions once the gateway reloads
 jetbridge token add alice --users users.toml         # prints the token, once
 jetbridge token revoke alice q3Xr --users users.toml # by the token, its id, or the id's start
 jetbridge user remove alice --users users.toml

@@ -335,6 +335,16 @@ impl Setup {
         self.venue.events.parse().await
     }
 
+    /// Reloads off the async workers, as the gateway does, failing the test if any file didn't
+    /// load.
+    async fn reload(&self) {
+        let service = self.service.clone();
+        let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().expect("not shutting down");
+        assert!(reloaded.sessions.is_ok(), "{:?}", reloaded.sessions.err());
+        assert!(reloaded.config.is_ok(), "{:?}", reloaded.config.err());
+        assert!(reloaded.warnings.is_empty(), "{:?}", reloaded.warnings);
+    }
+
     /// Order C1, acked by the venue, the client having seen the ack.
     async fn working_order(&mut self) {
         self.order("C1").await;
@@ -625,7 +635,7 @@ async fn reloaded_routes_apply_to_new_orders_and_working_ones_carry_on() {
     let mut setup = Setup::new().await;
     setup.working_order().await;
     std::fs::write(setup.dir.path().join("jetbridge.toml"), routes("AAPL", "AAPL is halted")).unwrap();
-    setup.service.reload();
+    setup.reload().await;
 
     setup.send(order("C2", "AAPL"));
     let rejected: v44::ExecutionReport = setup.events.parse().await;
@@ -1000,7 +1010,7 @@ async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
     let mut setup = Setup::new().await;
     let risk = "[risk.defaults]\nmax_order_qty = 99\n";
     std::fs::write(setup.dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + risk).unwrap();
-    setup.service.reload();
+    setup.reload().await;
 
     setup.send(order("C1", "AAPL"));
     let rejected: v44::ExecutionReport = setup.events.parse().await;
@@ -1008,7 +1018,7 @@ async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
     assert_eq!(rejected.text.as_deref(), Some("quantity over the limit (risk max_order_qty)"));
     assert_eq!(rejected.ord_rej_reason, Some(Code::Known(v44::OrdRejReason::OrderExceedsLimit)));
     std::fs::write(setup.dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT)).unwrap();
-    setup.service.reload();
+    setup.reload().await;
     assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("1"));
 }
 
@@ -1022,11 +1032,7 @@ async fn the_kill_switch_over_the_api_cancels_a_clients_orders() {
     users.add("olga", Role::Operator, Vec::new(), "a long enough password").unwrap();
     let token = users.add_token("olga").unwrap();
     users.save(&users_path).unwrap();
-    let service = setup.service.clone();
-    let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().expect("not shutting down");
-    assert!(reloaded.sessions.is_ok(), "{:?}", reloaded.sessions.err());
-    assert!(reloaded.config.is_ok(), "{:?}", reloaded.config.err());
-    assert!(reloaded.warnings.is_empty(), "{:?}", reloaded.warnings);
+    setup.reload().await;
     setup.working_order().await;
 
     let body = format!(r#"{{"scope":"comp:{CLIENT}","reason":"runaway algo"}}"#);

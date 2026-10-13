@@ -278,6 +278,8 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   Lines are written one at a time within the gateway's process only: two processes mustn't share
   an audit file. A change waits for its line behind any refusals being written, up to 120 a
   minute of anonymous ones, each synced to disk.
+  Refusals by identified callers aren't budgeted: a token holder posting refused mutations in a
+  loop writes one synced line each, and can delay real mutations.
 - A reload answered 422 may have applied half: the file that loaded is in use. The answer says
   which.
 - Each API connection holds one of 256 slots for as long as it's open; one that moves no bytes for

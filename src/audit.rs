@@ -2,7 +2,7 @@
 //! each, fsynced before the action runs.
 //!
 //! ```json
-//! {"time":"2026-10-11T09:30:00.123456Z","user":"alice","role":"operator","ip":"192.0.2.1","action":"block","target":"FUNDA","params":null,"reason":"runaway algo","result":"allowed"}
+//! {"time":"2026-10-11T09:30:00.123456Z","user":"alice","role":"operator","ip":"192.0.2.1","action":"block","target":"comp:FUNDA","params":null,"reason":"runaway algo","result":"allowed"}
 //! ```
 //!
 //! `result` is `allowed` or `refused: <why>`. An allowed action that didn't simply get done has a

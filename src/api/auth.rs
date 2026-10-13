@@ -763,11 +763,11 @@ mod tests {
 
     const PEER: &str = "192.0.2.1:5000";
 
-    /// Alice, an operator scoped to FUNDA with password "secret", and bob, an admin.
+    /// Alice, an operator scoped to FUNDA with password "alice secret", and bob, an admin.
     fn users() -> Users {
         let mut users = Users::default();
-        users.add("alice", Role::Operator, vec!["FUNDA".to_string()], "secret").unwrap();
-        users.add("bob", Role::Admin, Vec::new(), "hunter2").unwrap();
+        users.add("alice", Role::Operator, vec!["FUNDA".to_string()], "alice secret").unwrap();
+        users.add("bob", Role::Admin, Vec::new(), "hunter2hunter2").unwrap();
         users
     }
 
@@ -872,7 +872,7 @@ mod tests {
     async fn a_password_authenticates() {
         let (auth, _) = auth(users(), false);
         let app = app(&auth);
-        let answer = login(&app, "alice", "secret").await;
+        let answer = login(&app, "alice", "alice secret").await;
         assert_eq!(answer.status, StatusCode::OK);
         assert_eq!(answer.body["user"], "alice");
         assert_eq!(answer.body["role"], "operator");
@@ -884,7 +884,7 @@ mod tests {
         let lower = [("authorization", "bearer jb_wrong")];
         assert_eq!(send(&app, "GET", "/api/me", &lower, "").await.body["error"], Refusal::BadToken.message());
 
-        let (cookie, csrf) = session(&app, "alice", "secret").await;
+        let (cookie, csrf) = session(&app, "alice", "alice secret").await;
         let me = send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await;
         assert_eq!(me.status, StatusCode::OK);
         assert_eq!(me.body["user"], "alice");
@@ -892,7 +892,12 @@ mod tests {
 
         let long_name = "x".repeat(MAX_NAME_LEN + 1);
         let long_password = "x".repeat(MAX_PASSWORD_LEN + 1);
-        let tries = [("alice", "Secret"), ("carol", "secret"), (&long_name, "secret"), ("alice", &long_password)];
+        let tries = [
+            ("alice", "Alice secret"),
+            ("carol", "alice secret"),
+            (&long_name, "alice secret"),
+            ("alice", &long_password),
+        ];
         for (user, password) in tries {
             let answer = login(&app, user, password).await;
             assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{user}");
@@ -914,7 +919,7 @@ mod tests {
         assert_eq!(auth.cookie("x"), "__Host-jetbridge_session=x; HttpOnly; SameSite=Strict; Path=/; Secure");
         assert!(auth.cookie("").ends_with("; Secure; Max-Age=0"));
         let app = app(&auth);
-        let (cookie, _) = session(&app, "bob", "hunter2").await;
+        let (cookie, _) = session(&app, "bob", "hunter2hunter2").await;
         assert!(cookie.starts_with("__Host-jetbridge_session="));
         assert_eq!(send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status, StatusCode::OK);
         let plain = cookie.replace("__Host-", "");
@@ -951,7 +956,7 @@ mod tests {
             StatusCode::NO_CONTENT
         );
 
-        let (cookie, _) = session(&app, "bob", "hunter2").await;
+        let (cookie, _) = session(&app, "bob", "hunter2hunter2").await;
         let wrong = [("authorization", "Bearer jb_wrong"), ("cookie", cookie.as_str())];
         assert_eq!(send(&app, "GET", "/api/me", &wrong, "").await.status, StatusCode::UNAUTHORIZED);
 
@@ -973,7 +978,7 @@ mod tests {
     async fn sessions_end_when_idle_or_logged_out() {
         let (auth, clock) = auth(users(), false);
         let app = app(&auth);
-        let (cookie, csrf) = session(&app, "alice", "secret").await;
+        let (cookie, csrf) = session(&app, "alice", "alice secret").await;
         let me = async || send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status;
         clock.pass(SESSION_IDLE - Duration::from_secs(1));
         assert_eq!(me().await, StatusCode::OK);
@@ -983,7 +988,7 @@ mod tests {
         assert_eq!(me().await, StatusCode::UNAUTHORIZED);
 
         // However much it's used, a session ends SESSION_MAX after it began.
-        let (cookie, _) = session(&app, "alice", "secret").await;
+        let (cookie, _) = session(&app, "alice", "alice secret").await;
         let me = async || send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status;
         for _ in 0..3 {
             clock.pass(SESSION_MAX / 4);
@@ -992,7 +997,7 @@ mod tests {
         clock.pass(SESSION_MAX / 4);
         assert_eq!(me().await, StatusCode::UNAUTHORIZED);
 
-        let (cookie, csrf_2) = session(&app, "alice", "secret").await;
+        let (cookie, csrf_2) = session(&app, "alice", "alice secret").await;
         assert_ne!(csrf, csrf_2);
         let answer = send(&app, "POST", "/api/logout", &[("cookie", &cookie), ("x-csrf-token", &csrf_2)], "").await;
         assert_eq!(answer.status, StatusCode::NO_CONTENT);
@@ -1005,7 +1010,7 @@ mod tests {
     async fn a_recheck_doesnt_keep_a_session() {
         let (auth, clock) = auth(users(), false);
         let app = app(&auth);
-        let (cookie, _) = session(&app, "alice", "secret").await;
+        let (cookie, _) = session(&app, "alice", "alice secret").await;
         let headers = HeaderMap::from_iter([(COOKIE, cookie.parse().unwrap())]);
         let ip = IpAddr::from([127, 0, 0, 1]);
         clock.pass(SESSION_IDLE - Duration::from_secs(1));
@@ -1021,11 +1026,11 @@ mod tests {
         let users = users();
         let (auth, _) = auth(users.clone(), false);
         let app = app(&auth);
-        let (alice, _) = session(&app, "alice", "secret").await;
-        let (bob, _) = session(&app, "bob", "hunter2").await;
+        let (alice, _) = session(&app, "alice", "alice secret").await;
+        let (bob, _) = session(&app, "bob", "hunter2hunter2").await;
         let mut changed = users;
         changed.remove("bob");
-        changed.add("bob", Role::Admin, Vec::new(), "hunter3").unwrap();
+        changed.add("bob", Role::Admin, Vec::new(), "hunter3hunter3").unwrap();
         let changed = toml::to_string(&changed).unwrap().replace("role = \"operator\"", "role = \"viewer\"");
         *auth.users.write().unwrap() = Arc::new(changed.parse().unwrap());
         let answer = send(&app, "GET", "/api/me", &[("cookie", &alice)], "").await;
@@ -1041,8 +1046,8 @@ mod tests {
     async fn csrf_missing_or_wrong_is_forbidden() {
         let (auth, _) = auth(users(), false);
         let app = app(&auth);
-        let (cookie, csrf) = session(&app, "alice", "secret").await;
-        let (_, other) = session(&app, "alice", "secret").await;
+        let (cookie, csrf) = session(&app, "alice", "alice secret").await;
+        let (_, other) = session(&app, "alice", "alice secret").await;
         for headers in [
             vec![("cookie", cookie.as_str())],
             vec![("cookie", &cookie), ("x-csrf-token", &other)],
@@ -1066,17 +1071,17 @@ mod tests {
         for _ in 0..LOGIN_FAILURES {
             assert_eq!(login(&app, "alice", "guess").await.status, StatusCode::UNAUTHORIZED);
         }
-        let answer = login(&app, "alice", "secret").await;
+        let answer = login(&app, "alice", "alice secret").await;
         assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(answer.body["error"], Refusal::Limited.message());
         // Another address is limited for alice too; bob isn't, from another address.
         let elsewhere = "198.51.100.7".parse().unwrap();
-        assert_eq!(auth.verify("alice", "secret".into(), elsewhere).await.err(), Some(Refusal::Limited));
-        assert!(auth.verify("bob", "hunter2".into(), "198.51.100.7".parse().unwrap()).await.is_ok());
+        assert_eq!(auth.verify("alice", "alice secret".into(), elsewhere).await.err(), Some(Refusal::Limited));
+        assert!(auth.verify("bob", "hunter2hunter2".into(), "198.51.100.7".parse().unwrap()).await.is_ok());
         clock.pass(LOGIN_WINDOW - Duration::from_secs(1));
-        assert_eq!(login(&app, "alice", "secret").await.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(login(&app, "alice", "alice secret").await.status, StatusCode::TOO_MANY_REQUESTS);
         clock.pass(Duration::from_secs(1));
-        assert_eq!(login(&app, "alice", "secret").await.status, StatusCode::OK);
+        assert_eq!(login(&app, "alice", "alice secret").await.status, StatusCode::OK);
     }
 
     /// A burst of guesses at once gets at most LOGIN_FAILURES + MAX_PASSWORD_CHECKS - 1 tries:
@@ -1105,9 +1110,9 @@ mod tests {
         for i in 0..LOGIN_FAILURES {
             assert_eq!(login(&app, &format!("nobody{i}"), "guess").await.status, StatusCode::UNAUTHORIZED);
         }
-        assert_eq!(login(&app, "bob", "hunter2").await.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(login(&app, "bob", "hunter2hunter2").await.status, StatusCode::TOO_MANY_REQUESTS);
         clock.pass(LOGIN_WINDOW);
-        assert_eq!(login(&app, "bob", "hunter2").await.status, StatusCode::OK);
+        assert_eq!(login(&app, "bob", "hunter2hunter2").await.status, StatusCode::OK);
     }
 
     /// An IPv6 address counts as its /64: a host can't step through its addresses to dodge the
@@ -1120,8 +1125,8 @@ mod tests {
             assert_eq!(auth.verify(&format!("nobody{i}"), "guess".into(), ip).await.err(), Some(Refusal::BadPassword));
         }
         let same = "2001:db8:1:2:ffff::9".parse().unwrap();
-        assert_eq!(auth.verify("bob", "hunter2".into(), same).await.err(), Some(Refusal::Limited));
-        assert!(auth.verify("bob", "hunter2".into(), "2001:db8:1:3::1".parse().unwrap()).await.is_ok());
+        assert_eq!(auth.verify("bob", "hunter2hunter2".into(), same).await.err(), Some(Refusal::Limited));
+        assert!(auth.verify("bob", "hunter2hunter2".into(), "2001:db8:1:3::1".parse().unwrap()).await.is_ok());
     }
 
     /// When the limit's names are full, expired windows go; if none have, new names are refused,
@@ -1168,7 +1173,7 @@ mod tests {
         let token = users.add_token("bob").unwrap();
         let (auth, _) = auth(users, false);
         let app = app(&auth);
-        let (cookie, csrf) = session(&app, "alice", "secret").await;
+        let (cookie, csrf) = session(&app, "alice", "alice secret").await;
         assert_eq!(login(&app, "alice", "guess").await.status, StatusCode::UNAUTHORIZED);
         assert_eq!(login(&app, &"x".repeat(MAX_NAME_LEN + 1), "guess").await.status, StatusCode::UNAUTHORIZED);
         assert_eq!(login(&app, "carol", "guess").await.status, StatusCode::UNAUTHORIZED);
@@ -1188,7 +1193,7 @@ mod tests {
         for _ in 2..LOGIN_FAILURES {
             login(&app, "alice", "guess").await;
         }
-        assert_eq!(login(&app, "alice", "secret").await.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(login(&app, "alice", "alice secret").await.status, StatusCode::TOO_MANY_REQUESTS);
 
         let lines = app.audit();
         let line = |i: usize| {
@@ -1215,7 +1220,7 @@ mod tests {
         assert_eq!(lines[0]["ip"], "192.0.2.1");
         let text = std::fs::read_to_string(app.dir.path().join("audit.jsonl")).unwrap();
         let session = cookie.split_once('=').unwrap().1;
-        for secret in ["secret", "guess", "carol", &csrf, session, &token] {
+        for secret in ["alice secret", "guess", "carol", &csrf, session, &token] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
     }
@@ -1246,9 +1251,9 @@ mod tests {
     async fn no_audit_line_no_login_or_logout() {
         let (auth, _) = auth(users(), false);
         let app = app(&auth);
-        let (cookie, csrf) = session(&app, "alice", "secret").await;
+        let (cookie, csrf) = session(&app, "alice", "alice secret").await;
         crate::audit::tests::make_read_only(&app.dir.path().join("audit.jsonl"));
-        let answer = login(&app, "bob", "hunter2").await;
+        let answer = login(&app, "bob", "hunter2hunter2").await;
         assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!answer.headers.contains_key(SET_COOKIE));
         assert_eq!(auth.sessions().len(), 1);
@@ -1283,7 +1288,7 @@ mod tests {
         clock.pass(Duration::from_millis(1));
         assert!(auth.authenticate(&Method::GET, &headers("0"), ip).is_ok());
         let app = app(&auth);
-        session(&app, "bob", "hunter2").await;
+        session(&app, "bob", "hunter2hunter2").await;
         assert_eq!(auth.sessions().len(), MAX_SESSIONS);
         assert!(auth.authenticate(&Method::GET, &headers("0"), ip).is_ok());
         assert_eq!(auth.authenticate(&Method::GET, &headers("1"), ip).err(), Some(Refusal::SessionEnded.into()));

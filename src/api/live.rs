@@ -562,7 +562,8 @@ mod tests {
     #[tokio::test]
     async fn the_cookie_needs_this_hosts_origin() {
         let fixture = fixture().await;
-        let login = send(&fixture.app, "POST", "/api/login", &[], r#"{"user":"vic","password":"a password"}"#).await;
+        let login =
+            send(&fixture.app, "POST", "/api/login", &[], r#"{"user":"vic","password":"a long password"}"#).await;
         let set = login.headers["set-cookie"].to_str().unwrap();
         let cookie = set.split(';').next().unwrap();
         let (addr, _stop) = serve(fixture.app.clone()).await;

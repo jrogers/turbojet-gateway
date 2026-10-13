@@ -180,7 +180,8 @@ impl Book {
     /// The order and every request sent for it, if the book holds it.
     pub fn order_detail(&self, id: OrderId) -> Option<OrderDetail> {
         let order = self.orders.get(&id)?;
-        // Its requests are `<name>` and `<name>-<n>`, numbered by `amendments`: no walk of them all.
+        // Its requests are `<name>` and `<name>-<n>`, numbered by `amendments`: no walk of them
+        // all.
         let names = std::iter::once(order.name.clone())
             .chain((1..=order.amendments).map(|n| format_compact!("{}-{n}", order.name)));
         let requests = names
