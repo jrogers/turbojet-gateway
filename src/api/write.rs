@@ -228,11 +228,12 @@ pub(super) async fn cancel_order(
         .and(parsed_id)
         .and(parsed)
         .and_then(|()| find_order(&caller, &gateway, order_id.as_deref()));
+    let unknown = format!("no order {}", order_id.as_deref().unwrap_or_default());
     let mutation =
         Mutation { action: "cancel_order", target: order_id, params: serde_json::Value::Null, reason: body.reason };
     audited_on(&state, &caller, mutation, found, |order| async move {
         gateway.cancel_order(order).await.map_err(|e| match e {
-            CancelError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, e.to_string()),
+            CancelError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, unknown),
             CancelError::Done => ApiError::new(StatusCode::CONFLICT, e.to_string()),
         })?;
         Ok((StatusCode::NO_CONTENT, None))
@@ -258,11 +259,12 @@ pub(super) async fn request_status(
         .and(parsed_id)
         .and(parsed)
         .and_then(|()| find_order(&caller, &gateway, order_id.as_deref()));
+    let unknown = format!("no order {}", order_id.as_deref().unwrap_or_default());
     let mutation =
         Mutation { action: "request_status", target: order_id, params: serde_json::Value::Null, reason: body.reason };
     audited_on(&state, &caller, mutation, found, |order| async move {
         gateway.request_status(order).map_err(|e| match e {
-            StatusError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, e.to_string()),
+            StatusError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, unknown),
             StatusError::Done | StatusError::VenueUnavailable => ApiError::new(StatusCode::CONFLICT, e.to_string()),
         })?;
         Ok((StatusCode::ACCEPTED, None))
@@ -1197,5 +1199,20 @@ mod tests {
         }
         std::fs::write(&path, &good).unwrap();
         fixture.admin("PATCH", DEFAULTS, credit, StatusCode::OK).await;
+    }
+
+    /// An edit whose reload keeps the broken sessions file is written all the same, and answered
+    /// and audited as failed saying so.
+    #[tokio::test]
+    async fn an_edit_whose_reload_keeps_a_file_is_written() {
+        let fixture = fixture().await;
+        std::fs::write(fixture.dirs.0.path().join("sessions.toml"), "[acceptor\n").unwrap();
+        let body = fixture
+            .admin("PATCH", DEFAULTS, r#"{"reason":"r","set":{"credit":5}}"#, StatusCode::UNPROCESSABLE_ENTITY)
+            .await;
+        let written = "the edit is written, but the reload kept the sessions file: ";
+        assert!(body["error"].as_str().unwrap().starts_with(written), "{body}");
+        assert!(fixture.last_result().starts_with(&format!("failed: {written}")), "{}", fixture.last_result());
+        assert!(fixture.config().contains("credit = 5"));
     }
 }

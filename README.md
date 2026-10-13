@@ -541,9 +541,9 @@ in force, merged. An admin changes them with a `PATCH` to `/api/risk/limits/defa
   is, is refused (422) and the file left as it was.
 - **The answer** is `{table, reload}`: the table as the file now has it (`null` once deleted),
   and what the reload did, as `POST /api/reload` answers it; a reload that kept a file answers 422,
-  though the edit is written. Edits and reloads run one at a time. Audited as `set_limits`, with
-  the keys set and their values and the keys removed, or `delete_limits`, on `risk.defaults` or
-  `risk.client.COMPID`.
+  though the edit is written (audited as failed, saying so). Edits and reloads run one at a time,
+  and one sent during shutdown answers 503. Audited as `set_limits`, with the keys set and their
+  values and the keys removed, or `delete_limits`, on `risk.defaults` or `risk.client.COMPID`.
 
 ### Searching the message log
 
@@ -660,7 +660,11 @@ file is created readable by its owner only. `GET /api/audit` reads it back, olde
   every client out ("gateway shutting down"), which fires any cancel-on-disconnect countdowns under
   way, and cancels the working orders of clients with cancel on disconnect (see above); waits up to
   5 seconds for the venues to answer the gateway's cancels; then logs every venue out, waits for the
-  last changes to commit to the database, if there is one, and exits. A second signal exits at once.
+  last changes to commit to the database, if there is one, and exits. A second signal stops
+  waiting, but the exit still waits for work under way on blocking threads, such as a message log
+  search (each reads up to 256 MiB) or a `.log.gz` decompressed up to a cursor, and for the message
+  log to close its files, gzipping the last with `compress = true`: bounded, but it can take
+  seconds.
   On the way out it logs how many orders are still open at each venue and how many reports weren't
   delivered to each client. With a database, the next start restores both. Without one, both are
   lost: the open orders stay working at their venues with nothing to report their fills to.

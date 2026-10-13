@@ -224,8 +224,11 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   deleted table takes its comments with it, and any just before it. A new client's table goes at
   the end of the file.
 - A file broken by hand refuses every edit (422) until it's fixed; a `DELETE` of a table that
-  isn't there answers 404 before that. Limits written as `[risk]` keys or inline tables rather than
+  isn't there answers 404 before that, as long as the file is still valid TOML (one that doesn't
+  parse answers 422 first). Limits written as `[risk]` keys or inline tables rather than
   `[risk.defaults]` and `[risk.client.COMPID]` tables answer 422: edit those by hand.
+- An edit checks the routes against the venues running now, so a venue added by hand to both
+  files but not yet reloaded makes every edit 422 until a reload starts it.
 - Each edit runs a full reload, which takes whatever else was changed by hand in `jetbridge.toml`
   and the sessions file. A hand edit saved while an API edit is under way is overwritten.
 - Removing a client's last key leaves its table, empty: the client has the defaults, but still a
@@ -330,6 +333,8 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - After an `unknown_at_venue` alarm the order stays live, its exposure counted, until an operator
   resolves it with the venue; there's no API call yet to mark it done. "Unknown" under a ClOrdID a
   replace has since superseded is only a warning in the log: ask again.
+- The alarm isn't deduplicated: the same "unknown order" answer redelivered (PossDupFlag, after a
+  resend) raises it again.
 - Each API connection holds one of 256 slots for as long as it's open; one that moves no bytes for
   60 seconds is closed, so an idle connection holds its slot for up to that long. Past 256, new
   connections wait in the kernel's backlog. A live socket holds one too, up to 64 of them, and its
