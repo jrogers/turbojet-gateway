@@ -63,11 +63,13 @@ type AxumState = axum::extract::State<State>;
 #[derive(Debug, Serialize)]
 pub(super) struct Page {
     messages: Vec<Hit>,
-    /// The `after` for the next page; `None` once the range is read to its end. A page cut short
-    /// by the byte budget may hold no hits and still have a `next`. While the range's end is
-    /// still to come, the end of what's logged so far is a `next` too, for a caller following the
-    /// log (unless no file of the range is there yet, or the last one read ends in a bad record).
+    /// The `after` for the next page; `None` once the range is read to the end of what's logged.
+    /// A page cut short by the byte budget may hold no hits and still have a `next`.
     next: Option<String>,
+    /// With no `next`, while the range's end is still to come: the end of what's logged, an
+    /// `after` to pass later for what's logged since. `None` too if no file of the range is there
+    /// yet, or the last one read ends in a bad record.
+    follow: Option<String>,
 }
 
 /// A message found.
@@ -363,12 +365,12 @@ fn scan(dir: &Path, search: &Search, bytes_max: u64, now: DateTime<Utc>) -> Resu
         let from_cursor = index == first && search.after.is_some();
         let start = if index == first { start } else { 0 };
         if let Some(stopped) = reading.file(file, start, from_cursor)? {
-            return Ok(Page { messages: reading.messages, next: Some(stopped.encode()) });
+            return Ok(Page { messages: reading.messages, next: Some(stopped.encode()), follow: None });
         }
     }
     let ended = search.range.until.is_none_or(|until| until <= now);
-    let next = if ended { None } else { reading.end.map(Cursor::encode) };
-    Ok(Page { messages: reading.messages, next })
+    let follow = if ended { None } else { reading.end.map(Cursor::encode) };
+    Ok(Page { messages: reading.messages, next: None, follow })
 }
 
 /// The log's files, oldest first. While a file is being compressed, both its `.log` and its
@@ -803,8 +805,8 @@ mod tests {
         assert!(String::from_utf8_lossy(&frame).contains("\x0111=B\x01"));
     }
 
-    /// While the range's end is to come, the last page's `next` is the end of what's logged, from
-    /// which what's logged later is found; once it's come, the last page has none.
+    /// While the range's end is to come, the last page has no `next` but a `follow`, the end of
+    /// what's logged, from which what's logged later is found; once it's come, it has neither.
     #[test]
     fn a_range_not_yet_ended_can_be_followed() {
         let dir = tempfile::tempdir().unwrap();
@@ -812,17 +814,20 @@ mod tests {
         log(dir.path(), &[order(0, "A")]);
         let mut search = Search::new(vec![LogFilter::default()], at(8, 0, 0), None, None, None).unwrap();
         let ids = |page: &Page| page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>();
-        assert_eq!(scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0)).unwrap().next, None);
+        let ended = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(9, 0, 0)).unwrap();
+        assert_eq!((ended.next, ended.follow), (None, None));
         let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(8, 12, 0)).unwrap();
         assert_eq!(ids(&page), ["A"]);
-        search.after = Some(Cursor::decode(page.next.as_ref().unwrap()).unwrap());
+        assert_eq!(page.next, None);
+        search.after = Some(Cursor::decode(page.follow.as_ref().unwrap()).unwrap());
         let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(8, 12, 0)).unwrap();
         assert!(page.messages.is_empty());
-        assert_eq!(page.next, search.after.map(Cursor::encode));
+        assert_eq!((page.next, page.follow), (None, search.after.map(Cursor::encode)));
         log(dir.path(), &[order(1, "B")]);
         let page = scan(dir.path(), &search, SEARCH_BYTES_MAX, at(8, 12, 0)).unwrap();
         assert_eq!(ids(&page), ["B"]);
-        assert!(page.next.is_some());
+        assert_eq!(page.next, None);
+        assert!(page.follow.is_some());
     }
 
     /// Past [`SEARCHES_MAX`] under way, a search is 503; once one ends, they run again.
@@ -838,33 +843,37 @@ mod tests {
 
     /// An order's messages, both sides': the client's with its ClOrdID in 11 or 41, the venue's
     /// with the downstream ClOrdID in 11 or 41 or the venue's OrderID in 37. Not another order's,
-    /// an ID on the other side's session, or a message after the order's range.
+    /// an ID on the other side's session, or a message after the order's range. The order is
+    /// booked now, so its range is still under way: the last page has no `next` but a `follow`,
+    /// from which a message logged later is found.
     #[tokio::test]
     async fn an_orders_messages_on_both_sides() {
         let (fixture, dir) = logged().await;
-        let order = &fixture.ok("/api/orders").await["orders"][0];
+        crate::edge::tests::book_order_now(fixture.service.gateway(), "N1");
+        let orders = fixture.ok("/api/orders").await;
+        let order = orders["orders"].as_array().unwrap().iter().find(|order| order["cl_ord_id"] == "N1").unwrap();
         let name = order["order_id"].as_str().unwrap().to_string();
         crate::edge::tests::acknowledge(fixture.service.gateway(), &name, "V1");
         let created: DateTime<Utc> = order["created"].as_str().unwrap().parse().unwrap();
+        assert!(Utc::now() - created < TimeDelta::minutes(1), "{created}");
         let at = |seconds| created + TimeDelta::seconds(seconds);
         let (client, venue) = (Some("FUNDA"), Some("NASDAQ"));
         let msg = |time, direction, comp_id, fields: &[(u32, &str)]| (time, direction, comp_id, fix(fields));
         log(
             &dir,
             &[
-                msg(at(-1), Direction::Inbound, client, &[(35, "D"), (11, "C1")]),
+                msg(at(-1), Direction::Inbound, client, &[(35, "D"), (11, "N1")]),
                 msg(at(0), Direction::Outbound, venue, &[(35, "D"), (11, &name)]),
                 msg(at(1), Direction::Inbound, venue, &[(35, "8"), (11, "X"), (37, "V1")]),
-                msg(at(2), Direction::Inbound, client, &[(35, "F"), (11, "C2"), (41, "C1")]),
+                msg(at(2), Direction::Inbound, client, &[(35, "F"), (11, "N2"), (41, "N1")]),
                 msg(at(3), Direction::Inbound, venue, &[(35, "9"), (11, "X"), (41, &name)]),
-                msg(at(4), Direction::Inbound, client, &[(35, "D"), (11, "C9")]),
-                msg(at(5), Direction::Inbound, venue, &[(35, "8"), (11, "C1")]),
+                msg(at(4), Direction::Inbound, client, &[(35, "D"), (11, "N9")]),
+                msg(at(5), Direction::Inbound, venue, &[(35, "8"), (11, "N1")]),
                 msg(at(6), Direction::Inbound, client, &[(35, "8"), (11, "Y"), (37, "V1")]),
             ],
         );
-        // A day on, past the range.
-        log(&dir, &[msg(at(86_400), Direction::Inbound, client, &[(35, "D"), (11, "C1")])]);
-        let page = fixture.ok(&format!("/api/orders/{name}/messages")).await;
+        let path = format!("/api/orders/{name}/messages");
+        let page = fixture.ok(&path).await;
         let found: Vec<_> = page["messages"]
             .as_array()
             .unwrap()
@@ -881,11 +890,26 @@ mod tests {
         ];
         assert_eq!(found, expected.map(|(session, msg_type)| (session, msg_type.to_string())));
         assert_eq!(page["next"], serde_json::Value::Null);
-        let page = fixture.ok(&format!("/api/orders/{name}/messages?limit=2")).await;
+        let follow = page["follow"].as_str().unwrap().to_string();
+
+        let page = fixture.ok(&format!("{path}?limit=2")).await;
         assert_eq!(page["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(page["follow"], serde_json::Value::Null);
         let next = page["next"].as_str().unwrap();
-        let page = fixture.ok(&format!("/api/orders/{name}/messages?after={next}")).await;
+        let page = fixture.ok(&format!("{path}?after={next}")).await;
         assert_eq!(page["messages"].as_array().unwrap().len(), 3);
         assert_eq!(fixture.ok(&format!("/api/orders/{name}")).await["venue_order_id"], "V1");
+
+        let page = fixture.ok(&format!("{path}?after={follow}")).await;
+        assert_eq!((&page["messages"], &page["next"]), (&serde_json::json!([]), &serde_json::Value::Null));
+        log(&dir, &[msg(at(7), Direction::Outbound, client, &[(35, "8"), (11, "N2"), (41, "N1")])]);
+        let page = fixture.ok(&format!("{path}?after={follow}")).await;
+        let [later] = page["messages"].as_array().unwrap().as_slice() else { panic!("{page}") };
+        assert_eq!(later["direction"], "out");
+        let follow = page["follow"].as_str().unwrap().to_string();
+        // A day on, past the range (logged last: the log writes its files in order of time).
+        log(&dir, &[msg(at(86_400), Direction::Inbound, client, &[(35, "D"), (11, "N1")])]);
+        let page = fixture.ok(&format!("{path}?after={follow}")).await;
+        assert_eq!(page["messages"], serde_json::json!([]));
     }
 }
