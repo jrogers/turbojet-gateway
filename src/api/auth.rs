@@ -8,8 +8,11 @@
 //! - **a session**, from `POST /api/login`: the session cookie (`__Host-jetbridge_session` under
 //!   TLS, here or at a proxy; `jetbridge_session` on plain loopback), which a browser sends by
 //!   itself, so every request but a GET or HEAD must also carry `X-CSRF-Token`, the session's own
-//!   token, which a page on another site can't read. A session ends after [`SESSION_IDLE`] unused
-//!   or [`SESSION_MAX`] in all. Sessions are kept in memory: a restart logs everyone out.
+//!   token, which a page on another site can't read. A websocket upgrade can't carry a header a
+//!   page sets, so it must come from a page on the API's own host instead: its `Origin` must name
+//!   the `Host` (behind a proxy, `X-Forwarded-Host` if sent). A session ends after
+//!   [`SESSION_IDLE`] unused or [`SESSION_MAX`] in all. Sessions are kept in memory: a restart
+//!   logs everyone out.
 //!
 //! Each request reads the user afresh from the users file in use, so a reload that removes a user
 //! or a token, or changes a role or clients, applies from the next request; a session whose user
@@ -30,7 +33,7 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, FromRequestParts, Request};
-use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use axum::http::header::{AUTHORIZATION, COOKIE, ORIGIN, SET_COOKIE, UPGRADE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
@@ -164,6 +167,8 @@ pub(crate) enum Refusal {
     /// changed, or the gateway restarted.
     SessionEnded,
     Csrf,
+    /// A websocket upgrade with the session cookie, from a page on another host or none.
+    Origin,
     Limited,
 }
 
@@ -171,7 +176,7 @@ impl Refusal {
     fn status(self) -> StatusCode {
         match self {
             Self::NoCredentials | Self::BadPassword | Self::BadToken | Self::SessionEnded => StatusCode::UNAUTHORIZED,
-            Self::Csrf => StatusCode::FORBIDDEN,
+            Self::Csrf | Self::Origin => StatusCode::FORBIDDEN,
             Self::Limited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
@@ -183,6 +188,7 @@ impl Refusal {
             Self::BadToken => "unknown or revoked token",
             Self::SessionEnded => "the session has ended: log in again",
             Self::Csrf => "missing or wrong X-CSRF-Token",
+            Self::Origin => "a websocket with the session cookie must come from this host's pages",
             Self::Limited => "too many failed logins: try again in a minute",
         }
     }
@@ -409,9 +415,25 @@ impl Auth {
                 return Err(Refused(Refusal::Csrf, Some(session.user.clone())));
             }
         }
+        if is_websocket(headers) && !self.same_origin(headers) {
+            return Err(Refused(Refusal::Origin, Some(session.user.clone())));
+        }
         session.last_seen = now;
         let reference = SessionRef { id: id.to_string(), csrf: session.csrf.clone() };
         Ok(Caller::new(&session.user, user, ip, Some(reference)))
+    }
+
+    /// Whether the request's `Origin` is the host it was sent to: the `Host`, or behind a proxy
+    /// the last `X-Forwarded-Host` (the proxy's), if sent. Hosts compare without case; a port must
+    /// match as written, so a browser's default port left out of one but not the other refuses.
+    fn same_origin(&self, headers: &HeaderMap) -> bool {
+        let last = |name| headers.get_all(name).iter().next_back().and_then(|value| value.to_str().ok());
+        let forwarded = if self.behind_proxy { last("x-forwarded-host") } else { None };
+        let host = forwarded.and_then(|hosts| hosts.rsplit(',').next()).or_else(|| last("host"));
+        let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok());
+        // `scheme://host[:port]`; a page with no origin to tell sends `null`, which has no `://`.
+        let authority = origin.and_then(|origin| origin.split_once("://")).map(|(_, authority)| authority);
+        matches!((authority, host), (Some(authority), Some(host)) if authority.eq_ignore_ascii_case(host.trim()))
     }
 
     fn end_session(&self, id: &str) {
@@ -494,6 +516,11 @@ fn limit_address(ip: IpAddr) -> IpAddr {
 fn dummy_hash() -> &'static str {
     static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DUMMY.get_or_init(|| crate::auth::hash_password(&Base64UrlUnpadded::encode_string(&random::<32>())))
+}
+
+/// Whether the request asks to upgrade to a websocket.
+fn is_websocket(headers: &HeaderMap) -> bool {
+    headers.get(UPGRADE).is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
 }
 
 /// The value of the session cookie `name`, if the request has one.
@@ -1248,6 +1275,31 @@ mod tests {
         assert_eq!(proxied.client_ip(peer, &one("a, [2001:db8::2]:443")), "2001:db8::2".parse::<IpAddr>().unwrap());
         let mapped: SocketAddr = "[::ffff:192.0.2.1]:1".parse().unwrap();
         assert_eq!(direct.client_ip(mapped, &headers), peer.ip());
+    }
+
+    /// The Origin must name the Host, or behind a proxy the last X-Forwarded-Host if there is one;
+    /// without a proxy, X-Forwarded-Host is the client's to write and isn't read.
+    #[test]
+    fn the_origin_must_be_the_host() {
+        let proxied = Auth::new(PathBuf::new(), Users::default(), true, true);
+        let direct = Auth::new(PathBuf::new(), Users::default(), false, false);
+        let headers = |pairs: &[(&'static str, &str)]| {
+            HeaderMap::from_iter(pairs.iter().map(|(name, value)| ((*name).parse().unwrap(), value.parse().unwrap())))
+        };
+        let here = [("host", "gw.example:8443"), ("origin", "https://GW.example:8443")];
+        assert!(direct.same_origin(&headers(&here)));
+        assert!(proxied.same_origin(&headers(&here)));
+        for origin in ["https://gw.example", "https://evil.example:8443", "null", "gw.example:8443"] {
+            assert!(!direct.same_origin(&headers(&[("host", "gw.example:8443"), ("origin", origin)])), "{origin}");
+        }
+        assert!(!direct.same_origin(&headers(&[("host", "gw.example:8443")])));
+        let forwarded = [
+            ("host", "10.0.0.5:8080"),
+            ("x-forwarded-host", "evil.example, gw.example"),
+            ("origin", "https://gw.example"),
+        ];
+        assert!(proxied.same_origin(&headers(&forwarded)));
+        assert!(!direct.same_origin(&headers(&forwarded)));
     }
 
     /// Roles are ordered; a scoped caller acts on its CompIDs' clients only, and never on all.
