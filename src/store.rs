@@ -316,15 +316,13 @@ impl Store {
             .map_err(database("pruning orders"))?;
         connection.execute("DROP TABLE pruning").await.map_err(database("pruning orders"))?;
         if let Some(latest) = latest {
-            let latest = parse_time("sent_at", &latest)?;
-            if pruned_through(connection).await?.is_none_or(|through| through < latest) {
-                let query = sqlx::query(
-                    "INSERT INTO pruned (id, sent_through) VALUES (1, $1) \
-                     ON CONFLICT (id) DO UPDATE SET sent_through = excluded.sent_through",
-                )
-                .bind(time_text(latest));
-                run(connection, query, "recording what was pruned").await?;
-            }
+            // Only ever later: text order is time order.
+            let query = sqlx::query(
+                "INSERT INTO pruned (id, sent_through) VALUES (1, $1) ON CONFLICT (id) \
+                 DO UPDATE SET sent_through = excluded.sent_through WHERE pruned.sent_through < excluded.sent_through",
+            )
+            .bind(latest);
+            run(connection, query, "recording what was pruned").await?;
         }
         transaction.commit().await.map_err(database("committing a prune"))?;
         Ok(orders)
@@ -332,23 +330,20 @@ impl Store {
 
     /// The latest time a request was sent of an order [`prune`](Self::prune) deleted, if it has
     /// deleted any that had one: a venue may still store a request sent then or before, which the
-    /// store no longer knows. It never moves back.
+    /// store no longer knows. It never moves back. It is the book's `sent_at`, not the
+    /// SendingTime(52) a venue's store has: Turbojet stamps that a little later, as it encodes,
+    /// so compare the two with some slack.
     ///
     /// # Errors
     ///
     /// The database refuses the query, or holds a time this build can't read.
     pub async fn pruned_through(&self) -> io::Result<Option<DateTime<Utc>>> {
-        let mut connection = self.pool.acquire().await.map_err(database("reading what was pruned"))?;
-        pruned_through(&mut connection).await
+        let through: Option<String> = sqlx::query_scalar("SELECT sent_through FROM pruned")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database("reading what was pruned"))?;
+        through.map(|through| parse_time("sent_through", &through)).transpose()
     }
-}
-
-async fn pruned_through(connection: &mut AnyConnection) -> io::Result<Option<DateTime<Utc>>> {
-    let through: Option<String> = sqlx::query_scalar("SELECT sent_through FROM pruned")
-        .fetch_optional(connection)
-        .await
-        .map_err(database("reading what was pruned"))?;
-    through.map(|through| parse_time("sent_through", &through)).transpose()
 }
 
 /// What [`Store::prune`] deleted.
@@ -358,9 +353,11 @@ pub struct Pruned {
     pub orders: u64,
 }
 
-/// The orders one [`Store::prune`] batch deletes, oldest first, `$1` the cutoff's `time_text`
-/// and `$2` the batch. A day is its end, stored by `time_text`, whose fixed width makes text
-/// order time order. Left alone:
+/// The orders one [`Store::prune`] batch deletes, oldest day first, `$1` the cutoff's
+/// `time_text` and `$2` the batch. A day is its end, stored by `time_text`, whose fixed width
+/// makes text order time order. Read by the `orders_day` range, in its order: the unary `+`
+/// (PostgreSQL takes it too) keeps SQLite from going by `orders_live`, where `live = 0` is nearly
+/// every row, and sorting all of history each batch. Left alone:
 /// - a live order, which the book holds and a venue may still report on;
 /// - one with no day, as its client had none yet: `load` holds it while its client has no day or
 ///   is in its first, and such rows are few, written only before a client's first day;
@@ -369,11 +366,11 @@ pub struct Pruned {
 /// - one of its client's current day, however old, as `load` holds it (see [`HELD`]): a client
 ///   gone quiet keeps its day until it's next seen.
 const PRUNABLE: &str = "SELECT o.id FROM orders o
-    WHERE o.live = 0 AND o.day IS NOT NULL AND o.day < $1
+    WHERE +o.live = 0 AND o.day IS NOT NULL AND o.day < $1
         AND o.id < (SELECT MAX(id) FROM orders)
         AND NOT EXISTS (SELECT 1 FROM days d WHERE d.client = o.client
             AND d.client_comp_id = o.client_comp_id AND d.day_end = o.day)
-    ORDER BY o.id LIMIT $2";
+    ORDER BY o.day LIMIT $2";
 
 /// Downstream ClOrdIDs looked up per query by [`Store::unknown_downstreams`]: under SQLite's
 /// oldest limit of 999 parameters, and PostgreSQL's 65,535.
@@ -457,6 +454,7 @@ const TABLES: &[&str] = &[
     )",
     // For `HELD`: few orders are live, and each day's are found by day and client, NULL included.
     "CREATE INDEX IF NOT EXISTS orders_live ON orders (live)",
+    // `PRUNABLE` reads past days' orders by `orders_day` too.
     "CREATE INDEX IF NOT EXISTS orders_day ON orders (day, client, client_comp_id)",
     "CREATE TABLE IF NOT EXISTS sent (
         downstream TEXT PRIMARY KEY,

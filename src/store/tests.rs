@@ -672,8 +672,9 @@ async fn ids(store: &Store, sql: &str) -> Vec<i64> {
 
 /// Pruning deletes only done orders of days ended before the cutoff, with their requests sent and
 /// ClOrdIDs, and keeps live ones, those with no day, a client's current day however old and the
-/// newest order: a load after is the load before. `pruned_through` is the latest request sent of
-/// those pruned, and doesn't move back for a later prune of earlier requests.
+/// newest order (unless it's live): a load after is the load before. A day ending at the cutoff
+/// stays. `pruned_through` is the latest request sent of those pruned, amends included, and
+/// doesn't move back for a later prune of earlier requests.
 #[tokio::test]
 async fn pruning_deletes_done_orders_of_past_days_and_load_is_unchanged() {
     let store = memory().await;
@@ -684,7 +685,15 @@ async fn pruning_deletes_done_orders_of_past_days_and_load_is_unchanged() {
         dated(2, &funda, Some(day1), false, time(0, 6)),
         // FUNDB's current day, though it ended before the cutoff.
         dated(3, &fundb, Some(day1), true, time(0, 1)),
-        dated(4, &funda, Some(day2), true, time(1, 7)),
+        dated(4, &funda, Some(day2), true, time(1, 3)),
+        // An amend of 4, sent later: the latest of 4's requests.
+        Changes {
+            sent: vec![(
+                "4-2".into(),
+                Sent { sent_at: time(1, 7), ..dated(4, &funda, None, true, time(0, 0)).sent[0].1.clone() },
+            )],
+            ..Changes::default()
+        },
         dated(5, &funda, Some(day3), true, time(2, 9)),
         dated(6, &funda, None, true, time(0, 2)),
         // The newest.
@@ -700,16 +709,30 @@ async fn pruning_deletes_done_orders_of_past_days_and_load_is_unchanged() {
     assert_eq!(store.prune(cutoff, 10).await.unwrap(), Pruned { orders: 2 });
     assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [2, 3, 5, 6, 7]);
     assert_eq!(ids(&store, "SELECT order_id FROM sent ORDER BY order_id").await, [2, 3, 5, 6, 7]);
+    assert_eq!(ids(&store, "SELECT COUNT(*) FROM sent WHERE order_id = 4").await, [0]);
     assert_eq!(ids(&store, "SELECT order_id FROM cl_ord_ids ORDER BY order_id").await, [2, 3, 5, 6, 7]);
     assert_eq!(store.load().await.unwrap(), before);
     assert_eq!(store.pruned_through().await.unwrap(), Some(time(1, 7)));
     assert_eq!(store.prune(cutoff, 10).await.unwrap(), Pruned { orders: 0 });
 
+    // A day ending at the cutoff is kept, the comparison strict; and a live newest order lets the
+    // one before it go.
+    store
+        .write(&[
+            dated(8, &funda, Some(Day(cutoff)), true, time(2, 20)),
+            dated(9, &funda, Some(day3), false, time(2, 25)),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(store.prune(cutoff, 10).await.unwrap(), Pruned { orders: 1 });
+    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [2, 3, 5, 6, 8, 9]);
+    assert_eq!(store.pruned_through().await.unwrap(), Some(time(1, 8)));
+
     // FUNDB's day moves on: its order of day 1, sent earliest, goes to an earlier cutoff.
     store.write(&[current(&fundb, day3)]).await.unwrap();
     assert_eq!(store.prune(time(1, 30), 10).await.unwrap(), Pruned { orders: 1 });
-    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [2, 5, 6, 7]);
-    assert_eq!(store.pruned_through().await.unwrap(), Some(time(1, 7)), "never moves back");
+    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [2, 5, 6, 8, 9]);
+    assert_eq!(store.pruned_through().await.unwrap(), Some(time(1, 8)), "never moves back");
 }
 
 /// Batches run until one is short: a batch of 2 prunes all 5 orders it may.
@@ -737,4 +760,15 @@ async fn opening_an_older_database_adds_the_pruned_table() {
     let store = Store::open(&url).await.unwrap();
     assert_eq!(store.pruned_through().await.unwrap(), None);
     assert_eq!(store.prune(time(2, 0), 1).await.unwrap(), Pruned { orders: 0 });
+}
+
+/// Pruning reads past days' orders by the `orders_day` range, in its order: not by `orders_live`,
+/// nor sorting all of history each batch.
+#[tokio::test]
+async fn pruning_reads_by_day() {
+    let store = memory().await;
+    let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {PRUNABLE}")).fetch_all(&store.pool).await.unwrap();
+    let plan: Vec<String> = plan.iter().map(|row| row.try_get("detail").unwrap()).collect();
+    assert!(plan.iter().any(|step| step.starts_with("SEARCH o USING INDEX orders_day")), "{plan:?}");
+    assert!(!plan.iter().any(|step| step.contains("orders_live") || step.contains("TEMP B-TREE")), "{plan:?}");
 }
