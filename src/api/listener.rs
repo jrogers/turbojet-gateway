@@ -142,12 +142,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Conn<S> {
         self.stream.is_write_vectored()
     }
 
+    // TLS writes ciphertext on flush and shutdown (close_notify), which a peer not reading stalls.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.stream).poll_flush(cx);
+        this.check(cx, polled, false)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.stream).poll_shutdown(cx);
+        this.check(cx, polled, false)
     }
 }
 
@@ -261,6 +266,20 @@ mod tests {
         let read = tokio::time::timeout(IDLE_SHORT * 10, conn.read(&mut [0; 8])).await.unwrap();
         assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() >= IDLE_SHORT);
+    }
+
+    /// A client that stops reading stalls the server's writes, which then fail at the deadline.
+    #[tokio::test]
+    async fn a_stalled_write_times_out() {
+        let (mut conn, _client) = conn();
+        let written = tokio::time::timeout(IDLE_SHORT * 10, async {
+            loop {
+                if let Err(error) = conn.write_all(&[0; 1024]).await {
+                    return error;
+                }
+            }
+        });
+        assert_eq!(written.await.unwrap().kind(), io::ErrorKind::TimedOut);
     }
 
     /// A client sending a byte every quarter deadline, for several deadlines, keeps its connection
