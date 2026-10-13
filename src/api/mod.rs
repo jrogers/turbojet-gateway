@@ -98,6 +98,11 @@ impl ApiError {
     }
 }
 
+/// A 400 saying `message`.
+fn bad(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, message)
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()

@@ -18,11 +18,8 @@ use tracing::error;
 use turbojet::fields::CompactString;
 use turbojet::{SessionId, SessionStatus};
 
-use super::messages::bad;
-use super::{ApiError, State};
-use crate::book::{
-    ClientId, MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, Scope, ScopeName, Status,
-};
+use super::{ApiError, State, bad};
+use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
 use crate::config::RiskTables;
 use crate::router::{Rule, Target};
 use crate::service::Service;
@@ -268,7 +265,7 @@ async fn stored_orders(
     let stored = StoredOrders {
         from: range.start,
         to: range.end,
-        client: client.map(stored_scope),
+        client,
         venue: query.venue,
         symbol: query.symbol,
         status: query.status,
@@ -281,21 +278,6 @@ async fn stored_orders(
     Ok(Json(OrdersPage { orders, next }))
 }
 
-/// The scope `name` names, without the gateway: a past session may not be connected now, or
-/// known since the restart. The database matches a session by its name alone; the CompID is the
-/// name's target, as a [`SessionId`] shows it.
-fn stored_scope(name: ScopeName) -> Scope {
-    match name {
-        ScopeName::Session(session) => {
-            let target = session.split_once("->").map_or("", |(_, target)| target);
-            let comp_id = target.split(['/', ':']).next().unwrap_or_default().into();
-            Scope::Session(ClientId::from_parts(session, comp_id))
-        }
-        ScopeName::CompId(comp_id) => Scope::CompId(comp_id),
-        ScopeName::All => Scope::All,
-    }
-}
-
 /// A database page's `next`: its last order's `<created>/<id>` (RFC 3339), in base64url: opaque,
 /// so callers pass it back rather than build one.
 fn encode_after(order: &OrderView) -> String {
@@ -304,7 +286,7 @@ fn encode_after(order: &OrderView) -> String {
 }
 
 fn decode_after(text: &str) -> Result<(DateTime<Utc>, OrderId), ApiError> {
-    let forged = || bad("after isn't a next a range of orders gave");
+    let forged = || bad("after isn't a cursor from a range's next");
     let bytes = Base64UrlUnpadded::decode_vec(text).map_err(|_| forged())?;
     let text = String::from_utf8(bytes).map_err(|_| forged())?;
     let (created, id) = text.split_once('/').ok_or_else(forged)?;
@@ -329,7 +311,9 @@ pub(super) async fn order(
 }
 
 /// The order whose OrderID(37) is `order_id`, the book's or else the database's; 404 if neither
-/// holds it.
+/// holds it. The book drops a done order at its client's day roll whether or not the writer has
+/// committed it yet, so until it has, such an order reads as missing, or as its last committed
+/// state.
 pub(super) async fn find_detail(state: &State, order_id: &str) -> Result<OrderDetail, ApiError> {
     let store = {
         let service = state.service()?;
@@ -438,6 +422,7 @@ pub(super) mod tests {
     use super::super::tests::{Answer, send};
     use super::*;
     use crate::auth::{Role, Users};
+    use crate::book::ClientId;
 
     struct Nothing;
 
@@ -690,8 +675,8 @@ pub(super) mod tests {
             (format!("{from}&to=2026-10-01T00:00:00Z"), "from must be before to"),
             (format!("{from}&to=2026-09-30T00:00:00Z"), "from must be before to"),
             ("to=2026-10-04T00:00:00Z".to_string(), "to needs from"),
-            (format!("{range}&after=JB1"), "after isn't a next a range of orders gave"),
-            (format!("{range}&after={id}"), "after isn't a next a range of orders gave"),
+            (format!("{range}&after=JB1"), "after isn't a cursor from a range's next"),
+            (format!("{range}&after={id}"), "after isn't a cursor from a range's next"),
         ];
         for (query, error) in cases {
             let answer = fixture.get(&format!("/api/orders?{query}")).await;
@@ -725,6 +710,51 @@ pub(super) mod tests {
             (answer.status, answer.body["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("from must be before to"))
         );
+    }
+
+    /// A cursor is a position, not a range: replayed against a range wholly before it, it finds
+    /// nothing.
+    #[tokio::test]
+    async fn a_cursor_replayed_against_an_earlier_range_finds_nothing() {
+        let fixture = with_history("").await;
+        let page = fixture.ok("/api/orders?from=2026-10-02T00:00:00Z&to=2026-10-04T00:00:00Z&limit=1").await;
+        let next = page["next"].as_str().unwrap();
+        let page =
+            fixture.ok(&format!("/api/orders?from=2026-10-01T00:00:00Z&to=2026-10-02T00:00:00Z&after={next}")).await;
+        assert_eq!(page, serde_json::json!({ "orders": [], "next": null }));
+    }
+
+    /// A session scope matches the whole of the session's name, a SubID's `/` and all: FUNDA's
+    /// desk is another session than FUNDA, of the same CompID.
+    #[tokio::test]
+    async fn a_session_scope_matches_the_whole_name() {
+        let fixture = with_history("").await;
+        let desk = ClientId::new(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA").with_target_sub_id("DESK"));
+        assert_eq!(desk.session(), "FIX.4.4:JETBRIDGE->FUNDA/DESK");
+        let written = crate::store::tests::dated(103, &desk, None, true, past(3) + TimeDelta::hours(1));
+        fixture.service.store().unwrap().write(&[written]).await.unwrap();
+        let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z";
+        let found = async |client: &str| {
+            let page = fixture.ok(&format!("/api/orders?{range}&client={client}")).await;
+            names(&page).0.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        assert_eq!(found("session:FIX.4.4:JETBRIDGE-%3EFUNDA%2FDESK").await, ["A103"]);
+        assert_eq!(found("session:FIX.4.4:JETBRIDGE-%3EFUNDA").await, ["A100", "A101", "A102"]);
+        assert_eq!(found("session:FIX.4.4:JETBRIDGE-%3EFUNDA%2FDES").await, Vec::<String>::new());
+        assert_eq!(found("comp:FUNDA").await, ["A100", "A101", "A102", "A103"]);
+    }
+
+    /// A database read that fails is a 500, for a range and for an order the book doesn't hold.
+    #[tokio::test]
+    async fn a_failed_database_read_is_500() {
+        let fixture = with_history("").await;
+        fixture.service.store().unwrap().close_reads().await;
+        let answer = fixture.get("/api/orders?from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z").await;
+        assert_eq!(
+            (answer.status, answer.body["error"].as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("cannot read the database"))
+        );
+        assert_eq!(fixture.get("/api/orders/A100").await.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Risk counts the resting order's session; the routes are the file's.

@@ -21,7 +21,7 @@ use tracing::{error, warn};
 use turbojet::codec::{Decoded, decode};
 use turbojet::{Direction, FileMessageLog, LogFile, LogFilter, LogRecord, LogRecords, Message};
 
-use super::{ApiError, State};
+use super::{ApiError, State, bad};
 use crate::book::OrderDetail;
 use crate::service::Service;
 
@@ -133,6 +133,8 @@ pub(super) async fn order_messages(
     let Query(query) = query.map_err(|e| bad(e.body_text()))?;
     let dir = log_dir(&*state.service()?)?;
     let detail = super::read::find_detail(&state, &order_id).await?;
+    // The service again, not held over `find_detail`'s database read: a read doesn't keep a
+    // stopping gateway's service alive.
     let venue = state.service()?.venue_session(&detail.order.venue).map(|venue| venue.id().to_string());
     let after = query.after.as_deref().map(Cursor::decode).transpose()?;
     let created = detail.order.created;
@@ -308,10 +310,6 @@ fn time(key: &str, value: &str) -> Result<DateTime<Utc>, ApiError> {
     DateTime::parse_from_rfc3339(value)
         .map(|time| time.to_utc())
         .map_err(|e| bad(format!("{key} {value:?} isn't an RFC 3339 time: {e}")))
-}
-
-pub(super) fn bad(message: impl Into<String>) -> ApiError {
-    ApiError::new(StatusCode::BAD_REQUEST, message)
 }
 
 /// Where a search carries on from: the record starting at `position` of file `number` of `day`,

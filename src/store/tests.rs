@@ -873,16 +873,16 @@ async fn stored_orders_are_read_by_creation_and_filters() {
         query
     };
     let funda = ClientId::from("FUNDA");
-    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::Session(funda.clone())))).await, [1, 4, 6]);
-    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::Session(funda_42.clone())))).await, [3]);
-    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::CompId("FUNDA".into())))).await, [1, 3, 4, 6]);
-    assert_eq!(ids_of(&store, with(&|q| q.client = Some(Scope::All))).await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(ScopeName::Session(funda.session().into())))).await, [1, 4, 6]);
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(ScopeName::Session(funda_42.session().into())))).await, [3]);
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(ScopeName::CompId("FUNDA".into())))).await, [1, 3, 4, 6]);
+    assert_eq!(ids_of(&store, with(&|q| q.client = Some(ScopeName::All))).await, [1, 2, 3, 4, 5, 6]);
     assert_eq!(ids_of(&store, with(&|q| q.venue = Some("NYSE".into()))).await, [2, 4]);
     assert_eq!(ids_of(&store, with(&|q| q.symbol = Some("MSFT".into()))).await, [2, 3]);
     assert_eq!(ids_of(&store, with(&|q| q.status = Some(Status::Filled))).await, [2, 3, 6]);
     assert_eq!(ids_of(&store, with(&|q| q.working = true)).await, [1, 4, 5]);
     let narrow = with(&|q| {
-        q.client = Some(Scope::CompId("FUNDA".into()));
+        q.client = Some(ScopeName::CompId("FUNDA".into()));
         q.venue = Some("NASDAQ".into());
         q.working = true;
     });
@@ -1007,7 +1007,7 @@ async fn stored_orders_read_by_creation_without_sorting() {
     let store = memory().await;
     let bare = created_in(on(0, 0), on(1, 0));
     let full = StoredOrders {
-        client: Some(Scope::Session("FUNDA".into())),
+        client: Some(ScopeName::Session(ClientId::from("FUNDA").session().into())),
         venue: Some("NASDAQ".into()),
         symbol: Some("AAPL".into()),
         status: Some(Status::New),

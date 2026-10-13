@@ -27,8 +27,8 @@ use turbojet::fields::{CompactString, Decimal};
 
 use crate::book::{
     CancelKind, Changes, ClOrdIdRow, ClientId, Day, GatewayCancel, MAX_ORDERS_PER_PAGE, OrdType, Order, OrderDetail,
-    OrderId, OrderRequest, OrderRow, OrderView, Origin, Pending, Scope, Sent, Side, Snapshot, Status, TimeInForce,
-    Today, Undelivered, VenueId, order_view, request_view,
+    OrderId, OrderRequest, OrderRow, OrderView, Origin, Pending, Scope, ScopeName, Sent, Side, Snapshot, Status,
+    TimeInForce, Today, Undelivered, VenueId, order_view, request_view,
 };
 
 /// The schema this build reads and writes. A database of another is refused, not migrated.
@@ -419,6 +419,13 @@ impl Store {
         let view = stored_view(&order, &row, created)?;
         Ok(Some(OrderDetail { order: view, venue_order_id: order.venue_order_id, requests }))
     }
+
+    /// Closes the reads' pool (an in-memory database's is the writer's too): how the API's tests
+    /// make a read fail.
+    #[cfg(test)]
+    pub(crate) async fn close_reads(&self) {
+        self.reads.close().await;
+    }
 }
 
 /// Which orders [`Store::orders`] returns: those created in `from..to` matching every other field
@@ -429,8 +436,9 @@ pub struct StoredOrders {
     pub from: DateTime<Utc>,
     /// The creation up to which orders are included, not at it: one day's `to` is the next's `from`.
     pub to: DateTime<Utc>,
-    /// A client session, or every session of a CompID.
-    pub client: Option<Scope>,
+    /// A client session, by the whole of its name as it shows, or every session of a CompID.
+    /// A name is enough: a past session may be neither connected nor known since the restart.
+    pub client: Option<ScopeName>,
     /// The venue the order was routed to.
     pub venue: Option<VenueId>,
     pub symbol: Option<CompactString>,
@@ -479,9 +487,9 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
     };
     match &query.client {
         // The session as it shows names its CompID: the column alone is the session.
-        Some(Scope::Session(client)) => and("o.client = $", Value::Text(client.to_string())),
-        Some(Scope::CompId(comp_id)) => and("o.client_comp_id = $", Value::Text(comp_id.to_string())),
-        Some(Scope::All) | None => {}
+        Some(ScopeName::Session(session)) => and("o.client = $", Value::Text(session.clone())),
+        Some(ScopeName::CompId(comp_id)) => and("o.client_comp_id = $", Value::Text(comp_id.to_string())),
+        Some(ScopeName::All) | None => {}
     }
     if let Some(venue) = &query.venue {
         and("o.venue = $", Value::Text(venue.to_string()));
