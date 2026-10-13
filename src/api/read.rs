@@ -70,12 +70,14 @@ impl SessionView {
     /// Session `id`, connected with `status` or disconnected (`None`).
     fn new(side: SessionSide, id: &SessionId, paused: bool, status: Option<&SessionStatus>) -> Self {
         let live = status.and_then(|status| status.activity.as_ref());
-        let state = match (status, live.map(|live| live.state)) {
-            (None, _) => SessionState::Disconnected,
-            (Some(_), Some(turbojet::SessionState::LoggingOn)) => SessionState::LoggingOn,
-            (Some(_), Some(turbojet::SessionState::LoggedOn)) => SessionState::LoggedOn,
-            (Some(_), Some(turbojet::SessionState::LoggingOut)) => SessionState::LoggingOut,
-            (Some(_), _) => SessionState::Connected,
+        let state = match status {
+            None => SessionState::Disconnected,
+            Some(_) => match live.map(|live| live.state) {
+                Some(turbojet::SessionState::LoggingOn) => SessionState::LoggingOn,
+                Some(turbojet::SessionState::LoggedOn) => SessionState::LoggedOn,
+                Some(turbojet::SessionState::LoggingOut) => SessionState::LoggingOut,
+                _ => SessionState::Connected,
+            },
         };
         Self {
             side,
@@ -100,7 +102,7 @@ impl SessionView {
 pub(super) async fn sessions(axum::extract::State(state): AxumState) -> Result<Json<Vec<SessionView>>, ApiError> {
     let service = state.service()?;
     let mut clients = service.client_statuses();
-    clients.sort_unstable_by_key(|status| status.id.to_string());
+    clients.sort_by_cached_key(|status| status.id.to_string());
     let mut sessions: Vec<_> = clients
         .iter()
         .map(|status| SessionView::new(SessionSide::Client, &status.id, status.paused, Some(status)))
@@ -135,7 +137,8 @@ pub(super) struct OrdersQuery {
 #[derive(Debug, Serialize)]
 pub(super) struct OrdersPage {
     orders: Vec<OrderView>,
-    /// The `after` for the next page; `None` on the last.
+    /// The `after` for the next page; `None` when this page is short. A full page may be followed
+    /// by an empty one.
     next: Option<u64>,
 }
 
@@ -178,6 +181,7 @@ pub(super) async fn orders(
         limit: Some(limit),
     };
     let orders = gateway.orders(&filter);
+    // Whether more match isn't known without a walk past the page: a full page may be the last.
     let next = if orders.len() == limit { orders.last().map(|order| order.id.0) } else { None };
     Ok(Json(OrdersPage { orders, next }))
 }
