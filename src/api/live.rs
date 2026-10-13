@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Serialize;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::info;
 use turbojet::{SessionEvent, SessionEventKind};
 
@@ -228,6 +228,8 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
     info!(user = viewer.user, ip = %viewer.ip, "API live socket opened");
     let mut stopping = state.stopping.subscribe();
     let mut recheck = tokio::time::interval_at(Instant::now() + RECHECK, RECHECK);
+    // A tick missed while a send waited comes once, late, not as a burst of rechecks and pings.
+    recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // Its pongs, at least, every RECHECK.
     let mut last_received = Instant::now();
     let mut last_snapshot: Option<Instant> = None;
