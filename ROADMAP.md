@@ -6,13 +6,13 @@ knowing about is in [CAVEATS.md](CAVEATS.md).
 
 ## 1. Operator access
 
-The [API](README.md#api) covers sessions, the blotter, risk and the kill switch, reload and the
-audit log. Still to do:
+The [API](README.md#api) covers sessions and their sequence numbers, the blotter, asking a venue
+for an order's status, risk with the kill switch and limit editing, routes with a dry run, the
+message log with search, reload and the audit log. Still to do:
 
-- **More of the API** (M). The message log per session, with search; editing the risk limits;
-  a routing dry run (which route an order would take); setting and resetting a session's
-  sequence numbers; and asking a venue for an order's status, which needs the book to send an
-  OrderStatusRequest of its own.
+- **Resolving an order a venue doesn't know** (S). After an `unknown_at_venue` alarm the order
+  stays live, its exposure counted, with no way for an operator to mark it done once they've
+  settled it with the venue.
 - **History beyond the current day** (M). The blotter reads the book, which holds each client's
   current day only; earlier days are in the database but not readable over the API.
 - **Audit log rotation** (S). The file grows for as long as the gateway runs, and reading it back

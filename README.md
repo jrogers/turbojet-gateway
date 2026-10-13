@@ -50,6 +50,10 @@ reports back, keeping each order's state as it goes.
   survive a restart, and the restart sorts out what a crash left half done with the venues.
 - **An operator API**, optional: HTTP and JSON, with local users in three roles, an audit log of
   every change, and a websocket of the book's and the sessions' changes as they happen.
+  Operators can also ask a venue where an order stands; admins can edit the risk limits and set
+  sequence numbers.
+- **A message log**, optional: every message both sides send and receive, in files by day,
+  searchable over the API.
 - **Reload on SIGHUP** of the routes, the risk limits, `day_end` and the sessions file, keeping connected
   sessions the file still has.
 
@@ -66,6 +70,8 @@ file; without it, a sessions file that asks for TLS doesn't load.
 ```sh
 cargo run --release --features tls -- --config examples/jetbridge.toml
 ```
+
+Build with `--features gzip` to compress the [message log](#message-log)'s files.
 
 Jetbridge builds against Turbojet by path, so it expects a Turbojet checkout next to it
 (`../turbojet`). It needs Rust 1.89 or later.
@@ -108,6 +114,13 @@ credit = 10000000                 # open + filled today + this order
 listen = "127.0.0.1:8080"
 users = "users.toml"              # paths relative to this file
 audit = "audit.jsonl"
+
+# Every message the clients' and venues' sessions receive and send, in files by day, passwords
+# masked. Left out, nothing is logged.
+# [message_log]
+# dir = "log"                     # relative to this file
+# retention = "90d"               # files older are deleted; kept for ever if left out
+# compress = true                 # gzip finished files; needs the `gzip` feature
 ```
 
 - `sessions`: the sessions file, relative to this file. Read at start only; a reload rereads the
@@ -136,6 +149,7 @@ now.
   other changes apply at the next start, and an `[api]` that doesn't load refuses the whole
   reload of this file. Off loopback the API refuses to start without `tls`,
   unless `behind_proxy = true` says a proxy in front terminates TLS. See [API](#api).
+- `[message_log]`, optional: see [Message log](#message-log).
 
 ### sessions.toml
 
@@ -234,6 +248,37 @@ session stops reading 256 messages past its oldest one waiting.
 
 What recovery doesn't cover is in [CAVEATS.md](CAVEATS.md#database-and-recovery).
 
+## Message log
+
+With a `[message_log]` in `jetbridge.toml`, every message the clients' and venues' sessions receive
+and send is written to files in one directory, both sides in the same files, for a record of what
+was said and to search over the [API](#searching-the-message-log).
+
+```toml
+[message_log]
+dir = "/var/log/jetbridge/fix"
+file_bytes_max = 268435456
+retention = "90d"
+compress = true
+```
+
+- `dir`: where the files go, relative to this file; created if missing. A log that can't be
+  opened stops the start.
+- `file_bytes_max`, optional: a new file is started once one reaches this many bytes; 256 MiB if
+  left out.
+- `retention`, optional: files older than this are deleted. A whole number and `s`, `m`, `h` or
+  `d` (`90d`), at most 100 years; left out, files are kept for ever.
+- `compress`, optional: gzip each file once it's finished. It needs the `gzip` feature: a build
+  without it refuses `compress = true`.
+
+Unknown keys are errors. Files are named `messages-YYYYMMDD-NNNNNN.log` (`.log.gz` once
+compressed), by UTC day and a number within it: a new one starts each UTC day, when the current
+one is full, and at each start. Each message is a line `<time> <in|out> <length> <session>`, the
+time in UTC and the session `-` until a client's Logon names it, then the message as on the wire;
+passwords are written as `*`s. Turbojet's `turbojet-log` command reads them. The log is opened at
+start only: a reload that finds `[message_log]` changed keeps the one in use and warns that the
+change needs a restart.
+
 ## Risk limits
 
 Each new order a route sends to a venue, and each replace, is checked against its client's limits
@@ -274,6 +319,8 @@ written), and must be positive; `symbols` can't be empty. Unknown keys are error
   too many ClOrdIDs, the routes (a route's reject or no route), then the limits.
 - **Reloads.** A SIGHUP rereads the limits with the routes, both or neither. New limits apply from
   the next order or replace; orders already working stay, and what's been counted carries over.
+  An admin can also edit them over the API, which rewrites the file and reloads: see
+  [Editing the risk limits](#editing-the-risk-limits).
 
 ## Trading day
 
@@ -357,9 +404,9 @@ as one warning with the count per session. Other clients' orders stay working at
 ## API
 
 With `[api]` in `jetbridge.toml` (see [Configuration](#jetbridgetoml)), the gateway serves an HTTP
-JSON API for operators: the sessions, the book's orders, risk and routes to read, and the kill
-switch, session controls and reload to act with. Every answer is JSON, an error as
-`{"error": "..."}` with its status.
+JSON API for operators: the sessions, the book's orders, risk, routes and the message log to read,
+and the kill switch, session controls, risk limits and reload to act with. Every answer is JSON,
+an error as `{"error": "..."}` with its status.
 
 ### Users and tokens
 
@@ -375,8 +422,9 @@ jetbridge token revoke alice q3Xr --users users.toml # by the token, its id, or 
 jetbridge user remove alice --users users.toml
 ```
 
-- **Roles**: `viewer` reads; `operator` also pauses, resumes and resends sessions, cancels orders,
-  and blocks, unblocks and cancels clients; `admin` also reloads and reads the audit log.
+- **Roles**: `viewer` reads; `operator` also pauses, resumes and resends sessions, cancels orders
+  and asks venues where they stand, and blocks, unblocks and cancels clients; `admin` also sets and
+  resets sequence numbers, edits the risk limits, reloads and reads the audit log.
 - **`--clients`** limits a user to acting on those CompIDs' client sessions, orders and scopes. Such
   a user still reads everything, and can't act on a venue's session or on `all`. Without it a user
   acts on every client; the API shows its `clients` as `null`.
@@ -400,21 +448,30 @@ jetbridge user remove alice --users users.toml
 | `POST /api/login`, `POST /api/logout`, `GET /api/me` | none, any, any | see above |
 | `GET /api/sessions` | viewer | client sessions connected or paused, then every venue's: status, sequence numbers, activity, `paused` |
 | `GET /api/orders` | viewer | the book's orders: `?client=&venue=&symbol=&status=&working=true&after=&limit=` |
-| `GET /api/orders/{order_id}` | viewer | one order by its OrderID(37), with every request sent for it |
+| `GET /api/orders/{order_id}` | viewer | one order by its OrderID(37), with every request sent for it and the venue's OrderID |
+| `GET /api/orders/{order_id}/messages` | viewer | `?limit=&after=`: the order's messages, both sides'; see [Searching the message log](#searching-the-message-log) |
+| `GET /api/messages` | viewer | `?session=&direction=&msg_type=&tag=&since=&until=&limit=&after=`: the message log, searched |
 | `GET /api/risk` | viewer | the limits in force, each session's open and filled notional, reference prices, blocks |
+| `GET /api/risk/limits` | viewer | the limits as `jetbridge.toml` writes them; see [Editing the risk limits](#editing-the-risk-limits) |
 | `GET /api/routes` | viewer | the routes, in the order they're tried |
+| `GET /api/routes/test` | viewer | `?client=&ex_destination=&symbol=`: the route such an order would take |
 | `GET /api/live` | viewer | a websocket; see [Live events](#live-events) |
 | `POST /api/sessions/{id}/pause` | operator | logs the session out and keeps it out until resumed |
 | `POST /api/sessions/{id}/resume` | operator | lets it log on again |
 | `POST /api/sessions/{id}/resend` | operator | `{from}`: asks the counterparty to send again from that MsgSeqNum; answers the sequence numbers |
 | `POST /api/orders/{order_id}/cancel` | operator | the gateway's own cancel of one order; retries a stuck one |
+| `POST /api/orders/{order_id}/status` | operator | asks the order's venue where it stands; answers 202 |
 | `POST /api/risk/block`, `/unblock` | operator | `{scope}`: see [Kill switch](#kill-switch); answers `{"changed"}` |
 | `POST /api/risk/cancel-all` | operator | `{scope}`: blocks the scope and cancels its orders |
+| `POST /api/sessions/{id}/sequence` | admin | `{next_incoming, next_outgoing}`, either or both: sets the session's sequence numbers |
+| `POST /api/sessions/{id}/reset` | admin | sets both sequence numbers to 1 and clears the session's resend store |
+| `PATCH /api/risk/limits/defaults`, `/client/{comp_id}` | admin | `{set}`: edits the limits in `jetbridge.toml`, then reloads |
+| `DELETE /api/risk/limits/client/{comp_id}` | admin | removes a CompID's limits from `jetbridge.toml`, then reloads |
 | `POST /api/reload` | admin | rereads the files, as SIGHUP does, and says what changed |
 | `GET /api/audit` | admin | `?since=&limit=`: the audit log's last entries |
 
-- **Every change needs a reason**: each POST but login and logout takes a JSON body with a
-  non-empty `reason` (up to 1,000 bytes), or is refused (400).
+- **Every change needs a reason**: each POST, PATCH and DELETE but login and logout takes a JSON
+  body with a non-empty `reason` (up to 1,000 bytes), or is refused (400).
 - **Scopes** are `all`, `comp:COMPID` or `session:SESSION`, a session as `GET /api/sessions` shows
   it (`session:FIX.4.4:JETBRIDGE->FUNDA`). A session scope names one the gateway has seen.
 - **A session in a path** is its `id` percent-encoded as `encodeURIComponent` does, `>` as `%3E` and
@@ -426,14 +483,98 @@ jetbridge user remove alice --users users.toml
   `client` is a scope (a session the gateway hasn't seen gives an empty page); `status` is `new`,
   `partially_filled`, `filled`, `canceled` and so on. The orders are the book's: working ones and
   each client's done orders of its current trading day.
+- **A routing dry run**, `GET /api/routes/test`, answers `{rule, route, target}`: `rule` is the
+  index in `GET /api/routes` of the first route the order would match, `route` that route, and
+  `target` `{"venue": NAME}` or `{"reject": TEXT}`; all three are `null` when none matches (the
+  order would be rejected "no route for this order"). `client` is a CompID, as routes match it,
+  not a scope; `client` and `symbol` are required. It's routing only: blocks, the ClOrdID limit
+  and the risk limits aren't checked.
+- **Asking a venue** where an order stands, `POST /api/orders/{order_id}/status`, sends it an
+  OrderStatusRequest under the gateway's ClOrdID the venue last acknowledged, and answers 202: the
+  venue's answer comes as the order's reports. One showing a fill the gateway missed reaches the
+  client as a fill, one that changes nothing is dropped, and one saying the venue doesn't know the
+  order raises an `unknown_at_venue` alarm and leaves the order as it was. Audited as
+  `request_status`.
+- **Sequence numbers.** `sequence` takes `next_incoming`, `next_outgoing` or both (numbers from
+  1). The outgoing one only moves forward; a logged-on counterparty is told with a gap fill.
+  `reset` works only while the session is disconnected: pause it first. For a reset agreed with
+  the counterparty, it logs on with ResetSeqNumFlag(141) instead. Both answer `{next_incoming,
+  next_outgoing}`, and 500 if the session's store fails. See
+  [CAVEATS.md](CAVEATS.md#operator-api) before moving a live session's numbers.
 - **What a refusal says**: 401 without valid credentials, 403 for the role or the CSRF token or a
   target out of a scoped user's CompIDs, 404 for a target that doesn't exist (whatever the user's
-  scope), 409 for an order already done or a resend the session can't make now (not logged on, a
-  resend under way, or `from` not below the next expected).
+  scope), 409 for an order already done, a status request to a venue that isn't logged on, a
+  resend the session can't make now (not logged on, a resend under way, or `from` not below the
+  next expected), an outgoing sequence number below the next, or a reset while connected.
 - **Reload** answers 200 with what changed in the sessions file, the routes, limits and `day_end`
   taken, and any warnings; or 422 if either file was kept, saying why and what the other one
-  changed, since that one did apply. Reloads run one at a time, and one sent during shutdown
-  answers 503.
+  changed, since that one did apply. Its warnings include a changed `[database]` or
+  `[message_log]`, which waits for a restart. Reloads run one at a time, and one sent during
+  shutdown answers 503.
+
+### Editing the risk limits
+
+`GET /api/risk/limits` answers the limits as `jetbridge.toml` writes them, `{"defaults": {...},
+"clients": {"FUNDA": {...}}}`, each table with only the keys it sets; `GET /api/risk` has them as
+in force, merged. An admin changes them with a `PATCH` to `/api/risk/limits/defaults` or
+`/api/risk/limits/client/{comp_id}`:
+
+```json
+{"reason": "more room for the open", "set": {"credit": "20000000.50", "symbols": null}}
+```
+
+- **`set`** names each key to change, the keys as [Risk limits](#risk-limits) lists them: an
+  amount as a JSON number or, to keep every digit, a decimal as a string; `symbols` an array of
+  strings; `self_trade` `true` or `false`. `null` removes the key: removed from a client's table,
+  the client has the default's again. A client's table is created if it has none. An unknown key
+  or a value of the wrong type is refused (400).
+- **`DELETE /api/risk/limits/client/{comp_id}`** removes the client's table, so its sessions get
+  the defaults; 404 if it has none.
+- **The file is rewritten.** The gateway reads `jetbridge.toml` afresh, changes only that table,
+  keeping the comments and layout elsewhere, checks the result loads, and replaces the file
+  whole (the file a symlink points to, keeping its permissions). Then it reloads, as SIGHUP does,
+  so the reload takes whatever else changed in the files since the last, the sessions file
+  included. An edit the file wouldn't load with, or any edit while the file doesn't load as it
+  is, is refused (422) and the file left as it was.
+- **The answer** is `{table, reload}`: the table as the file now has it (`null` once deleted),
+  and what the reload did, as `POST /api/reload` answers it; a reload that kept a file answers 422,
+  though the edit is written. Edits and reloads run one at a time. Audited as `set_limits`, with
+  the keys set and their values and the keys removed, or `delete_limits`, on `risk.defaults` or
+  `risk.client.COMPID`.
+
+### Searching the message log
+
+With a [message log](#message-log), `GET /api/messages` finds the messages matching every condition
+given, oldest first; without one, it answers 404 "no message log".
+
+- `since`, an RFC 3339 time, is required. `until` is a day after it by default, and a search covers
+  a day at most.
+- `session`, a session's `id` as `GET /api/sessions` shows it, repeats: any of them.
+- `direction` is `in` (received) or `out` (sent).
+- `msg_type` repeats or takes a list (`msg_type=D,F`): any of them.
+- `tag=11=ABC` repeats, and every one must hold. A search takes 100 sessions, MsgTypes and tags
+  at most, together.
+- `limit` is 100 by default, at most 1,000.
+
+It answers `{messages, next, follow}`, each message
+`{"time", "direction", "session", "msg_type", "fields": [[11, "ABC"], ...], "raw"}`, `raw` as on
+the wire with `|` for SOH. `session` is `null` for a client's messages before its Logon, and
+`msg_type` `null`, with no fields, for one that doesn't decode.
+
+- **Paging.** `next` is a cursor: pass it as `after`, with the same query, for the next page. A
+  search reads up to 256 MiB of the log per page, so a page can come back short, or empty, with a
+  `next`. `next` is `null` once the range is read to the end of what's logged.
+- **Following.** While the range's end is still to come (until two seconds past it), the last page
+  also has `follow`, the end of what's logged so far: passed as `after` later, it finds what's
+  been logged since. A live order's search has one.
+- **Refusals**: 400 for an unknown parameter, one given twice that can't repeat, an empty value,
+  over 100 conditions, `until` not after `since`, a range over a day, or an `after` that isn't a
+  cursor a search gave (or whose file has gone); 503 while two searches are under way.
+
+`GET /api/orders/{order_id}/messages?limit=&after=` finds an order's messages on both sides, paged
+the same way: its client session's with any of the order's ClOrdIDs in ClOrdID(11) or
+OrigClOrdID(41), and its venue session's with any of the gateway's ClOrdIDs for it in either, or
+the venue's OrderID in OrderID(37), from a minute before the order was booked, for a day.
 
 ### Live events
 
@@ -454,7 +595,8 @@ each change, in the order it happened:
   the one held, or add.
 - `{"type":"blocked","scope":...}` and `{"type":"unblocked","scope":...}`.
 - `{"type":"alarm","time","kind","text"}`, `kind` one of `gateway_unavailable`,
-  `gateway_available`, `stuck_cancel`, `orphan`, `overfill`, `unknown_order` and
+  `gateway_available`, `stuck_cancel`, `orphan`, `overfill`, `unknown_order`, `unknown_at_venue`
+  (a venue answered a status request saying it doesn't know a live order) and
   `venue_store_reset`. Each is in the log too.
 - `{"type":"session","side","id","event"}` for the session keyed by `side` (`client` or `venue`)
   and `id`: `connected`, `logged_on`, `logging_out`, `resend_started`, `resend_finished`,

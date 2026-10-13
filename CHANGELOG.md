@@ -92,3 +92,16 @@ Notable changes to Jetbridge.
   and per address.
 - An audit log: every change through the API, and every login and logout, as a JSON line synced
   to disk before it runs, with who, from where, why and what came of it; refusals too.
+- More of the API: a routing dry run (`GET /api/routes/test`); setting and resetting a session's
+  sequence numbers; asking a venue where an order stands (`POST /api/orders/{order_id}/status`),
+  with an `unknown_at_venue` alarm when it doesn't know a live order; the risk limits as
+  configured (`GET /api/risk/limits`), and editing them, which rewrites `jetbridge.toml`'s table
+  in place and reloads. The order detail has the venue's OrderID.
+- A venue's ExecutionReport saying it doesn't know an order (Status, Rejected, OrdRejReason 5) no
+  longer rejects the order: it raises the `unknown_at_venue` alarm, and the order stays live.
+- A message log, with `[message_log]` in `jetbridge.toml`: every message both sides' sessions
+  receive and send, in files by UTC day, passwords masked, with size, retention and gzip
+  compression (feature `gzip`). `GET /api/messages` searches it by session, direction, MsgType,
+  tags and time, and `GET /api/orders/{order_id}/messages` finds an order's messages on both
+  sides.
+- A reload that finds `[database]` or `[message_log]` changed says so in its warnings.

@@ -86,8 +86,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   but not yet sent.
 - Deleting a venue's disk store while the database has orders for that venue stops every start,
   since the gateway can no longer tell what the venue was sent. To start a venue's sequence
-  numbers again, reset them rather than delete its files: `Service::venue_session(name)`, then
-  `reset_sequence_numbers()` on it while it's disconnected.
+  numbers again, reset them rather than delete its files: pause the venue's session, then
+  `POST /api/sessions/{id}/reset` (or `reset_sequence_numbers()` on `Service::venue_session(name)`
+  while it's disconnected).
 - An orphan (a request the venue's session stored that the database never recorded, from a crash
   within a commit of sending it) is logged as an error at the start. An orphaned order is
   cancelled at the venue's next logon, under a ClOrdID of the gateway's own (`<prefix>C<n>`);
@@ -213,6 +214,27 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - A reload's new limits apply to the next order or replace: orders already working aren't
   checked again or cancelled.
 
+## Editing the limits over the API
+
+- An edit rewrites `jetbridge.toml`, so the gateway's user must be able to write it and to create
+  and rename a file in its directory (the directory of the file a symlink points to). The new
+  file belongs to the gateway's user; an owner that changed, or a directory that couldn't be
+  synced once the file was in place, comes back as a warning in the answer.
+- An edit reformats only the table it touches. A comment after a value it replaces stays; a
+  deleted table takes its comments with it, and any just before it. A new client's table goes at
+  the end of the file.
+- A file broken by hand refuses every edit (422) until it's fixed; a `DELETE` of a table that
+  isn't there answers 404 before that. Limits written as `[risk]` keys or inline tables rather than
+  `[risk.defaults]` and `[risk.client.COMPID]` tables answer 422: edit those by hand.
+- Each edit runs a full reload, which takes whatever else was changed by hand in `jetbridge.toml`
+  and the sessions file. A hand edit saved while an API edit is under way is overwritten.
+- Removing a client's last key leaves its table, empty: the client has the defaults, but still a
+  table until it's deleted.
+- CompIDs the API refuses in a path (with dots, spaces, quotes, backslashes or non-ASCII) show in
+  `GET /api/risk/limits` but can't be edited over the API.
+- A JSON number that isn't an integer is written as a TOML float, which may not keep every digit:
+  send an exact decimal as a string. An integer too large for TOML is written as a string.
+
 ## Venues
 
 - FIX 4.2 venues get HandlInst(21) 1 (automated, private) on every order and replace, whatever
@@ -282,6 +304,32 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   loop writes one synced line each, and can delay real mutations.
 - A reload answered 422 may have applied half: the file that loaded is in use. The answer says
   which.
+- `jetbridge user` replaces a dangling symlink at the users file's path with a regular file.
+- Setting a session's sequence numbers while it's logged on has effects on the counterparty;
+  pausing it first is safer:
+  - lowering next_incoming can have messages accepted again, or, with messages in flight, draw a
+    ResendRequest or a Logout. On a client's session, messages accepted again are answered by the
+    book as duplicates, by ClOrdID;
+  - raising a client's next_incoming skips messages: an order among them is lost;
+  - next_outgoing only moves forward, and a logged-on counterparty is told with a gap fill.
+- A reset only works on a disconnected session, and clears its resend store: the messages sent
+  before it can't be sent again. For a reset the counterparty agrees to, it logs on with
+  ResetSeqNumFlag(141)=Y.
+- Given both numbers, the outgoing one is set first, so a refusal changes nothing; only a store
+  failure setting the incoming one leaves the outgoing one set, and the error and the audit line
+  say so.
+- A status request to a venue that isn't logged on is refused (409), not queued: ask again once
+  it is. It's sent under the gateway's ClOrdID the venue last acknowledged, not a pending
+  replace's.
+- An answer that changes the order reaches the client as an unsolicited report with ExecType
+  Status, a missed fill as a Trade.
+- Only an ExecutionReport with ExecType Status, OrdStatus Rejected and OrdRejReason(103) 5 (unknown
+  order) is recognised as a venue not knowing an order; a BusinessMessageReject or an
+  OrderCancelReject isn't. That report is taken so whether the gateway asked or not: it no longer
+  rejects the order, or refuses a cancel or replace pending on it.
+- After an `unknown_at_venue` alarm the order stays live, its exposure counted, until an operator
+  resolves it with the venue; there's no API call yet to mark it done. "Unknown" under a ClOrdID a
+  replace has since superseded is only a warning in the log: ask again.
 - Each API connection holds one of 256 slots for as long as it's open; one that moves no bytes for
   60 seconds is closed, so an idle connection holds its slot for up to that long. Past 256, new
   connections wait in the kernel's backlog. A live socket holds one too, up to 64 of them, and its
@@ -299,3 +347,25 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   not a path on a site that serves other pages.
 - A live socket's snapshot holds up to 1,000 working orders; the rest are read from
   `GET /api/orders`, and may change between the two.
+
+## Message log
+
+- Messages are written with no `fsync`: they survive the gateway's process crashing, not the
+  machine. If the log's 16 MiB buffer fills, messages are dropped, and the gap recorded in the
+  file as a `dropped` line.
+- A client's messages before its Logon names its session are logged with session `-` (`null` in a
+  search), so a search by `session` doesn't find them.
+- A file is finished, and compressed, only when the next one starts or the gateway stops.
+- The log is opened before the sessions file is loaded: a start that stops on a bad sessions
+  file leaves an empty log file behind.
+- A search reads the files with no index, so a rare match on a busy day pages slowly, up to
+  256 MiB a page. Resuming in a `.log.gz` file decompresses it up to the cursor. A search stops
+  reading a file at a corrupt record, and the rest of that file isn't searched.
+- A cursor is refused once retention has deleted its file, or if the record it points at is
+  corrupt. `follow` assumes one gateway writes to the log's directory.
+- A build without the `gzip` feature skips `.log.gz` files in a search, with a warning logged.
+- An order's messages are searched for a day from its creation: later ones, a GTC order's say,
+  are found with `GET /api/messages` by tag. A done order from before its client's current
+  trading day isn't in the book, so it has no `{order_id}`: search for it by tag too. A venue
+  whose initiator a reload stopped has no session to search, so only the client's side of its
+  orders is found.
