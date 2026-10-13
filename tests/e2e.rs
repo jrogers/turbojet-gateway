@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jetbridge::auth::{Role, Users};
-use jetbridge::book::{ClientId, Scope, Status};
+use jetbridge::book::{AlarmKind, ClientId, GatewayEvent, Scope, Status};
 use jetbridge::service::Service;
 use jetbridge::store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1027,12 +1027,7 @@ async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
 #[tokio::test]
 async fn the_kill_switch_over_the_api_cancels_a_clients_orders() {
     let mut setup = Setup::with(Options { api: true, ..Options::default() }).await;
-    let users_path = setup.dir.path().join("users.toml");
-    let mut users = Users::load(&users_path).unwrap();
-    users.add("olga", Role::Operator, Vec::new(), "a long enough password").unwrap();
-    let token = users.add_token("olga").unwrap();
-    users.save(&users_path).unwrap();
-    setup.reload().await;
+    let token = operator(&setup).await;
     setup.working_order().await;
 
     let body = format!(r#"{{"scope":"comp:{CLIENT}","reason":"runaway algo"}}"#);
@@ -1053,6 +1048,61 @@ async fn the_kill_switch_over_the_api_cancels_a_clients_orders() {
         (&line["user"], &line["action"], &line["target"], &line["reason"], &line["result"]),
         (&"olga".into(), &"cancel_all".into(), &target.into(), &"runaway algo".into(), &"allowed".into())
     );
+}
+
+/// An operator over the API asks the venue where order C1 stands: the venue gets an
+/// OrderStatusRequest under the order's downstream ClOrdID and OrderID. Its answer showing a fill
+/// the gateway missed reaches the client as a Trade; a later answer that it doesn't know the order
+/// raises an alarm and reaches the client not at all, the next thing it hears being the next fill.
+#[tokio::test]
+async fn a_venue_asked_for_an_orders_status_answers_through_the_book() {
+    let mut setup = Setup::with(Options { api: true, ..Options::default() }).await;
+    let token = operator(&setup).await;
+    let mut gateway_events = setup.service.gateway().subscribe();
+    setup.working_order().await;
+    let (addr, path) = (setup.service.api_addr().unwrap(), format!("/api/orders/{}/status", setup.id("1")));
+    let ask = async || {
+        let response = post(addr, &path, &token, r#"{"reason":"missed a fill?"}"#).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    };
+
+    ask().await;
+    let asked: v44::OrderStatusRequest = setup.venue.events.parse().await;
+    assert_eq!((asked.cl_ord_id.as_str(), asked.order_id.as_deref()), (&*setup.id("1"), Some("V-1")));
+    assert_eq!((asked.side, asked.symbol.as_deref()), (Code::Known(v44::Side::Buy), Some("AAPL")));
+    let status = (v44::ExecType::OrderStatus, v44::OrdStatus::PartiallyFilled);
+    setup.venue.send(report(&setup.id("1"), "E-status", status, (60, 40)).to_message());
+    let missed: v44::ExecutionReport = setup.events.parse().await;
+    assert_eq!(seen(&missed), setup.c1("1.2", v44::ExecType::Trade, Some(40), 40));
+
+    ask().await;
+    let _: v44::OrderStatusRequest = setup.venue.events.parse().await;
+    let mut unknown =
+        report(&setup.id("1"), "E-unknown", (v44::ExecType::OrderStatus, v44::OrdStatus::Rejected), (0, 0));
+    unknown.ord_rej_reason = Some(v44::OrdRejReason::UnknownOrder.into());
+    setup.venue.send(unknown.to_message());
+    let alarm = timeout(WAIT, async {
+        loop {
+            if let GatewayEvent::Alarm(alarm) = gateway_events.recv().await.unwrap() {
+                return alarm;
+            }
+        }
+    });
+    assert_eq!(alarm.await.expect("no alarm").kind, AlarmKind::UnknownAtVenue);
+    setup.venue.send(fill(&setup.id("1"), "E-2", 60, 100));
+    let filled: v44::ExecutionReport = setup.events.parse().await;
+    assert_eq!(seen(&filled), setup.c1("1.3", v44::ExecType::Trade, Some(60), 100));
+}
+
+/// An operator with an API token, the users file reloaded: the token.
+async fn operator(setup: &Setup) -> String {
+    let users_path = setup.dir.path().join("users.toml");
+    let mut users = Users::load(&users_path).unwrap();
+    users.add("olga", Role::Operator, Vec::new(), "a long enough password").unwrap();
+    let token = users.add_token("olga").unwrap();
+    users.save(&users_path).unwrap();
+    setup.reload().await;
+    token
 }
 
 /// POSTs JSON `body` to the API at `addr` with bearer `token`, returning the whole answer.
