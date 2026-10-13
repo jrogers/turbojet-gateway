@@ -3,10 +3,11 @@
 //!
 //! The log has no index. A search reads the files of the days its range touches, oldest first,
 //! and answers once it has a page of hits or has read [`SEARCH_BYTES_MAX`], with a `next` cursor
-//! to carry on from. The cursor names a file by its day and number, and a record by its index in
-//! the file: a log file, compressed or not, reads only from its start, so the next page reads the
-//! file again, skipping that many records.
+//! to carry on from. The cursor names a file by its day and number, and a record by where it
+//! starts in the file, counted before compression: the next page seeks straight there in a `.log`
+//! file, and decompresses up to it, without parsing, in a `.log.gz` one.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use axum::Json;
@@ -18,7 +19,7 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 use turbojet::codec::{Decoded, decode};
-use turbojet::{Direction, FileMessageLog, LogFile, LogFilter, LogRecord, Message};
+use turbojet::{Direction, FileMessageLog, LogFile, LogFilter, LogRecord, LogRecords, Message};
 
 use super::{ApiError, State};
 use crate::book::OrderDetail;
@@ -51,12 +52,9 @@ const MAX_PARAMS: usize = 100;
 /// logged as it arrived, a moment before.
 const ORDER_MARGIN: TimeDelta = TimeDelta::minutes(1);
 
-/// A record's header as the log writes it, roughly: its time, direction and length, the spaces
-/// between, and the newlines after it and its message. What a record costs the budget is this,
-/// its session and its message.
-const RECORD_HEADER_BYTES: u64 = 40;
-
 const _: () = assert!(PAGE_DEFAULT <= MAX_PAGE);
+// A page reads a record at least, so paging always moves on.
+const _: () = assert!(SEARCH_BYTES_MAX > 0);
 
 type AxumState = axum::extract::State<State>;
 
@@ -293,20 +291,21 @@ fn bad(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, message)
 }
 
-/// Where a search carries on from: record `index` (from 0) of file `number` of `day`. The file's
-/// name is never taken from the caller: it's found in the directory's listing by day and number,
-/// so a cursor can't name a file outside the log.
+/// Where a search carries on from: the record starting at `position` of file `number` of `day`,
+/// a [`LogRecords::position`](turbojet::LogRecords::position). The file's name is never taken
+/// from the caller: it's found in the directory's listing by day and number, so a cursor can't
+/// name a file outside the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cursor {
     day: NaiveDate,
     number: u32,
-    index: u64,
+    position: u64,
 }
 
 impl Cursor {
-    /// `DAY-NUMBER-INDEX` in base64url: opaque, so callers pass it back rather than build one.
+    /// `DAY-NUMBER-POSITION` in base64url: opaque, so callers pass it back rather than build one.
     fn encode(self) -> String {
-        let text = format!("{}-{}-{}", self.day.format("%Y%m%d"), self.number, self.index);
+        let text = format!("{}-{}-{}", self.day.format("%Y%m%d"), self.number, self.position);
         Base64UrlUnpadded::encode_string(text.as_bytes())
     }
 
@@ -315,14 +314,14 @@ impl Cursor {
         let bytes = Base64UrlUnpadded::decode_vec(text).map_err(|_| forged())?;
         let text = String::from_utf8(bytes).map_err(|_| forged())?;
         let mut parts = text.split('-');
-        let (Some(day), Some(number), Some(index), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+        let (Some(day), Some(number), Some(position), None) = (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             return Err(forged());
         };
         Ok(Self {
             day: NaiveDate::parse_from_str(day, "%Y%m%d").map_err(|_| forged())?,
             number: number.parse().map_err(|_| forged())?,
-            index: index.parse().map_err(|_| forged())?,
+            position: position.parse().map_err(|_| forged())?,
         })
     }
 }
@@ -336,17 +335,18 @@ fn scan(dir: &Path, search: &Search, bytes_max: u64) -> Result<Page, ApiError> {
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot list the message log")
     })?;
     let files: Vec<LogFile> = files.into_iter().filter(|file| search.range.covers_day(file.day)).collect();
-    let (first, skip) = match search.after {
+    let (first, start) = match search.after {
         None => (0, 0),
         Some(cursor) => {
-            let position = files.iter().position(|file| (file.day, file.number) == (cursor.day, cursor.number));
-            (position.ok_or_else(gone)?, cursor.index)
+            let index = files.iter().position(|file| (file.day, file.number) == (cursor.day, cursor.number));
+            (index.ok_or_else(gone)?, cursor.position)
         }
     };
-    let mut reading = Reading { search, bytes_max, bytes: 0, read_any: false, messages: Vec::new() };
-    for (position, file) in files.iter().enumerate().skip(first) {
-        let skip = if position == first { skip } else { 0 };
-        if let Some(stopped) = reading.file(file, skip)? {
+    let mut reading = Reading { search, bytes_max, bytes: 0, messages: Vec::new() };
+    for (index, file) in files.iter().enumerate().skip(first) {
+        let from_cursor = index == first && search.after.is_some();
+        let start = if index == first { start } else { 0 };
+        if let Some(stopped) = reading.file(file, start, from_cursor)? {
             return Ok(Page { messages: reading.messages, next: Some(stopped.encode()) });
         }
     }
@@ -362,68 +362,62 @@ fn gone() -> ApiError {
 struct Reading<'a> {
     search: &'a Search,
     bytes_max: u64,
-    /// Read so far, the records skipped to a cursor included.
+    /// Read so far, before compression: what the records read took up in their files.
     bytes: u64,
-    /// A record has been read past the cursor: the budget is checked only after one, so each page
-    /// moves on however much skipping to its cursor cost.
-    read_any: bool,
     messages: Vec<Hit>,
 }
 
 impl Reading<'_> {
-    /// Reads `file` from record `skip`, and where to carry on from if the page ends in it.
-    fn file(&mut self, file: &LogFile, skip: u64) -> Result<Option<Cursor>, ApiError> {
-        let mut records = match FileMessageLog::read(&file.path) {
-            Ok(records) => records,
-            // Deleted for its age since it was listed.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && skip == 0 => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(gone()),
-            Err(e) => {
-                error!("cannot read the message log's {}: {e}", file.path.display());
-                return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot read the message log"));
-            }
-        };
-        for _ in 0..skip {
-            match records.next() {
-                Some(Ok(record)) => self.bytes = self.bytes.saturating_add(record_bytes(&record)),
-                _ => return Err(bad("after is past the end of its file")),
-            }
-        }
-        let mut index = skip;
+    /// Reads `file` from `start`, and where to carry on from if the page ends in it. `from_cursor`:
+    /// `start` is the caller's, so a file gone or a bad first record is the cursor's fault.
+    fn file(&mut self, file: &LogFile, start: u64, from_cursor: bool) -> Result<Option<Cursor>, ApiError> {
+        let Some(mut records) = open(file, start, from_cursor)? else { return Ok(None) };
+        let mut first = true;
         loop {
-            let here = Cursor { day: file.day, number: file.number, index };
-            if self.read_any && self.bytes >= self.bytes_max {
-                return Ok(Some(here));
+            let position = records.position();
+            // Before reading, so a page reads a record at least: `bytes` is under the budget at
+            // its start.
+            if self.bytes.saturating_add(position - start) >= self.bytes_max {
+                return Ok(Some(Cursor { day: file.day, number: file.number, position }));
             }
             let record = match records.next() {
-                None => return Ok(None),
+                None => break,
                 Some(Ok(record)) => record,
+                // Not at a record: a position the caller made up.
+                Some(Err(_)) if first && start > 0 => return Err(bad("after isn't at a record of its file")),
                 // The reader stops at a bad record: the rest of the file can't be found.
                 Some(Err(e)) => {
                     warn!("a message log search stops reading {} at a bad record: {e}", file.path.display());
-                    return Ok(None);
+                    break;
                 }
             };
-            index += 1;
-            self.read_any = true;
-            self.bytes = self.bytes.saturating_add(record_bytes(&record));
+            first = false;
             if let Some(hit) = hit(record, self.search) {
                 self.messages.push(hit);
                 if self.messages.len() >= self.search.limit {
-                    return Ok(Some(Cursor { index, ..here }));
+                    let position = records.position();
+                    return Ok(Some(Cursor { day: file.day, number: file.number, position }));
                 }
             }
         }
+        self.bytes = self.bytes.saturating_add(records.position() - start);
+        Ok(None)
     }
 }
 
-/// What reading `record` cost, near enough: see [`RECORD_HEADER_BYTES`].
-fn record_bytes(record: &LogRecord) -> u64 {
-    let body = match record {
-        LogRecord::Message { session, frame, .. } => frame.len() + session.as_ref().map_or(1, String::len),
-        _ => 0,
-    };
-    RECORD_HEADER_BYTES.saturating_add(u64::try_from(body).unwrap_or(u64::MAX))
+/// `file`'s records from `start`; `None` for a file deleted since it was listed, which only a
+/// cursor's file can't be (400), as can't a `start` past its end.
+fn open(file: &LogFile, start: u64, from_cursor: bool) -> Result<Option<LogRecords>, ApiError> {
+    match FileMessageLog::read_from(&file.path, start) {
+        Ok(records) => Ok(Some(records)),
+        Err(e) if e.kind() == ErrorKind::NotFound && from_cursor => Err(gone()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Err(bad("after is past the end of its file")),
+        Err(e) => {
+            error!("cannot read the message log's {}: {e}", file.path.display());
+            Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cannot read the message log"))
+        }
+    }
 }
 
 /// `record` as a hit, if it's a FIX message in the range matching one of the search's filters.
@@ -648,38 +642,55 @@ mod tests {
         assert_eq!(pages, [vec!["A", "B"], vec!["C", "D"], vec!["E"]]);
     }
 
-    /// With a budget of a byte, each page reads one record past its cursor: one without a hit is
-    /// an empty page with a `next`, and every hit is still found, once.
+    /// Each page reads up to the budget (and a record at least), and the next carries on where it
+    /// stopped: with two records' bytes, a page of A and B, then the rest; with a byte, a record a
+    /// page, one without a hit an empty page with a `next`. Every hit is found, once.
     #[test]
     fn the_byte_budget_cuts_pages_short() {
         let dir = tempfile::tempdir().unwrap();
         let order = |minute, id| (at(8, 9, minute), Direction::Inbound, Some("FUNDA"), fix(&[(35, "D"), (11, id)]));
         let other = (at(8, 9, 2), Direction::Inbound, Some("FUNDA"), fix(&[(35, "0")]));
         log(dir.path(), &[order(0, "A"), order(1, "B"), other, order(3, "C")]);
-        let mut filter = LogFilter::default();
-        filter.msg_types = vec!["D".into()];
-        let mut search = Search::new(vec![filter], at(8, 0, 0), None, None, None).unwrap();
-        let mut pages = Vec::new();
-        loop {
-            let page = scan(dir.path(), &search, 1).unwrap();
-            pages.push(page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>());
-            match page.next {
-                Some(next) => search.after = Some(Cursor::decode(&next).unwrap()),
-                None => break,
-            }
+        let file = &FileMessageLog::files(dir.path()).unwrap()[0];
+        let mut records = FileMessageLog::read(&file.path).unwrap();
+        let mut positions = vec![records.position()];
+        while records.next().is_some() {
+            positions.push(records.position());
         }
-        // The last record's page doesn't yet know it's the last: an empty page ends.
-        assert_eq!(pages, [vec!["A"], vec!["B"], vec![], vec!["C"], vec![]]);
+        let pages = |bytes_max| {
+            let mut filter = LogFilter::default();
+            filter.msg_types = vec!["D".into()];
+            let mut search = Search::new(vec![filter], at(8, 0, 0), None, None, None).unwrap();
+            let mut pages = Vec::new();
+            loop {
+                let page = scan(dir.path(), &search, bytes_max).unwrap();
+                let ids = page.messages.iter().map(|hit| hit.fields[3].1.clone()).collect::<Vec<_>>();
+                search.after = page.next.map(|next| Cursor::decode(&next).unwrap());
+                pages.push((ids, search.after.map(|cursor| cursor.position)));
+                if search.after.is_none() {
+                    return pages;
+                }
+            }
+        };
+        let two = positions[2];
+        let strings = |ids: &[&str]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(pages(two), [(strings(&["A", "B"]), Some(two)), (strings(&["C"]), None)]);
+        let ones = pages(1);
+        let ids: Vec<_> = ones.iter().map(|(ids, _)| ids.clone()).collect();
+        assert_eq!(ids, [vec!["A"], vec!["B"], vec![], vec!["C"], vec![]]);
+        let nexts: Vec<_> = ones.iter().map(|(_, next)| *next).collect();
+        assert_eq!(nexts, [Some(positions[1]), Some(positions[2]), Some(positions[3]), Some(positions[4]), None]);
     }
 
     /// A cursor that isn't one a search gave is refused: not base64, not a cursor, a file outside
-    /// the range or not in the log, or a record past its file's end.
+    /// the range or not in the log, a position past its file's end or in the middle of a record.
     #[tokio::test]
     async fn a_forged_cursor_is_refused() {
         let (fixture, dir) = logged().await;
         log(&dir, &[(at(8, 9, 0), Direction::Inbound, Some("FUNDA"), fix(&[(35, "D"), (11, "A")]))]);
         let cursor = |text: &str| Base64UrlUnpadded::encode_string(text.as_bytes());
-        let good = cursor("20261008-0-1");
+        let length = std::fs::metadata(&FileMessageLog::files(&dir).unwrap()[0].path).unwrap().len();
+        let good = cursor(&format!("20261008-0-{length}"));
         let (ids, next) = search(&fixture, &format!("/api/messages?{DAY}&after={good}")).await;
         assert_eq!((ids, next), (Vec::<String>::new(), None));
         for forged in [
@@ -689,7 +700,8 @@ mod tests {
             cursor("20261008-0-1-2"),
             cursor("20261001-0-0"),
             cursor("20261008-7-0"),
-            cursor("20261008-0-2"),
+            cursor(&format!("20261008-0-{}", length + 1)),
+            cursor("20261008-0-1"),
             cursor("20261008-0--1"),
         ] {
             let answer = fixture.get(&format!("/api/messages?{DAY}&after={forged}")).await;
