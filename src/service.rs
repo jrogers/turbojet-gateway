@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use turbojet::{Acceptor, SessionHandle, SessionId, SessionSchedule};
+use turbojet::{Acceptor, SessionHandle, SessionId, SessionSchedule, SessionStatus};
 use turbojet_config::{Changes, Initiators, SessionsFile};
 
 use crate::api;
@@ -191,6 +191,16 @@ impl Service {
     /// The client session `id`, connected or not.
     pub fn client_session(&self, id: &SessionId) -> SessionHandle {
         self.acceptor.handle(id)
+    }
+
+    /// The client sessions connected now: see [`Acceptor::statuses`].
+    pub fn client_statuses(&self) -> Vec<SessionStatus> {
+        self.acceptor.statuses()
+    }
+
+    /// The venues whose initiators are running, by name (`[initiator.NAME]`), in order.
+    pub fn venues(&self) -> Vec<String> {
+        self.initiators.names()
     }
 
     /// The session of venue `name` (its `[initiator.NAME]`), if its initiator is running.

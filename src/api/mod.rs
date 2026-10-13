@@ -35,6 +35,7 @@ use crate::service::Service;
 
 mod auth;
 mod listener;
+mod read;
 
 use auth::{Auth, Caller};
 
@@ -47,13 +48,17 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub(crate) struct State {
     /// Gone once the service is dropped; see the module documentation.
-    #[expect(dead_code, reason = "the endpoints after health reach the gateway and sessions through it")]
     service: Weak<Service>,
     auth: Arc<Auth>,
     audit: Arc<Audit>,
 }
 
 impl State {
+    /// The service, or 503 once it's gone: the gateway is shutting down.
+    fn service(&self) -> Result<Arc<Service>, ApiError> {
+        self.service.upgrade().ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "the gateway is stopping"))
+    }
+
     /// Records `entry` as refused with `error` and answers `error`; or 503 if the line can't be
     /// written. An identified caller's refusal (role known) is always written, anyone else's
     /// within the audit log's budget for refusals; see [`crate::audit`].
@@ -97,6 +102,11 @@ fn router(state: State) -> axum::Router {
         .route("/api/me", get(auth::me))
         .route("/api/logout", post(auth::logout))
         .route("/api/audit", get(read_audit))
+        .route("/api/sessions", get(read::sessions))
+        .route("/api/orders", get(read::orders))
+        .route("/api/orders/{order_id}", get(read::order))
+        .route("/api/risk", get(read::risk))
+        .route("/api/routes", get(read::routes))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate));
     axum::Router::new()
         .route("/api/health", get(health))

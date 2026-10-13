@@ -788,7 +788,16 @@ mod tests {
 
     /// The routes behind authentication: Tasks 6 to 8 add theirs. Each answers 401 without
     /// credentials; only health and login don't need them.
-    const AUTHENTICATED: &[(&str, &str)] = &[("GET", "/api/me"), ("POST", "/api/logout")];
+    const AUTHENTICATED: &[(&str, &str)] = &[
+        ("GET", "/api/me"),
+        ("POST", "/api/logout"),
+        ("GET", "/api/audit"),
+        ("GET", "/api/sessions"),
+        ("GET", "/api/orders"),
+        ("GET", "/api/orders/JB1"),
+        ("GET", "/api/risk"),
+        ("GET", "/api/routes"),
+    ];
 
     #[tokio::test]
     async fn every_route_but_health_and_login_needs_a_caller() {

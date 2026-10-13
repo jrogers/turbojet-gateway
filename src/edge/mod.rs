@@ -1339,7 +1339,7 @@ pub(crate) mod tests {
 
     /// Order 1 in the book, from FUNDA, as if sent to [`VENUE`]: what the book asked to send is
     /// dropped.
-    fn book_order(gateway: &Gateway) {
+    pub(crate) fn book_order(gateway: &Gateway) {
         let request = crate::book::OrderRequest {
             cl_ord_id: "C1".into(),
             account: None,
