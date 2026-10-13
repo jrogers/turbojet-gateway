@@ -1,5 +1,6 @@
-//! The API's mutations [operator; a reload, admin]: sessions paused, resumed and asked to resend,
-//! orders cancelled, clients blocked, unblocked and cancelled, and the configuration reloaded.
+//! The API's mutations [operator; sequence numbers and a reload, admin]: sessions paused, resumed,
+//! asked to resend and their sequence numbers set or reset, orders cancelled, clients blocked,
+//! unblocked and cancelled, and the configuration reloaded.
 //! Each takes a JSON body with a `reason` and runs through [`audited`]: refused, and the refusal
 //! recorded, for the caller's role or scope, a body that doesn't parse, or nothing to act on.
 //!
@@ -15,7 +16,7 @@ use axum::extract::Path;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use turbojet::{SequenceError, SessionHandle};
+use turbojet::{SequenceError, SequenceNumbers, SessionHandle};
 use turbojet_config::Changes;
 
 use super::auth::{Caller, Target};
@@ -41,6 +42,14 @@ pub(super) struct Resend {
     reason: Option<String>,
     /// The first MsgSeqNum to ask for again.
     from: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Sequence {
+    reason: Option<String>,
+    next_incoming: Option<u64>,
+    next_outgoing: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -93,7 +102,7 @@ pub(super) async fn resume(
     .await
 }
 
-/// The session's sequence numbers after a resend request.
+/// The session's sequence numbers after a resend request or a sequence change.
 #[derive(Debug, Serialize)]
 pub(super) struct Numbers {
     next_incoming: u64,
@@ -118,16 +127,79 @@ pub(super) async fn resend(
     let params = serde_json::json!({ "from": from });
     let mutation = Mutation { action: "resend", target: id, params, reason: body.reason };
     on_session(&state, &caller, mutation, parsed, |session, from| async move {
-        let numbers = session.request_resend(from).await.map_err(|e| match e {
-            SequenceError::Storage(e) => {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("the session store failed: {e}"))
-            }
-            e => ApiError::new(StatusCode::CONFLICT, e.to_string()),
-        })?;
-        let numbers = Numbers { next_incoming: numbers.next_incoming, next_outgoing: numbers.next_outgoing };
-        Ok((Json(numbers), None))
+        Ok((Json(numbers(session.request_resend(from).await)?), None))
     })
     .await
+}
+
+/// `POST /api/sessions/{id}/sequence {reason, next_incoming, next_outgoing}` [admin]: sets either
+/// number or both; see [`SessionHandle::set_next_incoming`] and
+/// [`SessionHandle::set_next_outgoing`]. 409 for 0, or an outgoing number below the next.
+///
+/// Outgoing goes first, as the one refused for going back, so a refusal leaves nothing changed.
+/// If incoming then fails, outgoing stays set, and the error (and the audit line) says so.
+pub(super) async fn sequence(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+    id: Id,
+    body: Body<Sequence>,
+) -> Result<Json<Numbers>, ApiError> {
+    let (id, parsed_id) = parse_id(id);
+    let (body, parsed) = parse(body);
+    let parsed = caller.require(Role::Admin).and(parsed_id).and(parsed);
+    let (incoming, outgoing) = (body.next_incoming, body.next_outgoing);
+    let parsed = parsed.and_then(|()| match (incoming, outgoing) {
+        (None, None) => Err(ApiError::new(StatusCode::BAD_REQUEST, "needs next_incoming, next_outgoing or both")),
+        numbers => Ok(numbers),
+    });
+    let params = serde_json::json!({ "next_incoming": incoming, "next_outgoing": outgoing });
+    let mutation = Mutation { action: "sequence", target: id, params, reason: body.reason };
+    on_session(&state, &caller, mutation, parsed, |session, (incoming, outgoing)| async move {
+        let mut set = None;
+        if let Some(seq) = outgoing {
+            set = Some(numbers(session.set_next_outgoing(seq).await)?);
+        }
+        if let Some(seq) = incoming {
+            let result = numbers(session.set_next_incoming(seq).await);
+            set = Some(result.map_err(|mut e| {
+                if let Some(outgoing) = outgoing {
+                    e.message = format!("next_outgoing is set to {outgoing}, but next_incoming isn't: {}", e.message);
+                }
+                e
+            })?);
+        }
+        Ok((Json(set.expect("guarded by parsed: one number at least")), None))
+    })
+    .await
+}
+
+/// `POST /api/sessions/{id}/reset {reason}` [admin]: resets both sequence numbers to 1 and clears
+/// the resend store; see [`SessionHandle::reset_sequence_numbers`]. 409 while connected.
+pub(super) async fn reset(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+    id: Id,
+    body: Body<Reason>,
+) -> Result<Json<Numbers>, ApiError> {
+    let (id, parsed_id) = parse_id(id);
+    let (body, parsed) = parse(body);
+    let parsed = caller.require(Role::Admin).and(parsed_id).and(parsed);
+    let mutation = Mutation { action: "reset", target: id, params: serde_json::Value::Null, reason: body.reason };
+    on_session(&state, &caller, mutation, parsed, |session, ()| async move {
+        Ok((Json(numbers(session.reset_sequence_numbers().await)?), None))
+    })
+    .await
+}
+
+/// A sequence change's numbers, or 409 for a change refused and 500 for the store failing.
+fn numbers(result: Result<SequenceNumbers, SequenceError>) -> Result<Numbers, ApiError> {
+    match result {
+        Ok(numbers) => Ok(Numbers { next_incoming: numbers.next_incoming, next_outgoing: numbers.next_outgoing }),
+        Err(SequenceError::Storage(e)) => {
+            Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("the session store failed: {e}")))
+        }
+        Err(e) => Err(ApiError::new(StatusCode::CONFLICT, e.to_string())),
+    }
 }
 
 /// `POST /api/orders/{order_id}/cancel {reason}`: the gateway's own cancel of the order whose
@@ -340,8 +412,9 @@ where
     }
 }
 
-/// A session mutation [operator]: `action` on the session `mutation.target` names, with what
-/// `parsed` (the body, checked) holds, once the caller may act on it.
+/// A session mutation [operator; an admin's if `parsed` requires it]: `action` on the session
+/// `mutation.target` names, with what `parsed` (the body, checked) holds, once the caller may act
+/// on it.
 async fn on_session<P, T, A>(
     state: &State,
     caller: &Caller,
@@ -509,7 +582,7 @@ mod tests {
 
     /// Every endpoint as each role calls it: no one (401), a viewer (403), an operator, an
     /// operator scoped to FUNDB (403: FUNDA's session, order and CompID, and the venue), and an
-    /// admin; a reload is an admin's only. An allowed call answers success, or on a row marked so,
+    /// admin; sequence numbers and a reload are an admin's only. An allowed call answers success, or on a row marked so,
     /// 409 (a second resend while the first is under way). Pausing FUNDA comes last, as it logs
     /// FUNDA out.
     #[tokio::test]
@@ -528,6 +601,8 @@ mod tests {
             ("/api/risk/cancel-all".to_string(), funda, operator, false),
             (format!("/api/sessions/{venue}/pause"), REASON, operator, false),
             (format!("/api/sessions/{venue}/resume"), REASON, operator, false),
+            (format!("/api/sessions/{venue}/sequence"), r#"{"reason":"testing","next_incoming":1}"#, admin, false),
+            (format!("/api/sessions/{venue}/reset"), REASON, admin, false),
             ("/api/reload".to_string(), REASON, admin, false),
             (format!("/api/sessions/{FUNDA}/pause"), REASON, operator, false),
         ];
@@ -593,6 +668,51 @@ mod tests {
         // A `/` in the name stays in its segment.
         let body = fixture.expect(&format!("/api/sessions/{FUNDA}%2FDESK/pause"), REASON, StatusCode::NOT_FOUND).await;
         assert_eq!(body["error"], "no session FIX.4.4:JETBRIDGE->FUNDA/DESK");
+    }
+
+    /// An admin sets FUNDA's outgoing number while it's logged on, but not below the next, and
+    /// can't reset it then; a change of both whose second half is refused says the first was
+    /// made. Once FUNDA is paused, it resets to 1 and takes an incoming number; the venue, never
+    /// logged on, takes both. Each is audited with the numbers asked for.
+    #[tokio::test]
+    async fn sessions_sequence_and_reset() {
+        let fixture = fixture().await;
+        let post = async |path: &str, body: &str, status: StatusCode| {
+            let answer = fixture.post(&fixture.admin, path, body).await;
+            assert_eq!(answer.status, status, "{path} {body}: {}", answer.body);
+            answer.body
+        };
+        let numbers = |body: &serde_json::Value| (body["next_incoming"].as_u64(), body["next_outgoing"].as_u64());
+        let (sequence, reset) = (format!("/api/sessions/{FUNDA}/sequence"), format!("/api/sessions/{FUNDA}/reset"));
+        post(&sequence, REASON, StatusCode::BAD_REQUEST).await;
+        assert_eq!(fixture.last_result(), "refused: needs next_incoming, next_outgoing or both");
+        let body = post(&sequence, r#"{"reason":"r","next_outgoing":100}"#, StatusCode::OK).await;
+        assert_eq!(body["next_outgoing"], 100, "{body}");
+        post(&sequence, r#"{"reason":"r","next_outgoing":50}"#, StatusCode::CONFLICT).await;
+        let body =
+            post(&sequence, r#"{"reason":"r","next_incoming":0,"next_outgoing":200}"#, StatusCode::CONFLICT).await;
+        let error = body["error"].as_str().unwrap();
+        assert!(error.starts_with("next_outgoing is set to 200, but next_incoming isn't: "), "{error}");
+        assert_eq!(fixture.last_result(), format!("failed: {error}"));
+        let audit = std::fs::read_to_string(fixture.dirs.1.path().join("audit.jsonl")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(last["params"], serde_json::json!({ "next_incoming": 0, "next_outgoing": 200 }));
+        post(&reset, REASON, StatusCode::CONFLICT).await;
+        assert_eq!(fixture.last_result(), "failed: the session is connected; disconnect it first");
+
+        fixture.expect(&format!("/api/sessions/{FUNDA}/pause"), REASON, StatusCode::NO_CONTENT).await;
+        fixture.wait_for_funda(false).await;
+        assert_eq!(numbers(&post(&reset, REASON, StatusCode::OK).await), (Some(1), Some(1)));
+        assert_eq!(fixture.last_result(), "allowed");
+        let body = post(&sequence, r#"{"reason":"r","next_incoming":7}"#, StatusCode::OK).await;
+        assert_eq!(numbers(&body), (Some(7), Some(1)));
+
+        let venue = fixture.venue().await;
+        let both = r#"{"reason":"r","next_incoming":5,"next_outgoing":9}"#;
+        let body = post(&format!("/api/sessions/{venue}/sequence"), both, StatusCode::OK).await;
+        assert_eq!(numbers(&body), (Some(5), Some(9)));
+        let body = post(&format!("/api/sessions/{venue}/reset"), REASON, StatusCode::OK).await;
+        assert_eq!(numbers(&body), (Some(1), Some(1)));
     }
 
     /// A cancel goes to the book, which starts the gateway's cancel; an order unknown is 404,

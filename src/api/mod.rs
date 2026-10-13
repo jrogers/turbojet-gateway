@@ -118,6 +118,8 @@ fn router(state: State) -> axum::Router {
         .route("/api/sessions/{id}/pause", post(write::pause))
         .route("/api/sessions/{id}/resume", post(write::resume))
         .route("/api/sessions/{id}/resend", post(write::resend))
+        .route("/api/sessions/{id}/sequence", post(write::sequence))
+        .route("/api/sessions/{id}/reset", post(write::reset))
         .route("/api/orders/{order_id}/cancel", post(write::cancel_order))
         .route("/api/risk/block", post(write::block))
         .route("/api/risk/unblock", post(write::unblock))
