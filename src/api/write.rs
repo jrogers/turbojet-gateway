@@ -1,6 +1,7 @@
-//! The API's mutations [operator; sequence numbers and a reload, admin]: sessions paused, resumed,
-//! asked to resend and their sequence numbers set or reset, orders cancelled or their venues asked
-//! where they stand, clients blocked, unblocked and cancelled, and the configuration reloaded.
+//! The API's mutations [operator; sequence numbers, risk limits and a reload, admin]: sessions
+//! paused, resumed, asked to resend and their sequence numbers set or reset, orders cancelled or
+//! their venues asked where they stand, clients blocked, unblocked and cancelled, the risk limits
+//! in the configuration file edited, and the configuration reloaded.
 //! Each takes a JSON body with a `reason` and runs through [`audited`]: refused, and the refusal
 //! recorded, for the caller's role or scope, a body that doesn't parse, or nothing to act on.
 //!
@@ -23,8 +24,10 @@ use super::auth::{Caller, Target};
 use super::{ApiError, Mutation, Outcome, State, audited};
 use crate::auth::Role;
 use crate::book::{OrderId, Scope, ScopeName};
+use crate::config::RiskTable;
 use crate::edge::{CancelError, Gateway, StatusError};
-use crate::service::{ConfigSummary, Reloaded, Service};
+use crate::limits::{self, Edit, EditError, Limits};
+use crate::service::{ConfigSummary, Edited, Reloaded, Service};
 
 type AxumState = axum::extract::State<State>;
 type Body<B> = Result<Json<B>, JsonRejection>;
@@ -372,6 +375,134 @@ pub(super) async fn reload(
     audited(&state, &caller, mutation, allowed, reload).await
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LimitsBody {
+    reason: Option<String>,
+    /// Each key's new value, or `null` to remove it.
+    set: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// What a limit edit answers: the table edited as the file now has it (`null` once deleted), and
+/// what the reload took.
+#[derive(Debug, Serialize)]
+pub(super) struct EditedView {
+    table: Option<RiskTable>,
+    reload: ReloadView,
+}
+
+/// `PATCH /api/risk/limits/defaults {reason, set: {key: value | null}}` [admin]: sets the
+/// defaults' keys, removing those set to `null`, in `jetbridge.toml`, and reloads; see
+/// [`Service::edit_limits`]. The keys and their values are the file's: an amount is a JSON number
+/// or a decimal as a string (which keeps every digit), `symbols` an array of strings,
+/// `self_trade` a boolean; 400 for another key or type. 422 with why if the file wouldn't load
+/// with the edit, or doesn't load now: it's left as it was.
+///
+/// The reload takes whatever else changed in the files since the last, as any reload does. A
+/// reload that keeps something answers 422 with why, though the edit is written.
+pub(super) async fn set_default_limits(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+    body: Body<LimitsBody>,
+) -> Result<Json<EditedView>, ApiError> {
+    let (body, parsed) = parse(body);
+    let allowed = caller.require(Role::Admin).and(parsed);
+    set_limits(&state, &caller, Limits::Defaults, "risk.defaults".to_string(), allowed, body).await
+}
+
+/// `PATCH /api/risk/limits/client/{comp_id} {reason, set: {key: value | null}}` [admin]: as
+/// [`set_default_limits`], for the CompID's own table, created if it has none. A key it removes
+/// is the defaults' again.
+pub(super) async fn set_client_limits(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+    comp_id: Id,
+    body: Body<LimitsBody>,
+) -> Result<Json<EditedView>, ApiError> {
+    let (comp_id, parsed_id) = parse_id(comp_id);
+    let (body, parsed) = parse(body);
+    let comp_id = comp_id.unwrap_or_default();
+    let allowed = caller
+        .require(Role::Admin)
+        .and(parsed_id)
+        .and(parsed)
+        .and_then(|()| limits::check_comp_id(&comp_id).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e)));
+    let target = format!("risk.client.{comp_id}");
+    set_limits(&state, &caller, Limits::Client(comp_id), target, allowed, body).await
+}
+
+/// `DELETE /api/risk/limits/client/{comp_id} {reason}` [admin]: removes the CompID's table from
+/// `jetbridge.toml`, so its sessions get the defaults, and reloads, as [`set_default_limits`]
+/// does; 404 if it has none.
+pub(super) async fn delete_client_limits(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+    comp_id: Id,
+    body: Body<Reason>,
+) -> Result<Json<EditedView>, ApiError> {
+    let (comp_id, parsed_id) = parse_id(comp_id);
+    let (body, parsed) = parse(body);
+    let comp_id = comp_id.unwrap_or_default();
+    let edit = caller
+        .require(Role::Admin)
+        .and(parsed_id)
+        .and(parsed)
+        .and_then(|()| limits::check_comp_id(&comp_id).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e)))
+        .map(|()| Edit::Delete { comp_id: comp_id.clone() });
+    let target = Some(format!("risk.client.{comp_id}"));
+    let mutation = Mutation { action: "delete_limits", target, params: serde_json::Value::Null, reason: body.reason };
+    edit_limits(&state, &caller, mutation, edit).await
+}
+
+/// A set of `body`'s keys in `table`, once `allowed`; audited with the keys set, and their values,
+/// and those removed.
+async fn set_limits(
+    state: &State,
+    caller: &Caller,
+    table: Limits,
+    target: String,
+    allowed: Result<(), ApiError>,
+    body: LimitsBody,
+) -> Result<Json<EditedView>, ApiError> {
+    let set = body.set.unwrap_or_default();
+    let edit = allowed.and_then(|()| Edit::set(table, &set).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e)));
+    let (removed, set): (Vec<_>, Vec<_>) = set.into_iter().partition(|(_, value)| value.is_null());
+    let removed: Vec<_> = removed.into_iter().map(|(key, _)| key).collect();
+    let params = serde_json::json!({ "set": serde_json::Map::from_iter(set), "removed": removed });
+    let mutation = Mutation { action: "set_limits", target: Some(target), params, reason: body.reason };
+    edit_limits(state, caller, mutation, edit).await
+}
+
+/// Runs `edit`, audited as `mutation`, if it parsed; see [`Service::edit_limits`].
+async fn edit_limits(
+    state: &State,
+    caller: &Caller,
+    mutation: Mutation,
+    edit: Result<Edit, ApiError>,
+) -> Result<Json<EditedView>, ApiError> {
+    let service = state.service()?;
+    audited_on(state, caller, mutation, edit, |edit| async move {
+        let edited = tokio::task::spawn_blocking(move || service.edit_limits(&edit))
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("the edit failed: {e}")))?;
+        let Edited { table, reloaded } = edited.map_err(|e| {
+            let status = match e {
+                EditError::Stopping => StatusCode::SERVICE_UNAVAILABLE,
+                EditError::NoTable(_) => StatusCode::NOT_FOUND,
+                EditError::Refused(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                EditError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            ApiError::new(status, e.to_string())
+        })?;
+        let (Json(reload), note) = answer(reloaded).map_err(|mut e| {
+            e.message = format!("the edit is written, but the reload {}", e.message);
+            e
+        })?;
+        Ok((Json(EditedView { table, reload }), note))
+    })
+    .await
+}
+
 /// A reload's answer: all of it taken, or 422 (see [`partly_kept`]).
 fn answer(reloaded: Reloaded) -> Outcome<Json<ReloadView>> {
     let Reloaded { sessions, config, warnings } = reloaded;
@@ -568,8 +699,25 @@ mod tests {
     impl Fixture {
         /// `POST path` with `body`, as `bearer` (none if empty).
         async fn post(&self, bearer: &str, path: &str, body: &str) -> Answer {
+            self.send("POST", bearer, path, body).await
+        }
+
+        /// `method path` with `body`, as `bearer` (none if empty).
+        async fn send(&self, method: &str, bearer: &str, path: &str, body: &str) -> Answer {
             let headers: &[(&str, &str)] = if bearer.is_empty() { &[] } else { &[("authorization", bearer)] };
-            send(&self.app, "POST", path, headers, body).await
+            send(&self.app, method, path, headers, body).await
+        }
+
+        /// `method path` with `body` as the admin, which must answer `status`: its body.
+        async fn admin(&self, method: &str, path: &str, body: &str, status: StatusCode) -> serde_json::Value {
+            let answer = self.send(method, &self.admin, path, body).await;
+            assert_eq!(answer.status, status, "{method} {path} {body}: {}", answer.body);
+            answer.body
+        }
+
+        /// The configuration file's text.
+        fn config(&self) -> String {
+            std::fs::read_to_string(self.dirs.0.path().join("jetbridge.toml")).unwrap()
         }
 
         /// `POST path` with `body` as the operator, which must answer `status`: its body.
@@ -637,19 +785,40 @@ mod tests {
         let admin = [none, forbidden, forbidden, forbidden, None];
         let funda = r#"{"reason":"testing","scope":"comp:FUNDA"}"#;
         let rows = [
-            (format!("/api/sessions/{FUNDA}/resend"), r#"{"reason":"testing","from":1}"#, operator, true),
-            (format!("/api/orders/{order}/cancel"), REASON, operator, false),
+            ("POST", format!("/api/sessions/{FUNDA}/resend"), r#"{"reason":"testing","from":1}"#, operator, true),
+            ("POST", format!("/api/orders/{order}/cancel"), REASON, operator, false),
             // The venue never logs on.
-            (format!("/api/orders/{order}/status"), REASON, operator, true),
-            ("/api/risk/block".to_string(), funda, operator, false),
-            ("/api/risk/unblock".to_string(), funda, operator, false),
-            ("/api/risk/cancel-all".to_string(), funda, operator, false),
-            (format!("/api/sessions/{venue}/pause"), REASON, operator, false),
-            (format!("/api/sessions/{venue}/resume"), REASON, operator, false),
-            (format!("/api/sessions/{venue}/sequence"), r#"{"reason":"testing","next_incoming":1}"#, admin, false),
-            (format!("/api/sessions/{venue}/reset"), REASON, admin, false),
-            ("/api/reload".to_string(), REASON, admin, false),
-            (format!("/api/sessions/{FUNDA}/pause"), REASON, operator, false),
+            ("POST", format!("/api/orders/{order}/status"), REASON, operator, true),
+            ("POST", "/api/risk/block".to_string(), funda, operator, false),
+            ("POST", "/api/risk/unblock".to_string(), funda, operator, false),
+            ("POST", "/api/risk/cancel-all".to_string(), funda, operator, false),
+            ("POST", format!("/api/sessions/{venue}/pause"), REASON, operator, false),
+            ("POST", format!("/api/sessions/{venue}/resume"), REASON, operator, false),
+            (
+                "POST",
+                format!("/api/sessions/{venue}/sequence"),
+                r#"{"reason":"testing","next_incoming":1}"#,
+                admin,
+                false,
+            ),
+            ("POST", format!("/api/sessions/{venue}/reset"), REASON, admin, false),
+            (
+                "PATCH",
+                "/api/risk/limits/defaults".to_string(),
+                r#"{"reason":"testing","set":{"credit":5}}"#,
+                admin,
+                false,
+            ),
+            (
+                "PATCH",
+                "/api/risk/limits/client/FUNDB".to_string(),
+                r#"{"reason":"testing","set":{"credit":5}}"#,
+                admin,
+                false,
+            ),
+            ("DELETE", "/api/risk/limits/client/FUNDB".to_string(), REASON, admin, false),
+            ("POST", "/api/reload".to_string(), REASON, admin, false),
+            ("POST", format!("/api/sessions/{FUNDA}/pause"), REASON, operator, false),
         ];
         let callers = [
             ("no one", ""),
@@ -658,9 +827,9 @@ mod tests {
             ("scoped", &fixture.scoped),
             ("admin", &fixture.admin),
         ];
-        for (path, body, wants, conflict) in rows {
+        for (method, path, body, wants, conflict) in rows {
             for ((caller, bearer), want) in callers.iter().zip(wants) {
-                let answer = fixture.post(bearer, &path, body).await;
+                let answer = fixture.send(method, bearer, &path, body).await;
                 match want {
                     Some(want) => assert_eq!(answer.status, want, "{path} as {caller}: {}", answer.body),
                     None => assert!(
@@ -895,5 +1064,101 @@ mod tests {
         let took = "took the sessions file (added FUNDC; removed FUNDB); kept the routes, limits and day_end: ";
         assert!(error.starts_with(took), "{error}");
         assert_eq!(fixture.last_result(), format!("failed: {error}"));
+    }
+
+    const DEFAULTS: &str = "/api/risk/limits/defaults";
+    const CLIENT_FUNDA: &str = "/api/risk/limits/client/FUNDA";
+
+    /// Sets, changes and removes keys, in the defaults and a new client table, and deletes the
+    /// table: each answers the table as the file has it and what the reload took, applies to the
+    /// gateway's checks, and is audited with the keys set and removed. The comments and layout
+    /// outside the table edited stay byte for byte.
+    #[tokio::test]
+    async fn limits_are_set_changed_removed_and_deleted() {
+        let fixture = fixture().await;
+        let top = "# Jetbridge\nsessions = \"sessions.toml\"  # beside this file\n\n[[route]]\nvenue = \"NASDAQ\"\n";
+        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), top).unwrap();
+        let set = |set: &str| format!(r#"{{"reason":"testing","set":{set}}}"#);
+        let funda = || fixture.service.gateway().limits().limits("FUNDA").clone();
+
+        let body =
+            fixture.admin("PATCH", DEFAULTS, &set(r#"{"credit":1000,"symbols":["AAPL"]}"#), StatusCode::OK).await;
+        assert_eq!(body["table"], serde_json::json!({ "symbols": ["AAPL"], "credit": 1000 }));
+        assert_eq!(body["reload"]["config"]["routes"], 1);
+        assert_eq!(fixture.config(), format!("{top}\n[risk.defaults]\ncredit = 1000\nsymbols = [\"AAPL\"]\n"));
+        assert_eq!(funda().credit, Some(Decimal::from(1000)));
+        let audit = std::fs::read_to_string(fixture.dirs.1.path().join("audit.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!((&line["action"], &line["target"]), (&"set_limits".into(), &"risk.defaults".into()));
+        assert_eq!(
+            line["params"],
+            serde_json::json!({ "set": { "credit": 1000, "symbols": ["AAPL"] }, "removed": [] })
+        );
+
+        let body = fixture.admin("PATCH", CLIENT_FUNDA, &set(r#"{"credit":"250.5"}"#), StatusCode::OK).await;
+        assert_eq!(body["table"], serde_json::json!({ "credit": "250.5" }));
+        assert_eq!(funda().credit, Some("250.5".parse().unwrap()));
+        assert_eq!(funda().symbols, Some(vec!["AAPL".into()]));
+        fixture.admin("PATCH", CLIENT_FUNDA, &set(r#"{"credit":300,"self_trade":true}"#), StatusCode::OK).await;
+        let body = fixture.admin("PATCH", CLIENT_FUNDA, &set(r#"{"credit":null}"#), StatusCode::OK).await;
+        assert_eq!(body["table"], serde_json::json!({ "self_trade": true }));
+        assert_eq!(funda().credit, Some(Decimal::from(1000)));
+        let line = fixture.results().len();
+        assert_eq!(fixture.ok("/api/risk/limits").await["clients"]["FUNDA"], serde_json::json!({ "self_trade": true }));
+        assert_eq!(fixture.results().len(), line);
+
+        let body = fixture.admin("DELETE", CLIENT_FUNDA, REASON, StatusCode::OK).await;
+        assert_eq!(body["table"], serde_json::Value::Null);
+        assert!(!funda().self_trade);
+        assert_eq!(fixture.config(), format!("{top}\n[risk.defaults]\ncredit = 1000\nsymbols = [\"AAPL\"]\n"));
+        fixture.admin("DELETE", CLIENT_FUNDA, REASON, StatusCode::NOT_FOUND).await;
+        assert_eq!(fixture.last_result(), "failed: no [risk.client.FUNDA]");
+        let body = fixture.admin("PATCH", DEFAULTS, &set(r#"{"credit":null,"symbols":null}"#), StatusCode::OK).await;
+        assert_eq!(body["table"], serde_json::json!({}));
+        assert_eq!(*fixture.service.gateway().limits().limits("FUNDA"), crate::risk::Limits::default());
+    }
+
+    /// A key or a type a risk table doesn't take, nothing to set, or a CompID that isn't plain,
+    /// is 400; a value the loader refuses (a negative credit) is 422, the file left as it was.
+    /// Each refusal is audited.
+    #[tokio::test]
+    async fn a_bad_limit_edit_is_refused_and_changes_nothing() {
+        let fixture = fixture().await;
+        let before = fixture.config();
+        for (path, body, status) in [
+            (DEFAULTS, r#"{"reason":"r","set":{"max_qty":5}}"#, StatusCode::BAD_REQUEST),
+            (DEFAULTS, r#"{"reason":"r","set":{"credit":true}}"#, StatusCode::BAD_REQUEST),
+            (DEFAULTS, r#"{"reason":"r"}"#, StatusCode::BAD_REQUEST),
+            (DEFAULTS, r#"{"set":{"credit":5}}"#, StatusCode::BAD_REQUEST),
+            ("/api/risk/limits/client/FUND.A", r#"{"reason":"r","set":{"credit":5}}"#, StatusCode::BAD_REQUEST),
+            (DEFAULTS, r#"{"reason":"r","set":{"credit":-5}}"#, StatusCode::UNPROCESSABLE_ENTITY),
+            (CLIENT_FUNDA, r#"{"reason":"r","set":{"symbols":[]}}"#, StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            fixture.admin("PATCH", path, body, status).await;
+            assert_eq!(fixture.config(), before, "{body}");
+        }
+        let results = fixture.results();
+        assert_eq!(results[0], "refused: unknown key \"max_qty\"");
+        assert!(results.last().unwrap().contains("risk.client.FUNDA.symbols: empty"), "{results:?}");
+        assert!(results[results.len() - 3].ends_with("risk.defaults.credit: -5 is not positive"), "{results:?}");
+    }
+
+    /// A file a hand edit broke, as TOML or as a configuration, refuses every edit until it's
+    /// fixed, and is left as it was.
+    #[tokio::test]
+    async fn a_file_broken_by_hand_refuses_every_edit() {
+        let fixture = fixture().await;
+        let path = fixture.dirs.0.path().join("jetbridge.toml");
+        let good = format!("{}[risk.client.FUNDA]\ncredit = 1\n", fixture.config());
+        let credit = r#"{"reason":"r","set":{"credit":5}}"#;
+        for broken in [format!("{good}[[route]\n"), format!("{good}[[route]]\nvenue = \"NOWHERE\"\n")] {
+            std::fs::write(&path, &broken).unwrap();
+            let body = fixture.admin("PATCH", DEFAULTS, credit, StatusCode::UNPROCESSABLE_ENTITY).await;
+            assert!(body["error"].as_str().unwrap().contains("jetbridge.toml: "), "{body}");
+            fixture.admin("DELETE", CLIENT_FUNDA, REASON, StatusCode::UNPROCESSABLE_ENTITY).await;
+            assert_eq!(fixture.config(), broken);
+        }
+        std::fs::write(&path, &good).unwrap();
+        fixture.admin("PATCH", DEFAULTS, credit, StatusCode::OK).await;
     }
 }

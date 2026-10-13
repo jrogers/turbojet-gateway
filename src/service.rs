@@ -19,9 +19,10 @@ use turbojet_config::{Changes, Initiators, SessionsFile};
 
 use crate::api;
 use crate::book::{self, Snapshot};
-use crate::config::{self, Error, RiskTables};
+use crate::config::{self, Error, RiskTable, RiskTables};
 use crate::edge::{ClientApp, Gateway, Schedules, TICK_INTERVAL, VenueApp, Writer};
 use crate::fix::Version;
+use crate::limits::{self, EditError};
 use crate::risk;
 use crate::router::Router;
 use crate::store::Store;
@@ -45,6 +46,14 @@ pub struct Reloaded {
     /// Problems with what was taken: a sessions file that, with a database, keeps a session's
     /// messages only in memory, so a restart loses what recovery needs.
     pub warnings: Vec<String>,
+}
+
+/// What [`Service::edit_limits`] did.
+#[derive(Debug)]
+pub struct Edited {
+    /// The table edited, as the file now has it; `None` if it has none.
+    pub table: Option<RiskTable>,
+    pub reloaded: Reloaded,
 }
 
 /// The routes, limits and `day_end` a reload took.
@@ -261,6 +270,48 @@ impl Service {
             warn!("not reloading: the gateway is stopping");
             return None;
         }
+        Some(self.reload_locked())
+    }
+
+    /// Edits the risk limits in the configuration file and reloads, as [`reload`](Self::reload)
+    /// does, all under its lock: reads the file afresh, makes `edit` (see [`limits::apply`]),
+    /// checks the whole text as a reload would, and only then writes it, atomically (to the file
+    /// itself, if the path is a symlink), keeping its permissions. A file that doesn't load as it
+    /// is refuses every edit until it's fixed. Returns the table the edit is to, as the file now
+    /// has it (`None` once deleted), and what the reload did, which takes whatever else changed
+    /// in the files since the last.
+    ///
+    /// Call it off the async workers (`spawn_blocking`), as [`reload`](Self::reload).
+    ///
+    /// # Errors
+    ///
+    /// The gateway is stopping, the edit can't be made or the file wouldn't load with it (it's
+    /// left as it was), or the file can't be read or written.
+    pub fn edit_limits(&self, edit: &limits::Edit) -> Result<Edited, EditError> {
+        let _reloading = self.reloading.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(EditError::Stopping);
+        }
+        let io = |e: io::Error| EditError::Io(format!("{}: {e}", self.path.display()));
+        // The file itself, so a symlink stays one.
+        let path = std::fs::canonicalize(&self.path).map_err(io)?;
+        let text = std::fs::read_to_string(&path).map_err(io)?;
+        let edited = limits::apply(&text, edit).map_err(|e| match e {
+            EditError::Refused(why) => EditError::Refused(format!("{}: {why}", self.path.display())),
+            e => e,
+        })?;
+        let venues = self.set_venues();
+        let reread = config::reread(&self.path, &edited, &venues, self.database.as_deref())
+            .map_err(|e| EditError::Refused(e.to_string()))?;
+        let warning = crate::auth::write_atomically(&path, &edited).map_err(io)?;
+        info!(file = %path.display(), ?edit, "edited the risk limits");
+        let mut reloaded = self.reload_locked();
+        reloaded.warnings.extend(warning);
+        Ok(Edited { table: edit.table_in(&reread.risk), reloaded })
+    }
+
+    /// [`reload`](Self::reload)'s work, its lock held.
+    fn reload_locked(&self) -> Reloaded {
         let sessions = self.sessions.reload_all(Some(&self.acceptor), &self.initiators).map_err(|e| e.to_string());
         match &sessions {
             Ok(changes) => {
@@ -311,7 +362,7 @@ impl Service {
                 Err(e.to_string())
             }
         };
-        Some(Reloaded { sessions, config, warnings })
+        Reloaded { sessions, config, warnings }
     }
 
     /// Rereads the API's users file, returning (and logging) why it was kept, if it was. Whatever
@@ -619,6 +670,46 @@ mod tests {
         assert!(reloaded.config.is_err());
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
         assert!(warning.contains("keeping the users in use"), "{warning}");
+        service.shutdown().await;
+        serving.abort();
+    }
+
+    /// A limit edit through a symlinked path writes the file it points to, keeping the link and
+    /// the file's permissions; edits from many threads at once each land; once stopping, an edit
+    /// is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn limit_edits_write_through_a_symlink_one_at_a_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
+        write(&dir, "real.toml", "sessions = \"sessions.toml\"\n");
+        let (real, link) = (dir.path().join("real.toml"), dir.path().join("jetbridge.toml"));
+        std::os::unix::fs::symlink("real.toml", &link).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let (service, serving) = Service::start(&link).await.unwrap();
+        let edits: Vec<_> = (0..8)
+            .map(|n| {
+                let (service, credit) = (service.clone(), serde_json::json!({ "credit": n + 1 }));
+                std::thread::spawn(move || {
+                    let edit =
+                        limits::Edit::set(limits::Limits::Client(format!("FUND{n}")), credit.as_object().unwrap());
+                    service.edit_limits(&edit.unwrap()).unwrap()
+                })
+            })
+            .collect();
+        for edit in edits {
+            assert!(edit.join().unwrap().reloaded.config.is_ok());
+        }
+        assert_eq!(service.risk_tables().client.len(), 8);
+        assert_eq!(service.gateway().limits().by_comp_id.len(), 8);
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
+        assert!(std::fs::read_to_string(&real).unwrap().contains("[risk.client.FUND7]\ncredit = 8\n"));
+
+        service.stopping.store(true, Ordering::SeqCst);
+        let edit = limits::Edit::Delete { comp_id: "FUND0".into() };
+        assert_eq!(service.edit_limits(&edit).unwrap_err(), EditError::Stopping);
         service.shutdown().await;
         serving.abort();
     }

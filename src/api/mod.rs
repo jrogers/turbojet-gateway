@@ -19,7 +19,7 @@ use axum::extract::Query;
 use axum::extract::rejection::QueryRejection;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::serve::ListenerExt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,8 @@ fn router(state: State) -> axum::Router {
         .route("/api/risk/block", post(write::block))
         .route("/api/risk/unblock", post(write::unblock))
         .route("/api/risk/cancel-all", post(write::cancel_all))
+        .route("/api/risk/limits/defaults", patch(write::set_default_limits))
+        .route("/api/risk/limits/client/{comp_id}", patch(write::set_client_limits).delete(write::delete_client_limits))
         .route("/api/reload", post(write::reload))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate));
     axum::Router::new()
