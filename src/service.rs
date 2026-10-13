@@ -5,7 +5,8 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
@@ -77,6 +78,9 @@ pub struct Service {
     /// Held for the whole of a reload: SIGHUP and the API can each start one, and only the
     /// sessions file's half locks itself, so an older jetbridge.toml could land over a newer one.
     reloading: Mutex<()>,
+    /// Set as shutdown starts: a reload that hasn't begun doesn't, as it would start initiators
+    /// being stopped.
+    stopping: AtomicBool,
 }
 
 impl Drop for Service {
@@ -148,6 +152,7 @@ impl Service {
             store,
             api: Mutex::new(None),
             reloading: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         };
         service.set_venues();
         // The initiators are running: stop them rather than leave them logging on.
@@ -224,13 +229,18 @@ impl Service {
     /// together; a users file that doesn't load is a warning); the routes are checked against the venues the gateway took after the sessions
     /// reload, so a venue added to both files at once can be routed to. A changed schedule or
     /// `day_end` applies from each session's next trading day. Returns what it logged: each file's
-    /// changes or why it was kept, and any warning about what was taken.
+    /// changes or why it was kept, and any warning about what was taken. `None`, doing nothing,
+    /// once shutdown has started.
     ///
     /// One reload runs at a time, the others waiting: call it off the async workers
     /// (`spawn_blocking`).
-    pub fn reload(&self) -> Reloaded {
+    pub fn reload(&self) -> Option<Reloaded> {
         // Nothing panics while holding it but a reload's own bug; the next reload goes ahead.
-        let _reloading = self.reloading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _reloading = self.reloading.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.stopping.load(Ordering::SeqCst) {
+            warn!("not reloading: the gateway is stopping");
+            return None;
+        }
         let sessions = self.sessions.reload_all(Some(&self.acceptor), &self.initiators).map_err(|e| e.to_string());
         match &sessions {
             Ok(changes) => {
@@ -280,7 +290,7 @@ impl Service {
                 Err(e.to_string())
             }
         };
-        Reloaded { sessions, config, warnings }
+        Some(Reloaded { sessions, config, warnings })
     }
 
     /// Rereads the API's users file, returning (and logging) why it was kept, if it was. Whatever
@@ -304,12 +314,18 @@ impl Service {
         warnings
     }
 
-    /// Stops the operator API (its requests under way finish first, briefly), logs the clients'
-    /// sessions out, cancels the working orders of those with cancel on
-    /// disconnect (pending countdowns fire as the clients go; the shutdown's own Logouts start
-    /// none), waits for the venues to answer the gateway's cancels, logs the venues' sessions out,
+    /// Waits for a reload under way and refuses later ones, stops the operator API (its requests
+    /// under way finish first, briefly), logs the clients' sessions out, cancels the working
+    /// orders of those with cancel on disconnect (pending countdowns fire as the clients go; the
+    /// shutdown's own Logouts start none), waits for the venues to answer the gateway's cancels, logs the venues' sessions out,
     /// returning once all have closed, then logs what the stop loses.
     pub async fn shutdown(&self) {
+        // A reload under way finishes first; any later one finds the flag and does nothing.
+        self.stopping.store(true, Ordering::SeqCst);
+        // ponytail: polled, as the cancels below are; reloads are rare and quick.
+        while matches!(self.reloading.try_lock(), Err(TryLockError::WouldBlock)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let api = self.api.lock().expect("API lock poisoned").take();
         if let Some(api) = api {
             api.shutdown().await;
@@ -574,10 +590,10 @@ mod tests {
         assert!(e.to_string().contains("users.toml"), "{e}");
         write(&dir, "users.toml", "");
         let (service, serving) = Service::start(&path).await.unwrap();
-        assert!(service.reload().warnings.is_empty());
+        assert!(service.reload().unwrap().warnings.is_empty());
         write(&dir, "users.toml", "[user.a]\nrole = \"viewer\"\n");
         write(&dir, "jetbridge.toml", "not toml");
-        let reloaded = service.reload();
+        let reloaded = service.reload().unwrap();
         assert!(reloaded.config.is_err());
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
         assert!(warning.contains("keeping the users in use"), "{warning}");
@@ -585,7 +601,8 @@ mod tests {
         serving.abort();
     }
 
-    /// One reload waits for another to finish, so the older file can't land over the newer.
+    /// One reload waits for another to finish, so the older file can't land over the newer; and
+    /// shutdown waits for one under way.
     #[tokio::test]
     async fn reloads_run_one_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
@@ -599,8 +616,22 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(!reload.is_finished());
         drop(held);
-        assert!(reload.await.unwrap().config.is_ok());
+        assert!(reload.await.unwrap().unwrap().config.is_ok());
+
+        // Shutdown waits for a reload under way (one holding the lock), and refuses later ones.
+        let (reloading, finished) = (service.clone(), Arc::new(AtomicBool::new(false)));
+        let finishing = finished.clone();
+        tokio::task::spawn_blocking(move || {
+            let _held = reloading.reloading.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            finishing.store(true, Ordering::SeqCst);
+        });
+        while !matches!(service.reloading.try_lock(), Err(TryLockError::WouldBlock)) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         service.shutdown().await;
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(service.reload().is_none());
         serving.abort();
     }
 
@@ -656,9 +687,9 @@ mod tests {
         let options = StartOptions { api_listener: Some(listener), ..StartOptions::default() };
         let (service, serving) = Service::start_with(&dir.path().join("jetbridge.toml"), options).await.unwrap();
         assert!(api::tests::request(addr, "GET", "/api/health").await.starts_with("HTTP/1.1 200"));
-        assert!(service.reload().warnings.is_empty());
+        assert!(service.reload().unwrap().warnings.is_empty());
         write(&dir, "jetbridge.toml", &config("0.0.0.0:8081"));
-        let reloaded = service.reload();
+        let reloaded = service.reload().unwrap();
         assert!(reloaded.config.is_ok(), "{reloaded:?}");
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
         assert!(warning.contains("[api] changed"), "{warning}");
@@ -687,7 +718,7 @@ mod tests {
         assert!(response.contains("\"version\""), "{response}");
 
         write(&dir, "api.pem", "not a certificate");
-        let reloaded = service.reload();
+        let reloaded = service.reload().unwrap();
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
         assert!(warning.contains("keeping the API's certificate in use"), "{warning}");
         assert!(health(&cert).await.unwrap().starts_with("HTTP/1.1 200"));
@@ -695,7 +726,7 @@ mod tests {
         let (renewed, renewed_key) = api::tests::localhost_cert();
         write(&dir, "api.pem", &renewed);
         write(&dir, "api.key", &renewed_key);
-        let reloaded = service.reload();
+        let reloaded = service.reload().unwrap();
         assert!(reloaded.warnings.is_empty(), "{reloaded:?}");
         assert!(health(&cert).await.is_err());
         assert!(health(&renewed).await.unwrap().starts_with("HTTP/1.1 200"));
@@ -720,7 +751,7 @@ mod tests {
             &format!("{ACCEPTOR}{listen}{}{}", venue_section("B", "FIX.4.4"), venue_section("C", "FIX.4.3")),
         );
         write(&dir, "jetbridge.toml", &routes_to("B"));
-        let reloaded = service.reload();
+        let reloaded = service.reload().unwrap();
         assert_eq!(reloaded.sessions.map(|changes| changes.started), Ok(vec!["B".into(), "C".into()]));
         assert_eq!(reloaded.config.map(|config| config.routes), Ok(1));
         let to_b = Router::new(vec![Rule {
@@ -733,7 +764,7 @@ mod tests {
         assert_eq!(service.set_venues(), ["B"]);
 
         write(&dir, "jetbridge.toml", &routes_to("C"));
-        let reloaded = service.reload();
+        let reloaded = service.reload().unwrap();
         assert_eq!(reloaded.sessions, Ok(Changes::default()));
         assert!(reloaded.config.unwrap_err().contains("\"C\""));
         assert_eq!(service.gateway.router(), to_b);
@@ -755,11 +786,11 @@ mod tests {
         assert_eq!(max_order_qty(), Some(5.into()));
 
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(7)));
-        let config = service.reload().config.unwrap();
+        let config = service.reload().unwrap().config.unwrap();
         assert_eq!((config.routes, config.clients), (0, 0));
         assert_eq!(max_order_qty(), Some(7.into()));
         write(&dir, "jetbridge.toml", &format!("{}{}", routes_to("NOWHERE"), limit(9)));
-        service.reload();
+        service.reload().unwrap();
         assert_eq!(max_order_qty(), Some(7.into()));
         assert_eq!(service.gateway.router(), Router::new(Vec::new()));
         service.shutdown().await;
@@ -819,9 +850,9 @@ mod tests {
         );
         write(&dir, "sessions.toml", &durable);
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
-        assert!(service.reload().warnings.is_empty());
+        assert!(service.reload().unwrap().warnings.is_empty());
         write(&dir, "sessions.toml", &format!("{durable}{}store = \"memory\"\n", venue_section("C", "FIX.4.4")));
-        let reloaded = service.reload();
+        let reloaded = service.reload().unwrap();
         assert!(reloaded.sessions.is_ok(), "{reloaded:?}");
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
         assert!(warning.contains("venue C's session must be kept in a durable store"), "{warning}");

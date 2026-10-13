@@ -246,7 +246,8 @@ pub(super) async fn reload(
     let reload = async move {
         let reloaded = tokio::task::spawn_blocking(move || service.reload())
             .await
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("the reload failed: {e}")))?;
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("the reload failed: {e}")))?
+            .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "the gateway is stopping"))?;
         answer(reloaded)
     };
     audited(&state, &caller, mutation, allowed, reload).await
