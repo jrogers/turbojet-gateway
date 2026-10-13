@@ -129,7 +129,7 @@ impl Service {
     /// As [`start`](Self::start), with `options`.
     pub(crate) async fn start_with(path: &Path, options: StartOptions) -> Result<(Arc<Self>, Serving), Error> {
         let StartOptions { stores, listener, api_listener, max_commit_wait } = options;
-        let loaded = config::load_with_stores(path, stores)?;
+        let loaded = config::load(path, stores)?;
         if loaded.database.is_some() {
             check_durable(&loaded.sessions)?;
         }
@@ -305,8 +305,8 @@ impl Service {
         })?;
         let venues = self.set_venues();
         // Quiet: the reload below logs what's worth a warning.
-        let reread = config::reread(&self.path, &edited, &venues, self.database.as_deref(), false)
-            .map_err(|e| EditError::Refused(e.to_string()))?;
+        let reread =
+            config::reread(&self.path, &edited, &venues, false).map_err(|e| EditError::Refused(e.to_string()))?;
         let warning = crate::auth::write_atomically(&self.path, &edited).map_err(io)?;
         info!(file = %self.path.display(), "edited the risk limits: {edit}");
         let mut reloaded = self.reload_locked();
@@ -342,8 +342,8 @@ impl Service {
             warnings.push(warning);
         }
         let venues = self.set_venues();
-        let config = match config::reload(&self.path, &venues, self.database.as_deref()) {
-            Ok(config::Reread { router, limits, risk, day_end, api, message_log }) => {
+        let config = match config::reload(&self.path, &venues) {
+            Ok(config::Reread { router, limits, risk, day_end, api, message_log, database }) => {
                 let summary = ConfigSummary {
                     routes: router.rules().len(),
                     clients: limits.by_comp_id.len(),
@@ -359,11 +359,7 @@ impl Service {
                 *self.risk.lock().unwrap_or_else(PoisonError::into_inner) = risk;
                 self.gateway.set_day_end(day_end);
                 warnings.extend(self.reload_api(api.as_ref()));
-                if message_log != self.message_log {
-                    let warning = "[message_log] changed, which needs a restart: the log in use is kept".to_string();
-                    warn!("{warning}");
-                    warnings.push(warning);
-                }
+                warnings.extend(self.needing_restart(message_log.as_ref(), database.as_deref()));
                 Ok(summary)
             }
             Err(e) => {
@@ -380,6 +376,22 @@ impl Service {
         let warning = self.api.lock().expect("API lock poisoned").as_ref()?.reload_users()?;
         warn!("{warning}");
         Some(warning)
+    }
+
+    /// What changed in the reloaded file but waits for a restart, logged: the `[message_log]` and
+    /// the `[database] url`, which the gateway keeps as it started.
+    fn needing_restart(&self, message_log: Option<&config::MessageLog>, database: Option<&str>) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if message_log != self.message_log.as_ref() {
+            warnings.push("[message_log] changed, which needs a restart: the log in use is kept".to_string());
+        }
+        if database != self.database.as_deref() {
+            warnings.push("[database] url changed, which needs a restart: the database in use is kept".to_string());
+        }
+        for warning in &warnings {
+            warn!(file = %self.path.display(), "{warning}");
+        }
+        warnings
     }
 
     /// Takes the reloaded `[api]`'s certificate, returning (and logging) what waits for a restart.
@@ -565,7 +577,7 @@ async fn next_second() -> SystemTime {
 /// What [`Service::start_with`] does differently from [`Service::start`].
 #[derive(Default)]
 pub(crate) struct StartOptions {
-    /// Stores the sessions file may name, registered by name (see [`config::load_with_stores`]).
+    /// Stores the sessions file may name, registered by name (see [`config::load`]).
     pub(crate) stores: Vec<(String, Arc<dyn turbojet::SessionStorage>)>,
     /// Serves clients on this rather than binding the file's address: a listener kept open across
     /// starts, as socket activation keeps one, holds its port while the gateway is down.
@@ -1117,20 +1129,20 @@ mod tests {
         }
     }
 
-    /// The sessions of the message log's records in `dir`, so far.
-    fn logged_sessions(dir: &Path) -> Vec<String> {
+    /// The sessions and frames of the message log's records in `dir`, so far.
+    fn logged(dir: &Path) -> Vec<(Option<String>, Vec<u8>)> {
         let files = turbojet::FileMessageLog::files(dir).unwrap();
         let records = files.iter().flat_map(|file| turbojet::FileMessageLog::read(&file.path).unwrap());
         records
             .filter_map(|record| match record.unwrap() {
-                turbojet::LogRecord::Message { session, .. } => session,
+                turbojet::LogRecord::Message { session, frame, .. } => Some((session, frame)),
                 _ => None,
             })
             .collect()
     }
 
-    /// With `[message_log]`, the clients' and the venues' sessions log to its one directory; a
-    /// reload changing it warns and keeps the log in use.
+    /// With `[message_log]`, the clients' and the venues' sessions log to its one directory, a
+    /// client's Password(554) masked; a reload changing it warns and keeps the log in use.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_message_log_has_both_sides_and_a_reload_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1150,26 +1162,31 @@ mod tests {
         write(&dir, "jetbridge.toml", jetbridge);
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
 
-        let client = format!(
-            "[initiator.JETBRIDGE]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"FUNDA\"\n\
-             target_comp_id = \"JETBRIDGE\"\nconnect = [\"{}\"]\n",
-            service.local_addr()
-        );
-        write(&dir, "client.toml", &client);
+        let mut config = turbojet::InitiatorConfig::new(turbojet::SessionConfig::new("FIX.4.4", "FUNDA"), "JETBRIDGE");
+        config.password = Some("hunter2".to_string().into());
         let app = Arc::new(LoggedOn(tokio::sync::Notify::new()));
-        let client = SessionsFile::load(dir.path().join("client.toml")).unwrap().initiators(app.clone()).unwrap();
+        let addr = service.local_addr().to_string();
+        let client =
+            turbojet::Initiator::new(addr, config, Arc::new(turbojet::MemoryStorage::new()), app.clone()).unwrap();
+        tokio::spawn(client.clone().run());
         tokio::time::timeout(Duration::from_secs(5), app.0.notified()).await.expect("no logon");
         // The log's writer thread gathers records for a millisecond before writing them.
-        let both = async {
+        let has = |records: &[(Option<String>, Vec<u8>)], comp_id: &str| {
+            records.iter().any(|(session, _)| session.as_ref().is_some_and(|s| s.contains(comp_id)))
+        };
+        let records = async {
             loop {
-                let sessions = logged_sessions(&dir.path().join("log"));
-                if sessions.iter().any(|s| s.contains("FUNDA")) && sessions.iter().any(|s| s.contains("VENUE")) {
-                    break;
+                let records = logged(&dir.path().join("log"));
+                if has(&records, "FUNDA") && has(&records, "VENUE") {
+                    return records;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        tokio::time::timeout(Duration::from_secs(5), both).await.expect("the log lacks a side");
+        let records = tokio::time::timeout(Duration::from_secs(5), records).await.expect("the log lacks a side");
+        let frames = records.iter().map(|(_, frame)| String::from_utf8_lossy(frame)).collect::<Vec<_>>();
+        assert!(frames.iter().any(|frame| frame.contains("\x01554=*")), "{frames:?}");
+        assert!(!frames.iter().any(|frame| frame.contains("hunter2")), "{frames:?}");
 
         write(&dir, "jetbridge.toml", &format!("{jetbridge}retention = \"30d\"\n"));
         let reloaded = tokio::task::spawn_blocking({
@@ -1187,6 +1204,7 @@ mod tests {
     }
 
     /// Without `[message_log]`, nothing is logged; a reload adding one warns, and still logs nothing.
+    /// Adding a `[database]` warns too.
     #[tokio::test]
     async fn no_message_log_table_no_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -1194,9 +1212,12 @@ mod tests {
         write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"\n");
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         assert!(service.message_log.is_none());
-        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log\"\n");
+        let changed =
+            "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log\"\n[database]\nurl = \"sqlite://j.db\"\n";
+        write(&dir, "jetbridge.toml", changed);
         let reloaded = service.reload().unwrap();
         assert!(reloaded.warnings.iter().any(|w| w.contains("[message_log] changed")), "{reloaded:?}");
+        assert!(reloaded.warnings.iter().any(|w| w.contains("[database] url changed")), "{reloaded:?}");
         assert!(!dir.path().join("log").exists());
         service.shutdown().await;
         serving.abort();

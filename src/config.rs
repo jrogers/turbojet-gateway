@@ -48,9 +48,8 @@
 //! The sessions file is Turbojet's (`turbojet-config`): its `[acceptor]` serves the clients, all
 //! speaking its `begin_string`, and each `[initiator.NAME]` logs on to venue `NAME`. The
 //! `sessions` key is read at start only: a reload rereads the routes and limits, and the sessions
-//! file in use. A reload keeps the `[database]` in use: a changed url is logged, for the next start.
-//! It keeps the `[message_log]` in use too: a changed one is a warning, for the next start. The
-//! log masks passwords.
+//! file in use. A reload keeps the `[database]` and the `[message_log]` in use: a changed one is a
+//! warning, for the next start. The log masks passwords.
 //!
 //! A client session's trading day ends at `day_end`, or sooner when its schedule's period (from
 //! the sessions file) ends. `day_end` is a time, `HH:MM` or `HH:MM:SS`, and a time zone, `UTC`,
@@ -170,27 +169,28 @@ impl MessageLog {
     }
 }
 
-/// Reads the configuration file at `path` and the sessions file it names, and opens the
-/// `[message_log]`, if any, for the sessions file's sessions.
+/// Reads the configuration file at `path` and the sessions file it names, registering `stores`
+/// with it by name (the crash tests' gated stores, say), and opens the `[message_log]`, if any,
+/// for the sessions file's sessions.
 ///
 /// # Errors
 ///
 /// Either file can't be read or doesn't load, the sessions file has no `[acceptor]` or one with a
 /// BeginString the gateway doesn't convert, a route names a venue with no initiator, or the
 /// message log can't be opened.
-pub fn load(path: &Path) -> Result<Loaded, Error> {
-    load_with_stores(path, Vec::new())
-}
-
-/// As [`load`], the sessions file also naming `stores`, each registered by its name (the
-/// crash tests' gated stores, say).
-pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn SessionStorage>)>) -> Result<Loaded, Error> {
+pub(crate) fn load(path: &Path, stores: Vec<(String, Arc<dyn SessionStorage>)>) -> Result<Loaded, Error> {
     let file = read(path)?;
-    let sessions_path = path.parent().unwrap_or(Path::new(".")).join(&file.sessions);
+    let router = file.router(path, true)?;
+    let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    let day_end = file.day_end(path)?;
+    let api = file.api(path)?;
     let message_log = file.message_log(path)?;
+    let sessions_path = path.parent().unwrap_or(Path::new(".")).join(&file.sessions);
     let mut builder = stores
         .into_iter()
         .fold(SessionsFile::builder(&sessions_path), |builder, (name, storage)| builder.with_store(name, storage));
+    // ponytail: the builder takes the log before it loads the sessions file, so a sessions file
+    // that doesn't load leaves the log's directory and an empty file; load it twice if that matters.
     if let Some(log) = &message_log {
         let opened = log
             .open()
@@ -202,11 +202,7 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
         return Err(Error(format!("{}: no [acceptor]: the clients log on to it", sessions_path.display())));
     };
     let version = base.begin_string.parse().map_err(|e| Error(format!("{}: {e}", sessions_path.display())))?;
-    let router = file.router(path, true)?;
     check_venues(path, &router, &sessions.initiator_names())?;
-    let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    let day_end = file.day_end(path)?;
-    let api = file.api(path)?;
     let database = file.database.map(|database| database.url);
     Ok(Loaded { router, limits, risk: file.risk, sessions, version, day_end, database, api, message_log })
 }
@@ -222,21 +218,23 @@ pub struct Reread {
     pub api: Option<Api>,
     /// Not opened: a reload keeps the log in use.
     pub message_log: Option<MessageLog>,
+    /// Not opened: a reload keeps the database in use.
+    pub database: Option<String>,
 }
 
-/// Reads the routes, limits, `day_end`, `[api]` and `[message_log]` in the configuration file at `path` again,
-/// checking that each venue the routes name is one of `venues`. A `[database] url` other than
-/// `database`, the one in use, is logged: it applies at the next start.
+/// Reads the routes, limits, `day_end`, `[api]`, `[message_log]` and `[database] url` in the
+/// configuration file at `path` again, checking that each venue the routes name is one of
+/// `venues`.
 ///
 /// # Errors
 ///
-/// As [`load`], for the routes, limits, `day_end`, `[api]` and `[message_log]`, or a route names
+/// As at start, for the routes, limits, `day_end`, `[api]` and `[message_log]`, or a route names
 /// a venue not in `venues`. An `[api]` that doesn't load (or breaks the bind rule), or a
 /// `[message_log]` that doesn't, refuses the whole file: the routes, limits and `day_end` in it
 /// aren't taken either.
-pub fn reload(path: &Path, venues: &[String], database: Option<&str>) -> Result<Reread, Error> {
+pub fn reload(path: &Path, venues: &[String]) -> Result<Reread, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    reread(path, &text, venues, database, true)
+    reread(path, &text, venues, true)
 }
 
 /// As [`reload`], from `text` rather than the file at `path`, which only names it in errors and
@@ -246,18 +244,16 @@ pub fn reload(path: &Path, venues: &[String], database: Option<&str>) -> Result<
 /// # Errors
 ///
 /// As [`reload`].
-pub fn reread(path: &Path, text: &str, venues: &[String], database: Option<&str>, log: bool) -> Result<Reread, Error> {
+pub fn reread(path: &Path, text: &str, venues: &[String], log: bool) -> Result<Reread, Error> {
     let file = parse(path, text)?;
-    if log && file.database.as_ref().map(|database| database.url.as_str()) != database {
-        warn!(file = %path.display(), "[database] url changed: the gateway keeps its database until the next start");
-    }
     let router = file.router(path, log)?;
     check_venues(path, &router, venues)?;
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
     let api = file.api(path)?;
     let message_log = file.message_log(path)?;
-    Ok(Reread { router, limits, risk: file.risk, day_end, api, message_log })
+    let database = file.database.map(|database| database.url);
+    Ok(Reread { router, limits, risk: file.risk, day_end, api, message_log, database })
 }
 
 /// `day_end` as written, `HH:MM[:SS] [ZONE]`, as a schedule whose periods run from one end of day
@@ -440,8 +436,13 @@ struct Route {
     reject: Option<String>,
 }
 
+/// The longest `[message_log] retention`: longer than any record-keeping rule asks for, and short
+/// enough that the log's date arithmetic can't overflow, so a typo is refused at load and reload
+/// rather than at the next start's open.
+const RETENTION_MAX: Duration = Duration::from_secs(100 * 366 * 86_400);
+
 /// `[message_log] retention`: a whole number and a unit, `s`, `m`, `h` or `d` (`90d`), as the
-/// sessions file writes its durations, with days added; positive.
+/// sessions file writes its durations, with days added; positive, and at most [`RETENTION_MAX`].
 fn retention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Duration>, D::Error> {
     let text = String::deserialize(deserializer)?;
     let invalid = || serde::de::Error::custom(format!("invalid duration {text:?} (expected e.g. 12h or 90d)"));
@@ -454,10 +455,12 @@ fn retention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Durati
         "d" => 86_400,
         _ => return Err(invalid()),
     };
-    match count.checked_mul(unit_secs) {
-        Some(0) => Err(serde::de::Error::custom("retention must be positive; leave it out to keep every file")),
-        Some(secs) => Ok(Some(Duration::from_secs(secs))),
-        None => Err(serde::de::Error::custom(format!("duration {text:?} is too long"))),
+    match count.checked_mul(unit_secs).map(Duration::from_secs) {
+        Some(Duration::ZERO) => {
+            Err(serde::de::Error::custom("retention must be positive; leave it out to keep every file"))
+        }
+        Some(retention) if retention <= RETENTION_MAX => Ok(Some(retention)),
+        _ => Err(serde::de::Error::custom(format!("retention {text:?} is longer than 100 years"))),
     }
 }
 
@@ -544,6 +547,10 @@ impl File {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load(path: &Path) -> Result<Loaded, Error> {
+        super::load(path, Vec::new())
+    }
 
     const SESSIONS: &str = r#"
 [acceptor]
@@ -650,7 +657,8 @@ reject = "no route"
             ("retention = \"90 days\"", "invalid duration \"90 days\""),
             ("retention = \"d\"", "invalid duration"),
             ("retention = \"0d\"", "retention must be positive"),
-            ("retention = \"999999999999999999d\"", "too long"),
+            ("retention = \"999999999999999999d\"", "longer than 100 years"),
+            ("retention = \"36601d\"", "longer than 100 years"),
             ("file_bytes_max = 0", "nonzero"),
             ("level = 1", "unknown field `level`"),
         ] {
@@ -718,10 +726,10 @@ reject = "no route"
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"")
             .unwrap();
         let venues = loaded.sessions.initiator_names();
-        let router = reload(&path, &venues, None).unwrap().router;
+        let router = reload(&path, &venues).unwrap().router;
         assert_eq!(router, Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ")]));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"LSE\"").unwrap();
-        assert!(reload(&path, &venues, None).is_err());
+        assert!(reload(&path, &venues).is_err());
     }
 
     fn limits(risk: &str) -> Result<risk::Config, String> {
@@ -801,10 +809,10 @@ self_trade = false
         let path = dir.path().join("jetbridge.toml");
         let venues = load(&path).unwrap().sessions.initiator_names();
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = 5").unwrap();
-        let limits = reload(&path, &venues, None).unwrap().limits;
+        let limits = reload(&path, &venues).unwrap().limits;
         assert_eq!(limits.limits("FUNDA").max_order_qty, Some(decimal("5")));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = -5").unwrap();
-        assert!(reload(&path, &venues, None).is_err());
+        assert!(reload(&path, &venues).is_err());
     }
 
     #[test]
@@ -853,7 +861,7 @@ self_trade = false
     #[test]
     fn reloading_reads_day_end() {
         let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
-        let reloaded = reload(&dir.path().join("jetbridge.toml"), &[], None).unwrap().day_end;
+        let reloaded = reload(&dir.path().join("jetbridge.toml"), &[]).unwrap().day_end;
         assert_eq!(reloaded, day_end("17:00").unwrap());
     }
 
@@ -909,5 +917,22 @@ self_trade = false
         assert_eq!(funda.max_notional, Some(decimal("2500000.50")));
         assert_eq!((funda.max_order_qty, funda.price_band), (Some(decimal("10000")), Some(decimal("5"))));
         assert_eq!(loaded.limits.limits("FUNDB").credit, None);
+
+        // The commented `[message_log]`, uncommented, is valid too.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (before, example) = text.split_once("# [message_log]").unwrap();
+        let mut uncommented = format!("{before}[message_log]");
+        for line in example.lines() {
+            uncommented.push_str(line.strip_prefix("# ").unwrap_or(line));
+            uncommented.push('\n');
+        }
+        let reread = reread(&path, &uncommented, &["NASDAQ".to_string()], false);
+        if cfg!(feature = "gzip") {
+            let log = reread.unwrap().message_log.unwrap();
+            assert_eq!(log.dir, path.parent().unwrap().join("log"));
+            assert_eq!((log.retention, log.compress), (Some(Duration::from_secs(90 * 86_400)), true));
+        } else {
+            assert!(reread.unwrap_err().to_string().contains("build with the `gzip` feature"));
+        }
     }
 }
