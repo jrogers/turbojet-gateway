@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use jetbridge::auth::{Role, Users};
 use jetbridge::book::{ClientId, Scope, Status};
 use jetbridge::service::Service;
 use jetbridge::store::Store;
@@ -201,7 +202,7 @@ fn routes(symbol: &str, text: &str) -> String {
 /// The gateway's two files, its clients speaking `client_version` and its venue
 /// `venue_version` at `venue_port`.
 fn write_config(dir: &tempfile::TempDir, options: &Options, venue_port: u16) {
-    let Options { client_version, venue_version, cancel_on_disconnect, database, .. } = options;
+    let Options { client_version, venue_version, cancel_on_disconnect, database, api, .. } = options;
     let cancel = cancel_on_disconnect
         .map(|(trigger, grace)| {
             format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", grace.as_millis())
@@ -228,7 +229,14 @@ reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
     );
     std::fs::write(dir.path().join("sessions.toml"), sessions).unwrap();
     let database = if *database { format!("[database]\nurl = \"{}\"\n", database_url(dir)) } else { String::new() };
-    std::fs::write(dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + &database).unwrap();
+    // No users yet: a test adds them and reloads.
+    let api = if *api {
+        std::fs::write(dir.path().join("users.toml"), "").unwrap();
+        "[api]\nlisten = \"127.0.0.1:0\"\nusers = \"users.toml\"\naudit = \"audit.jsonl\"\n"
+    } else {
+        ""
+    };
+    std::fs::write(dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + &database + api).unwrap();
 }
 
 /// The gateway's database, with [`Options::database`].
@@ -247,6 +255,8 @@ struct Options {
     cancel_on_disconnect: Option<(&'static str, Duration)>,
     /// The gateway keeps its book in a SQLite file in the test's directory.
     database: bool,
+    /// The gateway serves its operator API, with an empty users file.
+    api: bool,
 }
 
 impl Default for Options {
@@ -258,6 +268,7 @@ impl Default for Options {
             answers: false,
             cancel_on_disconnect: None,
             database: false,
+            api: false,
         }
     }
 }
@@ -999,4 +1010,51 @@ async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
     std::fs::write(setup.dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT)).unwrap();
     setup.service.reload();
     assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("1"));
+}
+
+/// The kill switch over the API: an operator's token cancels a CompID's orders. The venue gets
+/// the cancel, the client hears Canceled, and the audit log has the call, allowed, with its reason.
+#[tokio::test]
+async fn the_kill_switch_over_the_api_cancels_a_clients_orders() {
+    let mut setup = Setup::with(Options { api: true, ..Options::default() }).await;
+    let users_path = setup.dir.path().join("users.toml");
+    let mut users = Users::load(&users_path).unwrap();
+    users.add("olga", Role::Operator, Vec::new(), "a long enough password").unwrap();
+    let token = users.add_token("olga").unwrap();
+    users.save(&users_path).unwrap();
+    setup.service.reload();
+    setup.working_order().await;
+
+    let body = format!(r#"{{"scope":"comp:{CLIENT}","reason":"runaway algo"}}"#);
+    let response = post(setup.service.api_addr().unwrap(), "/api/risk/cancel-all", &token, &body).await;
+    assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+    let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
+    assert_eq!((sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_str()), (&*setup.id("1-1"), &*setup.id("1")));
+    setup.venue.send(canceled(&sent.cl_ord_id, &sent.orig_cl_ord_id));
+    let canceled: v44::ExecutionReport = setup.events.parse().await;
+    assert_eq!(canceled.cl_ord_id.as_deref(), Some("C1"));
+    assert_eq!(canceled.exec_type, Code::Known(v44::ExecType::Canceled));
+
+    let audit = std::fs::read_to_string(setup.dir.path().join("audit.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let [line] = lines.as_slice() else { panic!("{audit}") };
+    let target = format!("comp:{CLIENT}");
+    assert_eq!(
+        (&line["user"], &line["action"], &line["target"], &line["reason"], &line["result"]),
+        (&"olga".into(), &"cancel_all".into(), &target.into(), &"runaway algo".into(), &"allowed".into())
+    );
+}
+
+/// POSTs JSON `body` to the API at `addr` with bearer `token`, returning the whole answer.
+async fn post(addr: SocketAddr, path: &str, token: &str, body: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    timeout(WAIT, stream.read_to_string(&mut response)).await.expect("timed out").unwrap();
+    response
 }
