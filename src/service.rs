@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::{Duration, SystemTime};
 
-use chrono::Utc;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -429,7 +428,7 @@ impl Service {
         warnings
     }
 
-    /// Waits for a reload under way and refuses later ones, stops the operator API (its requests
+    /// Waits for a reload under way and refuses later ones, stops pruning, stops the operator API (its requests
     /// under way finish first, briefly), logs the clients' sessions out, cancels the working
     /// orders of those with cancel on disconnect (pending countdowns fire as the clients go; the
     /// shutdown's own Logouts start none), waits for the venues to answer the gateway's cancels,
@@ -439,6 +438,9 @@ impl Service {
     pub async fn shutdown(&self) {
         // A reload under way finishes first; any later one finds the flag and does nothing.
         self.stopping.store(true, Ordering::SeqCst);
+        if let Some(pruning) = &self.pruning {
+            pruning.abort();
+        }
         // ponytail: polled, as the cancels below are; reloads are rare and quick.
         while matches!(self.reloading.try_lock(), Err(TryLockError::WouldBlock)) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -462,9 +464,6 @@ impl Service {
             warn!(cancelling = ?self.gateway.cancelling(), "stopping without the venues' answer to these cancels");
         }
         self.retrying.abort();
-        if let Some(pruning) = &self.pruning {
-            pruning.abort();
-        }
         self.initiators.shutdown(Some(SHUTTING_DOWN)).await;
         // What the last messages changed, before the process goes. A database that's down holds
         // this up; a second signal exits (see the binary).
@@ -571,7 +570,7 @@ async fn prune_hourly(gateway: Arc<Gateway>, store: Store, retention: Arc<Mutex<
     loop {
         interval.tick().await;
         let retention = *retention.lock().unwrap_or_else(PoisonError::into_inner);
-        gateway.prune_once(&store, retention, Utc::now()).await;
+        gateway.prune_once(&store, retention).await;
     }
 }
 
@@ -1294,6 +1293,35 @@ mod tests {
         assert_eq!(retention(), None);
         service.shutdown().await;
         serving.abort();
+    }
+
+    /// The first prune is an hour after the start, not at it: each run reads the gateway's clock,
+    /// here counting, before its first await. Later runs aren't checked: the paused clock races
+    /// ahead of the database, whose run delays the next tick.
+    #[tokio::test]
+    async fn pruning_runs_an_hour_after_the_start_and_hourly() {
+        use std::sync::atomic::AtomicUsize;
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let clock = {
+            let runs = runs.clone();
+            turbojet::Clock::from_fn(move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                chrono::DateTime::UNIX_EPOCH
+            })
+        };
+        let gateway = Arc::new(Gateway::new(Router::new(Vec::new()), Version::Fix44).with_clock(clock));
+        tokio::time::pause();
+        let retention = Arc::new(Mutex::new(Some(Duration::from_secs(86_400))));
+        let pruning = tokio::spawn(prune_hourly(gateway, store, retention));
+        let runs_after = async |wait: Duration| {
+            tokio::time::sleep(wait).await;
+            runs.load(Ordering::SeqCst)
+        };
+        assert_eq!(runs_after(Duration::ZERO).await, 0);
+        assert_eq!(runs_after(PRUNE_INTERVAL - Duration::from_millis(1)).await, 0);
+        assert_eq!(runs_after(Duration::from_millis(2)).await, 1);
+        pruning.abort();
     }
 
     /// A database with rows in it is restored from at the next start: here a block.

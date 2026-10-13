@@ -416,7 +416,9 @@ impl Gateway {
                     gateway.lock().orphan_cancels.entry(venue).or_default().push(orphan);
                 }
             }
-            gateway.lock().orphan_cancels_sending -= 1;
+            let mut state = gateway.lock();
+            debug_assert!(state.orphan_cancels_sending > 0, "a cancel settled that wasn't counted as sending");
+            state.orphan_cancels_sending -= 1;
         });
     }
 
@@ -442,22 +444,40 @@ impl Gateway {
     /// recorded, and were a prune to raise [`Store::pruned_through`] past it and the gateway then
     /// stop, the next start would take it for a pruned order's.
     pub fn orphans_pending(&self) -> bool {
-        let state = self.lock();
-        !state.orphan_cancels.is_empty()
-            || state.orphan_cancels_sending > 0
-            || !state.unsent.is_empty()
-            || state.book.orphans_waiting()
+        self.orphan_work().is_some()
     }
 
-    /// Deletes from `store` the done orders of trading days that ended `retention` before `now`
-    /// (see [`Store::prune`]). Does nothing without a `retention`, and skips the run while
-    /// [orphan work is pending](Self::orphans_pending); waits first for what's recorded to
-    /// commit, the orphans handled with it. Logs what it did, an error included, which waits for
-    /// the next run. Returns the orders deleted, if it ran and didn't fail.
-    pub async fn prune_once(&self, store: &Store, retention: Option<Duration>, now: DateTime<Utc>) -> Option<u64> {
+    /// What [`orphans_pending`](Self::orphans_pending) finds, said, if anything: the venues with
+    /// cancels or unsent requests waiting, the cancels being sent, and whether replaces wait.
+    fn orphan_work(&self) -> Option<String> {
+        let state = self.lock();
+        let replaces = state.book.orphaned_replaces_waiting();
+        if state.orphan_cancels.is_empty() && state.orphan_cancels_sending == 0 && state.unsent.is_empty() && !replaces
+        {
+            return None;
+        }
+        let mut cancels: Vec<&VenueId> = state.orphan_cancels.keys().collect();
+        let mut unsent: Vec<&VenueId> = state.unsent.keys().collect();
+        cancels.sort();
+        unsent.sort();
+        Some(format!(
+            "cancels waiting for venues {cancels:?}, {} being sent, unsent requests waiting for venues {unsent:?}, \
+             replaces waiting: {replaces}",
+            state.orphan_cancels_sending
+        ))
+    }
+
+    /// Deletes from `store` the done orders of trading days that ended `retention` before now, by
+    /// the gateway's clock (see [`Store::prune`]). Does nothing without a `retention`, and skips
+    /// the run, with a warning, while [orphan work is pending](Self::orphans_pending): a venue
+    /// that never logs on again keeps pruning off. Waits first for what's recorded to commit, the
+    /// orphans handled with it. Logs what it did, an error included, which waits for the next
+    /// run. Returns the orders deleted, if it ran and didn't fail.
+    pub async fn prune_once(&self, store: &Store, retention: Option<Duration>) -> Option<u64> {
         let retention = retention?;
-        if self.orphans_pending() {
-            info!("not pruning the database: orphaned venue requests are still being handled");
+        let now = self.clock.now();
+        if let Some(work) = self.orphan_work() {
+            warn!("not pruning the database while orphaned venue requests are handled: {work}");
             return None;
         }
         self.committed().await;

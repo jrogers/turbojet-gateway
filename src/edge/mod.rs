@@ -2655,13 +2655,16 @@ pub(crate) mod tests {
         let recorded = async {
             loop {
                 gateway.committed().await;
-                if store.unknown_downstreams(&["OLDOLD1".into()]).await.unwrap().is_empty() {
+                if gateway.lock().orphan_cancels_sending == 0
+                    && store.unknown_downstreams(&["OLDOLD1".into()]).await.unwrap().is_empty()
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
         timeout(Duration::from_secs(5), recorded).await.expect("never recorded");
+        assert!(!gateway.orphans_pending());
         let restarted = restarted(&store, "NEWER1").await;
         let again = restarted.cancel_orphans(&store, vec![(VENUE.into(), id(), venue_store)]).await.unwrap();
         assert_eq!((again.orders, again.amendments), (0, 0));
@@ -2727,9 +2730,20 @@ pub(crate) mod tests {
         // Taken by the session, queued behind the logon.
         gateway.send_orphan_cancels(&VENUE.into());
         assert!(gateway.lock().orphan_cancels.is_empty());
+        // Being sent: pending, though no longer waiting.
+        assert_eq!(gateway.lock().orphan_cancels_sending, 1);
+        assert!(gateway.orphans_pending());
         release.send(()).unwrap();
         let requeued = async {
-            while gateway.lock().orphan_cancels.get(VENUE).is_none_or(Vec::is_empty) {
+            loop {
+                let requeued = {
+                    let state = gateway.lock();
+                    state.orphan_cancels.get(VENUE).is_some_and(|cancels| !cancels.is_empty())
+                        && state.orphan_cancels_sending == 0
+                };
+                if requeued {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
@@ -2848,21 +2862,23 @@ pub(crate) mod tests {
         let (day1, day3) = (crate::book::Day(at(60)), crate::book::Day(at(180)));
         let (old, newest) = (dated(1, &funda, Some(day1), true, at(5)), dated(2, &funda, Some(day1), true, at(8)));
         store.write(&[old, newest, current(&funda, day3)]).await.unwrap();
-        let gateway = restarted(&store, "NEWNEW").await;
-        let (day, now) = (Duration::from_secs(86_400), at(120) + chrono::Duration::days(1));
+        let now = at(120) + chrono::Duration::days(1);
+        let gateway =
+            Arc::try_unwrap(restarted(&store, "NEWNEW").await).unwrap().with_clock(Clock::from_fn(move || now));
+        let day = Duration::from_secs(86_400);
 
-        assert_eq!(gateway.prune_once(&store, None, now).await, None);
+        assert_eq!(gateway.prune_once(&store, None).await, None);
         gateway.lock().orphan_cancels_sending = 1;
         assert!(gateway.orphans_pending());
         gateway.lock().orphan_cancels_sending = 0;
         let unsent = orphans::Unsent { downstreams: vec!["1".into()], next_outgoing: 1 };
         gateway.lock().unsent.insert(VENUE.into(), unsent);
-        assert_eq!(gateway.prune_once(&store, Some(day), now).await, None);
+        assert_eq!(gateway.prune_once(&store, Some(day)).await, None);
         assert_eq!(store.pruned_through().await.unwrap(), None);
 
         gateway.lock().unsent.clear();
         assert!(!gateway.orphans_pending());
-        assert_eq!(gateway.prune_once(&store, Some(day), now).await, Some(1));
+        assert_eq!(gateway.prune_once(&store, Some(day)).await, Some(1));
         assert_eq!(store.pruned_through().await.unwrap(), Some(at(5)));
     }
 

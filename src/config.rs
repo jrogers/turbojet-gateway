@@ -26,7 +26,7 @@
 //!
 //! [database]                      # optional: without it, the book is kept in memory only
 //! url = "sqlite://jetbridge.db?mode=rwc"  # `mode=rwc` creates the file
-//! retention = "400d"               # optional: delete done orders older; a number and s, m, h or d
+//! retention = "400d"              # optional: delete done orders older; a number and s, m, h or d
 //!
 //! [api]                           # optional: the operator API, an HTTP JSON server
 //! listen = "127.0.0.1:8080"       # an IP address and port
@@ -216,7 +216,7 @@ pub(crate) fn load(path: &Path, stores: Vec<(String, Arc<dyn SessionStorage>)>) 
     };
     let version = base.begin_string.parse().map_err(|e| Error(format!("{}: {e}", sessions_path.display())))?;
     check_venues(path, &router, &sessions.initiator_names())?;
-    let (database, retention) = file.database(path)?;
+    let (database, retention) = file.database();
     Ok(Loaded { router, limits, risk: file.risk, sessions, version, day_end, database, retention, api, message_log })
 }
 
@@ -267,7 +267,7 @@ pub fn reread(path: &Path, text: &str, venues: &[String], log: bool) -> Result<R
     let day_end = file.day_end(path)?;
     let api = file.api(path)?;
     let message_log = file.message_log(path)?;
-    let (database, retention) = file.database(path)?;
+    let (database, retention) = file.database();
     Ok(Reread { router, limits, risk: file.risk, day_end, api, message_log, database, retention })
 }
 
@@ -345,7 +345,7 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct Database {
     url: String,
-    #[serde(default, deserialize_with = "retention")]
+    #[serde(default, deserialize_with = "database_retention")]
     retention: Option<Duration>,
 }
 
@@ -488,6 +488,16 @@ fn retention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Durati
     }
 }
 
+/// `[database] retention`: as [`retention`], and at least [`DATABASE_RETENTION_MIN`].
+fn database_retention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Duration>, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    let retention = retention(serde::de::value::StrDeserializer::<D::Error>::new(&text))?;
+    if retention.is_some_and(|retention| retention < DATABASE_RETENTION_MIN) {
+        return Err(serde::de::Error::custom(format!("[database] retention {text:?}: at least 1d")));
+    }
+    Ok(retention)
+}
+
 fn read(path: &Path) -> Result<File, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
     parse(path, &text)
@@ -505,16 +515,9 @@ impl File {
             .map_err(|e| Error(format!("{}: day_end: {e}", path.display())))
     }
 
-    /// `[database]`'s URL and retention, the retention at least [`DATABASE_RETENTION_MIN`].
-    fn database(&self, path: &Path) -> Result<(Option<String>, Option<Duration>), Error> {
-        let Some(database) = &self.database else { return Ok((None, None)) };
-        if database.retention.is_some_and(|retention| retention < DATABASE_RETENTION_MIN) {
-            return Err(Error(format!(
-                "{}: [database] retention: at least 1d, so no orphaned order is taken for a pruned one",
-                path.display()
-            )));
-        }
-        Ok((Some(database.url.clone()), database.retention))
+    /// `[database]`'s URL and retention.
+    fn database(&self) -> (Option<String>, Option<Duration>) {
+        self.database.as_ref().map_or((None, None), |database| (Some(database.url.clone()), database.retention))
     }
 
     /// `[api]`, its paths made relative to `path`'s directory, if the build and the bind rule
@@ -683,8 +686,8 @@ reject = "no route"
         for (more, error) in [
             ("retention = \"400 days\"", "invalid duration \"400 days\""),
             ("retention = \"0d\"", "retention must be positive"),
-            ("retention = \"23h\"", "[database] retention: at least 1d"),
-            ("retention = \"86399s\"", "[database] retention: at least 1d"),
+            ("retention = \"23h\"", "[database] retention \"23h\": at least 1d"),
+            ("retention = \"86399s\"", "[database] retention \"86399s\": at least 1d"),
         ] {
             let error_text = retention(more).unwrap_err();
             assert!(error_text.contains(error), "{more}: {error_text}");
@@ -693,7 +696,7 @@ reject = "no route"
         let reread = |more: &str| reread(path, &jetbridge(more), &[], false).map(|reread| reread.retention);
         assert_eq!(reread("retention = \"2d\"").unwrap(), Some(Duration::from_secs(2 * 86_400)));
         let error = reread("retention = \"1h\"").unwrap_err().to_string();
-        assert!(error.contains("[database] retention: at least 1d"), "{error}");
+        assert!(error.contains("[database] retention \"1h\": at least 1d"), "{error}");
     }
 
     /// `[message_log]`'s `dir` is relative to the file and required; the rest are optional, checked,

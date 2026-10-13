@@ -190,7 +190,7 @@ impl Book {
 
     /// Whether any orphaned replace waits for the replace pending before it: not recorded until
     /// it's made pending.
-    pub fn orphans_waiting(&self) -> bool {
+    pub fn orphaned_replaces_waiting(&self) -> bool {
         !self.orphaned_replaces.is_empty()
     }
 
