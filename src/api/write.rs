@@ -134,10 +134,14 @@ pub(super) async fn resend(
 
 /// `POST /api/sessions/{id}/sequence {reason, next_incoming, next_outgoing}` [admin]: sets either
 /// number or both; see [`SessionHandle::set_next_incoming`] and
-/// [`SessionHandle::set_next_outgoing`]. 409 for 0, or an outgoing number below the next.
+/// [`SessionHandle::set_next_outgoing`]. 400 for 0, 409 for an outgoing number below the next.
+///
+/// Lowering next_incoming on a logged-on session can have messages accepted again, or, if the
+/// counterparty has messages in flight, a ResendRequest or a Logout; pausing it first is safer.
 ///
 /// Outgoing goes first, as the one refused for going back, so a refusal leaves nothing changed.
-/// If incoming then fails, outgoing stays set, and the error (and the audit line) says so.
+/// Only a store failure setting incoming then leaves outgoing set, and the error (and the audit
+/// line) says so.
 pub(super) async fn sequence(
     axum::extract::State(state): AxumState,
     caller: Caller,
@@ -150,25 +154,25 @@ pub(super) async fn sequence(
     let (incoming, outgoing) = (body.next_incoming, body.next_outgoing);
     let parsed = parsed.and_then(|()| match (incoming, outgoing) {
         (None, None) => Err(ApiError::new(StatusCode::BAD_REQUEST, "needs next_incoming, next_outgoing or both")),
+        (Some(0), _) | (_, Some(0)) => Err(ApiError::new(StatusCode::BAD_REQUEST, "sequence numbers start at 1")),
         numbers => Ok(numbers),
     });
     let params = serde_json::json!({ "next_incoming": incoming, "next_outgoing": outgoing });
     let mutation = Mutation { action: "sequence", target: id, params, reason: body.reason };
     on_session(&state, &caller, mutation, parsed, |session, (incoming, outgoing)| async move {
-        let mut set = None;
-        if let Some(seq) = outgoing {
-            set = Some(numbers(session.set_next_outgoing(seq).await)?);
-        }
-        if let Some(seq) = incoming {
-            let result = numbers(session.set_next_incoming(seq).await);
-            set = Some(result.map_err(|mut e| {
-                if let Some(outgoing) = outgoing {
+        let set = match (incoming, outgoing) {
+            (None, Some(outgoing)) => numbers(session.set_next_outgoing(outgoing).await)?,
+            (Some(incoming), None) => numbers(session.set_next_incoming(incoming).await)?,
+            (Some(incoming), Some(outgoing)) => {
+                numbers(session.set_next_outgoing(outgoing).await)?;
+                numbers(session.set_next_incoming(incoming).await).map_err(|mut e| {
                     e.message = format!("next_outgoing is set to {outgoing}, but next_incoming isn't: {}", e.message);
-                }
-                e
-            })?);
-        }
-        Ok((Json(set.expect("guarded by parsed: one number at least")), None))
+                    e
+                })?
+            }
+            (None, None) => unreachable!("refused by parsed"),
+        };
+        Ok((Json(set), None))
     })
     .await
 }
@@ -184,7 +188,8 @@ pub(super) async fn reset(
     let (id, parsed_id) = parse_id(id);
     let (body, parsed) = parse(body);
     let parsed = caller.require(Role::Admin).and(parsed_id).and(parsed);
-    let mutation = Mutation { action: "reset", target: id, params: serde_json::Value::Null, reason: body.reason };
+    let params = serde_json::json!({ "next_incoming": 1, "next_outgoing": 1 });
+    let mutation = Mutation { action: "reset", target: id, params, reason: body.reason };
     on_session(&state, &caller, mutation, parsed, |session, ()| async move {
         Ok((Json(numbers(session.reset_sequence_numbers().await)?), None))
     })
@@ -582,9 +587,9 @@ mod tests {
 
     /// Every endpoint as each role calls it: no one (401), a viewer (403), an operator, an
     /// operator scoped to FUNDB (403: FUNDA's session, order and CompID, and the venue), and an
-    /// admin; sequence numbers and a reload are an admin's only. An allowed call answers success, or on a row marked so,
-    /// 409 (a second resend while the first is under way). Pausing FUNDA comes last, as it logs
-    /// FUNDA out.
+    /// admin; sequence numbers and a reload are an admin's only. An allowed call answers success,
+    /// or on a row marked so, 409 (a second resend while the first is under way). Pausing FUNDA
+    /// comes last, as it logs FUNDA out.
     #[tokio::test]
     async fn every_endpoint_by_role() {
         let fixture = fixture().await;
@@ -671,9 +676,9 @@ mod tests {
     }
 
     /// An admin sets FUNDA's outgoing number while it's logged on, but not below the next, and
-    /// can't reset it then; a change of both whose second half is refused says the first was
-    /// made. Once FUNDA is paused, it resets to 1 and takes an incoming number; the venue, never
-    /// logged on, takes both. Each is audited with the numbers asked for.
+    /// can't reset it then; a 0 for either is refused before anything is set. Once FUNDA is
+    /// paused, it resets to 1 and takes an incoming number; the venue, never logged on, takes
+    /// both. Each is audited with the numbers asked for.
     #[tokio::test]
     async fn sessions_sequence_and_reset() {
         let fixture = fixture().await;
@@ -683,20 +688,20 @@ mod tests {
             answer.body
         };
         let numbers = |body: &serde_json::Value| (body["next_incoming"].as_u64(), body["next_outgoing"].as_u64());
+        let last_params = || {
+            let audit = std::fs::read_to_string(fixture.dirs.1.path().join("audit.jsonl")).unwrap();
+            serde_json::from_str::<serde_json::Value>(audit.lines().last().unwrap()).unwrap()["params"].clone()
+        };
         let (sequence, reset) = (format!("/api/sessions/{FUNDA}/sequence"), format!("/api/sessions/{FUNDA}/reset"));
         post(&sequence, REASON, StatusCode::BAD_REQUEST).await;
         assert_eq!(fixture.last_result(), "refused: needs next_incoming, next_outgoing or both");
         let body = post(&sequence, r#"{"reason":"r","next_outgoing":100}"#, StatusCode::OK).await;
         assert_eq!(body["next_outgoing"], 100, "{body}");
         post(&sequence, r#"{"reason":"r","next_outgoing":50}"#, StatusCode::CONFLICT).await;
-        let body =
-            post(&sequence, r#"{"reason":"r","next_incoming":0,"next_outgoing":200}"#, StatusCode::CONFLICT).await;
-        let error = body["error"].as_str().unwrap();
-        assert!(error.starts_with("next_outgoing is set to 200, but next_incoming isn't: "), "{error}");
-        assert_eq!(fixture.last_result(), format!("failed: {error}"));
-        let audit = std::fs::read_to_string(fixture.dirs.1.path().join("audit.jsonl")).unwrap();
-        let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
-        assert_eq!(last["params"], serde_json::json!({ "next_incoming": 0, "next_outgoing": 200 }));
+        post(&sequence, r#"{"reason":"r","next_incoming":0,"next_outgoing":200}"#, StatusCode::BAD_REQUEST).await;
+        assert_eq!(fixture.last_result(), "refused: sequence numbers start at 1");
+        assert_eq!(fixture.ok("/api/sessions").await[0]["next_outgoing"], 100);
+        assert_eq!(last_params(), serde_json::json!({ "next_incoming": 0, "next_outgoing": 200 }));
         post(&reset, REASON, StatusCode::CONFLICT).await;
         assert_eq!(fixture.last_result(), "failed: the session is connected; disconnect it first");
 
@@ -704,9 +709,11 @@ mod tests {
         fixture.wait_for_funda(false).await;
         assert_eq!(numbers(&post(&reset, REASON, StatusCode::OK).await), (Some(1), Some(1)));
         assert_eq!(fixture.last_result(), "allowed");
+        assert_eq!(last_params(), serde_json::json!({ "next_incoming": 1, "next_outgoing": 1 }));
         let body = post(&sequence, r#"{"reason":"r","next_incoming":7}"#, StatusCode::OK).await;
         assert_eq!(numbers(&body), (Some(7), Some(1)));
 
+        // The venue never logs on, as nothing listens on its address, so it resets.
         let venue = fixture.venue().await;
         let both = r#"{"reason":"r","next_incoming":5,"next_outgoing":9}"#;
         let body = post(&format!("/api/sessions/{venue}/sequence"), both, StatusCode::OK).await;
