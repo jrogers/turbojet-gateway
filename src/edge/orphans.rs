@@ -19,8 +19,9 @@
 //! again.
 //!
 //! A venue's store may still hold requests of orders [`Store::prune`] has deleted, whose
-//! ClOrdIDs the database no longer knows. Those sent no later than [`Store::pruned_through`], with
-//! a minute's slack, aren't looked up as orphans: they're counted as pruned, and left alone.
+//! ClOrdIDs the database no longer knows. An unknown order whose requests were all sent no later
+//! than [`Store::pruned_through`], with a minute's slack, isn't an orphan: its requests are
+//! counted as pruned, and left alone.
 //!
 //! The scan also finds the converse: requests the database has as sent, unanswered, that the
 //! venue's session never stored, so never sent (the gateway stopped after their change committed,
@@ -72,16 +73,20 @@ pub struct Orphans {
     pub amendments: usize,
     /// Requests the database has that the venues' sessions never stored, to send at their logons.
     pub unsent: usize,
-    /// Requests sent no later than the orders pruned from the database, with a minute's slack,
-    /// not looked up: the pruned orders', and any of orders the book holds sent as early.
+    /// Requests of orders pruned from the database, left alone.
     pub pruned: usize,
 }
 
 /// How long after [`Store::pruned_through`] a stored request's SendingTime(52) may be and still
 /// be taken for a pruned order's: that time is the book's, and Turbojet stamps SendingTime a
-/// little later, as it encodes. Safe because an orphan was sent just before the last stop, and a
-/// pruned order's requests in a run before it, over a day before, retention being at least a day
-/// (orphans of earlier stops were handled and recorded at their starts).
+/// little later, as it encodes. An orphan is sent just before a stop, and found at the next
+/// start; a pruned order's requests are over a day older than the prune, retention being at least
+/// a day. That holds as long as pruning never runs while orphans are unrecorded: an orphaned
+/// order found at a start is recorded only once its cancel is stored, at the venue's logon. So the
+/// first prune comes an hour after the start, after `cancel_orphans`, and a run is skipped while
+/// the gateway has orphan work pending. The other way wrong is harmless: a SendingTime stamped
+/// more than the slack late, behind a throttle's backlog, only means a needless cancel of a done
+/// order, which the venue refuses.
 pub(super) const PRUNED_SLACK: Duration = Duration::from_secs(60);
 
 /// Requests the database has as sent that a venue's session never stored, waiting for its logon:
@@ -159,22 +164,21 @@ impl Gateway {
                      its files kept",
                 )));
             }
-            let mut requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
+            let requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
             self.check_prefix(&venue, &requests)?;
-            let stored: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
-            let created = log.created_at().map(DateTime::<Utc>::from);
-            found.unsent += self.find_unsent(&venue, &stored, created, log.next_outgoing());
-            // After find_unsent, which needs every stored request: one of a held order may be as
-            // old as a pruned order's. Of a pruned order, all its requests are this old, its
-            // amends included.
-            let before = requests.len();
-            requests.retain(|request| !request.sent.zip(pruned_through).is_some_and(|(sent, through)| sent <= through));
-            found.pruned += before - requests.len();
             let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
+            let created = log.created_at().map(DateTime::<Utc>::from);
+            found.unsent += self.find_unsent(&venue, &ids, created, log.next_outgoing());
             let chains = chains(requests);
             ids.extend(chains.keys().cloned());
             let unknown: HashSet<CompactString> = store.unknown_downstreams(&ids).await?.into_iter().collect();
             for (root, chain) in chains {
+                // Only a whole unknown order: an unknown amendment of a known one is never a
+                // pruned order's, however old (an orphaned replace waiting on an earlier one).
+                if unknown.contains(&root) && pruned_through.is_some_and(|through| pruned(&chain, through)) {
+                    found.pruned += chain.len();
+                    continue;
+                }
                 if unknown.contains(&root) {
                     let taken = self.orphaned_order(log.as_mut(), &venue, chain, found.orders).await?;
                     found.orders += usize::from(taken);
@@ -493,6 +497,12 @@ fn request(seq: u64, msg: &Message) -> Option<Request> {
         cl_ord_id: cl_ord_id.into(),
         sent: msg.opt_field::<UtcTimestamp>(tags::SENDING_TIME).ok().flatten().map(DateTime::from),
     })
+}
+
+/// Whether every request of an order the database doesn't know was sent by `through`: the
+/// order's been pruned. One without a SendingTime may be an orphan.
+fn pruned(chain: &[Request], through: DateTime<Utc>) -> bool {
+    chain.iter().all(|request| request.sent.is_some_and(|sent| sent <= through))
 }
 
 /// `requests` by their order's root ClOrdID, each order's in store order.

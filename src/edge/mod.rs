@@ -2770,8 +2770,10 @@ pub(crate) mod tests {
     }
 
     /// Requests a venue's session stored of an order the database has since pruned aren't
-    /// orphans, though the database no longer knows them, even stamped a little after the book's
-    /// send time; an orphan sent past that slack still is.
+    /// orphans, though the database no longer knows them, even stamped up to the slack after the
+    /// book's send time; an orphan sent past it still is. A live order's requests as old are
+    /// still seen: its unanswered order isn't sent again, and its orphaned replace goes to the
+    /// book.
     #[tokio::test]
     async fn requests_of_pruned_orders_arent_orphans() {
         use crate::store::tests::{current, dated};
@@ -2784,10 +2786,16 @@ pub(crate) mod tests {
         let mut amend = pruned.sent[0].clone();
         (amend.0, amend.1.sent_at) = ("OLDOLD1-1".into(), at(7));
         pruned.sent.push(amend);
+        // Live, so kept, its order unanswered and sent before the pruned order's last request.
+        let mut live = dated(2, &funda, Some(day1), false, at(6));
+        let row = &mut live.orders[0].order;
+        (row.status, row.name, row.downstream, row.amendments) =
+            (crate::book::Status::PendingNew, "OLDOLD2".into(), "OLDOLD2".into(), 0);
+        (live.sent[0].0, live.sent[0].1.answered) = ("OLDOLD2".into(), false);
         // The newest order, which pruning keeps.
-        let mut kept = dated(2, &funda, Some(day1), true, at(8));
-        kept.sent[0].0 = "OLDOLD2".into();
-        store.write(&[pruned, kept, current(&funda, day3)]).await.unwrap();
+        let mut newest = dated(3, &funda, Some(day1), true, at(8));
+        newest.sent[0].0 = "OLDOLD3".into();
+        store.write(&[pruned, live, newest, current(&funda, day3)]).await.unwrap();
         assert_eq!(store.prune(at(120), 10).await.unwrap().orders, 1);
         assert_eq!(store.pruned_through().await.unwrap(), Some(at(7)));
 
@@ -2795,22 +2803,34 @@ pub(crate) mod tests {
         let venues = Arc::new(MemoryStorage::new());
         let stamped = |msg: Message, at: DateTime<Utc>| msg.with(tags::SENDING_TIME, UtcTimestamp::from(at));
         let late = chrono::Duration::seconds(30);
+        let through = at(7) + orphans::PRUNED_SLACK;
         let cancel = v44::OrderCancelRequest::new("OLDOLD1", "OLDOLD1-1", v44::Side::Buy, UtcTimestamp::now());
+        let mut replace = v44::OrderCancelReplaceRequest::new(
+            "OLDOLD2",
+            "OLDOLD2-1",
+            v44::Side::Buy,
+            UtcTimestamp::now(),
+            v44::OrdType::Limit,
+        );
+        (replace.symbol, replace.order_qty, replace.price) = (Some("AAPL".into()), Some(200.into()), Some(10.into()));
         store_sent(
             &venues,
             &id(),
             &[
                 stamped(order("OLDOLD1"), at(5) + late),
-                stamped(cancel.to_message(), at(7) + late),
-                stamped(order("OLDOLD2"), at(10)),
-                stamped(order("OLDOLD3"), at(7) + orphans::PRUNED_SLACK + chrono::Duration::milliseconds(1)),
+                stamped(order("OLDOLD2"), at(6) + late),
+                // At the slack's end exactly: still the pruned order's.
+                stamped(cancel.to_message(), through),
+                stamped(replace.to_message(), at(7)),
+                stamped(order("OLDOLD3"), at(8) + late),
+                stamped(order("OLDOLD4"), through + chrono::Duration::milliseconds(1)),
             ],
         );
         let found = gateway.cancel_orphans(&store, vec![(VENUE.into(), id(), venues)]).await.unwrap();
-        assert_eq!(found, Orphans { scanned: 4, orders: 1, amendments: 0, unsent: 0, pruned: 2 });
+        assert_eq!(found, Orphans { scanned: 6, orders: 1, amendments: 1, unsent: 0, pruned: 2 });
         let state = gateway.lock();
         let [orphan] = state.orphan_cancels[VENUE].as_slice() else { panic!() };
-        assert_eq!(orphan.cancel.get(tags::ORIG_CL_ORD_ID), Some("OLDOLD3"));
+        assert_eq!(orphan.cancel.get(tags::ORIG_CL_ORD_ID), Some("OLDOLD4"));
     }
 
     /// Our session with the venue, as the gateway's initiator has it.
