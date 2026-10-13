@@ -3,6 +3,10 @@
 //! it happens: the gateway's (`order`, `blocked`, `unblocked` and `alarm`; see [`GatewayEvent`])
 //! and the client and venue sessions' (`session`). What the client sends is ignored.
 //!
+//! A console applies the events to the snapshot in the order they come. An `order` event is the
+//! order's whole view, to put in place of the one held (or add); `blocked` and `unblocked` add and
+//! remove a scope; a `session` event says what happened to the session keyed by (`side`, `id`).
+//!
 //! The events are subscribed to before the snapshot is read, so none falls between the two; the
 //! first few may repeat what the snapshot already shows. A socket that falls behind any
 //! channel's capacity skips to the channels' ends and gets a new snapshot, rather than the
@@ -59,6 +63,17 @@ const MIN_SNAPSHOT_GAP: Duration = Duration::from_secs(1);
 /// quiet gateway nothing else is sent, and a peer gone without a word would otherwise hold its
 /// connection until its session ends, or for ever with a token.
 const MAX_SILENT_TICKS: u32 = 3;
+
+/// The longest close reason, in bytes: a control frame carries 125, two of them the code.
+const MAX_CLOSE_REASON_LEN: usize = 123;
+
+const STOPPING: &str = "the gateway is stopping";
+const TOO_SLOW: &str = "too slow to keep up: reconnect";
+const SILENT: &str = "no answer to pings";
+
+const _: () = assert!(STOPPING.len() <= MAX_CLOSE_REASON_LEN);
+const _: () = assert!(TOO_SLOW.len() <= MAX_CLOSE_REASON_LEN);
+const _: () = assert!(SILENT.len() <= MAX_CLOSE_REASON_LEN);
 
 /// How long a send may wait for a client that isn't reading before its socket is dropped, so a
 /// stalled client can't hold its task, and its connection, for ever.
@@ -220,7 +235,7 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
     let why = loop {
         if matches!(step, Step::Snapshot) {
             step = if last_snapshot.is_some_and(|last| last.elapsed() < MIN_SNAPSHOT_GAP) {
-                Step::Close(close_code::AGAIN, "too slow to keep up: reconnect")
+                Step::Close(close_code::AGAIN, TOO_SLOW)
             } else {
                 events.skip_to_ends();
                 last_snapshot = Some(Instant::now());
@@ -241,28 +256,28 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
             Step::Snapshot | Step::Nothing => {}
         }
         step = tokio::select! {
-            _ = stopping.wait_for(|stopping| *stopping) => Step::Close(close_code::AWAY, "the gateway is stopping"),
+            _ = stopping.wait_for(|stopping| *stopping) => Step::Close(close_code::AWAY, STOPPING),
             _ = recheck.tick() => match state.auth.recheck(&viewer.headers, viewer.ip) {
                 Err(refusal) => Step::Close(close_code::POLICY, refusal.message()),
                 Ok(()) if last_received.elapsed() >= RECHECK * MAX_SILENT_TICKS => {
-                    Step::Close(close_code::AWAY, "no answer to pings")
+                    Step::Close(close_code::AWAY, SILENT)
                 }
                 Ok(()) => Step::Send(Message::Ping(Default::default())),
             },
             event = events.gateway.recv() => match event {
                 Ok(event) => json(&event),
                 Err(RecvError::Lagged(_)) => Step::Snapshot,
-                Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
+                Err(RecvError::Closed) => Step::Close(close_code::AWAY, STOPPING),
             },
             event = events.clients.recv() => match event {
                 Ok(event) => session_change(SessionSide::Client, &event).map_or(Step::Nothing, |change| json(&change)),
                 Err(RecvError::Lagged(_)) => Step::Snapshot,
-                Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
+                Err(RecvError::Closed) => Step::Close(close_code::AWAY, STOPPING),
             },
             event = events.venues.recv() => match event {
                 Ok(event) => session_change(SessionSide::Venue, &event).map_or(Step::Nothing, |change| json(&change)),
                 Err(RecvError::Lagged(_)) => Step::Snapshot,
-                Err(RecvError::Closed) => Step::Close(close_code::AWAY, "the gateway is stopping"),
+                Err(RecvError::Closed) => Step::Close(close_code::AWAY, STOPPING),
             },
             message = socket.recv() => match message {
                 Some(Ok(_)) => {
@@ -278,7 +293,7 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, viewer: Vi
 
 /// The snapshot as JSON, or the close if the gateway has gone.
 fn snapshot(state: &State) -> Step {
-    let Ok(service) = state.service() else { return Step::Close(close_code::AWAY, "the gateway is stopping") };
+    let Ok(service) = state.service() else { return Step::Close(close_code::AWAY, STOPPING) };
     let (orders, blocked, unavailable) = service.gateway().working_view();
     let orders_next = if orders.len() == MAX_ORDERS_PER_PAGE { orders.last().map(|order| order.id.0) } else { None };
     json(&Snapshot { sessions: session_views(&service), orders, orders_next, blocked, unavailable })
@@ -404,7 +419,8 @@ mod tests {
         assert_eq!(event["id"], id);
         assert_ne!(event, snapshot["orders"][0]);
         assert!(gateway.block(Scope::All).await);
-        assert_eq!(next_json(&mut client).await, serde_json::json!({ "type": "blocked", "scope": "all" }));
+        let blocked = until(&mut client, |message| message["type"] == "blocked").await;
+        assert_eq!(blocked, serde_json::json!({ "type": "blocked", "scope": "all" }));
     }
 
     /// A client session paused and resumed arrives step by step, to its logging on again.
@@ -515,7 +531,26 @@ mod tests {
         fixture.state.stopping.send_replace(true);
         let tungstenite::Message::Close(Some(frame)) = next(&mut client).await else { panic!("not closed") };
         assert_eq!(u16::from(frame.code), close_code::AWAY);
-        assert_eq!(frame.reason.as_str(), "the gateway is stopping");
+        assert_eq!(frame.reason.as_str(), STOPPING);
+    }
+
+    /// A recheck's refusal is a close reason too, so it must fit one; the socket's own reasons are
+    /// checked at compile time.
+    #[test]
+    fn refusals_fit_a_close_frame() {
+        use super::super::auth::Refusal;
+        let refusals = [
+            Refusal::NoCredentials,
+            Refusal::BadPassword,
+            Refusal::BadToken,
+            Refusal::SessionEnded,
+            Refusal::Csrf,
+            Refusal::Origin,
+            Refusal::Limited,
+        ];
+        for refusal in refusals {
+            assert!(refusal.message().len() <= MAX_CLOSE_REASON_LEN, "{refusal:?}");
+        }
     }
 
     /// With the cookie, the upgrade must come from a page on the host it was sent to; with a token,
