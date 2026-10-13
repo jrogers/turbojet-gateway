@@ -151,7 +151,7 @@ impl Users {
         }
     }
 
-    /// Writes the users to `path` whole, as [`write_atomically`] does: a symlink is followed, and
+    /// Writes the users to `path` whole, as `write_atomically` does: a symlink is followed, and
     /// the warnings are its. Whoever runs this owns the new file, so run it as the gateway's user.
     ///
     /// # Errors
