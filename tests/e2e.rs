@@ -202,7 +202,7 @@ fn routes(symbol: &str, text: &str) -> String {
 /// The gateway's two files, its clients speaking `client_version` and its venue
 /// `venue_version` at `venue_port`.
 fn write_config(dir: &tempfile::TempDir, options: &Options, venue_port: u16) {
-    let Options { client_version, venue_version, cancel_on_disconnect, database, api, .. } = options;
+    let Options { client_version, venue_version, cancel_on_disconnect, database, api, message_log, .. } = options;
     let cancel = cancel_on_disconnect
         .map(|(trigger, grace)| {
             format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", grace.as_millis())
@@ -236,7 +236,9 @@ reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
     } else {
         ""
     };
-    std::fs::write(dir.path().join("jetbridge.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + &database + api).unwrap();
+    let log = if *message_log { "[message_log]\ndir = \"log\"\n" } else { "" };
+    let config = routes(REFUSED_SYMBOL, REFUSED_TEXT) + &database + api + log;
+    std::fs::write(dir.path().join("jetbridge.toml"), config).unwrap();
 }
 
 /// The gateway's database, with [`Options::database`].
@@ -257,6 +259,8 @@ struct Options {
     database: bool,
     /// The gateway serves its operator API, with an empty users file.
     api: bool,
+    /// The gateway logs every message to `log` in the test's directory.
+    message_log: bool,
 }
 
 impl Default for Options {
@@ -269,6 +273,7 @@ impl Default for Options {
             cancel_on_disconnect: None,
             database: false,
             api: false,
+            message_log: false,
         }
     }
 }
@@ -1054,9 +1059,10 @@ async fn the_kill_switch_over_the_api_cancels_a_clients_orders() {
 /// OrderStatusRequest under the order's downstream ClOrdID and OrderID. Its answer showing a fill
 /// the gateway missed reaches the client as a Trade; a later answer that it doesn't know the order
 /// raises an alarm and reaches the client not at all, the next thing it hears being the next fill.
+/// The message log then has the order's messages on both sides, found over the API.
 #[tokio::test]
 async fn a_venue_asked_for_an_orders_status_answers_through_the_book() {
-    let mut setup = Setup::with(Options { api: true, ..Options::default() }).await;
+    let mut setup = Setup::with(Options { api: true, message_log: true, ..Options::default() }).await;
     let token = operator(&setup).await;
     let mut gateway_events = setup.service.gateway().subscribe();
     setup.working_order().await;
@@ -1092,6 +1098,37 @@ async fn a_venue_asked_for_an_orders_status_answers_through_the_book() {
     setup.venue.send(fill(&setup.id("1"), "E-2", 60, 100));
     let filled: v44::ExecutionReport = setup.events.parse().await;
     assert_eq!(seen(&filled), setup.c1("1.3", v44::ExecType::Trade, Some(60), 100));
+
+    // The client's order as received, and the status requests and their answers on the venue's
+    // side. The log's writer gathers for a moment, so the search is tried until they're there.
+    let path = format!("/api/orders/{}/messages", setup.id("1"));
+    let wanted = [(CLIENT, "in", "D"), (VENUE, "out", "H"), (VENUE, "in", "8")];
+    let found = timeout(WAIT, async {
+        loop {
+            let page = get(addr, &path, &token).await;
+            let messages = page["messages"].as_array().unwrap();
+            let has = |(comp_id, direction, msg_type): (&str, &str, &str)| {
+                messages.iter().any(|message| {
+                    let session = message["session"].as_str().unwrap_or_default();
+                    session.ends_with(&format!(">{comp_id}"))
+                        && (&message["direction"], &message["msg_type"]) == (&direction.into(), &msg_type.into())
+                })
+            };
+            if wanted.into_iter().all(has) {
+                return page;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let page = found.await.expect("the order's messages weren't found");
+    // Every hit is the order's: its ClOrdIDs on either side.
+    let ids = ["C1".to_string(), setup.id("1")];
+    for message in page["messages"].as_array().unwrap() {
+        assert!(ids.iter().any(|id| message["raw"].as_str().unwrap().contains(&format!("|11={id}|"))), "{message}");
+    }
+    // The whole range was read, and it's still open: no next page, but a cursor to follow.
+    assert_eq!(page["next"], serde_json::Value::Null, "{page}");
+    assert!(page["follow"].is_string(), "{page}");
 }
 
 /// An operator with an API token, the users file reloaded: the token.
@@ -1103,6 +1140,19 @@ async fn operator(setup: &Setup) -> String {
     users.save(&users_path).unwrap();
     setup.reload().await;
     token
+}
+
+/// GETs `path` from the API at `addr` with bearer `token`, returning the body of a 200.
+async fn get(addr: SocketAddr, path: &str, token: &str) -> serde_json::Value {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    timeout(WAIT, stream.read_to_string(&mut response)).await.expect("timed out").unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str(body).unwrap()
 }
 
 /// POSTs JSON `body` to the API at `addr` with bearer `token`, returning the whole answer.
