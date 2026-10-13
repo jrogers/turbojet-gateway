@@ -112,6 +112,7 @@ fn router(state: State) -> axum::Router {
         .route("/api/orders", get(read::orders))
         .route("/api/orders/{order_id}", get(read::order))
         .route("/api/risk", get(read::risk))
+        .route("/api/risk/limits", get(read::risk_limits))
         .route("/api/routes", get(read::routes))
         .route("/api/routes/test", get(read::route_test))
         .route("/api/live", get(live::live))

@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::NaiveTime;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use turbojet::fields::Decimal;
 use turbojet::schedule::ScheduleTimeZone;
@@ -92,6 +92,8 @@ impl std::error::Error for Error {}
 pub struct Loaded {
     pub router: Router,
     pub limits: risk::Config,
+    /// The limits as the file writes them.
+    pub risk: RiskTables,
     pub sessions: SessionsFile,
     /// The clients' version: the acceptor's BeginString.
     pub version: Version,
@@ -156,7 +158,18 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
     let day_end = file.day_end(path)?;
     let api = file.api(path)?;
     let database = file.database.map(|database| database.url);
-    Ok(Loaded { router, limits, sessions, version, day_end, database, api })
+    Ok(Loaded { router, limits, risk: file.risk, sessions, version, day_end, database, api })
+}
+
+/// What a reload rereads from the configuration file.
+#[derive(Debug)]
+pub struct Reread {
+    pub router: Router,
+    pub limits: risk::Config,
+    /// The limits as the file writes them.
+    pub risk: RiskTables,
+    pub day_end: SessionSchedule,
+    pub api: Option<Api>,
 }
 
 /// Reads the routes, limits, `day_end` and `[api]` in the configuration file at `path` again,
@@ -168,11 +181,7 @@ pub(crate) fn load_with_stores(path: &Path, stores: Vec<(String, Arc<dyn Session
 /// As [`load`], for the routes, limits, `day_end` and `[api]`, or a route names a venue not in
 /// `venues`. An `[api]` that doesn't load (or breaks the bind rule) refuses the whole file: the
 /// routes, limits and `day_end` in it aren't taken either.
-pub fn reload(
-    path: &Path,
-    venues: &[String],
-    database: Option<&str>,
-) -> Result<(Router, risk::Config, SessionSchedule, Option<Api>), Error> {
+pub fn reload(path: &Path, venues: &[String], database: Option<&str>) -> Result<Reread, Error> {
     let file = read(path)?;
     if file.database.as_ref().map(|database| database.url.as_str()) != database {
         warn!(file = %path.display(), "[database] url changed: the gateway keeps its database until the next start");
@@ -182,7 +191,7 @@ pub fn reload(
     let limits = file.risk.limits().map_err(|e| Error(format!("{}: {e}", path.display())))?;
     let day_end = file.day_end(path)?;
     let api = file.api(path)?;
-    Ok((router, limits, day_end, api))
+    Ok(Reread { router, limits, risk: file.risk, day_end, api })
 }
 
 /// `day_end` as written, `HH:MM[:SS] [ZONE]`, as a schedule whose periods run from one end of day
@@ -249,7 +258,7 @@ struct File {
     #[serde(default)]
     route: Vec<Route>,
     #[serde(default)]
-    risk: Risk,
+    risk: RiskTables,
     database: Option<Database>,
     api: Option<Api>,
 }
@@ -260,30 +269,38 @@ struct Database {
     url: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// `[risk]` as written: the API shows it so (`GET /api/risk/limits`), the client tables as
+/// `clients`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Risk {
+pub struct RiskTables {
     #[serde(default)]
-    defaults: RiskTable,
+    pub defaults: RiskTable,
     /// By CompID; ordered so the first bad one reported is the same each time.
-    #[serde(default)]
-    client: BTreeMap<String, RiskTable>,
+    #[serde(default, rename(serialize = "clients"))]
+    pub client: BTreeMap<String, RiskTable>,
 }
 
-/// `[risk.defaults]` or `[risk.client.COMPID]`, as written.
-#[derive(Debug, Default, Clone, Deserialize)]
+/// `[risk.defaults]` or `[risk.client.COMPID]`, as written: the keys left out are absent.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RiskTable {
+pub struct RiskTable {
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_order_qty: Option<Amount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_notional: Option<Amount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     symbols: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     price_band: Option<Amount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     credit: Option<Amount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     self_trade: Option<bool>,
 }
 
 /// A decimal as TOML writes it: a float goes through its shortest exact form, so `0.1` is 0.1.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum Amount {
     Integer(i64),
@@ -291,7 +308,7 @@ enum Amount {
     Text(String),
 }
 
-impl Risk {
+impl RiskTables {
     /// The limits per CompID, each client table's keys over the defaults'.
     fn limits(&self) -> Result<risk::Config, Error> {
         let defaults = self.defaults.limits("risk.defaults", &Limits::default())?;
@@ -548,7 +565,7 @@ reject = "no route"
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"")
             .unwrap();
         let venues = loaded.sessions.initiator_names();
-        let (router, ..) = reload(&path, &venues, None).unwrap();
+        let router = reload(&path, &venues, None).unwrap().router;
         assert_eq!(router, Router::new(vec![venue_rule(Some("FUNDA"), "NASDAQ")]));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"LSE\"").unwrap();
         assert!(reload(&path, &venues, None).is_err());
@@ -631,7 +648,7 @@ self_trade = false
         let path = dir.path().join("jetbridge.toml");
         let venues = load(&path).unwrap().sessions.initiator_names();
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = 5").unwrap();
-        let (_, limits, ..) = reload(&path, &venues, None).unwrap();
+        let limits = reload(&path, &venues, None).unwrap().limits;
         assert_eq!(limits.limits("FUNDA").max_order_qty, Some(decimal("5")));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = -5").unwrap();
         assert!(reload(&path, &venues, None).is_err());
@@ -683,7 +700,7 @@ self_trade = false
     #[test]
     fn reloading_reads_day_end() {
         let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
-        let (_, _, reloaded, _) = reload(&dir.path().join("jetbridge.toml"), &[], None).unwrap();
+        let reloaded = reload(&dir.path().join("jetbridge.toml"), &[], None).unwrap().day_end;
         assert_eq!(reloaded, day_end("17:00").unwrap());
     }
 

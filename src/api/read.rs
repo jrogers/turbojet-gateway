@@ -14,6 +14,7 @@ use turbojet::{SessionId, SessionStatus};
 
 use super::{ApiError, State};
 use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
+use crate::config::RiskTables;
 use crate::router::{Rule, Target};
 use crate::service::Service;
 
@@ -216,6 +217,13 @@ pub(super) async fn order(
 /// blocks.
 pub(super) async fn risk(axum::extract::State(state): AxumState) -> Result<Json<RiskView>, ApiError> {
     Ok(Json(state.service()?.gateway().risk()))
+}
+
+/// `GET /api/risk/limits`: the limits in force as the configuration writes them, `{defaults,
+/// clients: {COMPID: ...}}`, each table with only the keys it sets. A client's keys replace the
+/// defaults'; `GET /api/risk` shows the limits merged.
+pub(super) async fn risk_limits(axum::extract::State(state): AxumState) -> Result<Json<RiskTables>, ApiError> {
+    Ok(Json(state.service()?.risk_tables()))
 }
 
 /// A routing rule as the configuration writes it (`[[route]]`): one of `venue` and `reject` set.
@@ -452,6 +460,26 @@ pub(super) mod tests {
             "client": null, "ex_destination": null, "symbol": null, "venue": "NASDAQ", "reject": null
         });
         assert_eq!(routes, serde_json::json!([route]));
+    }
+
+    /// The defaults and each client's own keys as the file writes them: a key left out isn't
+    /// shown, and an amount keeps its form (integer, float or string).
+    #[tokio::test]
+    async fn risk_limits_as_written() {
+        let fixture = fixture().await;
+        assert_eq!(fixture.ok("/api/risk/limits").await, serde_json::json!({ "defaults": {}, "clients": {} }));
+        let config = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n\
+                      [risk.defaults]\nmax_order_qty = 1000\nprice_band = 5.5\nsymbols = [\"AAPL\"]\n\
+                      [risk.client.FUNDA]\nmax_notional = \"250000.50\"\nself_trade = true\n";
+        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), config).unwrap();
+        let service = fixture.service.clone();
+        let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
+        assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);
+        let expected = serde_json::json!({
+            "defaults": { "max_order_qty": 1000, "price_band": 5.5, "symbols": ["AAPL"] },
+            "clients": { "FUNDA": { "max_notional": "250000.50", "self_trade": true } },
+        });
+        assert_eq!(fixture.ok("/api/risk/limits").await, expected);
     }
 
     /// A dry run names the first rule matching by client, ExDestination or symbol, and its target;

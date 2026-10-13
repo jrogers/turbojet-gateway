@@ -19,7 +19,7 @@ use turbojet_config::{Changes, Initiators, SessionsFile};
 
 use crate::api;
 use crate::book::{self, Snapshot};
-use crate::config::{self, Error};
+use crate::config::{self, Error, RiskTables};
 use crate::edge::{ClientApp, Gateway, Schedules, TICK_INTERVAL, VenueApp, Writer};
 use crate::fix::Version;
 use crate::risk;
@@ -76,6 +76,8 @@ pub struct Service {
     store: Option<Store>,
     /// The operator API, with `[api]`: set once the acceptor serves, taken at shutdown.
     api: Mutex<Option<api::Server>>,
+    /// The limits in force, as the file writes them: set with the gateway's.
+    risk: Mutex<RiskTables>,
     /// Held for the whole of a reload: SIGHUP and the API can each start one, and only the
     /// sessions file's half locks itself, so an older jetbridge.toml could land over a newer one.
     reloading: Mutex<()>,
@@ -152,6 +154,7 @@ impl Service {
             writing,
             store,
             api: Mutex::new(None),
+            risk: Mutex::new(loaded.risk),
             reloading: Mutex::new(()),
             stopping: AtomicBool::new(false),
         };
@@ -197,6 +200,11 @@ impl Service {
     #[cfg_attr(not(test), expect(dead_code, reason = "the tests' way to the store's hooks"))]
     pub(crate) fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// The limits in force, as the file writes them.
+    pub fn risk_tables(&self) -> RiskTables {
+        self.risk.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// The client session `id`, connected or not.
@@ -280,7 +288,7 @@ impl Service {
         }
         let venues = self.set_venues();
         let config = match config::reload(&self.path, &venues, self.database.as_deref()) {
-            Ok((router, limits, day_end, api)) => {
+            Ok(config::Reread { router, limits, risk, day_end, api }) => {
                 let summary = ConfigSummary {
                     routes: router.rules().len(),
                     clients: limits.by_comp_id.len(),
@@ -293,6 +301,7 @@ impl Service {
                     "reloaded the routes, limits and day_end"
                 );
                 self.gateway.set_config(router, limits);
+                *self.risk.lock().unwrap_or_else(PoisonError::into_inner) = risk;
                 self.gateway.set_day_end(day_end);
                 warnings.extend(self.reload_api(api.as_ref()));
                 Ok(summary)

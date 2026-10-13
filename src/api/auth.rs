@@ -841,6 +841,7 @@ mod tests {
         ("GET", "/api/orders"),
         ("GET", "/api/orders/JB1"),
         ("GET", "/api/risk"),
+        ("GET", "/api/risk/limits"),
         ("GET", "/api/routes"),
         ("GET", "/api/routes/test?client=FUNDA&symbol=AAPL"),
         ("GET", "/api/live"),
