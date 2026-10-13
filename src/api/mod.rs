@@ -58,7 +58,7 @@ pub(crate) struct State {
     /// websockets they upgraded to, which watch this to close.
     stopping: watch::Sender<bool>,
     live: Arc<live::Sockets>,
-    /// The message log's searches under way: see [`messages::MAX_SEARCHES`].
+    /// The message log's searches under way: see [`messages::SEARCHES_MAX`].
     searches: Arc<Semaphore>,
 }
 
@@ -345,7 +345,7 @@ impl Bound {
             audit: self.audit,
             stopping: stopping.clone(),
             live: Arc::default(),
-            searches: Arc::new(Semaphore::new(messages::MAX_SEARCHES)),
+            searches: Arc::new(Semaphore::new(messages::SEARCHES_MAX)),
         });
         let (stop, stopped) = oneshot::channel::<()>();
         #[cfg(feature = "tls")]
@@ -473,7 +473,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(Audit::open(&dir.path().join("audit.jsonl")).unwrap());
         let stopping = watch::Sender::new(false);
-        let searches = Arc::new(Semaphore::new(messages::MAX_SEARCHES));
+        let searches = Arc::new(Semaphore::new(messages::SEARCHES_MAX));
         (State { service: Weak::new(), auth, audit, stopping, live: Arc::default(), searches }, dir)
     }
 

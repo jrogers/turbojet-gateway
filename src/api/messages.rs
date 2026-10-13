@@ -28,14 +28,14 @@ use crate::service::Service;
 /// The longest time range one search covers. With the day after's file (see
 /// [`LogFilter::covers_day`]) that's three days' files at most, so a cursor's file is one of a
 /// handful.
-const MAX_RANGE: TimeDelta = TimeDelta::days(1);
+const RANGE_MAX: TimeDelta = TimeDelta::days(1);
 
 /// Hits a page holds without a `limit`: a screenful.
 const PAGE_DEFAULT: usize = 100;
 
 /// Hits a page holds at most: each is a message twice over (its fields and its raw form), a few
 /// KiB at most, so a page is a few MiB.
-const MAX_PAGE: usize = 1_000;
+const PAGE_MAX: usize = 1_000;
 
 /// Bytes a search reads before answering what it has found: a second or so of reading and
 /// decoding, so a search for something rare on a busy day pages rather than holds a thread.
@@ -43,7 +43,7 @@ const SEARCH_BYTES_MAX: u64 = 256 * 1024 * 1024;
 
 /// Searches under way at once, each on a blocking thread: a third is answered 503, so searches
 /// can't take the threads the gateway's own blocking work (a reload, the users file) needs.
-pub(super) const MAX_SEARCHES: usize = 2;
+pub(super) const SEARCHES_MAX: usize = 2;
 
 /// Sessions, MsgTypes and tags a search gives at most, together: each is checked against every
 /// record read.
@@ -53,7 +53,7 @@ const CONDITIONS_MAX: usize = 100;
 /// logged as it arrived, a moment before.
 const ORDER_MARGIN: TimeDelta = TimeDelta::minutes(1);
 
-const _: () = assert!(PAGE_DEFAULT <= MAX_PAGE);
+const _: () = assert!(PAGE_DEFAULT <= PAGE_MAX);
 // A page reads a record at least, so paging always moves on.
 const _: () = assert!(SEARCH_BYTES_MAX > 0);
 
@@ -88,9 +88,9 @@ pub(super) struct Hit {
 
 /// `GET /api/messages?session=&direction=&msg_type=&tag=&since=&until=&limit=&after=`: the logged
 /// messages matching every condition given, oldest first, `limit` at a time (by default
-/// [`PAGE_DEFAULT`], at most [`MAX_PAGE`]). `session` (as logged) and `tag` (`11=ABC`) repeat;
+/// [`PAGE_DEFAULT`], at most [`PAGE_MAX`]). `session` (as logged) and `tag` (`11=ABC`) repeat;
 /// `msg_type` repeats or takes a list (`D,F`); `direction` is `in` or `out`. `since` (RFC 3339)
-/// is required, `until` is `since` and [`MAX_RANGE`] by default, and the range is at most that.
+/// is required, `until` is `since` and [`RANGE_MAX`] by default, and the range is at most that.
 pub(super) async fn messages(
     axum::extract::State(state): AxumState,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
@@ -114,7 +114,7 @@ pub(super) struct OrderMessagesQuery {
 /// OrderID(37) is `order_id`, both sides', paged as `GET /api/messages`. The client's are those of
 /// its session with any of the order's ClOrdIDs in ClOrdID(11) or OrigClOrdID(41); the venue's
 /// those of its session with any of the order's downstream ClOrdIDs in either, or the venue's
-/// OrderID in OrderID(37). The range is [`MAX_RANGE`] from just before its first request: an
+/// OrderID in OrderID(37). The range is [`RANGE_MAX`] from just before its first request: an
 /// order working longer has its later messages found by `GET /api/messages`. A venue whose
 /// initiator a reload has stopped has no session to search, so only the client's side is found.
 pub(super) async fn order_messages(
@@ -175,13 +175,13 @@ fn log_dir(service: &Service) -> Result<PathBuf, ApiError> {
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no message log"))
 }
 
-/// Runs `search` on a blocking thread, or answers 503 if [`MAX_SEARCHES`] are under way. The
+/// Runs `search` on a blocking thread, or answers 503 if [`SEARCHES_MAX`] are under way. The
 /// thread holds its place until it's done, even if the caller gives up.
 async fn run(state: &State, dir: PathBuf, search: Search) -> Result<Json<Page>, ApiError> {
     let permit = state.searches.clone().try_acquire_owned().map_err(|_| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("{MAX_SEARCHES} searches are under way: try again shortly"),
+            format!("{SEARCHES_MAX} searches are under way: try again shortly"),
         )
     })?;
     let scanned = tokio::task::spawn_blocking(move || {
@@ -212,7 +212,7 @@ struct Search {
 }
 
 impl Search {
-    /// A search of `filters` from `since` to `until` (by default `since` and [`MAX_RANGE`]), or
+    /// A search of `filters` from `since` to `until` (by default `since` and [`RANGE_MAX`]), or
     /// 400 for a range or `limit` out of bounds.
     fn new(
         filters: Vec<LogFilter>,
@@ -223,17 +223,17 @@ impl Search {
     ) -> Result<Self, ApiError> {
         let until = match until {
             Some(until) => until,
-            None => since.checked_add_signed(MAX_RANGE).ok_or_else(|| bad("since is too late"))?,
+            None => since.checked_add_signed(RANGE_MAX).ok_or_else(|| bad("since is too late"))?,
         };
         if until <= since {
             return Err(bad("until must be after since"));
         }
-        if until - since > MAX_RANGE {
-            return Err(bad(format!("a search covers {} hours at most", MAX_RANGE.num_hours())));
+        if until - since > RANGE_MAX {
+            return Err(bad(format!("a search covers {} hours at most", RANGE_MAX.num_hours())));
         }
         let limit = limit.unwrap_or(PAGE_DEFAULT);
-        if !(1..=MAX_PAGE).contains(&limit) {
-            return Err(bad(format!("limit must be 1 to {MAX_PAGE}")));
+        if !(1..=PAGE_MAX).contains(&limit) {
+            return Err(bad(format!("limit must be 1 to {PAGE_MAX}")));
         }
         let mut range = LogFilter::default();
         range.since = Some(since);
@@ -622,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn bad_queries_and_no_log() {
         let (fixture, _dir) = logged().await;
-        let over = MAX_PAGE + 1;
+        let over = PAGE_MAX + 1;
         for bad in [
             "",
             "since=yesterday",
@@ -825,11 +825,11 @@ mod tests {
         assert!(page.next.is_some());
     }
 
-    /// Past [`MAX_SEARCHES`] under way, a search is 503; once one ends, they run again.
+    /// Past [`SEARCHES_MAX`] under way, a search is 503; once one ends, they run again.
     #[tokio::test]
     async fn searches_past_the_cap_are_refused() {
         let (fixture, _dir) = logged().await;
-        let held = fixture.state.searches.clone().try_acquire_many_owned(MAX_SEARCHES.try_into().unwrap()).unwrap();
+        let held = fixture.state.searches.clone().try_acquire_many_owned(SEARCHES_MAX.try_into().unwrap()).unwrap();
         let answer = fixture.get(&format!("/api/messages?{DAY}")).await;
         assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
         drop(held);
