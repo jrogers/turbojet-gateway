@@ -38,6 +38,9 @@ pub const SCHEMA_VERSION: i64 = 1;
 #[derive(Debug, Clone)]
 pub struct Store {
     pool: AnyPool,
+    /// What [`orders`](Store::orders) and [`order`](Store::order) read with, so a page of history
+    /// doesn't hold the writer's one connection: see [`open`](Store::open).
+    reads: AnyPool,
     /// What the tests make a write do first.
     #[cfg(test)]
     pub(crate) hooks: Arc<Hooks>,
@@ -111,8 +114,8 @@ impl Store {
     pub async fn open(url: &str) -> io::Result<Self> {
         sqlx::any::install_default_drivers();
         let sqlite = url.starts_with("sqlite:");
-        // ponytail: one connection, as one writer task writes and `load` runs once at start; more
-        // if reads (a blotter) come to share the store. No idle timeout or lifetime, so a
+        // One connection to write, as one writer task writes and `load` runs once at start; reads
+        // of history have their own pool (`reads`). No idle timeout or lifetime, so a
         // `sqlite::memory:` database, which is its connection's, lives as long as the store.
         let pool = AnyPoolOptions::new()
             .max_connections(1)
@@ -137,8 +140,10 @@ impl Store {
         if create(&pool).await? {
             warn!("created a new, empty database at {}", without_password(url));
         }
+        let reads = open_reads(url, sqlite, &pool).await?;
         Ok(Self {
             pool,
+            reads,
             #[cfg(test)]
             hooks: Arc::default(),
         })
@@ -361,7 +366,7 @@ impl Store {
             Value::Text(text) => query.bind(text.as_str()),
             Value::Integer(integer) => query.bind(*integer),
         });
-        let rows = query.fetch_all(&self.pool).await.map_err(database("reading past orders"))?;
+        let rows = query.fetch_all(&self.reads).await.map_err(database("reading past orders"))?;
         rows.iter()
             .map(|row| {
                 let row = Columns(row);
@@ -371,7 +376,7 @@ impl Store {
     }
 
     /// The order whose OrderID(37) is `name`, from history as [`orders`](Self::orders) reads
-    /// it, with every request sent for it, in the order they were sent.
+    /// it, with every request sent for it, in the order the book numbered them.
     ///
     /// # Errors
     ///
@@ -379,7 +384,7 @@ impl Store {
     /// its original request.
     pub async fn order(&self, name: &str) -> io::Result<Option<OrderDetail>> {
         // One transaction, so the order and its requests are of the same commit, as in `load`.
-        let mut transaction = self.pool.begin().await.map_err(database("starting to read an order"))?;
+        let mut transaction = self.reads.begin().await.map_err(database("starting to read an order"))?;
         let row = sqlx::query(
             "SELECT o.*, c.answered AS cancel_answered FROM orders o \
              LEFT JOIN sent c ON c.downstream = o.cancel WHERE o.name = $1",
@@ -391,7 +396,10 @@ impl Store {
         let Some(row) = row else { return Ok(None) };
         let row = Columns(&row);
         let order = order_row(&row)?.order;
-        let sent_rows = sqlx::query("SELECT * FROM sent WHERE order_id = $1 ORDER BY sent_at, downstream")
+        // The book's order: an order's downstreams are its name and `<name>-<n>`, numbered as
+        // sent, so by length then text is by number. `sent_at` isn't: `Input::Unsent` stamps it
+        // again.
+        let sent_rows = sqlx::query("SELECT * FROM sent WHERE order_id = $1 ORDER BY LENGTH(downstream), downstream")
             .bind(signed(order.id.0)?)
             .fetch_all(&mut *transaction)
             .await
@@ -417,15 +425,18 @@ impl Store {
 /// set, by creation time, then OrderId. As [`OrderFilter`](crate::book::OrderFilter), over history.
 #[derive(Debug, Clone)]
 pub struct StoredOrders {
-    /// When the order's original request was sent, from `from` up to but not including `to`.
+    /// The earliest creation (when the order's original request was sent) included.
     pub from: DateTime<Utc>,
+    /// The creation up to which orders are included, not at it: one day's `to` is the next's `from`.
     pub to: DateTime<Utc>,
     /// A client session, or every session of a CompID.
     pub client: Option<Scope>,
+    /// The venue the order was routed to.
     pub venue: Option<VenueId>,
     pub symbol: Option<CompactString>,
+    /// The order's status as last written.
     pub status: Option<Status>,
-    /// Only orders not yet done.
+    /// Only orders not yet done when last written.
     pub working: bool,
     /// Only orders after this one, by creation time then OrderId: the last of the previous page,
     /// its [`OrderView::created`] and [`OrderView::id`]. Creation times can tie.
@@ -467,10 +478,8 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
         sql.push_str(&condition.replace('$', &format!("${}", values.len())));
     };
     match &query.client {
-        Some(Scope::Session(client)) => {
-            and("o.client = $", Value::Text(client.to_string()));
-            and("o.client_comp_id = $", Value::Text(client.comp_id().to_string()));
-        }
+        // The session as it shows names its CompID: the column alone is the session.
+        Some(Scope::Session(client)) => and("o.client = $", Value::Text(client.to_string())),
         Some(Scope::CompId(comp_id)) => and("o.client_comp_id = $", Value::Text(comp_id.to_string())),
         Some(Scope::All) | None => {}
     }
@@ -490,6 +499,40 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
     values.push(Value::Integer(i64::try_from(limit).expect("at most MAX_ORDERS_PER_PAGE")));
     sql.push_str(&format!(" ORDER BY s.sent_at, s.order_id LIMIT ${}", values.len()));
     (sql, values)
+}
+
+/// The pool [`Store::orders`] and [`Store::order`] read with: two connections of their own, so a
+/// page of history, which may walk every order in its range, never holds the writer's. SQLite's
+/// are read-only, and WAL (which the writer turns on) lets them read while it writes. An
+/// in-memory SQLite database is its one connection's, so it can't have another pool: its reads
+/// share the writer's, which is for tests.
+async fn open_reads(url: &str, sqlite: bool, pool: &AnyPool) -> io::Result<AnyPool> {
+    if sqlite && (url.contains(":memory:") || url.contains("mode=memory")) {
+        return Ok(pool.clone());
+    }
+    let url = if sqlite { read_only(url) } else { url.to_string() };
+    AnyPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |connection, _| {
+            Box::pin(async move {
+                if sqlite {
+                    connection.execute("PRAGMA busy_timeout = 5000").await?;
+                }
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .map_err(|e| io::Error::other(format!("cannot open reads of the database at {}: {e}", without_password(&url))))
+}
+
+/// A SQLite `url` with its `mode` (`rwc`, say) replaced by `ro`.
+fn read_only(url: &str) -> String {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let mut parameters: Vec<&str> =
+        query.split('&').filter(|parameter| !parameter.is_empty() && !parameter.starts_with("mode=")).collect();
+    parameters.push("mode=ro");
+    format!("{path}?{}", parameters.join("&"))
 }
 
 /// `time_text` of `time` within the years 0 to 9999, where its text is fixed-width, so text order

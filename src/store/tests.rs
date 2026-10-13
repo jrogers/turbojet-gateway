@@ -915,14 +915,16 @@ async fn stored_orders_page_by_creation_then_order_id() {
 }
 
 /// A replaced order with its cancel outstanding shows once, created at its original request, its
-/// replace and cancel pending; its detail has every request in the order sent, ties by
-/// downstream, and is what the page shows. Once the cancel is answered, it's no longer pending.
+/// replace and cancel pending; its detail has every request in the book's order, by number (not
+/// when sent, which a resend stamps again, nor as text, where `-10` comes before `-2`), and is
+/// what the page shows. Once the cancel is answered, it's no longer pending.
 #[tokio::test]
 async fn a_replaced_order_shows_once_with_every_request() {
     let store = memory().await;
     let funda = ClientId::from("FUNDA");
-    // `order(.., true)` has a pending replace, `cancel` 7-3 and the gateway's cancel.
-    let row = OrderRow { order: order(7, &funda, true), day: None };
+    // `order(.., true)` has a pending replace and the gateway's cancel.
+    let mut row = OrderRow { order: order(7, &funda, true), day: None };
+    row.order.cancel = Some("A7-2".into());
     let request = |kind, origin, sent_at| Sent {
         order: OrderId(7),
         origin,
@@ -933,9 +935,10 @@ async fn a_replaced_order_shows_once_with_every_request() {
         sent_at,
     };
     let sent = vec![
-        ("7-1".into(), request(None, Origin::Client, on(0, 9))),
-        ("7-3".into(), request(Some(CancelKind::Cancel), Origin::Gateway, on(0, 11))),
-        ("7-2".into(), request(Some(CancelKind::Replace), Origin::Client, on(0, 11))),
+        ("A7-10".into(), request(Some(CancelKind::Replace), Origin::Client, on(0, 12))),
+        ("A7".into(), request(None, Origin::Client, on(0, 9))),
+        ("A7-2".into(), request(Some(CancelKind::Cancel), Origin::Gateway, on(0, 10))),
+        ("A7-1".into(), request(Some(CancelKind::Replace), Origin::Client, on(0, 11))),
     ];
     store.write(&[Changes { orders: vec![row], sent: sent.clone(), ..Changes::default() }]).await.unwrap();
     let views = store.orders(&created_in(on(0, 0), on(1, 0))).await.unwrap();
@@ -954,18 +957,47 @@ async fn a_replaced_order_shows_once_with_every_request() {
     assert_eq!(
         requests,
         [
-            ("7-1", RequestKind::New, on(0, 9)),
-            ("7-2", RequestKind::Replace, on(0, 11)),
-            ("7-3", RequestKind::Cancel, on(0, 11))
+            ("A7", RequestKind::New, on(0, 9)),
+            ("A7-1", RequestKind::Replace, on(0, 11)),
+            ("A7-2", RequestKind::Cancel, on(0, 10)),
+            ("A7-10", RequestKind::Replace, on(0, 12)),
         ]
     );
     assert_eq!(detail.requests[2].cl_ord_id, None, "the gateway's own");
     assert_eq!(detail.requests[1].cl_ord_id.as_deref(), Some("C7"));
     assert_eq!(store.order("A8").await.unwrap(), None);
 
-    let answered = Sent { answered: true, ..sent[1].1.clone() };
-    store.write(&[Changes { sent: vec![("7-3".into(), answered)], ..Changes::default() }]).await.unwrap();
+    let answered = Sent { answered: true, ..sent[2].1.clone() };
+    store.write(&[Changes { sent: vec![("A7-2".into(), answered)], ..Changes::default() }]).await.unwrap();
     assert!(!store.order("A7").await.unwrap().unwrap().order.pending_cancel);
+}
+
+/// On a file database, history is read on a pool of its own: a read runs while the writer's one
+/// connection holds a transaction open, not waiting for it, and sees only what's committed. The
+/// read pool is read-only.
+#[tokio::test]
+async fn reads_of_history_dont_wait_for_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display())).await.unwrap();
+    let funda = ClientId::from("FUNDA");
+    store.write(&[dated(1, &funda, None, true, on(0, 9))]).await.unwrap();
+    let mut writing = store.pool.begin().await.unwrap();
+    write_changes(&mut writing, &dated(2, &funda, None, true, on(0, 10))).await.unwrap();
+    let wait = std::time::Duration::from_secs(5);
+    let read = tokio::time::timeout(wait, store.orders(&created_in(on(0, 0), on(1, 0)))).await;
+    assert_eq!(read.expect("not waiting for the writer").unwrap().len(), 1, "only what's committed");
+    let read = tokio::time::timeout(wait, store.order("A1")).await;
+    assert!(read.expect("not waiting for the writer").unwrap().is_some());
+    writing.commit().await.unwrap();
+    assert_eq!(ids_of(&store, created_in(on(0, 0), on(1, 0))).await, [1, 2]);
+    assert!(sqlx::query("DELETE FROM orders").execute(&store.reads).await.is_err(), "read-only");
+}
+
+#[test]
+fn a_read_only_url_replaces_its_mode() {
+    assert_eq!(read_only("sqlite://a/j.db?mode=rwc"), "sqlite://a/j.db?mode=ro");
+    assert_eq!(read_only("sqlite://a/j.db"), "sqlite://a/j.db?mode=ro");
+    assert_eq!(read_only("sqlite://j.db?cache=shared&mode=rw"), "sqlite://j.db?cache=shared&mode=ro");
 }
 
 /// Past orders are read along the `sent_new` range, in its order, every filter and the cursor
