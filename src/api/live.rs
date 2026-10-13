@@ -43,6 +43,8 @@ use crate::book::{GatewayEvent, MAX_ORDERS_PER_PAGE, OrderView, Scope};
 /// How often an open socket checks that its session or token still holds. Checking is a map
 /// lookup; a removed user or a revoked token keeps watching this long at most.
 const RECHECK: Duration = Duration::from_secs(10);
+// Its pings keep an idle socket's connection open.
+const _: () = assert!(RECHECK.as_secs() < super::listener::IDLE.as_secs());
 
 /// Live sockets open at once. Each holds one of the API's 256 connections for as long as it's
 /// open, so this leaves most for requests, and still allows a console for every operator.

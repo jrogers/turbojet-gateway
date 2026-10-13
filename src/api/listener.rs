@@ -1,6 +1,7 @@
 //! The API's listeners, plain and TLS, each holding at most [`MAX_CONNECTIONS`] connections.
 //! Beyond that, accepting waits until one closes: the new connections queue in the kernel's
-//! backlog. There is no idle timeout, so an idle connection keeps its slot.
+//! backlog. A connection that moves no bytes for [`IDLE`] is closed, so idle ones give their
+//! slots back.
 
 use std::io;
 use std::net::SocketAddr;
@@ -12,17 +13,48 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, Sleep};
 use tracing::warn;
 
 /// Connections open at once, TLS handshakes under way included. An operator API has a few users
 /// and a console or two; this many at once is a flood, and each costs a task and its buffers.
 pub(super) const MAX_CONNECTIONS: usize = 256;
 
-/// A connection, holding its slot until it's dropped.
+/// How long a connection may move no bytes before it's closed. axum sets no read or keep-alive
+/// timeout, so without this [`MAX_CONNECTIONS`] silent connections would hold every slot and keep
+/// operators out. Live sockets ping more often than this; a request whose handler moves no bytes
+/// for this long (no reload or fsync should) is cut off with its connection.
+pub(super) const IDLE: Duration = Duration::from_secs(60);
+
+/// A connection, holding its slot until it's dropped, and failing once it has been idle for
+/// `idle`.
 #[derive(Debug)]
 pub(super) struct Conn<S> {
     stream: S,
     _slot: OwnedSemaphorePermit,
+    idle: Duration,
+    deadline: Pin<Box<Sleep>>,
+}
+
+impl<S> Conn<S> {
+    fn new(stream: S, slot: OwnedSemaphorePermit, idle: Duration) -> Self {
+        Self { stream, _slot: slot, idle, deadline: Box::pin(tokio::time::sleep(idle)) }
+    }
+
+    /// Pushes the deadline back after bytes moved, or fails once it has passed while waiting.
+    fn check<T>(&mut self, cx: &mut Context<'_>, polled: Poll<io::Result<T>>, moved: bool) -> Poll<io::Result<T>> {
+        match polled {
+            Poll::Ready(Ok(_)) if moved => {
+                let idle = self.idle;
+                self.deadline.as_mut().reset(Instant::now() + idle);
+                polled
+            }
+            Poll::Pending if self.deadline.as_mut().poll(cx).is_ready() => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "API connection idle")))
+            }
+            _ => polled,
+        }
+    }
 }
 
 /// Plain TCP, capped.
@@ -44,7 +76,7 @@ impl axum::serve::Listener for Plain {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         let (stream, addr, slot) = accept(&self.tcp, &self.slots).await;
-        (Conn { stream, _slot: slot }, addr)
+        (Conn::new(stream, slot, IDLE), addr)
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -78,13 +110,21 @@ fn is_connection_error(e: &io::Error) -> bool {
 
 impl<S: AsyncRead + Unpin> AsyncRead for Conn<S> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+        let this = self.get_mut();
+        let filled = buf.filled().len();
+        let polled = Pin::new(&mut this.stream).poll_read(cx, buf);
+        let moved = buf.filled().len() > filled;
+        this.check(cx, polled, moved)
     }
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Conn<S> {
+    // A peer that stops reading stalls writes; the deadline frees its slot too.
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.stream).poll_write(cx, buf);
+        let moved = matches!(polled, Poll::Ready(Ok(n)) if n > 0);
+        this.check(cx, polled, moved)
     }
 
     fn poll_write_vectored(
@@ -92,7 +132,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Conn<S> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
+        let moved = matches!(polled, Poll::Ready(Ok(n)) if n > 0);
+        this.check(cx, polled, moved)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -125,7 +168,7 @@ mod tls {
     use tracing::debug;
     use turbojet::tls::{ClientTrust, Identity, ServerTls, TlsAcceptor};
 
-    use super::{Conn, MAX_CONNECTIONS, accept};
+    use super::{Conn, IDLE, MAX_CONNECTIONS, accept};
     use crate::config::ApiTls;
 
     /// How long a client has to finish its TLS handshake.
@@ -181,7 +224,7 @@ mod tls {
                     // until the next connection arrives.
                     Some(joined) = self.handshakes.join_next(), if !self.handshakes.is_empty() => {
                         if let Ok(Some((stream, addr, slot))) = joined {
-                            return (Conn { stream, _slot: slot }, addr);
+                            return (Conn::new(stream, slot, IDLE), addr);
                         }
                     }
                 }
@@ -191,5 +234,61 @@ mod tls {
         fn local_addr(&self) -> io::Result<Self::Addr> {
             self.tcp.local_addr()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    const IDLE_SHORT: Duration = Duration::from_millis(200);
+
+    fn conn() -> (Conn<tokio::io::DuplexStream>, tokio::io::DuplexStream) {
+        let (server, client) = tokio::io::duplex(64);
+        let slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        (Conn::new(server, slot, IDLE_SHORT), client)
+    }
+
+    /// A client that sends nothing has its connection's reads fail once the deadline passes.
+    #[tokio::test]
+    async fn an_idle_connection_times_out() {
+        let (mut conn, _client) = conn();
+        let started = std::time::Instant::now();
+        let read = tokio::time::timeout(IDLE_SHORT * 10, conn.read(&mut [0; 8])).await.unwrap();
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= IDLE_SHORT);
+    }
+
+    /// A client sending a byte every quarter deadline, for several deadlines, keeps its connection
+    /// open, with the server waiting on each; so do the server's own writes while it reads nothing.
+    #[tokio::test]
+    async fn an_active_connection_stays_open() {
+        let (mut conn, mut client) = conn();
+        for _ in 0..12 {
+            assert_eq!(read_after_quarter(&mut conn, &mut client).await, 1);
+        }
+        for _ in 0..12 {
+            tokio::time::sleep(IDLE_SHORT / 4).await;
+            conn.write_all(b"y").await.unwrap();
+            assert_eq!(client.read(&mut [0; 8]).await.unwrap(), 1);
+        }
+        assert_eq!(read_after_quarter(&mut conn, &mut client).await, 1);
+    }
+
+    /// The server's read, waiting while the client sends a byte a quarter deadline later.
+    async fn read_after_quarter(
+        conn: &mut Conn<tokio::io::DuplexStream>,
+        client: &mut tokio::io::DuplexStream,
+    ) -> usize {
+        let mut buf = [0; 8];
+        let (read, ()) = tokio::join!(conn.read(&mut buf), async {
+            tokio::time::sleep(IDLE_SHORT / 4).await;
+            client.write_all(b"x").await.unwrap();
+        });
+        read.unwrap()
     }
 }

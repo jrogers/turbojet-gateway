@@ -280,9 +280,11 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   minute of anonymous ones, each synced to disk.
 - A reload answered 422 may have applied half: the file that loaded is in use. The answer says
   which.
-- Each API connection holds one of 256 slots for as long as it's open, idle or not: there's no
-  idle timeout. Past 256, new connections wait in the kernel's backlog. A live socket holds one
-  too, up to 64 of them.
+- Each API connection holds one of 256 slots for as long as it's open; one that moves no bytes for
+  60 seconds is closed, so an idle connection holds its slot for up to that long. Past 256, new
+  connections wait in the kernel's backlog. A live socket holds one too, up to 64 of them, and its
+  pings keep it open. A request whose handler moves no bytes for 60 seconds is cut off with its
+  connection.
 - Alarms are sent only to the live sockets open when they're raised; earlier ones are in the log.
   The alarms of a start's recovery (orphans) come before the API is up, so only the log has them.
 - Behind a proxy, the client's address is whatever the last `X-Forwarded-For` hop says, and a
