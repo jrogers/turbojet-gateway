@@ -112,9 +112,20 @@ test('the buttons show by role and scope', async () => {
 
 test('a scoped admin may edit only its own tables, and add one', async () => {
   serve()
-  render(page(who('admin', ['FUNDB'])))
+  render(page(who('admin', ['FUNDB', 'FUNDC'])))
   await within(section()).findByText('FUNDA')
   expect(buttons()).toEqual(['Edit FUNDB', "Delete FUNDB's limits", 'Add…'])
+  // Add offers its clients, and refuses another's without asking.
+  expect([...section().querySelectorAll('datalist option')].map((o) => (o as HTMLOptionElement).value)).toEqual(['FUNDB', 'FUNDC'])
+  const add = within(section()).getByLabelText('Add client')
+  fireEvent.change(add, { target: { value: 'FUNDA' } })
+  await act(async () => fireEvent.click(within(section()).getByRole('button', { name: 'Add…' })))
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(screen.getByRole('alert').textContent).toBe("You may edit only your clients' limits: FUNDB, FUNDC.")
+  fireEvent.change(add, { target: { value: 'FUNDC' } })
+  expect(screen.queryByRole('alert')).toBeNull()
+  const dialog = await open('Add…')
+  expect(within(dialog).getByRole('heading').textContent).toBe('Edit FUNDC')
 })
 
 test('an edit sends the key and value, shows the table and the reload, and reads again', async () => {

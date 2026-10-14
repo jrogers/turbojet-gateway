@@ -198,7 +198,7 @@ test('the actions show by role, and a scoped user is offered only its CompIDs', 
       .queryAllByRole('button')
       .filter((b) => !b.closest('.limits'))
       .map((b) => b.textContent)
-  const offered = () => [...document.querySelectorAll('datalist option')].map((o) => (o as HTMLOptionElement).value)
+  const offered = () => [...document.querySelectorAll('#risk-scopes option')].map((o) => (o as HTMLOptionElement).value)
 
   render(page(who('viewer'), snapshot(['all'])))
   await screen.findByText(FUNDA)
@@ -234,7 +234,7 @@ const client = (id: string): SessionView => ({
 
 test("the CompIDs offered are the live sessions' too, and the snapshot's clients over login's", async () => {
   serve({ 'GET /api/risk': () => json({ ...fixture, by_comp_id: {}, sessions: [] }) })
-  const offered = () => [...document.querySelectorAll('datalist option')].map((o) => (o as HTMLOptionElement).value)
+  const offered = () => [...document.querySelectorAll('#risk-scopes option')].map((o) => (o as HTMLOptionElement).value)
   const sessions = [client('FIX.4.2:JETBRIDGE->DESK1:q'), client('FIX.4.4:JETBRIDGE->DESK1'), client('FIX.4.4:JETBRIDGE->DESK2/s/l')]
   render(page(who('operator'), snapshot([], null, sessions)))
   await act(async () => {})

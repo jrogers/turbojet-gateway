@@ -84,6 +84,8 @@ export default function Limits({
   const [on, setOn] = useState<boolean>()
   const [remove, setRemove] = useState(false)
   const [adding, setAdding] = useState('')
+  // Why Add refused the CompID typed: not one of a scoped admin's clients.
+  const [refused, setRefused] = useState<string>()
   const [answer, setAnswer] = useState<Answer>()
   const refocus = useRef(false)
   const [reads, reread] = useReducer((n: number) => n + 1, 0)
@@ -243,17 +245,42 @@ export default function Limits({
           className="filters"
           onSubmit={(e) => {
             e.preventDefault()
-            if (adding.trim() !== '') open({ kind: 'set', table: adding.trim() })
+            const table = adding.trim()
+            if (table === '') return
+            if (!mayEdit(table)) return setRefused(`You may edit only your clients' limits: ${clients!.join(', ')}.`)
+            open({ kind: 'set', table })
           }}
         >
           <label>
             Add client
-            <input placeholder="CompID" value={adding} onChange={(e) => setAdding(e.target.value)} />
+            <input
+              placeholder="CompID"
+              list={clients === null ? undefined : 'limit-clients'}
+              value={adding}
+              aria-invalid={refused !== undefined || undefined}
+              aria-describedby={refused === undefined ? undefined : 'add-refused'}
+              onChange={(e) => {
+                setAdding(e.target.value)
+                setRefused(undefined)
+              }}
+            />
           </label>
+          {clients !== null && (
+            <datalist id="limit-clients">
+              {clients.map((client) => (
+                <option key={client} value={client} />
+              ))}
+            </datalist>
+          )}
           <button type="submit" disabled={adding.trim() === ''}>
             Add…
           </button>
         </form>
+      )}
+      {refused && (
+        <p className="error" role="alert" id="add-refused">
+          {refused}
+        </p>
       )}
 
       {answer && <Answered answer={answer} />}
