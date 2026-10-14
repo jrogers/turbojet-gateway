@@ -655,6 +655,13 @@ fn a_urls_password_is_hidden() {
     assert_eq!(without_password("postgres://jet@db/j"), "postgres://jet@db/j");
     assert_eq!(without_password("sqlite://a/b@c.db?mode=rwc"), "sqlite://a/b@c.db?mode=rwc");
     assert_eq!(without_password("sqlite::memory:"), "sqlite::memory:");
+    assert_eq!(
+        without_password("postgres://jet@db/j?password=secret&sslmode=require"),
+        "postgres://jet@db/j?password=***&sslmode=require"
+    );
+    assert_eq!(without_password("postgres://jet:pa/ss@db/j"), "postgres://jet:***@db/j", "a '/' in the password");
+    assert_eq!(without_password("postgres://jet:pa?ss@db/j"), "postgres://jet:***@db/j", "a '?' in the password");
+    assert_eq!(without_password("postgres://jet:s@cret@db/j"), "postgres://jet:***@db/j");
 }
 
 /// A URL's scheme is read in any case, as sqlx reads it: an in-memory SQLite database's reads

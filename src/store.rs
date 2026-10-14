@@ -1198,13 +1198,29 @@ fn undecodable(column: &str, why: sqlx::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("the database's {column}: {why}"))
 }
 
-/// `url` with any password replaced, for the logs.
+/// `url` with any password replaced, in its userinfo or a `password` query parameter, for the
+/// logs. The userinfo ends at the last `@`, so a `/`, `?` or `@` in a password, which a URL that
+/// fails to parse may well have, can't end it early. Masks too much rather than too little: a
+/// URL with a `:` before an `@` that isn't its userinfo's (a SQLite path's, say) loses what's
+/// between.
 fn without_password(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
-    let authority = rest.split(['/', '?']).next().unwrap_or_default();
-    let Some((user_info, host)) = authority.rsplit_once('@') else { return url.to_string() };
-    let Some((user, _)) = user_info.split_once(':') else { return url.to_string() };
-    format!("{scheme}://{user}:***@{host}{}", &rest[authority.len()..])
+    let url = url
+        .split_once("://")
+        .and_then(|(scheme, rest)| {
+            let (user_info, host) = rest.rsplit_once('@')?;
+            let (user, _) = user_info.split_once(':')?;
+            Some(format!("{scheme}://{user}:***@{host}"))
+        })
+        .unwrap_or_else(|| url.to_string());
+    let Some((base, query)) = url.split_once('?') else { return url };
+    let parameters: Vec<String> = query
+        .split('&')
+        .map(|parameter| match parameter.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=***"),
+            _ => parameter.to_string(),
+        })
+        .collect();
+    format!("{base}?{}", parameters.join("&"))
 }
 
 fn database(doing: &'static str) -> impl Fn(sqlx::Error) -> io::Error {
