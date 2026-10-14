@@ -2,7 +2,8 @@
 
 Jetbridge is a FIX connectivity gateway built on the Turbojet engine, from crates.io.
 
-- House style is Turbojet's [STYLE.md](../turbojet/docs/STYLE.md); read it before writing code.
+- House style is Turbojet's [STYLE.md](https://github.com/jrogers/turbojet/blob/main/docs/STYLE.md)
+  (`../turbojet/docs/STYLE.md` in a checkout); read it before writing code.
 - Plans and working notes go in `docs/plans/` (gitignored).
 - Feature branches are git worktrees under `.worktrees/` (gitignored).
 - Commits are small and each says why.
@@ -21,6 +22,7 @@ Jetbridge is a FIX connectivity gateway built on the Turbojet engine, from crate
   turbojet-fix42 = { path = "../turbojet/crates/turbojet-fix42" }
   turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
   ```
-  It rewrites `Cargo.lock`'s Turbojet entries to the path; don't commit those.
+  It rewrites `Cargo.lock`'s Turbojet entries to the path; don't commit those. In the main
+  checkout it applies to the worktrees under `.worktrees/` too.
 - Engine bugs found here are fixed in the Turbojet repo, in their own commits; Jetbridge takes the
   fix from the next release, or meanwhile through the local patch.
