@@ -665,6 +665,23 @@ async fn a_schemes_case_does_not_matter() {
     assert!(store.order("o1").await.unwrap().is_none());
 }
 
+/// `load` and `order` read one snapshot throughout: on PostgreSQL, REPEATABLE READ, on the
+/// writer's pool and the reads', which stay read-only.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_snapshot_is_repeatable_read_on_postgres() {
+    let Some(url) = postgres().await else { return };
+    let store = Store::open(&url).await.unwrap();
+    for (pool, read_only) in [(&store.pool, "off"), (&store.reads, "on")] {
+        let mut transaction = store.begin_snapshot(pool).await.unwrap();
+        let level: String =
+            sqlx::query_scalar("SHOW transaction_isolation").fetch_one(&mut *transaction).await.unwrap();
+        assert_eq!(level, "repeatable read");
+        let only: String = sqlx::query_scalar("SHOW transaction_read_only").fetch_one(&mut *transaction).await.unwrap();
+        assert_eq!(only, read_only);
+    }
+}
+
 /// Creating the tables says whether the database was new, which `open` logs.
 #[tokio::test]
 async fn creating_says_whether_the_database_was_new() {

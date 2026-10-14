@@ -41,6 +41,9 @@ pub struct Store {
     /// What [`orders`](Store::orders) and [`order`](Store::order) read with, so a page of history
     /// doesn't hold the writer's one connection: see [`open`](Store::open).
     reads: AnyPool,
+    /// The database is PostgreSQL, not SQLite: see [`begin_snapshot`](Store::begin_snapshot) and
+    /// `open_reads`.
+    postgres: bool,
     /// What the tests make a write do first.
     #[cfg(test)]
     pub(crate) hooks: Arc<Hooks>,
@@ -147,6 +150,7 @@ impl Store {
         Ok(Self {
             pool,
             reads,
+            postgres,
             #[cfg(test)]
             hooks: Arc::default(),
         })
@@ -171,6 +175,12 @@ impl Store {
         transaction.commit().await.map_err(database("committing a write"))
     }
 
+    /// Begins a transaction on `pool` that reads one snapshot throughout: SQLite's always does;
+    /// PostgreSQL's default, READ COMMITTED, takes one per statement.
+    async fn begin_snapshot(&self, pool: &AnyPool) -> Result<sqlx::Transaction<'static, sqlx::Any>, sqlx::Error> {
+        if self.postgres { pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ").await } else { pool.begin().await }
+    }
+
     /// What [`Book::restore`](crate::book::Book::restore) keeps of the store: orders live or of
     /// their client's current day, the requests sent and ClOrdIDs of those, and all of the rest.
     ///
@@ -178,9 +188,9 @@ impl Store {
     ///
     /// The database refuses a query, or holds a value this build can't read.
     pub async fn load(&self) -> io::Result<Snapshot> {
-        // One transaction, so the orders and what names them are of the same commit: a SQLite
-        // transaction reads one snapshot; PostgreSQL's would need REPEATABLE READ for that.
-        let mut transaction = self.pool.begin().await.map_err(database("starting a load"))?;
+        // One transaction of one snapshot (see `begin_snapshot`), so the orders and what names
+        // them are of the same commit.
+        let mut transaction = self.begin_snapshot(&self.pool).await.map_err(database("starting a load"))?;
         let connection = &mut *transaction;
         let mut snapshot = Snapshot::default();
         // The held IDs found once, by index; dropped with the transaction should a read fail.
@@ -387,7 +397,7 @@ impl Store {
     /// its original request.
     pub async fn order(&self, name: &str) -> io::Result<Option<OrderDetail>> {
         // One transaction, so the order and its requests are of the same commit, as in `load`.
-        let mut transaction = self.reads.begin().await.map_err(database("starting to read an order"))?;
+        let mut transaction = self.begin_snapshot(&self.reads).await.map_err(database("starting to read an order"))?;
         let row = sqlx::query(
             "SELECT o.*, c.answered AS cancel_answered FROM orders o \
              LEFT JOIN sent c ON c.downstream = o.cancel WHERE o.name = $1",
