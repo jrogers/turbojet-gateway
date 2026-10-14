@@ -5,7 +5,7 @@ import { initial, LiveContext, reduce, type LiveState } from './store.ts'
 import type { EditedView, Me, ReloadView, RiskTables, RiskView } from './types.ts'
 
 const tables: RiskTables = {
-  defaults: { max_order_qty: 1000, price_band: 5.5, symbols: ['AAPL', 'MSFT'] },
+  defaults: { max_order_qty: '1000', price_band: '5.5', symbols: ['AAPL', 'MSFT'], self_trade: true },
   clients: { FUNDA: { max_notional: '250000.50', self_trade: true }, FUNDB: {} },
 }
 
@@ -57,15 +57,27 @@ afterEach(() => {
 })
 
 const section = () => document.querySelector('section.limits') as HTMLElement
-const cells = (name: string) => [...within(section()).getByText(name).closest('tr')!.querySelectorAll('td')].map((td) => td.textContent)
-const buttons = () => within(section()).queryAllByRole('button').map((b) => b.textContent)
+const cells = (name: string) =>
+  [...within(section()).getByRole('rowheader', { name }).closest('tr')!.querySelectorAll('th, td')].map((cell) => cell.textContent)
+/** The section's buttons by their names: a row's name the table. */
+const buttons = () =>
+  within(section())
+    .queryAllByRole('button')
+    .map((b) => b.getAttribute('aria-label') ?? b.textContent)
 const edits = (calls: { key: string; init: RequestInit }[]) =>
   calls.filter((c) => c.init.method !== 'GET').map((c) => [c.key, c.init.body])
 
-/** Opens `button` in `row`'s, types the reason and anything `fill` does, and confirms. */
-async function act_on(row: string, button: string, reason: string, fill: (dialog: HTMLElement) => void = () => {}) {
-  fireEvent.click(within(within(section()).getByText(row).closest('tr')!).getByRole('button', { name: button }))
-  const dialog = screen.getByRole('dialog')
+/** Opens the dialog of the section's button named `name`, focused as a click would. */
+async function open(name: string) {
+  const button = within(section()).getByRole('button', { name })
+  button.focus()
+  await act(async () => fireEvent.click(button))
+  return screen.getByRole('dialog')
+}
+
+/** Opens `button`'s dialog, types the reason and anything `fill` does, and confirms. */
+async function actOn(button: string, reason: string, fill: (dialog: HTMLElement) => void = () => {}) {
+  const dialog = await open(button)
   fireEvent.change(within(dialog).getByLabelText('Reason'), { target: { value: reason } })
   fill(dialog)
   await act(async () => fireEvent.click(within(dialog).getByRole('button', { name: /Confirm|Delete table/ })))
@@ -80,7 +92,7 @@ test('shows the tables as written, and the keys a client leaves to the defaults'
   serve()
   render(page(who('viewer')))
   await within(section()).findByText('FUNDA')
-  expect(cells('Defaults')).toEqual(['Defaults', '1000', '', 'AAPL, MSFT', '5.5', '', ''])
+  expect(cells('Defaults')).toEqual(['Defaults', '1000', '', 'AAPL, MSFT', '5.5', '', 'refused'])
   expect(cells('FUNDA')).toEqual(['FUNDA', 'default', '250000.50', 'default', 'default', 'default', 'refused'])
   expect(cells('FUNDB')).toEqual(['FUNDB', 'default', 'default', 'default', 'default', 'default', 'default'])
   expect(buttons()).toEqual([])
@@ -95,8 +107,7 @@ test('the buttons show by role and scope, the scope as the snapshot says', async
 
   render(page(who('admin')))
   await within(section()).findByText('FUNDA')
-  expect(buttons()).toEqual(['Edit…', 'Edit…', 'Delete table…', 'Edit…', 'Delete table…', 'Add…'])
-  expect(within(section()).getByText('Defaults').closest('tr')!.querySelectorAll('button')).toHaveLength(1)
+  expect(buttons()).toEqual(['Edit the defaults', 'Edit FUNDA', "Delete FUNDA's limits", 'Edit FUNDB', "Delete FUNDB's limits", 'Add…'])
 })
 
 test('a scoped admin may edit only its own tables, and add one', async () => {
@@ -104,8 +115,7 @@ test('a scoped admin may edit only its own tables, and add one', async () => {
   // Logged in with FUNDA, rescoped since to FUNDB.
   render(page(who('admin', ['FUNDA']), snapshot(['FUNDB'])))
   await within(section()).findByText('FUNDA')
-  expect(buttons()).toEqual(['Edit…', 'Delete table…', 'Add…'])
-  expect(within(within(section()).getByText('FUNDB').closest('tr')!).getAllByRole('button')).toHaveLength(2)
+  expect(buttons()).toEqual(['Edit FUNDB', "Delete FUNDB's limits", 'Add…'])
 })
 
 test('an edit sends the key and value, shows the table and the reload, and reads again', async () => {
@@ -114,10 +124,22 @@ test('an edit sends the key and value, shows the table and the reload, and reads
   render(page(who('admin')))
   await within(section()).findByText('FUNDA')
 
-  const dialog = await act_on('FUNDA', 'Edit…', 'more room', (dialog) => {
+  const dialog = await actOn('Edit FUNDA', 'more room', (dialog) => {
     expect(within(dialog).getByRole('heading').textContent).toBe('Edit FUNDA')
     const confirm = within(dialog).getByRole('button', { name: 'Confirm' }) as HTMLButtonElement
+    expect(within(dialog).getAllByRole('option').map((o) => o.textContent)).toEqual([
+      'Max order qty',
+      'Max notional',
+      'Symbols',
+      'Price band %',
+      'Credit',
+      'Self trade',
+    ])
+    // A key the table doesn't set can't be removed.
+    const remove = within(dialog).getByLabelText('Remove it: the default applies') as HTMLInputElement
+    expect(remove.disabled).toBe(true)
     pick(dialog, 'max_notional')
+    expect(remove.disabled).toBe(false)
     // Starts from the table's value, as written.
     expect((within(dialog).getByLabelText(/Value/) as HTMLInputElement).value).toBe('250000.50')
     pick(dialog, 'credit')
@@ -132,12 +154,12 @@ test('an edit sends the key and value, shows the table and the reload, and reads
   expect(screen.getByRole('status').textContent).toBe('Set credit in FUNDA.')
   expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
   expect(section().querySelector('.answer')!.textContent).toBe(
-    'FUNDA now: max_notional 250000.50; credit 300.25; self_trade refused.' +
+    'FUNDA now sets max_notional 250000.50; credit 300.25; self_trade refused.' +
       'The reload took 2 routes, limits for 2 clients and day_end 00:00 UTC; sessions: added FUNDC.' +
       'FUNDC has no schedule',
   )
-  // The limits and the risk read again.
-  expect(calls.filter((c) => c.key === 'GET /api/risk/limits')).toHaveLength(2)
+  // The limits read on opening and again after, and the risk after.
+  expect(calls.filter((c) => c.key === 'GET /api/risk/limits')).toHaveLength(3)
   expect(calls.filter((c) => c.key === 'GET /api/risk')).toHaveLength(2)
 })
 
@@ -148,22 +170,25 @@ test('symbols go as a list, self_trade as a boolean, and a new client by Add', a
   })
   render(page(who('admin')))
   await within(section()).findByText('FUNDA')
-  await act_on('Defaults', 'Edit…', 'r', (dialog) => {
+  await actOn('Edit the defaults', 'r', (dialog) => {
     pick(dialog, 'symbols')
     expect((within(dialog).getByLabelText(/Symbols/) as HTMLInputElement).value).toBe('AAPL, MSFT')
     type(dialog, /Symbols/, 'AAPL, MSFT IBM,')
   })
   fireEvent.change(within(section()).getByLabelText('Add client'), { target: { value: ' FUNDC ' } })
-  fireEvent.click(within(section()).getByRole('button', { name: 'Add…' }))
-  const dialog = screen.getByRole('dialog')
+  const dialog = await open('Add…')
   expect(within(dialog).getByRole('heading').textContent).toBe('Edit FUNDC')
   fireEvent.change(within(dialog).getByLabelText('Reason'), { target: { value: 'r' } })
   pick(dialog, 'self_trade')
-  fireEvent.click(within(dialog).getByLabelText('Refuse self trades'))
+  // A client without its own starts from the defaults', and says so.
+  const refuse = within(dialog).getByLabelText(/^Refuse self trades/) as HTMLInputElement
+  expect(refuse.checked).toBe(true)
+  expect(refuse.closest('label')!.textContent).toBe('Refuse self trades (default: refused)')
+  fireEvent.click(refuse)
   await act(async () => fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' })))
   expect(edits(calls)).toEqual([
     ['PATCH /api/risk/limits/defaults', '{"reason":"r","set":{"symbols":["AAPL","MSFT","IBM"]}}'],
-    ['PATCH /api/risk/limits/client/FUNDC', '{"reason":"r","set":{"self_trade":true}}'],
+    ['PATCH /api/risk/limits/client/FUNDC', '{"reason":"r","set":{"self_trade":false}}'],
   ])
   expect(section().querySelector('.answer')!.textContent).toMatch(/^FUNDC sets no keys now\./)
 })
@@ -172,10 +197,10 @@ test('removing a key sends null', async () => {
   const calls = serve({ 'PATCH /api/risk/limits/client/FUNDA': () => json({ table: {}, reload }) })
   render(page(who('admin')))
   await within(section()).findByText('FUNDA')
-  await act_on('FUNDA', 'Edit…', 'r', (dialog) => {
+  await actOn('Edit FUNDA', 'r', (dialog) => {
     pick(dialog, 'self_trade')
     fireEvent.click(within(dialog).getByLabelText('Remove it: the default applies'))
-    expect(within(dialog).queryByLabelText('Refuse self trades')).toBeNull()
+    expect(within(dialog).queryByLabelText(/^Refuse self trades/)).toBeNull()
   })
   expect(edits(calls)).toEqual([['PATCH /api/risk/limits/client/FUNDA', '{"reason":"r","set":{"self_trade":null}}']])
   expect(screen.getByRole('status').textContent).toBe('Removed self_trade from FUNDA.')
@@ -187,33 +212,63 @@ test('a refusal stays in the dialog, saying why', async () => {
   })
   render(page(who('admin')))
   await within(section()).findByText('FUNDA')
-  const dialog = await act_on('Defaults', 'Edit…', 'r', (dialog) => {
+  const dialog = await actOn('Edit the defaults', 'r', (dialog) => {
     pick(dialog, 'credit')
     type(dialog, /Value/, '-5')
   })
   expect(within(dialog).getByRole('alert').textContent).toBe('risk.defaults.credit: -5 is not positive')
   expect(screen.getByRole('dialog')).toBe(dialog)
-  expect(calls.filter((c) => c.key === 'GET /api/risk/limits')).toHaveLength(1)
+  expect(calls.filter((c) => c.key === 'GET /api/risk/limits')).toHaveLength(2)
 })
 
 test('Delete table deletes, and a scoped admin is shown no reload', async () => {
   const calls = serve({ 'DELETE /api/risk/limits/client/FUNDB': () => json({ table: null, reload: null }) })
   render(page(who('admin', ['FUNDB'])))
   await within(section()).findByText('FUNDB')
-  await act_on('FUNDB', 'Delete table…', 'gone')
+  await actOn("Delete FUNDB's limits", 'gone')
   expect(edits(calls)).toEqual([['DELETE /api/risk/limits/client/FUNDB', '{"reason":"gone"}']])
   expect(screen.getByRole('status').textContent).toBe("Deleted FUNDB's limits: its sessions have the defaults.")
   expect(section().querySelector('.answer')!.textContent).toBe('FUNDB has no table now.')
 })
 
-test('a 403 clears the tables, and says why', async () => {
+const again = (clients: string[] | null) =>
+  reduce(snapshot(), { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients })
+
+test('a 403 clears the tables and the edit open on them, and says why', async () => {
   let answer = () => json(tables)
   serve({ 'GET /api/risk/limits': () => answer() })
-  const { rerender } = render(page(who('viewer')))
+  const { rerender } = render(page(who('admin')))
   await within(section()).findByText('FUNDA')
-  answer = () => json({ error: 'u may see only clients FUNDA' }, 403)
+  await open('Edit FUNDA')
+  answer = () => json({ error: 'u may see only clients FUNDB' }, 403)
   // A snapshot reads again.
-  rerender(page(who('viewer'), reduce(snapshot(), { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients: ['FUNDA'] })))
-  expect((await within(section()).findByRole('alert')).textContent).toBe('u may see only clients FUNDA')
+  await act(async () => rerender(page(who('admin'), again(['FUNDB']))))
+  expect(within(section()).getByRole('alert').textContent).toBe('u may see only clients FUNDB')
   expect(section().querySelector('table')).toBeNull()
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
+})
+
+test('a limits read answering after a newer one was asked is dropped', async () => {
+  const answers: ((r: Response) => void)[] = []
+  vi.stubGlobal('fetch', (url: string) =>
+    url === '/api/risk/limits' ? new Promise<Response>((resolve) => answers.push(resolve)) : Promise.resolve(json(risk)),
+  )
+  const { rerender } = render(page(who('viewer')))
+  rerender(page(who('viewer'), again(null)))
+  expect(answers).toHaveLength(2)
+  await act(async () => answers[1](json({ defaults: {}, clients: { FUNDB: {} } })))
+  await act(async () => answers[0](json(tables)))
+  expect(within(section()).queryByText('FUNDA')).toBeNull()
+  expect(within(section()).getByText('FUNDB')).toBeTruthy()
+})
+
+test('Cancel closes the dialog, and focus goes back to its button', async () => {
+  serve()
+  render(page(who('admin')))
+  await within(section()).findByText('FUNDA')
+  const dialog = await open('Edit FUNDA')
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(document.activeElement).toBe(within(section()).getByRole('button', { name: 'Edit FUNDA' }))
 })

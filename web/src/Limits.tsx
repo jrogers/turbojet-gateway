@@ -23,12 +23,13 @@ const DECIMAL = /^[+-]?(\d+\.?\d*|\.\d+)$/
 type Editing = { kind: 'set'; table: string | null } | { kind: 'delete'; table: string }
 
 /** What the last edit answered, and of which table. */
-type Answer = { name: string; edited: EditedView }
+type Answer = { table: string | null; edited: EditedView }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const nameOf = (table: string | null) => (table === null ? 'the defaults' : table)
+const numeric = (key: Key) => (key === 'symbols' || key === 'self_trade' ? undefined : 'num')
 
-/** A key's value as written, as text; an amount as its number or string. */
+/** A key's value as written, as text: an amount as the API's decimal string. */
 function shown(key: Key, table: RiskTable): string {
   const value = table[key]
   if (value === undefined) return ''
@@ -77,35 +78,49 @@ export default function Limits({
   const [error, setError] = useState<string>()
   const [editing, setEditing] = useState<Editing>()
   const [key, setKey] = useState<Key>(KEYS[0])
-  const [text, setText] = useState('')
-  const [on, setOn] = useState(false)
+  // `undefined` until changed: the table's value then, as last read.
+  const [text, setText] = useState<string>()
+  const [on, setOn] = useState<boolean>()
   const [remove, setRemove] = useState(false)
   const [adding, setAdding] = useState('')
   const [answer, setAnswer] = useState<Answer>()
   const refocus = useRef(false)
   const [reads, reread] = useReducer((n: number) => n + 1, 0)
 
-  // On showing, each snapshot (the scope may have changed) and each edit. An answer to a read
-  // since outdone, or after unmounting, is dropped.
+  // On showing, on being seen again, on each snapshot (the scope may have changed), and on each
+  // edit opened or done. An answer to a read since outdone, or after unmounting, is dropped. A
+  // 403 or 404 clears the tables, and any edit open on them.
+  const asking = useRef<object>(undefined)
   useEffect(() => {
-    let current = true
-    api.riskLimits().then(
-      (tables) => {
-        if (!current) return
-        setTables(tables)
-        setError(undefined)
-      },
-      (e: unknown) => {
-        if (!current) return
-        if (e instanceof api.ApiError && (e.status === 403 || e.status === 404)) {
-          setTables(null)
-          setAnswer(undefined)
-        }
-        setError(message(e))
-      },
-    )
+    const read = () => {
+      if (document.hidden) return
+      const at = {}
+      asking.current = at
+      api.riskLimits().then(
+        (tables) => {
+          if (asking.current !== at) return
+          setTables(tables)
+          setError(undefined)
+        },
+        (e: unknown) => {
+          if (asking.current !== at) return
+          if (e instanceof api.ApiError && (e.status === 403 || e.status === 404)) {
+            setTables(null)
+            setAnswer(undefined)
+            setEditing((editing) => {
+              if (editing) refocus.current = true
+              return undefined
+            })
+          }
+          setError(message(e))
+        },
+      )
+    }
+    read()
+    document.addEventListener('visibilitychange', read)
     return () => {
-      current = false
+      document.removeEventListener('visibilitychange', read)
+      asking.current = undefined
     }
   }, [live.snapshots, reads])
 
@@ -118,22 +133,28 @@ export default function Limits({
 
   const admin = me.role === 'admin'
   const mayEdit = (table: string | null) => admin && (clients === null || (table !== null && clients.includes(table)))
-
-  // Starts from what the table has for `key`, unless that's a number JSON lost digits of.
-  const choose = (table: RiskTable, key: Key) => {
-    const value = table[key]
-    setKey(key)
-    setRemove(false)
-    setOn(value === true)
-    setText(typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value) ? '' : shown(key, table))
-  }
   const tableOf = (table: string | null): RiskTable => (table === null ? tables?.defaults : tables?.clients[table]) ?? {}
-  const edit = (table: string | null) => {
-    choose(tableOf(table), KEYS[0])
-    setEditing({ kind: 'set', table })
+
+  const choose = (key: Key) => {
+    setKey(key)
+    setText(undefined)
+    setOn(undefined)
+    setRemove(false)
+  }
+  const open = (editing: Editing) => {
+    choose(KEYS[0])
+    setEditing(editing)
+    reread()
   }
 
-  const value = editing?.kind === 'set' ? valueOf(key, text, on, remove) : undefined
+  // The fields as typed, else as the table has them, as last read; `self_trade` a client leaves
+  // out as the defaults have it.
+  const own = editing?.kind === 'set' ? tableOf(editing.table) : {}
+  const sets = own[key] !== undefined
+  const inherited = editing?.table != null && !sets && key === 'self_trade' ? (tables?.defaults.self_trade ?? false) : undefined
+  const typed = text ?? shown(key, own)
+  const ticked = on ?? own.self_trade ?? inherited ?? false
+  const value = editing?.kind === 'set' ? valueOf(key, typed, ticked, remove && sets) : undefined
 
   async function confirm(reason: string) {
     if (!editing) return
@@ -151,7 +172,7 @@ export default function Limits({
       said = value === null ? `Removed ${key} from ${name}.` : `Set ${key} in ${name}.`
       setAdding('')
     }
-    setAnswer({ name, edited })
+    setAnswer({ table: editing.table, edited })
     refocus.current = true
     reread()
     onDone(said)
@@ -170,7 +191,7 @@ export default function Limits({
             <tr>
               <th>Table</th>
               {KEYS.map((key) => (
-                <th key={key} className={key === 'symbols' || key === 'self_trade' ? undefined : 'num'}>
+                <th key={key} className={numeric(key)}>
                   {LABELS[key]}
                 </th>
               ))}
@@ -184,9 +205,9 @@ export default function Limits({
           <tbody>
             {rows.map(([table, limits]) => (
               <tr key={table ?? ''}>
-                <td>{table ?? 'Defaults'}</td>
+                <th scope="row">{table ?? 'Defaults'}</th>
                 {KEYS.map((key) => (
-                  <td key={key} className={key === 'symbols' || key === 'self_trade' ? undefined : 'num'}>
+                  <td key={key} className={numeric(key)}>
                     {/* A client's table leaving a key out has the default's. */}
                     {table !== null && limits[key] === undefined ? <span className="muted">default</span> : shown(key, limits)}
                   </td>
@@ -194,12 +215,12 @@ export default function Limits({
                 {admin && (
                   <td className="actions">
                     {mayEdit(table) && (
-                      <button type="button" onClick={() => edit(table)}>
+                      <button type="button" aria-label={`Edit ${nameOf(table)}`} onClick={() => open({ kind: 'set', table })}>
                         Edit…
                       </button>
                     )}
                     {table !== null && mayEdit(table) && (
-                      <button type="button" onClick={() => setEditing({ kind: 'delete', table })}>
+                      <button type="button" aria-label={`Delete ${table}'s limits`} onClick={() => open({ kind: 'delete', table })}>
                         Delete table…
                       </button>
                     )}
@@ -216,7 +237,7 @@ export default function Limits({
           className="filters"
           onSubmit={(e) => {
             e.preventDefault()
-            if (adding.trim() !== '') edit(adding.trim())
+            if (adding.trim() !== '') open({ kind: 'set', table: adding.trim() })
           }}
         >
           <label>
@@ -245,23 +266,25 @@ export default function Limits({
             <>
               <label>
                 Key
-                <select value={key} onChange={(e) => choose(tableOf(editing.table), e.target.value as Key)}>
+                <select value={key} onChange={(e) => choose(e.target.value as Key)}>
                   {KEYS.map((key) => (
                     <option key={key} value={key}>
-                      {key}
+                      {LABELS[key]}
                     </option>
                   ))}
                 </select>
               </label>
+              {/* Only a key the table sets can be removed. */}
               <label className="check">
-                <input type="checkbox" checked={remove} onChange={(e) => setRemove(e.target.checked)} />
+                <input type="checkbox" disabled={!sets} checked={remove && sets} onChange={(e) => setRemove(e.target.checked)} />
                 {editing.table === null ? 'Remove it: no check' : 'Remove it: the default applies'}
               </label>
-              {!remove &&
+              {!(remove && sets) &&
                 (key === 'self_trade' ? (
                   <label className="check">
-                    <input type="checkbox" checked={on} onChange={(e) => setOn(e.target.checked)} />
-                    Refuse self trades
+                    <input type="checkbox" checked={ticked} onChange={(e) => setOn(e.target.checked)} />
+                    Refuse self trades{' '}
+                    {inherited !== undefined && <span className="muted">(default: {inherited ? 'refused' : 'allowed'})</span>}
                   </label>
                 ) : (
                   <label>
@@ -270,7 +293,7 @@ export default function Limits({
                       autoComplete="off"
                       spellCheck={false}
                       inputMode={key === 'symbols' ? undefined : 'decimal'}
-                      value={text}
+                      value={typed}
                       onChange={(e) => setText(e.target.value)}
                     />
                   </label>
@@ -292,16 +315,17 @@ function Failed({ error }: { error?: string }) {
 }
 
 /** The table as the file now has it, and what the reload took, if the API said. */
-function Answered({ answer: { name, edited } }: { answer: Answer }) {
+function Answered({ answer: { table, edited } }: { answer: Answer }) {
+  const [subject, verb] = table === null ? ['The defaults', 'set'] : [table, 'sets']
   const keys = edited.table === null ? [] : KEYS.filter((key) => edited.table![key] !== undefined)
   return (
     <div className="answer">
       <p>
         {edited.table === null
-          ? `${name} has no table now.`
+          ? `${subject} has no table now.`
           : keys.length === 0
-            ? `${name} sets no keys now.`
-            : `${name} now: ${keys.map((key) => `${key} ${shown(key, edited.table!)}`).join('; ')}.`}
+            ? `${subject} ${verb} no keys now.`
+            : `${subject} now ${verb} ${keys.map((key) => `${key} ${shown(key, edited.table!)}`).join('; ')}.`}
       </p>
       {edited.reload && <Reloaded reload={edited.reload} />}
     </div>
@@ -311,7 +335,7 @@ function Answered({ answer: { name, edited } }: { answer: Answer }) {
 function Reloaded({ reload: { sessions, config, warnings } }: { reload: ReloadView }) {
   const changes = Object.entries(sessions)
     .filter(([, names]) => names.length > 0)
-    .map(([what, names]) => `${what.replace('_', ' ')} ${names.join(', ')}`)
+    .map(([what, names]) => `${what.replaceAll('_', ' ')} ${names.join(', ')}`)
   return (
     <>
       <p>

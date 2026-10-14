@@ -267,18 +267,15 @@ export type LiveMessage =
   | SessionChange
 
 /**
- * `config::Amount`: an amount as `jetbridge.toml` writes it, a number as TOML wrote one or a
- * decimal as a string. A number past 2^53 (an integer up to i64's) loses digits in `JSON.parse`.
+ * `config::RiskTable`: `[risk.defaults]` or `[risk.client.COMPID]` as written, only the keys it
+ * sets; an amount as a decimal string, however the file writes it.
  */
-export type Amount = number | string
-
-/** `config::RiskTable`: `[risk.defaults]` or `[risk.client.COMPID]` as written, only the keys it sets. */
 export interface RiskTable {
-  max_order_qty?: Amount
-  max_notional?: Amount
+  max_order_qty?: Decimal
+  max_notional?: Decimal
   symbols?: string[]
-  price_band?: Amount
-  credit?: Amount
+  price_band?: Decimal
+  credit?: Decimal
   self_trade?: boolean
 }
 

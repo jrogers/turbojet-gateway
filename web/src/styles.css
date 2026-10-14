@@ -419,7 +419,14 @@ button.danger {
   font-weight: 600;
 }
 
-/* Limits: a checkbox beside its text in the dialog, and an edit's answer. */
+/* Limits: each row named by its first cell, a checkbox beside its text in the dialog, and an
+   edit's answer. */
+
+tbody th[scope='row'] {
+  background: none;
+  color: inherit;
+  font-weight: inherit;
+}
 
 .dialog label.check {
   display: flex;

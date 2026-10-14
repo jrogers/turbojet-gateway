@@ -210,8 +210,8 @@ export default function Risk({ me }: { me: Me }) {
         )
       )}
 
-      <section className="limits">
-        <h2>Limits</h2>
+      <section className="limits" aria-labelledby="limits-title">
+        <h2 id="limits-title">Limits</h2>
         <RiskLimits
           me={me}
           clients={clients}
