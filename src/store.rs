@@ -17,6 +17,7 @@ use std::fmt::Display;
 use std::io;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use sqlx::any::{AnyPoolOptions, AnyRow};
@@ -33,6 +34,30 @@ use crate::book::{
 
 /// The schema this build reads and writes. A database of another is refused, not migrated.
 pub const SCHEMA_VERSION: i64 = 1;
+
+/// How long the store waits on the database for one statement, a write's begin or commit, a
+/// prune batch, or a connection from its pool, before giving up. A statement is a row or a
+/// bounded batch, so this is far past any healthy one; it's there for a connection lost
+/// without a reset, which would otherwise wait on the operating system's TCP timeouts.
+#[cfg(not(test))]
+pub(crate) const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Awaits `future`, failing with [`io::ErrorKind::TimedOut`] after [`DATABASE_TIMEOUT`].
+async fn timed<T>(doing: &'static str, future: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+    tokio::time::timeout(DATABASE_TIMEOUT, future).await.unwrap_or_else(|_| {
+        Err(io::Error::new(io::ErrorKind::TimedOut, format!("{doing}: no answer in {DATABASE_TIMEOUT:?}")))
+    })
+}
+
+/// Returns `connection` to its pool, or, if `result` timed out, drops it: sqlx pings a returned
+/// connection with no timeout, and one lost without a reset would hold its pool's place for good.
+fn release<T>(connection: PoolConnection<sqlx::Any>, result: &io::Result<T>) {
+    if matches!(result, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
+        drop(connection.detach());
+    }
+}
 
 /// The book's database: see the [module documentation](self).
 #[derive(Debug, Clone)]
@@ -132,6 +157,7 @@ impl Store {
         // `sqlite::memory:` database, which is its connection's, lives as long as the store.
         let pool = AnyPoolOptions::new()
             .max_connections(1)
+            .acquire_timeout(DATABASE_TIMEOUT)
             .idle_timeout(None)
             .max_lifetime(None)
             .after_connect(move |connection, _| {
@@ -164,28 +190,32 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// The database refuses a statement or the commit; nothing is written then.
+    /// The database refuses a statement or the commit; nothing is written then. A statement with
+    /// no answer in [`DATABASE_TIMEOUT`] fails the write, and its connection is dropped.
     pub async fn write(&self, changes: &[Changes]) -> io::Result<()> {
         #[cfg(test)]
         self.hooks.before_write().await?;
         self.on_writer("starting a write", async |connection| self.write_on(connection, changes).await).await
     }
 
-    /// [`write`](Self::write)'s transaction, on `connection`.
+    /// [`write`](Self::write)'s transaction, on `connection`, each statement under `timed`.
     async fn write_on(&self, connection: &mut AnyConnection, changes: &[Changes]) -> io::Result<()> {
-        let mut transaction = connection.begin().await.map_err(database("starting a write"))?;
+        let mut transaction =
+            timed("starting a write", async { connection.begin().await.map_err(database("starting a write")) }).await?;
         for changes in changes {
             write_changes(&mut transaction, changes).await?;
         }
         // Dropped uncommitted, the transaction rolls back.
         #[cfg(test)]
         self.hooks.before_commit().await?;
-        transaction.commit().await.map_err(database("committing a write"))
+        timed("committing a write", async { transaction.commit().await.map_err(database("committing a write")) }).await
     }
 
-    /// Runs `work` on the writer's connection, taking one from the pool if none is held. After an
-    /// error, one that doesn't answer a ping is dropped, so the next use takes a new one; one that
-    /// does is kept, as an in-memory database lives only as long as its connection.
+    /// Runs `work` on the writer's connection, taking one from the pool if none is held. One that
+    /// timed out is dropped, so the next use takes a new one, and so is one that, after another
+    /// error, doesn't answer a ping in [`DATABASE_TIMEOUT`]; one that does is kept, as an
+    /// in-memory database lives only as long as its connection. Dropped, not returned to the
+    /// pool: see [`release`].
     async fn on_writer<T>(
         &self,
         doing: &'static str,
@@ -197,8 +227,13 @@ impl Store {
         }
         let connection = held.as_mut().expect("taken above");
         let result = work(connection).await;
-        if result.is_err() && connection.ping().await.is_err() {
-            held.take();
+        let broken = match &result {
+            Ok(_) => false,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => true,
+            Err(_) => timed(doing, async { connection.ping().await.map_err(database(doing)) }).await.is_err(),
+        };
+        if broken && let Some(connection) = held.take() {
+            drop(connection.detach());
         }
         result
     }
@@ -211,7 +246,9 @@ impl Store {
     ) -> io::Result<T> {
         let Some(reads) = &self.reads else { return self.on_writer(doing, work).await };
         let mut connection = reads.acquire().await.map_err(database(doing))?;
-        work(&mut connection).await
+        let result = work(&mut connection).await;
+        release(connection, &result);
+        result
     }
 
     /// Begins a transaction on `connection` that reads one snapshot throughout: SQLite's always
@@ -662,8 +699,12 @@ async fn open_reads(url: &str, sqlite: bool, postgres: bool) -> io::Result<Optio
         return Ok(None);
     }
     let url = if sqlite { read_only(url) } else { url.to_string() };
+    // ponytail: its connections go back through sqlx's untimed ping (see `Store::writer`), so a
+    // loss during it holds one for about 15 minutes (TCP's timeout). History reads only, not
+    // trading; hold them as the writer's is if that matters.
     AnyPoolOptions::new()
         .max_connections(2)
+        .acquire_timeout(DATABASE_TIMEOUT)
         .after_connect(move |connection, _| {
             Box::pin(async move {
                 if sqlite {
@@ -1078,7 +1119,7 @@ async fn write_orphans(connection: &mut AnyConnection, orphans: &[CompactString]
 }
 
 async fn run(connection: &mut AnyConnection, query: Query<'_>, doing: &'static str) -> io::Result<()> {
-    query.execute(connection).await.map(drop).map_err(database(doing))
+    timed(doing, async { query.execute(connection).await.map(drop).map_err(database(doing)) }).await
 }
 
 async fn fetch(connection: &mut AnyConnection, sql: &str, table: &str) -> io::Result<Vec<AnyRow>> {

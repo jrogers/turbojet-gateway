@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+#[cfg(feature = "postgres")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::TimeZone;
 
@@ -47,6 +49,72 @@ async fn postgres() -> Option<String> {
 #[cfg(not(feature = "postgres"))]
 async fn postgres() -> Option<String> {
     None
+}
+
+/// A TCP relay to the test PostgreSQL that can go silent: after [`Relay::silence`], the
+/// connections it carries pass nothing more either way and stay open, as over a network that
+/// drops everything without a reset. Connections opened later pass as before.
+#[cfg(feature = "postgres")]
+struct Relay {
+    /// The URL given, through the relay.
+    url: String,
+    silent: Arc<std::sync::Mutex<Vec<Arc<AtomicBool>>>>,
+}
+
+#[cfg(feature = "postgres")]
+impl Relay {
+    /// A relay to the host and port of `url`, a `postgres://user:password@host:port/...` URL.
+    async fn new(url: &str) -> Self {
+        let (head, rest) = url.rsplit_once('@').expect("a URL with a user");
+        let (upstream, tail) = rest.split_once('/').expect("a URL with a database");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("{head}@{}/{tail}", listener.local_addr().unwrap());
+        let silent: Arc<std::sync::Mutex<Vec<Arc<AtomicBool>>>> = Arc::default();
+        let (upstream, connections) = (upstream.to_string(), silent.clone());
+        tokio::spawn(async move {
+            loop {
+                let (client, _) = listener.accept().await.unwrap();
+                let server = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                let flag = Arc::new(AtomicBool::new(false));
+                connections.lock().unwrap().push(flag.clone());
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                tokio::spawn(relay(client_read, server_write, flag.clone()));
+                tokio::spawn(relay(server_read, client_write, flag));
+            }
+        });
+        Self { url, silent }
+    }
+
+    /// Silences every connection open now.
+    fn silence(&self) {
+        for flag in self.silent.lock().unwrap().iter() {
+            flag.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Copies `from` to `to` until either ends, or, once `silent`, holds both open passing nothing.
+#[cfg(feature = "postgres")]
+async fn relay(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    silent: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buffer = vec![0; 8_192];
+    loop {
+        let Ok(read) = from.read(&mut buffer).await else { return };
+        if silent.load(Ordering::Acquire) {
+            // Held, not dropped: dropping would close the socket, which the other end would see.
+            let _held = (from, to);
+            std::future::pending::<()>().await;
+            return;
+        }
+        if read == 0 || to.write_all(&buffer[..read]).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// What a store of every change in `changes` holds, its next OrderId at least 1 as the store's
@@ -422,6 +490,34 @@ async fn a_write_failing_inside_its_transaction_leaves_nothing() {
     assert_eq!(store.load().await.unwrap(), applied(&[]));
     store.write(std::slice::from_ref(&changes)).await.unwrap();
     assert_eq!(store.load().await.unwrap(), applied(&[changes]));
+}
+
+/// An idle connection that went silent fails the next write within the store's timeout, and the
+/// one after commits on a new connection.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_connection_silent_while_idle_fails_one_write_at_most() {
+    let Some(url) = postgres().await else { return };
+    let relay = Relay::new(&url).await;
+    let store = Store::open(&relay.url).await.unwrap();
+    let first = Changes { orders: vec![order_row(1)], ..Changes::default() };
+    store.write(std::slice::from_ref(&first)).await.unwrap();
+    relay.silence();
+    let limit = DATABASE_TIMEOUT * 3;
+    let second = Changes { orders: vec![order_row(2)], ..Changes::default() };
+    let mut committed = false;
+    for _ in 0..2 {
+        match tokio::time::timeout(limit, store.write(std::slice::from_ref(&second))).await {
+            Ok(Ok(())) => {
+                committed = true;
+                break;
+            }
+            Ok(Err(_)) => {}
+            Err(_) => panic!("held by the silent connection"),
+        }
+    }
+    assert!(committed, "a write on a new connection commits");
+    assert_eq!(store.load().await.unwrap(), applied(&[first, second]));
 }
 
 /// An empty store's next OrderId is 1.
