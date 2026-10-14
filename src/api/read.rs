@@ -416,9 +416,9 @@ pub(super) async fn risk(axum::extract::State(state): AxumState, caller: Caller)
 }
 
 /// `GET /api/risk/limits`: the limits in force as the configuration writes them, `{defaults,
-/// clients: {COMPID: ...}}`, each table with only the keys it sets, amounts as decimal strings. A client's keys replace the
-/// defaults'; `GET /api/risk` shows the limits merged. A scoped caller's clients' only, and the
-/// defaults.
+/// clients: {COMPID: ...}}`, each table with only the keys it sets, amounts as decimal strings. A
+/// client's keys replace the defaults'; `GET /api/risk` shows the limits merged. A scoped caller's
+/// clients' only, and the defaults.
 pub(super) async fn risk_limits(
     axum::extract::State(state): AxumState,
     caller: Caller,

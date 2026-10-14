@@ -863,8 +863,8 @@ mod tests {
 
     /// Every endpoint as each role calls it: no one (401), a viewer (403), an operator, an
     /// operator scoped to FUNDB (403: FUNDA's session, order and CompID, and the venue), an
-    /// admin, and an admin scoped to FUNDB (FUNDB's limits alone); sequence numbers, a reload and
-    /// the audit log are an unscoped admin's only. The reads with a role or scope rule are here
+    /// admin, and an admin scoped to FUNDB (FUNDB's limits, and its own client sessions' sequence
+    /// numbers, not a venue's); a reload and the audit log are an unscoped admin's only. The reads with a role or scope rule are here
     /// too: the audit log, and a route test of FUNDA's. An allowed call answers success, or on a
     /// row marked so, 409 (a second resend while the first is under way). Pausing FUNDA comes
     /// last, as it logs FUNDA out.
