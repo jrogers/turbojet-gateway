@@ -60,13 +60,11 @@ function valueOf(key: Key, text: string, on: boolean, remove: boolean): LimitsSe
  */
 export default function Limits({
   me,
-  clients,
   heading,
   onDone,
 }: {
+  /** Its clients as the last snapshot said, as the shell merges them. */
   me: Me
-  /** As the last snapshot said; `null`, every client. */
-  clients: string[] | null
   /** Focused after an edit. */
   heading: RefObject<HTMLHeadingElement | null>
   /** Says how an edit went, and reads the risk again. */
@@ -132,6 +130,7 @@ export default function Limits({
   }, [editing, heading])
 
   const admin = me.role === 'admin'
+  const { clients } = me
   const mayEdit = (table: string | null) => admin && (clients === null || (table !== null && clients.includes(table)))
   const tableOf = (table: string | null): RiskTable => (table === null ? tables?.defaults : tables?.clients[table]) ?? {}
 

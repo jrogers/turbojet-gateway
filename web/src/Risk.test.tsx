@@ -241,8 +241,8 @@ test("the CompIDs offered are the live sessions' too, and the snapshot's clients
   expect(offered()).toEqual(['all', 'comp:DESK1', 'comp:DESK2', ...sessions.map((s) => `session:${s.id}`)])
   cleanup()
 
-  // Logged in unscoped, rescoped since by a reload: the snapshot says so.
-  render(page(who('operator'), snapshot(['all'], ['DESK2'], sessions.slice(2))))
+  // Scoped, as the shell merges a snapshot's clients into `me`.
+  render(page(who('operator', ['DESK2']), snapshot(['all'], ['DESK2'], sessions.slice(2))))
   await act(async () => {})
   expect(offered()).toEqual(['comp:DESK2', `session:${sessions[2].id}`])
   expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['Block', 'Cancel all orders…'])

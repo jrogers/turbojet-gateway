@@ -101,9 +101,9 @@ export default function Risk({ me }: { me: Me }) {
     reread()
   }
 
-  // The scopes the form offers; the API refuses a scoped user any other. The clients as the last
-  // snapshot said, as a reload may have changed them since login.
-  const clients = live.clients === undefined ? me.clients : live.clients
+  // The scopes the form offers; the API refuses a scoped user any other. `me`'s clients are the
+  // last snapshot's, as the shell merges them.
+  const clients = me.clients
   const sessions = [
     ...new Set([...live.sessions.filter((s) => s.side === 'client').map((s) => s.id), ...(risk?.sessions ?? []).map((s) => s.client)]),
   ]
@@ -211,7 +211,6 @@ export default function Risk({ me }: { me: Me }) {
         <h2 id="limits-title">Limits</h2>
         <RiskLimits
           me={me}
-          clients={clients}
           heading={heading}
           onDone={(text) => {
             setDone(text)

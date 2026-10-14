@@ -98,7 +98,7 @@ test('shows the tables as written, and the keys a client leaves to the defaults'
   expect(buttons()).toEqual([])
 })
 
-test('the buttons show by role and scope, the scope as the snapshot says', async () => {
+test('the buttons show by role and scope', async () => {
   serve()
   const { unmount } = render(page(who('operator')))
   await within(section()).findByText('FUNDA')
@@ -112,8 +112,7 @@ test('the buttons show by role and scope, the scope as the snapshot says', async
 
 test('a scoped admin may edit only its own tables, and add one', async () => {
   serve()
-  // Logged in with FUNDA, rescoped since to FUNDB.
-  render(page(who('admin', ['FUNDA']), snapshot(['FUNDB'])))
+  render(page(who('admin', ['FUNDB'])))
   await within(section()).findByText('FUNDA')
   expect(buttons()).toEqual(['Edit FUNDB', "Delete FUNDB's limits", 'Add…'])
 })
