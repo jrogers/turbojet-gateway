@@ -44,6 +44,9 @@ const REFUSED_SYMBOL: &str = "MSFT";
 const REFUSED_TEXT: &str = "MSFT is not traded here";
 /// How long any one event may take.
 const WAIT: Duration = Duration::from_secs(2);
+/// How long a start may take to log on: under load a start, a database open especially, takes
+/// longer than an exchange.
+const STARTUP_WAIT: Duration = Duration::from_secs(10);
 /// The client's cancel-on-disconnect grace, where a test waits it out.
 const GRACE: Duration = Duration::from_millis(200);
 /// A grace no test waits out: it must not end on a loaded host before the test is done.
@@ -95,11 +98,19 @@ struct Events(UnboundedReceiver<Event>);
 
 impl Events {
     async fn next(&mut self) -> Event {
-        timeout(WAIT, self.0.recv()).await.expect("timed out").expect("closed")
+        self.next_within(WAIT).await
+    }
+
+    async fn next_within(&mut self, wait: Duration) -> Event {
+        timeout(wait, self.0.recv()).await.expect("timed out").expect("closed")
     }
 
     async fn logged_on(&mut self) {
-        let event = self.next().await;
+        self.logged_on_within(WAIT).await;
+    }
+
+    async fn logged_on_within(&mut self, wait: Duration) {
+        let event = self.next_within(wait).await;
         assert!(matches!(event, Event::LoggedOn), "expected a logon, got {event:?}");
     }
 
@@ -317,10 +328,10 @@ impl Setup {
         let acceptor = Acceptor::new(config, Arc::new(MemoryStorage::new()), app).unwrap();
         let serving = tokio::spawn(acceptor.clone().serve(listener));
         let (service, _serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
-        venue_events.logged_on().await;
+        venue_events.logged_on_within(STARTUP_WAIT).await;
         let (client, mut events) = client(&service, options.client_version, None);
         let running = tokio::spawn(client.clone().run());
-        events.logged_on().await;
+        events.logged_on_within(STARTUP_WAIT).await;
         let venue = Venue { acceptor, serving, events: venue_events };
         let prefix = service.gateway().id_prefix().to_string();
         Self { service, venue, relay, client, running, events, dir, prefix }
