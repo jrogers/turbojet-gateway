@@ -25,13 +25,18 @@ const HEADERS: [(HeaderName, &str); 4] = [
 ];
 
 /// Answers `GET` or `HEAD` of `path`: its file, or `index.html` for a path the console's own
-/// routing handles. Files under `/assets/` have hashed names, so may be kept for ever.
+/// routing handles. Files under `/assets/` have hashed names, so may be kept for ever; one that
+/// isn't there is a 404, not the page, so a stale page's script fails plainly.
 pub(super) fn serve(method: &Method, path: &str) -> Response {
     if method != Method::GET && method != Method::HEAD {
-        return ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
+        let error = ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        return ([(header::ALLOW, "GET, HEAD")], error).into_response();
     }
     let (path, bytes) = match find(path) {
         Some(bytes) => (path, bytes),
+        None if path.starts_with("/assets/") => {
+            return ApiError::new(StatusCode::NOT_FOUND, format!("no such path: {path}")).into_response();
+        }
         None => ("/index.html", find("/index.html").expect("build.rs checks web/dist has index.html")),
     };
     let cache = if path.starts_with("/assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
@@ -107,25 +112,29 @@ mod tests {
         assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
     }
 
-    /// The console's own routes, and files it doesn't have, are its `index.html`.
+    /// The console's own routes are its `index.html`; a file under `/assets/` it doesn't have is a
+    /// 404.
     #[tokio::test]
     async fn other_paths_are_index_html() {
-        for path in ["/blotter/x", "/assets/gone.js"] {
-            let (status, headers, body) = send("GET", path).await;
-            assert_eq!(status, StatusCode::OK, "{path}");
-            assert_eq!(body, index(), "{path}");
-            assert_eq!(headers[header::CACHE_CONTROL], "no-cache", "{path}");
-        }
+        let (status, headers, body) = send("GET", "/blotter/x").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, index());
+        assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+        let (status, headers, body) = send("GET", "/assets/gone.js").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(body, br#"{"error":"no such path: /assets/gone.js"}"#);
     }
 
-    /// `/api` stays the API's, unknown paths and the authentication it needs included.
+    /// `/api` stays the API's, unknown paths and the authentication it needs included, and `//`
+    /// paths aren't the console's.
     #[tokio::test]
     async fn the_api_comes_first() {
         let (status, headers, body) = send("GET", "/api/me").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(headers[header::CONTENT_TYPE], "application/json");
         assert!(body.starts_with(br#"{"error":"#));
-        for path in ["/api/nope", "/api"] {
+        for path in ["/api/nope", "/api", "//api/me"] {
             let (status, headers, body) = send("GET", path).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
             assert_eq!(headers[header::CONTENT_TYPE], "application/json", "{path}");
@@ -135,12 +144,25 @@ mod tests {
 
     #[tokio::test]
     async fn only_get_and_head_are_served() {
+        let (_, get_headers, _) = send("GET", "/").await;
         let (status, headers, body) = send("HEAD", "/").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(headers[header::CONTENT_TYPE], "text/html; charset=utf-8");
-        assert_ne!(body, index());
-        let (status, _, body) = send("POST", "/").await;
+        assert!(body.is_empty());
+        for name in [header::CONTENT_TYPE, header::CONTENT_SECURITY_POLICY, header::CACHE_CONTROL] {
+            assert_eq!(headers[&name], get_headers[&name], "{name}");
+        }
+        let (status, headers, body) = send("POST", "/").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_ne!(body, index());
+        assert_eq!(headers[header::ALLOW], "GET, HEAD");
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(body, br#"{"error":"method not allowed"}"#);
+    }
+
+    /// A file the build adds of a type [`content_type`] doesn't know would be served as bytes.
+    #[test]
+    fn every_asset_has_a_known_type() {
+        for (path, _) in ASSETS {
+            assert_ne!(content_type(path), "application/octet-stream", "{path}");
+        }
     }
 }

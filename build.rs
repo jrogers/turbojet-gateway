@@ -12,7 +12,7 @@ fn main() {
         return;
     }
     println!("cargo:rerun-if-changed=web/dist");
-    let dist = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("web/dist");
+    let dist = Path::new(&env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR")).join("web/dist");
     assert!(
         dist.join("index.html").is_file(),
         "the console feature needs web/dist: run `npm ci && npm run build` in web/ first"
@@ -22,22 +22,26 @@ fn main() {
     files.sort();
     let mut table = String::from("static ASSETS: &[(&str, &[u8])] = &[\n");
     for file in &files {
-        let path = file.strip_prefix(&dist).unwrap().components().fold(String::new(), |mut path, part| {
-            path.push('/');
-            path.push_str(part.as_os_str().to_str().expect("web/dist's file names are UTF-8"));
-            path
-        });
+        let path = file.strip_prefix(&dist).expect("walk finds files under web/dist").components().fold(
+            String::new(),
+            |mut path, part| {
+                path.push('/');
+                path.push_str(part.as_os_str().to_str().expect("web/dist's file names are UTF-8"));
+                path
+            },
+        );
         let file = file.to_str().expect("web/dist's path is UTF-8");
-        writeln!(table, "    ({path:?}, include_bytes!({file:?})),").unwrap();
+        writeln!(table, "    ({path:?}, include_bytes!({file:?})),").expect("writing to a String succeeds");
     }
     table.push_str("];\n");
-    fs::write(Path::new(&env::var("OUT_DIR").unwrap()).join("console_assets.rs"), table).unwrap();
+    let out = env::var("OUT_DIR").expect("cargo sets OUT_DIR");
+    fs::write(Path::new(&out).join("console_assets.rs"), table).expect("OUT_DIR is writable");
 }
 
 /// Adds the files under `dir` to `files`, recursively.
 fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
+    for entry in fs::read_dir(dir).expect("web/dist is readable") {
+        let path = entry.expect("web/dist is readable").path();
         if path.is_dir() {
             walk(&path, files);
         } else {

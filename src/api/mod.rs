@@ -153,11 +153,12 @@ fn router(state: State) -> axum::Router {
 }
 
 /// A path no route has: the web console's outside `/api` (with the `console` feature), else a 404.
-/// Every `/api` path stays the API's, so a mistyped one is never the console's page.
+/// Every `/api` path stays the API's, so a mistyped one is never the console's page; nor is one
+/// starting `//`, as `//api/...` would otherwise be.
 async fn fallback(request: axum::extract::Request) -> Response {
     let path = request.uri().path();
     #[cfg(feature = "console")]
-    if path != "/api" && !path.starts_with("/api/") {
+    if path != "/api" && !path.starts_with("/api/") && !path.starts_with("//") {
         return console::serve(request.method(), path);
     }
     ApiError::new(StatusCode::NOT_FOUND, format!("no such path: {path}")).into_response()
