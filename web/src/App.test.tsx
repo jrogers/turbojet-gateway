@@ -99,6 +99,7 @@ test('routes switch with the hash, orders by default', async () => {
     'GET /api/me': () => json(alice),
     'GET /api/sessions': () => json([]),
     'GET /api/risk': () => json({ error: 'not now' }, 503),
+    'GET /api/risk/limits': () => json({ defaults: {}, clients: {} }),
     'GET /api/orders/A%2F1': () => json({ error: 'no order A/1' }, 404),
     'GET /api/orders/A%2F1/messages': () => json({ error: 'no order A/1' }, 404),
   })

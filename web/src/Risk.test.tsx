@@ -37,11 +37,15 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 // Fetches no route answers: `request()` would hide the throw as unreachable.
 let stray: string[] = []
 
-/** Answers fetches by `METHOD path` from `routes`, recording them; any other fails the test. */
+/**
+ * Answers fetches by `METHOD path` from `routes`, recording them; any other fails the test. The
+ * limits section's read, unless `routes` has it, gets no tables and isn't recorded.
+ */
 function serve(routes: Record<string, () => Response>) {
   const calls: { key: string; init: RequestInit }[] = []
   vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
     const key = `${init.method} ${url}`
+    if (key === 'GET /api/risk/limits' && !(key in routes)) return json({ defaults: {}, clients: {} })
     calls.push({ key, init })
     const answer = routes[key]
     if (answer === undefined) {
@@ -84,7 +88,7 @@ test('a 404 clears what was shown, says why, and stops the reads until a snapsho
     answer = () => json({ error: 'not found' }, 404)
     await act(() => vi.advanceTimersByTimeAsync(RISK_EVERY))
     expect(screen.getByRole('alert').textContent).toBe('not found')
-    expect(screen.queryAllByRole('table')).toEqual([])
+    expect(screen.queryByRole('heading', { name: 'Exposure' })).toBeNull()
     await act(() => vi.advanceTimersByTimeAsync(RISK_EVERY * 3))
     document.dispatchEvent(new Event('visibilitychange'))
     expect(calls).toHaveLength(2)
@@ -110,7 +114,7 @@ test('a 403 clears what was shown, and says why', async () => {
   rerender(page(who('viewer'), reduce(snapshot(), { ...snapshotMessage(), clients: ['FUNDA'] })))
   expect((await screen.findByRole('alert')).textContent).toBe('u may see only clients FUNDA')
   expect(screen.queryByText(FUNDA)).toBeNull()
-  expect(screen.queryAllByRole('table')).toEqual([])
+  expect(screen.queryByRole('heading', { name: 'Exposure' })).toBeNull()
 })
 
 const snapshotMessage = (): Extract<LiveMessage, { type: 'snapshot' }> => ({
@@ -156,7 +160,9 @@ test('reads on showing, every few seconds while seen and on being seen again, an
 
 test('a read answering after a newer one was asked is dropped', async () => {
   const answers: ((r: Response) => void)[] = []
-  vi.stubGlobal('fetch', () => new Promise<Response>((resolve) => answers.push(resolve)))
+  vi.stubGlobal('fetch', (url: string) =>
+    url === '/api/risk/limits' ? Promise.resolve(json({ defaults: {}, clients: {} })) : new Promise<Response>((resolve) => answers.push(resolve)),
+  )
   const { rerender } = render(page(who('viewer'), snapshot()))
   rerender(page(who('viewer'), reduce(snapshot(), snapshotMessage())))
   expect(answers).toHaveLength(2)
@@ -186,7 +192,12 @@ test('the blocks follow the store', async () => {
 
 test('the actions show by role, and a scoped user is offered only its CompIDs', async () => {
   serve({ 'GET /api/risk': () => json(fixture) })
-  const buttons = () => screen.queryAllByRole('button').map((b) => b.textContent)
+  // The limits' own are Limits.test.tsx's.
+  const buttons = () =>
+    screen
+      .queryAllByRole('button')
+      .filter((b) => !b.closest('.limits'))
+      .map((b) => b.textContent)
   const offered = () => [...document.querySelectorAll('datalist option')].map((o) => (o as HTMLOptionElement).value)
 
   render(page(who('viewer'), snapshot(['all'])))

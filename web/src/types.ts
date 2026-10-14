@@ -265,3 +265,62 @@ export type LiveMessage =
   | { type: 'unblocked'; scope: string }
   | ({ type: 'alarm' } & Alarm)
   | SessionChange
+
+/**
+ * `config::Amount`: an amount as `jetbridge.toml` writes it, a number as TOML wrote one or a
+ * decimal as a string. A number past 2^53 (an integer up to i64's) loses digits in `JSON.parse`.
+ */
+export type Amount = number | string
+
+/** `config::RiskTable`: `[risk.defaults]` or `[risk.client.COMPID]` as written, only the keys it sets. */
+export interface RiskTable {
+  max_order_qty?: Amount
+  max_notional?: Amount
+  symbols?: string[]
+  price_band?: Amount
+  credit?: Amount
+  self_trade?: boolean
+}
+
+/** `config::RiskTables`: `GET /api/risk/limits`. A scoped user's clients' tables only. */
+export interface RiskTables {
+  defaults: RiskTable
+  clients: Record<string, RiskTable>
+}
+
+/** `api::write::SessionChanges`: counterparties by CompID, initiators by section name. */
+export interface SessionChanges {
+  added: string[]
+  changed: string[]
+  removed: string[]
+  logged_out: string[]
+  started: string[]
+  reconfigured: string[]
+  stopped: string[]
+}
+
+/** `service::ConfigSummary`: the routes, limits and `day_end` a reload took. */
+export interface ConfigSummary {
+  routes: number
+  /** CompIDs with limits of their own. */
+  clients: number
+  day_end: string
+}
+
+/** `api::write::ReloadView`: what a reload took. */
+export interface ReloadView {
+  sessions: SessionChanges
+  config: ConfigSummary
+  warnings: string[]
+}
+
+/** `api::write::EditedView`: what a limit edit answers. */
+export interface EditedView {
+  /** The table as the file now has it; `null` once deleted. */
+  table: RiskTable | null
+  /** `null` for an admin with clients: it could name other clients. */
+  reload: ReloadView | null
+}
+
+/** A limit edit's `set`: each key's new value, `null` to remove it. */
+export type LimitsSet = { [K in keyof RiskTable]?: RiskTable[K] | null }

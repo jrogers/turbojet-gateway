@@ -1,4 +1,16 @@
-import type { Changed, Me, Numbers, OrderDetail, OrdersPage, Page, RiskView, SessionView } from './types.ts'
+import type {
+  Changed,
+  EditedView,
+  LimitsSet,
+  Me,
+  Numbers,
+  OrderDetail,
+  OrdersPage,
+  Page,
+  RiskTables,
+  RiskView,
+  SessionView,
+} from './types.ts'
 
 /**
  * A refusal or failure: the status, and the API's `{"error": ...}` (`api::ApiError`), or the
@@ -110,6 +122,8 @@ export async function logout() {
 
 export const sessions = () => request<SessionView[]>('GET', '/api/sessions')
 export const risk = () => request<RiskView>('GET', '/api/risk')
+/** The limits as `jetbridge.toml` writes them: edit from these, not `RiskView`'s, which are merged. */
+export const riskLimits = () => request<RiskTables>('GET', '/api/risk/limits')
 
 /**
  * `GET /api/orders` with the filters given: `client`, `venue`, `symbol`, `status`, `working`,
@@ -137,3 +151,12 @@ export const block = (scope: string, reason: string) => request<Changed>('POST',
 export const unblock = (scope: string, reason: string) => request<Changed>('POST', '/api/risk/unblock', { reason, scope })
 /** The kill switch: blocks `scope` and cancels its orders; 204. */
 export const cancelAll = (scope: string, reason: string) => request<void>('POST', '/api/risk/cancel-all', { reason, scope })
+// The limit edits [admin]: each writes `jetbridge.toml` and reloads. An amount goes as a decimal
+// string, which keeps every digit.
+export const setDefaultLimits = (reason: string, set: LimitsSet) =>
+  request<EditedView>('PATCH', '/api/risk/limits/defaults', { reason, set })
+/** Creates the CompID's table if it has none. */
+export const setClientLimits = (compId: string, reason: string, set: LimitsSet) =>
+  request<EditedView>('PATCH', `/api/risk/limits/client/${segment(compId)}`, { reason, set })
+export const deleteClientLimits = (compId: string, reason: string) =>
+  request<EditedView>('DELETE', `/api/risk/limits/client/${segment(compId)}`, { reason })

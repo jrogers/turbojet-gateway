@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import * as api from './api.ts'
+import RiskLimits from './Limits.tsx'
 import { namesTarget } from './Orders.tsx'
 import Reason from './Reason.tsx'
 import { useLive } from './store.ts'
@@ -19,7 +20,7 @@ const targetCompId = (session: string) => session.slice(session.indexOf('->') + 
  * Risk: each session's open and filled notional beside its limits, the reference prices, and the
  * blocks, live from the store. An operator or admin may block a scope, lift a block, or pull the
  * kill switch (block and cancel all), each with a reason; a scoped one only its clients', as the
- * API allows.
+ * API allows. Below, the limits as written, which an admin edits (`Limits.tsx`).
  */
 export default function Risk({ me }: { me: Me }) {
   const live = useLive()
@@ -208,6 +209,19 @@ export default function Risk({ me }: { me: Me }) {
           </>
         )
       )}
+
+      <section className="limits">
+        <h2>Limits</h2>
+        <RiskLimits
+          me={me}
+          clients={clients}
+          heading={heading}
+          onDone={(text) => {
+            setDone(text)
+            reread()
+          }}
+        />
+      </section>
 
       {action && (
         <Reason
