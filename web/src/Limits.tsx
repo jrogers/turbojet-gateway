@@ -155,7 +155,10 @@ export default function Limits({
   const inherited = editing?.table != null && !sets && key === 'self_trade' ? (tables?.defaults.self_trade ?? false) : undefined
   const typed = text ?? shown(key, own)
   const ticked = on ?? own.self_trade ?? inherited ?? false
-  const value = editing?.kind === 'set' ? valueOf(key, typed, ticked, remove && sets) : undefined
+  // A `self_trade` the table doesn't set sends nothing until clicked: confirming the box as shown
+  // would pin the default's value as the client's own.
+  const untouched = key === 'self_trade' && !sets && on === undefined
+  const value = editing?.kind === 'set' && !untouched ? valueOf(key, typed, ticked, remove && sets) : undefined
 
   async function confirm(reason: string) {
     if (!editing) return

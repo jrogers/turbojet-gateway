@@ -184,7 +184,11 @@ test('symbols go as a list, self_trade as a boolean, and a new client by Add', a
   const refuse = within(dialog).getByLabelText(/^Refuse self trades/) as HTMLInputElement
   expect(refuse.checked).toBe(true)
   expect(refuse.closest('label')!.textContent).toBe('Refuse self trades (default: refused)')
+  // Inherited: nothing to send until the box is clicked, or the default would be pinned.
+  const confirm = within(dialog).getByRole('button', { name: 'Confirm' }) as HTMLButtonElement
+  expect(confirm.disabled).toBe(true)
   fireEvent.click(refuse)
+  expect(confirm.disabled).toBe(false)
   await act(async () => fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' })))
   expect(edits(calls)).toEqual([
     ['PATCH /api/risk/limits/defaults', '{"reason":"r","set":{"symbols":["AAPL","MSFT","IBM"]}}'],
