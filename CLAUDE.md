@@ -6,5 +6,8 @@ Jetbridge is a FIX connectivity gateway built on the Turbojet engine (`../turboj
 - Plans and working notes go in `docs/plans/` (gitignored).
 - Feature branches are git worktrees under `.worktrees/` (gitignored).
 - Commits are small and each says why.
-- Before committing: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`.
+- `--all-features` includes `console`, which embeds `web/dist`: run `(cd web && npm ci && npm run
+  build)` first.
+- Before committing: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`, and
+  in `web/`, `npm run lint && npm test -- --run`.
 - Engine bugs found here are fixed in the Turbojet repo, in their own commits.
