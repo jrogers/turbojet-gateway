@@ -305,16 +305,25 @@ const Row = memo(function Row({ order }: { order: OrderView }) {
       <td className="num">{order.cum_qty}</td>
       <td className="num">{order.avg_px}</td>
       <td>
-        {order.status.replaceAll('_', ' ')}
-        {order.pending_cancel && <span className="badge">cancel pending</span>}
-        {order.pending_replace && <span className="badge">replace pending</span>}
-        {order.gateway_cancel && (
-          <span className={order.gateway_cancel.state === 'stuck' ? 'badge warn' : 'badge'}>
-            gateway cancel {order.gateway_cancel.state.replace('_', ' ')}
-          </span>
-        )}
-        {order.unknown_at_venue && <span className="badge error">unknown at venue</span>}
+        <StatusText order={order} />
       </td>
     </tr>
   )
 })
+
+/** An order's status, and its flags as badges after it: the blotter's and the order page's. */
+export function StatusText({ order }: { order: OrderView }) {
+  return (
+    <>
+      {order.status.replaceAll('_', ' ')}
+      {order.pending_cancel && <span className="badge">cancel pending</span>}
+      {order.pending_replace && <span className="badge">replace pending</span>}
+      {order.gateway_cancel && (
+        <span className={order.gateway_cancel.state === 'stuck' ? 'badge warn' : 'badge'}>
+          gateway cancel {order.gateway_cancel.state.replace('_', ' ')}
+        </span>
+      )}
+      {order.unknown_at_venue && <span className="badge error">unknown at venue</span>}
+    </>
+  )
+}

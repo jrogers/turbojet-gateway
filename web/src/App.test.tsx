@@ -95,7 +95,12 @@ test('the shell shows the role and clients, or all clients, and logs out', async
 })
 
 test('routes switch with the hash, orders by default', async () => {
-  serve({ 'GET /api/me': () => json(alice), 'GET /api/sessions': () => json([]) })
+  serve({
+    'GET /api/me': () => json(alice),
+    'GET /api/sessions': () => json([]),
+    'GET /api/orders/A%2F1': () => json({ error: 'no order A/1' }, 404),
+    'GET /api/orders/A%2F1/messages': () => json({ error: 'no order A/1' }, 404),
+  })
   render(<App />)
   expect((await screen.findByRole('heading')).textContent).toBe('Orders')
 
@@ -108,7 +113,8 @@ test('routes switch with the hash, orders by default', async () => {
   expect(screen.getByRole('heading').textContent).toBe('Sessions')
   expect(screen.getByRole('link', { name: 'Sessions' }).getAttribute('aria-current')).toBe('page')
   go('#/orders/A%2F1')
-  expect(screen.getByRole('heading').textContent).toBe('Order A/1')
+  expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Order A/1')
+  expect(await screen.findByText('No such order.')).toBeTruthy()
   go('#/nowhere')
   expect(screen.getByRole('heading').textContent).toBe('Orders')
 })

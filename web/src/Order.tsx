@@ -1,0 +1,309 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import * as api from './api.ts'
+import { StatusText } from './Orders.tsx'
+import Reason from './Reason.tsx'
+import { done, useLive } from './store.ts'
+import type { Hit, Me, OrderDetail } from './types.ts'
+
+type Action = 'cancel' | 'status' | 'resolve'
+
+const ACTIONS: Record<Action, { title: string; post: (orderId: string, reason: string) => Promise<void>; done: string }> = {
+  cancel: { title: 'Cancel order', post: api.cancelOrder, done: 'Cancel sent to the venue.' },
+  status: { title: 'Ask the venue for status', post: api.requestStatus, done: 'Status asked of the venue; its answer comes as the order’s reports.' },
+  resolve: { title: 'Resolve order', post: api.resolve, done: 'Resolved: the order is canceled.' },
+}
+
+/** A time to the second, UTC. */
+const when = (time: string) => time.slice(0, 19).replace('T', ' ')
+
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+/**
+ * An order's page: its fields, kept live by the store's events for it, its requests to the venue
+ * as last read, and its messages on both sides from the message log. An operator or admin may
+ * cancel it, ask its venue for status, or resolve it once its venue has said it doesn't know it.
+ * Mounted per order (keyed by the route), so nothing carries over from another.
+ */
+export default function Order({ orderId, me }: { orderId: string; me: Me }) {
+  const live = useLive()
+  // `undefined` until read; `null` for a 404.
+  const [detail, setDetail] = useState<OrderDetail | null>()
+  const [error, setError] = useState<string>()
+  // One more reads the order again: after an action, which changes it.
+  const [reads, setReads] = useState(0)
+  const [action, setAction] = useState<Action>()
+  const [notice, setNotice] = useState<string>()
+
+  // The store's version: the latest event for it, working or done.
+  const latest = useMemo(() => {
+    for (const order of [...live.orders.values(), ...live.finished.values()]) {
+      if (order.order_id === orderId) return order
+    }
+  }, [live.orders, live.finished, orderId])
+
+  // Read again on each snapshot: events may have been missed. A read answering after a newer one
+  // was asked is dropped.
+  const asking = useRef<object>(undefined)
+  useEffect(() => {
+    const at = {}
+    asking.current = at
+    api.order(orderId).then(
+      (order) => {
+        if (asking.current !== at) return
+        setDetail(order)
+        setError(undefined)
+      },
+      (e: unknown) => {
+        if (asking.current !== at) return
+        if (e instanceof api.ApiError && e.status === 404) setDetail(null)
+        else setError(message(e))
+      },
+    )
+  }, [orderId, live.snapshots, reads])
+
+  // An event for it changes its fields; the requests stay as last read, which events don't carry.
+  // ponytail: an event that came before a read's answer but after the server wrote it is
+  // overwritten by that answer until the next event or snapshot; a version on OrderView would
+  // tell them apart.
+  useEffect(() => {
+    if (latest) setDetail((detail) => detail && { ...detail, ...latest })
+  }, [latest])
+
+  async function confirm(reason: string) {
+    if (!action) return
+    await ACTIONS[action].post(orderId, reason)
+    setNotice(ACTIONS[action].done)
+    setReads((reads) => reads + 1)
+  }
+
+  if (detail === null) {
+    return (
+      <>
+        <h1>Order {orderId}</h1>
+        <p className="error" role="alert">
+          No such order.
+        </p>
+        <p>
+          <a href="#/orders">Back to the blotter</a>
+        </p>
+      </>
+    )
+  }
+
+  const acts = me.role !== 'viewer' && detail !== undefined && !done(detail.status)
+  const choose = (kind: Action) => {
+    setNotice(undefined)
+    setAction(kind)
+  }
+
+  return (
+    <>
+      <p>
+        <a href="#/orders">Orders</a>
+      </p>
+      <h1>Order {orderId}</h1>
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+      {notice && <p role="status">{notice}</p>}
+      {detail === undefined ? (
+        !error && <p className="muted">Loading…</p>
+      ) : (
+        <>
+          {acts && (
+            <p className="actions">
+              <button type="button" onClick={() => choose('cancel')}>
+                Cancel
+              </button>
+              <button type="button" onClick={() => choose('status')}>
+                Ask status
+              </button>
+              {detail.unknown_at_venue && (
+                <button type="button" onClick={() => choose('resolve')}>
+                  Resolve
+                </button>
+              )}
+            </p>
+          )}
+          <Fields order={detail} />
+          <h2>Requests to the venue</h2>
+          <Requests order={detail} />
+        </>
+      )}
+      <h2>Messages</h2>
+      <Messages orderId={orderId} />
+      {action && (
+        <Reason title={`${ACTIONS[action].title} ${orderId}`} onConfirm={confirm} onClose={() => setAction(undefined)} />
+      )}
+    </>
+  )
+}
+
+/** The order's fields. Amounts as the API wrote them: decimals, never floats. */
+function Fields({ order }: { order: OrderDetail }) {
+  const fields: [string, ReactNode][] = [
+    ['Status', <StatusText order={order} />],
+    ['Client', order.client],
+    ['ClOrdID', order.cl_ord_id],
+    ['Venue', order.venue],
+    ['Venue’s OrderID', order.venue_order_id ?? ''],
+    ['Symbol', order.symbol],
+    ['Side', order.side.replace('_', ' ')],
+    ['Type', order.ord_type],
+    ['Qty', order.qty],
+    ['Price', order.price ?? ''],
+    ['Filled', order.cum_qty],
+    ['Avg px', order.avg_px],
+    ['Created (UTC)', when(order.created)],
+  ]
+  return (
+    <dl className="fields">
+      {fields.map(([name, value]) => (
+        <div key={name}>
+          <dt>{name}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+function Requests({ order }: { order: OrderDetail }) {
+  if (order.requests.length === 0) return <p className="muted">None.</p>
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Downstream ClOrdID</th>
+            <th>Kind</th>
+            <th>Origin</th>
+            <th>Client’s ClOrdID</th>
+            <th>Sent (UTC)</th>
+            <th>Answered</th>
+          </tr>
+        </thead>
+        <tbody>
+          {order.requests.map((request) => (
+            <tr key={request.downstream}>
+              <td>{request.downstream}</td>
+              <td>{request.kind}</td>
+              <td>{request.origin}</td>
+              <td>{request.cl_ord_id ?? ''}</td>
+              <td>{when(request.sent_at)}</td>
+              <td>{request.answered ? 'yes' : 'no'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+/**
+ * The order's messages from the log, oldest first, a page at a time: "More" reads on from `next`;
+ * at the end, while the order's range is still to come, "Check for newer" reads on from `follow`.
+ * Each shows as plain text, never as HTML: the wire is the counterparties' to write.
+ */
+function Messages({ orderId }: { orderId: string }) {
+  const [hits, setHits] = useState<Hit[]>([])
+  const [page, setPage] = useState<{ next: string | null; follow: string | null }>()
+  const [busy, setBusy] = useState(true)
+  const [error, setError] = useState<string>()
+  // A token for the mounting: a read answering after it's gone is dropped (StrictMode mounts
+  // twice, and the first's answer mustn't be shown twice).
+  const reading = useRef<object>(undefined)
+
+  async function read(after: string | null, at = reading.current) {
+    setBusy(true)
+    setError(undefined)
+    try {
+      const answer = await api.orderMessages(orderId, { after })
+      if (reading.current !== at) return
+      setHits((hits) => [...hits, ...answer.messages])
+      setPage({ next: answer.next, follow: answer.follow })
+    } catch (e) {
+      if (reading.current === at) setError(message(e))
+    } finally {
+      if (reading.current === at) setBusy(false)
+    }
+  }
+
+  // Once: the page is mounted per order.
+  useEffect(() => {
+    const at = {}
+    reading.current = at
+    void read(null, at)
+    return () => {
+      reading.current = undefined
+    }
+  }, [])
+
+  return (
+    <>
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+      {hits.length > 0 && (
+        <div className="table-wrap">
+          <table className="messages">
+            <thead>
+              <tr>
+                <th>Time (UTC)</th>
+                <th>Dir</th>
+                <th>Session</th>
+                <th>MsgType</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody>
+              {hits.map((hit, at) => (
+                <tr key={at}>
+                  <td>{hit.time.slice(0, 23).replace('T', ' ')}</td>
+                  <td>{hit.direction}</td>
+                  <td>{hit.session ?? ''}</td>
+                  <td>{hit.msg_type ?? ''}</td>
+                  <td>
+                    <details>
+                      <summary>
+                        <code className="raw">{hit.raw}</code>
+                      </summary>
+                      <table className="tags">
+                        <tbody>
+                          {hit.fields.map(([tag, value], i) => (
+                            <tr key={i}>
+                              <td className="num">{tag}</td>
+                              <td>{value}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </details>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="muted">
+        {busy ? 'Reading…' : hits.length === 0 && !error ? 'No messages.' : null}{' '}
+        {page?.next != null ? (
+          <button type="button" onClick={() => read(page.next)} disabled={busy}>
+            More
+          </button>
+        ) : (
+          page?.follow != null && (
+            <button type="button" onClick={() => read(page.follow)} disabled={busy}>
+              Check for newer
+            </button>
+          )
+        )}
+      </p>
+    </>
+  )
+}

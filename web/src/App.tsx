@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import * as api from './api.ts'
 import Login from './Login.tsx'
+import Order from './Order.tsx'
 import Orders from './Orders.tsx'
 import Sessions from './Sessions.tsx'
 import { LiveProvider, useLive } from './store.ts'
@@ -117,7 +118,6 @@ function Banner() {
   )
 }
 
-// The order's placeholder until its screen is written (task 5).
 function Screen({ route, me }: { route: Route; me: Me }) {
   switch (route.screen) {
     case 'orders':
@@ -125,6 +125,7 @@ function Screen({ route, me }: { route: Route; me: Me }) {
     case 'sessions':
       return <Sessions me={me} />
     case 'order':
-      return <h1>Order {route.orderId}</h1>
+      // Keyed: another order's page starts afresh.
+      return <Order key={route.orderId} orderId={route.orderId} me={me} />
   }
 }

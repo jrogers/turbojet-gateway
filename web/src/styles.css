@@ -291,3 +291,50 @@ td.actions button + button {
   border-color: var(--error);
   color: var(--error);
 }
+
+/* An order: its fields as a grid of name over value, and its messages as on the wire. */
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 0 0 1rem;
+}
+
+.fields dt {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.fields dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+p.actions button + button {
+  margin-left: 0.4rem;
+}
+
+table.messages td {
+  vertical-align: top;
+}
+
+table.messages details summary {
+  cursor: pointer;
+}
+
+code.raw {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+table.messages td:last-child {
+  white-space: normal;
+  min-width: 24rem;
+}
+
+table.tags td {
+  border: 0;
+  padding: 0 0.6rem 0 0;
+  font-family: ui-monospace, monospace;
+}
