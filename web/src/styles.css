@@ -180,8 +180,6 @@ th {
   color: var(--muted);
   font-weight: 500;
   background: var(--panel);
-  position: sticky;
-  top: 0;
 }
 
 td.num,

@@ -16,41 +16,65 @@ export class ApiError extends Error {
 
 // The session's CSRF token, in memory only: a reload gets it again from `GET /api/me`.
 let csrf: string | undefined
-let unauthorized: () => void = () => {}
+let ended: (reason?: string) => void = () => {}
 
-/** What to do on a 401: the session has ended, or never was, so the user logs in. */
-export function onUnauthorized(handler: () => void) {
-  unauthorized = handler
+/**
+ * Registers what to do when the session ends: send the user to login. Answers a function that
+ * unregisters it.
+ */
+export function onSessionEnded(handler: (reason?: string) => void): () => void {
+  ended = handler
+  return () => {
+    if (ended === handler) ended = () => {}
+  }
+}
+
+/**
+ * The session has ended, or never was: forgets its token and calls the registered handler. A 401
+ * calls it, and so does the live socket's refusal.
+ */
+export function sessionEnded(reason?: string) {
+  csrf = undefined
+  ended(reason)
 }
 
 /**
  * Sends a JSON request to the API and answers its JSON, or `undefined` for an empty answer
- * (204, 202). Every request but a GET carries the CSRF token once known.
+ * (204, 202). Every request but a GET carries the CSRF token once known. A 401 ends the session,
+ * but for a login's: a wrong password ends nothing.
  */
 export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (method !== 'GET' && csrf !== undefined) headers['X-CSRF-Token'] = csrf
-  const response = await fetch(path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    credentials: 'same-origin',
-  })
-  const text = await response.text()
-  const json: unknown = text === '' ? undefined : parse(text)
-  if (!response.ok) {
-    if (response.status === 401) {
-      csrf = undefined
-      unauthorized()
-    }
-    const error = (json as { error?: unknown } | undefined)?.error
-    throw new ApiError(response.status, typeof error === 'string' ? error : response.statusText || `HTTP ${response.status}`)
+  let response: Response
+  let text: string
+  try {
+    response = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: 'same-origin',
+    })
+    text = await response.text()
+  } catch {
+    throw new ApiError(0, 'cannot reach the gateway')
   }
-  return json as T
+  if (response.ok) {
+    if (text === '') return undefined as T
+    try {
+      return JSON.parse(text) as T
+    } catch {
+      throw new ApiError(response.status, 'unexpected answer from the API')
+    }
+  }
+  if (response.status === 401 && !(method === 'POST' && path === '/api/login')) sessionEnded()
+  const error = (lenient(text) as { error?: unknown } | undefined)?.error
+  throw new ApiError(response.status, typeof error === 'string' ? error : response.statusText || `HTTP ${response.status}`)
 }
 
-function parse(text: string): unknown {
+/** An error answer's JSON, or `undefined`: a proxy's error page isn't. */
+function lenient(text: string): unknown {
   try {
     return JSON.parse(text)
   } catch {
@@ -78,12 +102,10 @@ function query(params: Record<string, string | number | boolean | null | undefin
 
 export const me = () => request<Me>('GET', '/api/me').then(keep)
 export const login = (user: string, password: string) => request<Me>('POST', '/api/login', { user, password }).then(keep)
+/** Ends the session; on a failure the token is kept, so the user can try again. */
 export async function logout() {
-  try {
-    await request<void>('POST', '/api/logout')
-  } finally {
-    csrf = undefined
-  }
+  await request<void>('POST', '/api/logout')
+  csrf = undefined
 }
 
 export const sessions = () => request<SessionView[]>('GET', '/api/sessions')

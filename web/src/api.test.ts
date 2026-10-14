@@ -1,30 +1,47 @@
-import { afterEach, expect, test, vi } from 'vitest'
-import * as api from './api.ts'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 type Call = { url: string; init: RequestInit }
+
+// A fresh module per test, so no token or handler carries over from another.
+let api: typeof import('./api.ts')
+beforeEach(async () => {
+  vi.resetModules()
+  api = await import('./api.ts')
+})
+
+// Fetches past the answers given: `request()` would hide the throw as unreachable, so they're
+// checked after each test too.
+let stray: string[] = []
 
 /** Answers each fetch with the next of `answers`, recording the calls. */
 function serve(...answers: Response[]): Call[] {
   const calls: Call[] = []
   vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
     calls.push({ url, init })
-    return answers.shift()!
+    const answer = answers.shift()
+    if (answer === undefined) {
+      stray.push(`${init.method} ${url}`)
+      throw new Error(`unexpected fetch: ${init.method} ${url}`)
+    }
+    return answer
   })
   return calls
 }
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+const empty = () => new Response(null, { status: 204 })
 const header = (call: Call, name: string) => (call.init.headers as Record<string, string>)[name]
 
 afterEach(() => {
   vi.unstubAllGlobals()
-  api.onUnauthorized(() => {})
+  expect(stray).toEqual([])
+  stray = []
 })
 
-test('sends the CSRF token on writes only, once known', async () => {
+test('sends the CSRF token on writes only, once known, until logged out', async () => {
   const me = { user: 'alice', role: 'operator', clients: null, csrf: 'tok' }
-  const calls = serve(json({ error: 'log in' }, 401), json(me), json([]), new Response(null, { status: 204 }), new Response(null, { status: 204 }))
+  const calls = serve(json({ error: 'log in' }, 401), json(me), json([]), empty(), empty(), empty())
   await expect(api.pause('x', 'why')).rejects.toThrow()
   expect(header(calls[0], 'X-CSRF-Token')).toBeUndefined()
 
@@ -39,6 +56,16 @@ test('sends the CSRF token on writes only, once known', async () => {
 
   await api.logout()
   expect(header(calls[4], 'X-CSRF-Token')).toBe('tok')
+  await api.resume('x', 'why')
+  expect(header(calls[5], 'X-CSRF-Token')).toBeUndefined()
+})
+
+test('a failed logout keeps the token, to try again', async () => {
+  const calls = serve(json({ user: 'alice', role: 'admin', clients: null, csrf: 'tok' }), json({ error: 'boom' }, 500), empty())
+  await api.me()
+  await expect(api.logout()).rejects.toMatchObject({ status: 500, message: 'boom' })
+  await api.logout()
+  expect(header(calls[2], 'X-CSRF-Token')).toBe('tok')
 })
 
 test("maps an error to ApiError with the API's message", async () => {
@@ -47,14 +74,39 @@ test("maps an error to ApiError with the API's message", async () => {
   await expect(api.sessions()).rejects.toMatchObject({ status: 502, message: 'Bad Gateway' })
 })
 
-test('calls onUnauthorized on a 401, and not on other refusals', async () => {
-  const unauthorized = vi.fn()
-  api.onUnauthorized(unauthorized)
-  serve(json({ error: 'missing or wrong X-CSRF-Token' }, 403), json({ error: 'the session has ended: log in again' }, 401))
+test("a 2xx that isn't JSON is an error", async () => {
+  serve(new Response('<html>a captive portal</html>', { status: 200 }))
+  await expect(api.sessions()).rejects.toMatchObject({ name: 'ApiError', status: 200, message: 'unexpected answer from the API' })
+})
+
+test("a fetch that fails is ApiError 0, the gateway unreachable", async () => {
+  vi.stubGlobal('fetch', async () => {
+    throw new TypeError('Failed to fetch')
+  })
+  await expect(api.sessions()).rejects.toMatchObject({ name: 'ApiError', status: 0, message: 'cannot reach the gateway' })
+})
+
+test("a 401 ends the session, but not a login's, nor another refusal", async () => {
+  const ended = vi.fn()
+  api.onSessionEnded(ended)
+  serve(
+    json({ error: 'wrong user or password' }, 401),
+    json({ error: 'missing or wrong X-CSRF-Token' }, 403),
+    json({ error: 'the session has ended: log in again' }, 401),
+  )
+  await expect(api.login('alice', 'guess')).rejects.toMatchObject({ status: 401, message: 'wrong user or password' })
   await expect(api.cancelOrder('X1', 'why')).rejects.toMatchObject({ status: 403 })
-  expect(unauthorized).not.toHaveBeenCalled()
+  expect(ended).not.toHaveBeenCalled()
   await expect(api.orders()).rejects.toMatchObject({ status: 401 })
-  expect(unauthorized).toHaveBeenCalledOnce()
+  expect(ended).toHaveBeenCalledOnce()
+})
+
+test('an unregistered handler is no longer called', async () => {
+  const ended = vi.fn()
+  const unregister = api.onSessionEnded(ended)
+  unregister()
+  api.sessionEnded('closed')
+  expect(ended).not.toHaveBeenCalled()
 })
 
 test('builds the orders query, leaving out empty filters', async () => {

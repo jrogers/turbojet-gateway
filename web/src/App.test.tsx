@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
+import * as api from './api.ts'
 import type { Me } from './types.ts'
 
 const alice: Me = { user: 'alice', role: 'operator', clients: ['FUNDA', 'FUNDB'], csrf: 'tok' }
@@ -8,13 +9,21 @@ const alice: Me = { user: 'alice', role: 'operator', clients: ['FUNDA', 'FUNDB']
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 
+// Fetches no route answers: `request()` would hide the throw as unreachable.
+let stray: string[] = []
+
 /** Answers fetches by `METHOD path` from `routes`, recording the requests. */
 function serve(routes: Record<string, () => Response>) {
   const calls: string[] = []
   vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
     const key = `${init.method} ${url}`
     calls.push(key)
-    return routes[key]?.() ?? json({ error: 'not found' }, 404)
+    const answer = routes[key]
+    if (answer === undefined) {
+      stray.push(key)
+      throw new Error(`unexpected fetch: ${key}`)
+    }
+    return answer()
   })
   return calls
 }
@@ -23,7 +32,11 @@ beforeEach(() => {
   window.location.hash = ''
 })
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => {
+  vi.unstubAllGlobals()
+  expect(stray).toEqual([])
+  stray = []
+})
 
 test('shows login without a session, and the app once logged in', async () => {
   let password = ''
@@ -33,6 +46,9 @@ test('shows login without a session, and the app once logged in', async () => {
   })
   render(<App />)
   const user = await screen.findByLabelText('User')
+  // No session at start is no session ended: nothing to say.
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(document.activeElement).toBe(user)
   fireEvent.change(user, { target: { value: 'alice' } })
 
   password = 'wrong'
@@ -80,4 +96,49 @@ test('routes switch with the hash, orders by default', async () => {
   expect(screen.getByRole('heading').textContent).toBe('Order A/1')
   go('#/nowhere')
   expect(screen.getByRole('heading').textContent).toBe('Orders')
+})
+
+test('a logout that fails keeps the shell and says why', async () => {
+  let status = 500
+  serve({
+    'GET /api/me': () => json(alice),
+    'POST /api/logout': () => (status === 204 ? new Response(null, { status }) : json({ error: 'cannot write the audit log' }, status)),
+  })
+  render(<App />)
+  const button = await screen.findByRole('button', { name: 'Log out' })
+  fireEvent.click(button)
+  expect((await screen.findByRole('alert')).textContent).toBe('cannot write the audit log')
+  expect(screen.getByText('operator')).toBeTruthy()
+  expect((button as HTMLButtonElement).disabled).toBe(false)
+
+  status = 204
+  fireEvent.click(button)
+  await screen.findByLabelText('User')
+  expect(screen.queryByRole('alert')).toBeNull()
+})
+
+test('a 401 later returns to login, saying the session ended, until the next login', async () => {
+  serve({
+    'GET /api/me': () => json(alice),
+    'GET /api/sessions': () => json({ error: 'the session has ended: log in again' }, 401),
+    'POST /api/login': () => json(alice),
+  })
+  render(<App />)
+  await screen.findByText('operator')
+  await act(() => api.sessions().catch(() => {}))
+  expect(screen.getByRole('alert').textContent).toBe('Your session has ended; log in again.')
+
+  fireEvent.change(screen.getByLabelText('User'), { target: { value: 'alice' } })
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'right' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
+  await screen.findByText('operator')
+  expect(screen.queryByRole('alert')).toBeNull()
+})
+
+test('says so when the gateway cannot be reached at start', async () => {
+  vi.stubGlobal('fetch', async () => {
+    throw new TypeError('Failed to fetch')
+  })
+  render(<App />)
+  expect((await screen.findByRole('alert')).textContent).toBe('cannot reach the gateway')
 })
