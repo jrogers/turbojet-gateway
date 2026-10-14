@@ -486,7 +486,7 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
         sql.push_str(&condition.replace('$', &format!("${}", values.len())));
     };
     match &query.client {
-        // The session as it shows names its CompID: the column alone is the session.
+        // A session is matched by its name alone, the column.
         Some(ScopeName::Session(session)) => and("o.client = $", Value::Text(session.clone())),
         Some(ScopeName::CompId(comp_id)) => and("o.client_comp_id = $", Value::Text(comp_id.to_string())),
         Some(ScopeName::All) | None => {}
