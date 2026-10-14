@@ -283,7 +283,7 @@ impl Store {
     /// The database refuses a query, or holds a value this build can't read.
     pub async fn load(&self) -> io::Result<Snapshot> {
         // ponytail: run at start, untimed, so a database that stops answering during a start
-        // holds the start until TCP gives up (about 15 minutes); time it if starts must fail fast.
+        // holds the start until TCP gives up, if ever; time it if starts must fail fast.
         self.on_writer("starting a load", async |connection| self.load_on(connection).await).await
     }
 
@@ -737,8 +737,8 @@ async fn open_reads(url: &str, sqlite: bool, postgres: bool) -> io::Result<Optio
     }
     let url = if sqlite { read_only(url) } else { url.to_string() };
     // ponytail: its connections go back through sqlx's untimed ping (see `Store::writer`), so a
-    // loss during it holds one for about 15 minutes (TCP's timeout). History reads only, not
-    // trading; hold them as the writer's is if that matters.
+    // loss during it holds one until TCP gives up, if ever. History reads only, not trading; hold
+    // them as the writer's is if that matters.
     AnyPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(DATABASE_TIMEOUT)

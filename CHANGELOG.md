@@ -145,7 +145,8 @@ Notable changes to Jetbridge.
 - Alarms carry `client`: the session of the order an alarm is about, or `null`. A scoped user's
   live socket gets the gateway-wide alarms and those about its clients' orders.
 - A database connection lost without a reset fails the write in hand within 10 seconds, rather
-  than holding the book's writer until the operating system gives up on it.
+  than holding the book's writer for minutes, or for good. Prune batches and reads of past orders
+  time out the same way.
 - **Security:** a client whose CompID, SubID or LocationID, or the SubID or LocationID it
   addresses the gateway by, contains '/', ':' or '>' is refused at logon. Its session's name
   could print the same as another session's, so under `unknown = "admit"` a client logging on as
