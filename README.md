@@ -46,7 +46,7 @@ reports back, keeping each order's state as it goes.
   orders and their ClOrdIDs go, and the session's ClOrdID count and filled notional start again.
 - **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
   cancelled when its session drops and it doesn't log back on in time, and at shutdown.
-- **A database**, optional (SQLite): the book, blocks, risk counts and undelivered reports
+- **A database**, optional (SQLite, or PostgreSQL with `--features postgres`): the book, blocks, risk counts and undelivered reports
   survive a restart, and the restart sorts out what a crash left half done with the venues. Past
   days' orders stay readable over the API until pruned.
 - **An operator API**, optional: HTTP and JSON, with local users in three roles, an audit log of
@@ -73,6 +73,9 @@ cargo run --release --features tls -- --config examples/jetbridge.toml
 ```
 
 Build with `--features gzip` to compress the [message log](#message-log)'s files.
+
+Build with `--features postgres` for a PostgreSQL [`[database]`](#database); with `tls` too for
+TLS to it.
 
 Build with `--features console` to serve the [web console](#console) at the API's address.
 
@@ -205,21 +208,40 @@ url = "sqlite:///var/lib/jetbridge/jetbridge.db?mode=rwc"
 retention = "400d"
 ```
 
-- `url`: a SQLite database. `?mode=rwc` creates the file if it's missing, with a warning logged
-  that a new, empty database was created; without it, a missing file stops the start, so a
-  mistyped path doesn't start an empty book. A relative path is from the working directory, not
-  from this file's directory as `sessions` is. It's
-  read at start only: a reload that finds it changed logs a warning and keeps the database in use.
+- `url`: a SQLite database, or a PostgreSQL one with the `postgres` feature. It's read at start
+  only: a reload that finds it changed logs a warning and keeps the database in use. For SQLite,
+  `?mode=rwc` creates the file if it's missing, with a warning logged that a new, empty database
+  was created; without it, a missing file stops the start, so a mistyped path doesn't start an
+  empty book. A relative path is from the working directory, not from this file's directory as
+  `sessions` is.
 - `retention`, optional: how long a done order is kept after its trading day ends, written as
   `[message_log]`'s `retention`, and at least `1d`. Left out, nothing is deleted. A reload takes a
   changed one. See Pruning, below.
 - Without a `[database]`, the gateway keeps everything in memory, and a restart forgets it.
 
+On PostgreSQL:
+
+```toml
+[database]
+url = "postgres://jetbridge@db.internal/jetbridge?sslmode=verify-full"
+```
+
+- The database must already exist (`?mode=rwc` is SQLite's); the tables are created on the
+  first start, in the user's default schema (its `search_path`).
+- The password can be in the URL, as `password=`, or in `PGPASSWORD` or `~/.pgpass`, which sqlx
+  reads. It's masked in the log either way. sqlx logs a parameter it doesn't know with its
+  value, as one it ignores, so a misspelt `passwd=` puts the password in the log.
+- TLS needs the `tls` feature: without it, `sslmode=require` doesn't connect, and the default,
+  `prefer`, connects in the clear, password included. `verify-full` and `verify-ca` check the
+  server's certificate against the operating system's roots and any `sslrootcert=`.
+- Each gateway holds three connections: one to write and two, read-only, to read past orders.
+
 **Orders don't wait for the database.** Orders go to venues and reports to clients without
 waiting for it; the changes are committed in the background, many at a time. Each message that
 changed the book counts as received by its session only once its change has committed, so a stop
 before then has its sender send it again (see below for the stores that takes). A commit is
-synced to disk.
+synced to disk: SQLite's by the gateway, PostgreSQL's by the server while it keeps
+`synchronous_commit` on, its default.
 
 **Sessions need a durable store.** With a database, the `[acceptor]` and every
 `[initiator.NAME]` need a store that survives a restart (`kind = "disk"`, say), with its files

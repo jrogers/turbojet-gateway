@@ -10,4 +10,6 @@ Jetbridge is a FIX connectivity gateway built on the Turbojet engine (`../turboj
   build)` first.
 - Before committing: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`, and
   in `web/`, `npm run lint && npm test -- --run`.
+- With a PostgreSQL to hand, also `JETBRIDGE_POSTGRES_URL=… cargo test --features postgres
+  store::`: see `src/store/tests.rs`'s `postgres()`.
 - Engine bugs found here are fixed in the Turbojet repo, in their own commits.

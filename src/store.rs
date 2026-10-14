@@ -1,5 +1,6 @@
 //! The book's database: [`Store::write`] commits the book's [`Changes`], and [`Store::load`] reads
-//! back the [`Snapshot`] a restart restores. SQLite through sqlx, in SQL PostgreSQL also speaks.
+//! back the [`Snapshot`] a restart restores. SQLite or PostgreSQL (the `postgres` feature) through
+//! sqlx, in SQL both speak.
 //!
 //! It also keeps the reports queued for clients that their sessions haven't yet stored, as
 //! `undelivered` rows the gateway adds and deletes (see [`Changes::undelivered`]).

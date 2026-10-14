@@ -48,6 +48,7 @@ Notable changes to Jetbridge.
   restored at the next start. Every
   message that changed the book is held in flight until its change has committed. Without a
   `[database]` everything stays in memory, as before.
+- PostgreSQL for `[database] url`, with `--features postgres`, and TLS to it with `tls`.
 - Recovery at start: before the venues log on, each venue's session store is read and compared
   with the database. An order the venue's session stored but the database never recorded is
   cancelled at the venue's logon, logged as an error; an unrecorded cancel cancels its order,
@@ -150,3 +151,5 @@ Notable changes to Jetbridge.
   an existing client with such a name is refused at logon, and its restored orders stay
   unclaimed: an operator can cancel them, or resolve those a venue doesn't know, or have the
   counterparty log on under a name without those characters.
+- **Security:** a database URL's password given as a `password` query parameter, or holding `/`,
+  was logged unmasked.

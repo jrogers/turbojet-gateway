@@ -88,6 +88,12 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   message held behind it stops reading 256 messages past it, new orders are rejected as
   "gateway unavailable", operator calls don't return, and shutdown waits for it too: a second
   Ctrl-C or SIGTERM exits.
+- A lost PostgreSQL connection is a failing write like any other: the retry opens a new one. A
+  commit whose answer the connection lost is written again, which writes each row once.
+- One gateway per database: two writing to one, SQLite or PostgreSQL, overwrite each other's
+  book. Nothing checks.
+- On PostgreSQL, how a start's load, pruning and reads of past orders run is the server's
+  choice: their query plans are checked on SQLite only.
 - Messages handled in the last commit before a clean shutdown are redelivered, flagged as
   possible resends, at the next start: the sessions had closed before they could record them
   as received. The book takes them as repeats.

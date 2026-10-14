@@ -25,7 +25,7 @@
 //! max_notional = "250000.50"
 //!
 //! [database]                      # optional: without it, the book is kept in memory only
-//! url = "sqlite://jetbridge.db?mode=rwc"  # `mode=rwc` creates the file
+//! url = "sqlite://jetbridge.db?mode=rwc"  # `mode=rwc` creates the file; or "postgres://..."
 //! retention = "400d"              # optional: delete done orders older; a number and s, m, h or d
 //!
 //! [api]                           # optional: the operator API, an HTTP JSON server
