@@ -442,3 +442,22 @@ tbody th[scope='row'] {
 ul.warnings {
   color: var(--warn);
 }
+
+/* Routes: the rule a dry run matched. */
+
+tr.matched {
+  background: var(--panel);
+  box-shadow: inset 3px 0 var(--accent);
+  font-weight: 600;
+}
+
+/* The reload's outcome, under the header on every screen. */
+
+.reloaded {
+  margin-bottom: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.reloaded:empty {
+  margin: 0;
+}

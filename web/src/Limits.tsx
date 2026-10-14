@@ -333,7 +333,8 @@ function Answered({ answer: { table, edited } }: { answer: Answer }) {
   )
 }
 
-function Reloaded({ reload: { sessions, config, warnings } }: { reload: ReloadView }) {
+/** What a reload took: the config's summary, the sessions changed, and its warnings. */
+export function Reloaded({ reload: { sessions, config, warnings } }: { reload: ReloadView }) {
   const changes = Object.entries(sessions)
     .filter(([, names]) => names.length > 0)
     .map(([what, names]) => `${what.replaceAll('_', ' ')} ${names.join(', ')}`)

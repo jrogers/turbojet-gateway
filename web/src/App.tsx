@@ -1,17 +1,27 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import Alarms, { AlarmCount, type Dismissed } from './Alarms.tsx'
 import * as api from './api.ts'
+import Audit from './Audit.tsx'
+import { Reloaded } from './Limits.tsx'
 import Login from './Login.tsx'
 import Messages from './Messages.tsx'
 import Order from './Order.tsx'
 import Orders from './Orders.tsx'
+import Reason from './Reason.tsx'
 import Risk from './Risk.tsx'
+import Routes from './Routes.tsx'
 import Sessions from './Sessions.tsx'
 import { LiveProvider, useLive } from './store.ts'
 import { useRoute, type Route } from './router.ts'
-import type { Me } from './types.ts'
+import type { Me, ReloadView } from './types.ts'
 
 const SESSION_ENDED = 'Your session has ended; log in again.'
+
+/** An admin without clients: the audit log and a reload reach every client, so they're its only. */
+const unscopedAdmin = (me: Me) => me.role === 'admin' && me.clients === null
+
+/** What the last reload said: what it took, or, for a 422, why a file was kept. */
+type Reload = { took: ReloadView } | { kept: string }
 
 /**
  * The console: login until `GET /api/me` or a login says who the user is, then the shell. A 401
@@ -75,6 +85,35 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [dismissed, setDismissed] = useState<Dismissed>(() => new Set())
+  const [reloading, setReloading] = useState(false)
+  const [reloaded, setReloaded] = useState<Reload>()
+  // Counts the reloads done, so the screens showing what one changes read again.
+  const [reloads, countReload] = useReducer((n: number) => n + 1, 0)
+  // Set by a reload done: focus goes to the screen's heading once its dialog has closed.
+  const refocus = useRef(false)
+  const admin = unscopedAdmin(me)
+
+  useEffect(() => {
+    if (!reloading && refocus.current) {
+      refocus.current = false
+      // Each screen has one h1; made focusable here, as not every screen needs it to be.
+      const heading = document.querySelector<HTMLElement>('main h1')
+      heading?.setAttribute('tabindex', '-1')
+      heading?.focus()
+    }
+  }, [reloading])
+
+  // A 422 is a reload that kept a file, and applied the other: an outcome to show, not a failure.
+  async function reload(reason: string) {
+    try {
+      setReloaded({ took: await api.reload(reason) })
+    } catch (e) {
+      if (!(e instanceof api.ApiError && e.status === 422)) throw e
+      setReloaded({ kept: e.message })
+    }
+    countReload()
+    refocus.current = true
+  }
 
   // Back to login once logged out, or on a 401: the session had ended already. Any other failure
   // keeps the session, and says so.
@@ -108,6 +147,14 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
           <a href="#/messages" aria-current={current(route, 'messages')}>
             Messages
           </a>
+          <a href="#/routes" aria-current={current(route, 'routes')}>
+            Routes
+          </a>
+          {admin && (
+            <a href="#/audit" aria-current={current(route, 'audit')}>
+              Audit
+            </a>
+          )}
         </nav>
         <AlarmCount dismissed={dismissed} />
         <span className="who">
@@ -119,6 +166,11 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
             {error}
           </span>
         )}
+        {admin && (
+          <button type="button" onClick={() => setReloading(true)}>
+            Reload…
+          </button>
+        )}
         <button type="button" onClick={logout} disabled={busy}>
           Log out
         </button>
@@ -126,8 +178,29 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
       <main>
         <Banner />
         <Alarms dismissed={dismissed} onDismiss={setDismissed} />
-        <Screen route={route} me={me} />
+        {admin && (
+          // Always there for an admin who may reload, so a screen reader hears its text change.
+          <div className="reloaded" role="status">
+            {reloaded &&
+              ('took' in reloaded ? (
+                <Reloaded reload={reloaded.took} />
+              ) : (
+                <p className="error">The reload kept a file: {reloaded.kept}</p>
+              ))}
+            {reloaded && (
+              <button type="button" onClick={() => setReloaded(undefined)}>
+                Dismiss
+              </button>
+            )}
+          </div>
+        )}
+        <Screen route={route} me={me} reloads={reloads} />
       </main>
+      {reloading && admin && (
+        <Reason title="Reload the configuration" confirmLabel="Reload" onConfirm={reload} onClose={() => setReloading(false)}>
+          <p>Rereads the configuration files, as SIGHUP does, and says what changed.</p>
+        </Reason>
+      )}
     </>
   )
 }
@@ -147,7 +220,8 @@ function Banner() {
   )
 }
 
-function Screen({ route, me }: { route: Route; me: Me }) {
+/** The screen the route names; one the user may not see says so, asking nothing of the API. */
+function Screen({ route, me, reloads }: { route: Route; me: Me; reloads: number }) {
   switch (route.screen) {
     case 'orders':
       return <Orders />
@@ -157,8 +231,21 @@ function Screen({ route, me }: { route: Route; me: Me }) {
       return <Risk me={me} />
     case 'messages':
       return <Messages me={me} />
+    case 'routes':
+      return <Routes me={me} reloads={reloads} />
+    case 'audit':
+      return unscopedAdmin(me) ? <Audit /> : <Hidden title="Audit" />
     case 'order':
       // Keyed: another order's page starts afresh.
       return <Order key={route.orderId} orderId={route.orderId} me={me} />
   }
+}
+
+function Hidden({ title }: { title: string }) {
+  return (
+    <>
+      <h1>{title}</h1>
+      <p className="muted">Not available to you.</p>
+    </>
+  )
 }

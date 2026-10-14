@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import * as api from './api.ts'
 import MessageList from './MessageList.tsx'
 import { useLive } from './store.ts'
+import { utcTime } from './time.ts'
 import type { Me } from './types.ts'
 
 /** `api::messages::RANGE_MAX`: the longest range a search covers, in ms. */
@@ -27,13 +28,6 @@ export interface Search {
   until: string
   /** `''` for the API's default. */
   limit: string
-}
-
-/** A `datetime-local` value (`2026-10-14T09:30`, maybe with seconds) as UTC, in ms; NaN if not one. */
-function utcTime(value: string): number {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(value)) return NaN
-  // With an explicit Z, never the browser's zone.
-  return Date.parse(`${value}Z`)
 }
 
 /** `search`'s since and until in ms, until a day after since if empty, or why the API would refuse them. */

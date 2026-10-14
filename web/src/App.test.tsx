@@ -100,6 +100,7 @@ test('routes switch with the hash, orders by default', async () => {
     'GET /api/sessions': () => json([]),
     'GET /api/risk': () => json({ error: 'not now' }, 503),
     'GET /api/risk/limits': () => json({ defaults: {}, clients: {} }),
+    'GET /api/routes': () => json([]),
     'GET /api/orders/A%2F1': () => json({ error: 'no order A/1' }, 404),
     'GET /api/orders/A%2F1/messages': () => json({ error: 'no order A/1' }, 404),
   })
@@ -125,6 +126,10 @@ test('routes switch with the hash, orders by default', async () => {
   go('#/messages')
   await screen.findByRole('heading', { level: 1, name: 'Messages' })
   expect(screen.getByRole('link', { name: 'Messages' }).getAttribute('aria-current')).toBe('page')
+  go('#/routes')
+  await screen.findByRole('heading', { level: 1, name: 'Routes' })
+  expect(screen.getByRole('link', { name: 'Routes' }).getAttribute('aria-current')).toBe('page')
+  expect(await screen.findByText('No routes: every order is rejected.')).toBeTruthy()
   go('#/orders/A%2F1')
   await screen.findByRole('heading', { level: 1, name: 'Order A/1' })
   expect(within(screen.getByRole('navigation')).getByRole('link', { name: 'Orders' }).getAttribute('aria-current')).toBe('page')
@@ -341,4 +346,92 @@ test('a snapshot under other clients shows them in the header, and scopes the ac
   act(() => socket.send(snapshot(null)))
   expect(screen.getByText('all clients')).toBeTruthy()
   expect(screen.getByRole('button', { name: 'Pause' })).toBeTruthy()
+})
+
+const root: Me = { user: 'root', role: 'admin', clients: null, csrf: 'tok' }
+const links = () => within(screen.getByRole('navigation')).getAllByRole('link').map((link) => link.textContent)
+
+test('the nav shows Routes to all, and Audit and Reload to an admin without clients only', async () => {
+  serve({ 'GET /api/me': () => json(alice) })
+  const { unmount } = render(<App />)
+  await screen.findByText('operator')
+  expect(links()).toEqual(['Orders', 'Sessions', 'Risk', 'Messages', 'Routes'])
+  expect(screen.queryByRole('button', { name: 'Reload…' })).toBeNull()
+  unmount()
+
+  serve({ 'GET /api/me': () => json({ ...root, clients: ['FUNDA'] }) })
+  render(<App />)
+  await screen.findByText('admin')
+  expect(links()).toEqual(['Orders', 'Sessions', 'Risk', 'Messages', 'Routes'])
+  expect(screen.queryByRole('button', { name: 'Reload…' })).toBeNull()
+  // A snapshot saying it has every client now shows them; one scoping it hides them again.
+  const socket = await opened()
+  const snapshot = (clients: string[] | null) => ({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients })
+  act(() => {
+    socket.open()
+    socket.send(snapshot(null))
+  })
+  expect(links()).toEqual(['Orders', 'Sessions', 'Risk', 'Messages', 'Routes', 'Audit'])
+  expect(screen.getByRole('button', { name: 'Reload…' })).toBeTruthy()
+  act(() => socket.send(snapshot(['FUNDA'])))
+  expect(links()).not.toContain('Audit')
+  expect(screen.queryByRole('button', { name: 'Reload…' })).toBeNull()
+})
+
+test('the audit log by its hash is not available to a user it is hidden from, asking nothing', async () => {
+  const calls = serve({ 'GET /api/me': () => json({ ...root, clients: ['FUNDA'] }) })
+  window.location.hash = '#/audit'
+  render(<App />)
+  await screen.findByRole('heading', { level: 1, name: 'Audit' })
+  expect(screen.getByText('Not available to you.')).toBeTruthy()
+  expect(calls).toEqual(['GET /api/me'])
+})
+
+test('an admin reloads from the header, and sees what it took or why a file was kept', async () => {
+  let answer = () =>
+    json({
+      sessions: { added: ['FUNDC'], changed: [], removed: [], logged_out: [], started: [], reconfigured: [], stopped: [] },
+      config: { routes: 3, clients: 1, day_end: '17:00' },
+      warnings: ['[database] url changed: restart to use it'],
+    })
+  const calls = serve({
+    'GET /api/me': () => json(root),
+    'GET /api/audit?limit=100': () => json([]),
+    'POST /api/reload': () => answer(),
+  })
+  window.location.hash = '#/audit'
+  render(<App />)
+  await screen.findByText('None.')
+  const reload = async (reason: string) => {
+    fireEvent.click(screen.getByRole('button', { name: 'Reload…' }))
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: reason } })
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Reload' })))
+  }
+  const outcome = () => document.querySelector('.reloaded')!
+  expect(outcome().getAttribute('role')).toBe('status')
+  expect(outcome().textContent).toBe('')
+
+  await reload('new client')
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(outcome().textContent).toBe(
+    'The reload took 3 routes, limits for 1 clients and day_end 17:00; sessions: added FUNDC.[database] url changed: restart to use itDismiss',
+  )
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Audit' }))
+
+  answer = () => json({ error: 'jetbridge.toml is kept: bad route; the sessions file: nothing changed' }, 422)
+  await reload('again')
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(outcome().textContent).toBe(
+    'The reload kept a file: jetbridge.toml is kept: bad route; the sessions file: nothing changedDismiss',
+  )
+
+  // Any other failure stays in the dialog, to try again.
+  answer = () => json({ error: 'the gateway is stopping' }, 503)
+  await reload('once more')
+  expect(within(screen.getByRole('dialog')).getByRole('alert').textContent).toBe('the gateway is stopping')
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+  fireEvent.click(within(outcome() as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+  expect(outcome().textContent).toBe('')
+  expect(calls.filter((call) => call === 'POST /api/reload')).toHaveLength(3)
 })

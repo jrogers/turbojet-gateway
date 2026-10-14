@@ -1,12 +1,14 @@
 import { useSyncExternalStore } from 'react'
 
 /** The console's screens, by the page's hash: `#/orders`, `#/sessions`, `#/risk`, `#/messages`,
- * `#/orders/{order_id}`. */
+ * `#/routes`, `#/audit`, `#/orders/{order_id}`. */
 export type Route =
   | { screen: 'orders' }
   | { screen: 'sessions' }
   | { screen: 'risk' }
   | { screen: 'messages' }
+  | { screen: 'routes' }
+  | { screen: 'audit' }
   | { screen: 'order'; orderId: string }
 
 /** The route `hash` names; `#/orders` for anything else. */
@@ -15,6 +17,8 @@ export function parseRoute(hash: string): Route {
   if (path === '/sessions') return { screen: 'sessions' }
   if (path === '/risk') return { screen: 'risk' }
   if (path === '/messages') return { screen: 'messages' }
+  if (path === '/routes') return { screen: 'routes' }
+  if (path === '/audit') return { screen: 'audit' }
   const order = /^\/orders\/(.+)$/.exec(path)
   if (order) {
     try {
