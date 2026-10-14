@@ -439,6 +439,8 @@ pub struct StoredOrders {
     /// A client session, by the whole of its name as it shows, or every session of a CompID.
     /// A name is enough: a past session may be neither connected nor known since the restart.
     pub client: Option<ScopeName>,
+    /// Only the clients of these CompIDs: a scoped caller's.
+    pub comp_ids: Option<Vec<CompactString>>,
     /// The venue the order was routed to.
     pub venue: Option<VenueId>,
     pub symbol: Option<CompactString>,
@@ -499,6 +501,16 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
     }
     if let Some(status) = query.status {
         and("o.status = $", Value::Text(status.code().to_string()));
+    }
+    if let Some(comp_ids) = &query.comp_ids {
+        let mut placeholders = Vec::with_capacity(comp_ids.len());
+        for comp_id in comp_ids {
+            values.push(Value::Text(comp_id.to_string()));
+            placeholders.push(format!("${}", values.len()));
+        }
+        // None is a list that matches nothing, and `IN ()` isn't SQL everywhere: `IN (NULL)` is.
+        let list = if placeholders.is_empty() { "NULL".to_string() } else { placeholders.join(", ") };
+        sql.push_str(&format!(" AND o.client_comp_id IN ({list})"));
     }
     if query.working {
         sql.push_str(" AND o.live = 1");

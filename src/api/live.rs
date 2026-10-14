@@ -300,7 +300,7 @@ fn snapshot(state: &State) -> Step {
     let Ok(service) = state.service() else { return Step::Close(close_code::AWAY, STOPPING) };
     let (orders, blocked, unavailable) = service.gateway().working_view();
     let orders_next = if orders.len() == MAX_ORDERS_PER_PAGE { orders.last().map(|order| order.id.0) } else { None };
-    json(&Snapshot { sessions: session_views(&service), orders, orders_next, blocked, unavailable })
+    json(&Snapshot { sessions: session_views(&service, None), orders, orders_next, blocked, unavailable })
 }
 
 fn json(value: &impl Serialize) -> Step {

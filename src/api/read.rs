@@ -1,5 +1,6 @@
 //! The API's reads [viewer]: the sessions, the book's orders, risk and routes, as JSON. Every role
-//! may read, so being behind `authenticate` is the only check; reads aren't audited.
+//! may read; reads aren't audited. A scoped caller reads its own CompIDs' clients only: a read
+//! naming another client is 403, as a write would be, and one naming none is narrowed to them.
 //!
 //! The orders are the book's: the working ones and each client's done orders of its current day.
 //! With a time range, or an order the book doesn't hold, they're the database's: every order kept
@@ -18,9 +19,11 @@ use tracing::error;
 use turbojet::fields::CompactString;
 use turbojet::{SessionId, SessionStatus};
 
-use super::{ApiError, State, bad};
+use super::write::{in_scope, out_of_scope};
+use super::{ApiError, Caller, State, bad};
 use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
 use crate::config::RiskTables;
+use crate::edge::Gateway;
 use crate::router::{Rule, Target};
 use crate::service::Service;
 use crate::store::StoredOrders;
@@ -111,14 +114,19 @@ impl SessionView {
 }
 
 /// `GET /api/sessions`: the clients' sessions connected now, by ID, then those paused and not
-/// connected, then every venue's, connected or not, by name.
-pub(super) async fn sessions(axum::extract::State(state): AxumState) -> Result<Json<Vec<SessionView>>, ApiError> {
-    Ok(Json(session_views(&*state.service()?)))
+/// connected, then every venue's, connected or not, by name. A scoped caller's clients only.
+pub(super) async fn sessions(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+) -> Result<Json<Vec<SessionView>>, ApiError> {
+    Ok(Json(session_views(&*state.service()?, caller.view_scope())))
 }
 
-/// What [`sessions`] answers.
-pub(super) fn session_views(service: &Service) -> Vec<SessionView> {
+/// What [`sessions`] answers: the clients' of `comp_ids` alone, if given.
+pub(super) fn session_views(service: &Service, comp_ids: Option<&[String]>) -> Vec<SessionView> {
+    let shown = |id: &SessionId| comp_ids.is_none_or(|comp_ids| comp_ids.iter().any(|c| *c == *id.target_comp_id));
     let mut clients = service.client_statuses();
+    clients.retain(|status| shown(&status.id));
     clients.sort_by_cached_key(|status| status.id.to_string());
     let mut sessions: Vec<_> = clients
         .iter()
@@ -126,7 +134,7 @@ pub(super) fn session_views(service: &Service) -> Vec<SessionView> {
         .collect();
     // A paused client is logged out, and would otherwise vanish from the list it's resumed from.
     let mut paused = service.client_paused();
-    paused.retain(|id| !clients.iter().any(|status| &status.id == id));
+    paused.retain(|id| shown(id) && !clients.iter().any(|status| &status.id == id));
     paused.sort_by_cached_key(ToString::to_string);
     sessions.extend(paused.iter().map(|id| SessionView::new(SessionSide::Client, id, true, None)));
     for name in service.venues() {
@@ -187,8 +195,12 @@ enum Next {
 /// created in `from..to`, a range of [`HISTORY_RANGE_MAX`] at most, by creation, then `id`: the
 /// orders of past days too, until pruned, as last written. `after` and `next` are then an opaque
 /// string. A range without `[database]` is 400. Its `client` may name a session not connected now.
+///
+/// A scoped caller's are its clients' only, and a `client` naming another's is 403: see
+/// [`may_see_named`].
 pub(super) async fn orders(
     axum::extract::State(state): AxumState,
+    caller: Caller,
     query: Result<Query<OrdersQuery>, QueryRejection>,
 ) -> Result<Json<OrdersPage>, ApiError> {
     let Query(query) = query.map_err(|e| bad(e.body_text()))?;
@@ -200,8 +212,12 @@ pub(super) async fn orders(
         Some(text) => Some(text.parse::<ScopeName>().map_err(|e| bad(e.to_string()))?),
         None => None,
     };
+    if let Some(name) = &client {
+        may_see_named(&caller, state.service()?.gateway(), name)?;
+    }
+    let comp_ids = caller.view_scope().map(|comp_ids| comp_ids.iter().map(|id| id.as_str().into()).collect());
     if let Some(range) = range(query.from, query.to, Utc::now())? {
-        return stored_orders(&state, query, client, range, limit).await;
+        return stored_orders(&state, query, client, comp_ids, range, limit).await;
     }
     let after = match &query.after {
         Some(text) => Some(OrderId(text.parse().map_err(|_| bad("after isn't a page's next"))?)),
@@ -219,6 +235,7 @@ pub(super) async fn orders(
     };
     let filter = OrderFilter {
         client,
+        comp_ids,
         venue: query.venue,
         symbol: query.symbol,
         status: query.status,
@@ -230,6 +247,33 @@ pub(super) async fn orders(
     // Whether more match isn't known without a walk past the page: a full page may be the last.
     let next = if orders.len() == limit { orders.last().map(|order| Next::Id(order.id.0)) } else { None };
     Ok(Json(OrdersPage { orders, next }))
+}
+
+/// 403 unless a scoped caller may see each client `name` names: never `all`, and a CompID or
+/// session only if it's one of the caller's CompIDs'. A session the gateway knows is checked by
+/// its client. One it doesn't, a past session a range may name, is checked by its name, whose
+/// target is the client: [`names_target`]. A CompID holding `->`, `/` or `:` can make a name
+/// ambiguous, but the orders are filtered by the caller's CompIDs as well, so a name misread
+/// still shows none of another client's.
+fn may_see_named(caller: &Caller, gateway: &Gateway, name: &ScopeName) -> Result<(), ApiError> {
+    let Some(comp_ids) = caller.view_scope() else { return Ok(()) };
+    let seen = match name {
+        ScopeName::Session(session) => match gateway.client(session) {
+            Some(client) => caller.may_act_on(&client),
+            None => comp_ids.iter().any(|comp_id| names_target(session, comp_id)),
+        },
+        ScopeName::CompId(comp_id) => return in_scope(caller, comp_id),
+        ScopeName::All => false,
+    };
+    if seen { Ok(()) } else { Err(out_of_scope(caller, &name.to_string())) }
+}
+
+/// Whether `session`, a session as Turbojet shows it (`BEGIN:SENDER->TARGET`, a side's SubID and
+/// LocationID after a `/` each, a qualifier after a `:`), has `comp_id` as its TargetCompID: the
+/// client's, as the acceptor sees it.
+fn names_target(session: &str, comp_id: &str) -> bool {
+    let rest = session.split_once("->").and_then(|(_, target)| target.strip_prefix(comp_id));
+    rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', ':']))
 }
 
 /// `from..to` of [`orders`], `None` without `from` or `to`, or 400.
@@ -257,6 +301,7 @@ async fn stored_orders(
     state: &State,
     query: OrdersQuery,
     client: Option<ScopeName>,
+    comp_ids: Option<Vec<CompactString>>,
     range: Range<DateTime<Utc>>,
     limit: usize,
 ) -> Result<Json<OrdersPage>, ApiError> {
@@ -267,6 +312,7 @@ async fn stored_orders(
         from: range.start,
         to: range.end,
         client,
+        comp_ids,
         venue: query.venue,
         symbol: query.symbol,
         status: query.status,
@@ -302,20 +348,27 @@ fn database_failed(e: std::io::Error) -> ApiError {
 }
 
 /// `GET /api/orders/{order_id}`: the order whose OrderID(37) is `order_id`, with every request sent
-/// for it; 404 if neither the book nor the database holds it.
+/// for it; 404 if neither the book nor the database holds it, 403 if it's not one the caller may see.
 pub(super) async fn order(
     axum::extract::State(state): AxumState,
+    caller: Caller,
     order_id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<OrderDetail>, ApiError> {
     let Path(order_id) = order_id.map_err(|e| bad(e.body_text()))?;
-    find_detail(&state, &order_id).await.map(Json)
+    find_detail_for(&state, &caller, &order_id).await.map(Json)
+}
+
+/// [`find_detail`] for `caller`: 403 if the order's client is outside its scope.
+pub(super) async fn find_detail_for(state: &State, caller: &Caller, order_id: &str) -> Result<OrderDetail, ApiError> {
+    let detail = find_detail(state, order_id).await?;
+    if caller.may_act_on(&detail.order.client) { Ok(detail) } else { Err(out_of_scope(caller, order_id)) }
 }
 
 /// The order whose OrderID(37) is `order_id`, the book's or else the database's; 404 if neither
 /// holds it. The book drops a done order at its client's day roll whether or not the writer has
 /// committed it yet, so until it has, such an order reads as missing, or as its last committed
 /// state.
-pub(super) async fn find_detail(state: &State, order_id: &str) -> Result<OrderDetail, ApiError> {
+async fn find_detail(state: &State, order_id: &str) -> Result<OrderDetail, ApiError> {
     let store = {
         let service = state.service()?;
         let gateway = service.gateway();
@@ -332,16 +385,28 @@ pub(super) async fn find_detail(state: &State, order_id: &str) -> Result<OrderDe
 }
 
 /// `GET /api/risk`: the limits in force, each session's notionals, the reference prices and the
-/// blocks.
-pub(super) async fn risk(axum::extract::State(state): AxumState) -> Result<Json<RiskView>, ApiError> {
-    Ok(Json(state.service()?.gateway().risk()))
+/// blocks. A scoped caller's clients' only: see [`RiskView::retain_for`].
+pub(super) async fn risk(axum::extract::State(state): AxumState, caller: Caller) -> Result<Json<RiskView>, ApiError> {
+    let mut risk = state.service()?.gateway().risk();
+    if let Some(comp_ids) = caller.view_scope() {
+        risk.retain_for(comp_ids);
+    }
+    Ok(Json(risk))
 }
 
 /// `GET /api/risk/limits`: the limits in force as the configuration writes them, `{defaults,
 /// clients: {COMPID: ...}}`, each table with only the keys it sets. A client's keys replace the
-/// defaults'; `GET /api/risk` shows the limits merged.
-pub(super) async fn risk_limits(axum::extract::State(state): AxumState) -> Result<Json<RiskTables>, ApiError> {
-    Ok(Json(state.service()?.risk_tables()))
+/// defaults'; `GET /api/risk` shows the limits merged. A scoped caller's clients' only, and the
+/// defaults.
+pub(super) async fn risk_limits(
+    axum::extract::State(state): AxumState,
+    caller: Caller,
+) -> Result<Json<RiskTables>, ApiError> {
+    let mut tables = state.service()?.risk_tables();
+    if let Some(comp_ids) = caller.view_scope() {
+        tables.client.retain(|comp_id, _| comp_ids.contains(comp_id));
+    }
+    Ok(Json(tables))
 }
 
 /// A routing rule as the configuration writes it (`[[route]]`): one of `venue` and `reject` set.
@@ -423,7 +488,7 @@ pub(super) mod tests {
     use super::super::tests::{Answer, send};
     use super::*;
     use crate::auth::{Role, Users};
-    use crate::book::ClientId;
+    use crate::book::{ClientId, Scope};
 
     struct Nothing;
 
@@ -433,9 +498,10 @@ pub(super) mod tests {
     /// API's routes reaching it, bearer headers for each role, and what keeps them alive.
     pub(in crate::api) struct Fixture {
         pub(in crate::api) app: axum::Router,
-        /// Bearer headers' values: a viewer's, an operator's, an operator's scoped to FUNDB, an
-        /// admin's, and an admin's scoped to FUNDB.
+        /// Bearer headers' values: a viewer's, a viewer's scoped to FUNDA, an operator's, an
+        /// operator's scoped to FUNDB, an admin's, and an admin's scoped to FUNDB.
         pub(in crate::api) viewer: String,
+        pub(in crate::api) scoped_viewer: String,
         pub(in crate::api) operator: String,
         pub(in crate::api) scoped: String,
         pub(in crate::api) admin: String,
@@ -489,6 +555,7 @@ pub(super) mod tests {
             format!("Bearer {}", users.add_token(name).unwrap())
         };
         let viewer = bearer("vic", Role::Viewer, &[]);
+        let scoped_viewer = bearer("val", Role::Viewer, &["FUNDA"]);
         let operator = bearer("olga", Role::Operator, &[]);
         let scoped = bearer("sam", Role::Operator, &["FUNDB"]);
         let admin = bearer("ada", Role::Admin, &[]);
@@ -501,6 +568,7 @@ pub(super) mod tests {
         Fixture {
             app,
             viewer,
+            scoped_viewer,
             operator,
             scoped,
             admin,
@@ -514,7 +582,12 @@ pub(super) mod tests {
 
     impl Fixture {
         pub(in crate::api) async fn get(&self, path: &str) -> Answer {
-            send(&self.app, "GET", path, &[("authorization", &self.viewer)], "").await
+            self.get_as(&self.viewer, path).await
+        }
+
+        /// `GET path` as `bearer`.
+        pub(in crate::api) async fn get_as(&self, bearer: &str, path: &str) -> Answer {
+            send(&self.app, "GET", path, &[("authorization", bearer)], "").await
         }
 
         /// `GET path`, which must answer 200: its body.
@@ -823,6 +896,152 @@ pub(super) mod tests {
 
         for bad in ["symbol=AAPL", "client=FUNDA", "client=FUNDA&symbol=AAPL&colour=red"] {
             assert_eq!(fixture.get(&format!("/api/routes/test?{bad}")).await.status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    /// The resting FUNDA order, read as FUNDA's viewer, FUNDB's operator and unscoped: a scoped
+    /// caller's page holds its clients' orders alone, a `client` naming another's (a CompID, a
+    /// session known or not, or all) is 403, and so is another's order by its OrderID.
+    #[tokio::test]
+    async fn a_scoped_caller_reads_its_clients_orders() {
+        let fixture = fixture().await;
+        let (funda, fundb) = (fixture.scoped_viewer.as_str(), fixture.scoped.as_str());
+        let count = async |bearer: &str, query: &str| {
+            let answer = fixture.get_as(bearer, &format!("/api/orders{query}")).await;
+            assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
+            answer.body["orders"].as_array().unwrap().len()
+        };
+        let session = |target: &str| format!("?client=session:FIX.4.4:JETBRIDGE-%3E{target}");
+        assert_eq!(count(funda, "").await, 1);
+        assert_eq!(count(funda, "?client=comp:FUNDA").await, 1);
+        assert_eq!(count(funda, &session("FUNDA")).await, 1);
+        // A session of its CompID the gateway hasn't seen: allowed, and empty.
+        assert_eq!(count(funda, &session("FUNDA%2FDESK")).await, 0);
+        assert_eq!(count(fundb, "").await, 0);
+        assert_eq!(count(fundb, "?client=comp:FUNDB").await, 0);
+        assert_eq!(count(fixture.viewer.as_str(), "").await, 1);
+        assert_eq!(count(fixture.viewer.as_str(), "?client=comp:FUNDB").await, 0);
+        let refused = [
+            (funda, "?client=comp:FUNDB".to_string()),
+            (funda, "?client=all".to_string()),
+            (funda, session("FUNDB")),
+            (funda, session("FUNDAX")),
+            (fundb, "?client=comp:FUNDA".to_string()),
+            (fundb, session("FUNDA")),
+        ];
+        for (bearer, query) in refused {
+            let answer = fixture.get_as(bearer, &format!("/api/orders{query}")).await;
+            assert_eq!(answer.status, StatusCode::FORBIDDEN, "{query}: {}", answer.body);
+        }
+
+        let name = fixture.ok("/api/orders").await["orders"][0]["order_id"].as_str().unwrap().to_string();
+        assert_eq!(fixture.get_as(funda, &format!("/api/orders/{name}")).await.status, StatusCode::OK);
+        let answer = fixture.get_as(fundb, &format!("/api/orders/{name}")).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(answer.body["error"], format!("sam may act only on clients FUNDB, not {name}"));
+    }
+
+    /// As [`a_scoped_caller_reads_its_clients_orders`], from the database, with a past order of
+    /// FUNDB's desk the gateway has never seen: a session it doesn't know is checked by its name.
+    #[tokio::test]
+    async fn a_scoped_caller_reads_its_clients_past_orders() {
+        let fixture = with_history("").await;
+        let desk = ClientId::new(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB").with_target_sub_id("DESK"));
+        let written = crate::store::tests::dated(103, &desk, None, true, past(3) + TimeDelta::hours(1));
+        fixture.service.store().unwrap().write(&[written]).await.unwrap();
+        let (funda, fundb) = (fixture.scoped_viewer.as_str(), fixture.scoped.as_str());
+        let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z";
+        let found = async |bearer: &str, query: &str| {
+            let answer = fixture.get_as(bearer, &format!("/api/orders?{range}{query}")).await;
+            assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
+            names(&answer.body).0.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        let session = |target: &str| format!("&client=session:FIX.4.4:JETBRIDGE-%3E{target}");
+        assert_eq!(found(funda, "").await, ["A100", "A101", "A102"]);
+        assert_eq!(found(funda, &session("FUNDA")).await, ["A100", "A101", "A102"]);
+        assert_eq!(found(funda, "&client=session:FIX.4.2:JETBRIDGE-%3EFUNDA").await, Vec::<String>::new());
+        assert_eq!(found(fundb, "").await, ["A103"]);
+        assert_eq!(found(fundb, "&client=comp:FUNDB").await, ["A103"]);
+        assert_eq!(found(fundb, &session("FUNDB%2FDESK")).await, ["A103"]);
+        assert_eq!(found(fixture.viewer.as_str(), "").await, ["A100", "A101", "A102", "A103"]);
+        let refused = [
+            (funda, "&client=comp:FUNDB".to_string()),
+            (funda, "&client=all".to_string()),
+            (funda, session("FUNDB%2FDESK")),
+            (fundb, session("FUNDA")),
+            (fundb, "&client=session:FIX.4.2:JETBRIDGE-%3EFUNDA".to_string()),
+        ];
+        for (bearer, query) in refused {
+            let answer = fixture.get_as(bearer, &format!("/api/orders?{range}{query}")).await;
+            assert_eq!(answer.status, StatusCode::FORBIDDEN, "{query}: {}", answer.body);
+        }
+
+        let status =
+            async |bearer: &str, name: &str| fixture.get_as(bearer, &format!("/api/orders/{name}")).await.status;
+        assert_eq!(status(funda, "A100").await, StatusCode::OK);
+        assert_eq!(status(fundb, "A100").await, StatusCode::FORBIDDEN);
+        assert_eq!(status(fundb, "A103").await, StatusCode::OK);
+        assert_eq!(status(funda, "A103").await, StatusCode::FORBIDDEN);
+    }
+
+    /// The target of a session's name: its TargetCompID, whole, before any SubID, LocationID or
+    /// qualifier.
+    #[test]
+    fn a_sessions_name_names_its_target() {
+        assert!(names_target("FIX.4.4:JETBRIDGE->FUNDA", "FUNDA"));
+        assert!(names_target("FIX.4.4:JETBRIDGE/S->FUNDA/DESK/NY", "FUNDA"));
+        assert!(names_target("FIX.4.4:JETBRIDGE->FUNDA:Q", "FUNDA"));
+        assert!(!names_target("FIX.4.4:JETBRIDGE->FUNDAX", "FUNDA"));
+        assert!(!names_target("FIX.4.4:FUNDA->JETBRIDGE", "FUNDA"));
+        assert!(!names_target("FUNDA", "FUNDA"));
+    }
+
+    /// Sessions, risk and limits as FUNDA's viewer, FUNDB's operator and unscoped: a scoped
+    /// caller's clients' sessions, notionals, limits and blocks alone (`all` covering them too),
+    /// while the venues, the defaults and the reference prices are everyone's.
+    #[tokio::test]
+    async fn a_scoped_caller_reads_its_clients_sessions_and_risk() {
+        let fixture = fixture().await;
+        let config = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n\
+                      [risk.defaults]\nmax_order_qty = 1000\n\
+                      [risk.client.FUNDA]\nmax_notional = 1\n[risk.client.FUNDB]\nmax_notional = 2\n";
+        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), config).unwrap();
+        let service = fixture.service.clone();
+        let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
+        assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);
+        let gateway = fixture.service.gateway();
+        for scope in [Scope::CompId("FUNDA".into()), Scope::CompId("FUNDB".into()), Scope::All] {
+            assert!(gateway.block(scope).await);
+        }
+        let read = async |bearer: &str, path: &str| {
+            let answer = fixture.get_as(bearer, path).await;
+            assert_eq!(answer.status, StatusCode::OK, "{path}: {}", answer.body);
+            answer.body
+        };
+        let keys = |value: &serde_json::Value| value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let funda_session = "FIX.4.4:JETBRIDGE->FUNDA";
+        let cases = [
+            (fixture.scoped_viewer.as_str(), vec!["client", "venue"], vec![funda_session], vec!["FUNDA"]),
+            (fixture.scoped.as_str(), vec!["venue"], vec![], vec!["FUNDB"]),
+            (fixture.viewer.as_str(), vec!["client", "venue"], vec![funda_session], vec!["FUNDA", "FUNDB"]),
+        ];
+        for (bearer, sides, risk_sessions, comp_ids) in cases {
+            let sessions = read(bearer, "/api/sessions").await;
+            let shown: Vec<_> = sessions.as_array().unwrap().iter().map(|s| s["side"].as_str().unwrap()).collect();
+            assert_eq!(shown, sides);
+            let risk = read(bearer, "/api/risk").await;
+            let shown: Vec<_> =
+                risk["sessions"].as_array().unwrap().iter().map(|s| s["client"].as_str().unwrap()).collect();
+            assert_eq!(shown, risk_sessions);
+            assert_eq!(keys(&risk["by_comp_id"]), comp_ids);
+            let blocked: Vec<_> =
+                comp_ids.iter().map(|comp_id| format!("comp:{comp_id}")).chain(["all".into()]).collect();
+            assert_eq!(risk["blocked"], serde_json::json!(blocked));
+            assert!(risk["defaults"].is_object(), "{risk}");
+            assert!(risk["references"].is_object(), "{risk}");
+            let limits = read(bearer, "/api/risk/limits").await;
+            assert_eq!(limits["defaults"], serde_json::json!({ "max_order_qty": 1000 }));
+            assert_eq!(keys(&limits["clients"]), comp_ids);
         }
     }
 

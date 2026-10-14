@@ -712,8 +712,8 @@ where
     audited_on(state, caller, mutation, found, |scope| action(gateway, scope)).await
 }
 
-/// 403 for a scoped caller acting on another CompID's client.
-fn in_scope(caller: &Caller, comp_id: &str) -> Result<(), ApiError> {
+/// 403 for a scoped caller acting on, or reading, another CompID's client.
+pub(super) fn in_scope(caller: &Caller, comp_id: &str) -> Result<(), ApiError> {
     if caller.may_act_on(comp_id) { Ok(()) } else { Err(out_of_scope(caller, comp_id)) }
 }
 
@@ -722,8 +722,8 @@ fn unscoped(caller: &Caller, what: &str) -> Result<(), ApiError> {
     if caller.may_act_on(&Scope::All) { Ok(()) } else { Err(out_of_scope(caller, what)) }
 }
 
-/// 403 for a scoped caller acting on what isn't theirs.
-fn out_of_scope(caller: &Caller, target: &str) -> ApiError {
+/// 403 for a scoped caller acting on, or reading, what isn't theirs.
+pub(super) fn out_of_scope(caller: &Caller, target: &str) -> ApiError {
     let clients = caller.clients.as_deref().unwrap_or_default().join(", ");
     ApiError::new(StatusCode::FORBIDDEN, format!("{} may act only on clients {clients}, not {target}", caller.user))
 }

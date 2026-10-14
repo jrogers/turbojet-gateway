@@ -21,7 +21,7 @@ use tracing::{error, warn};
 use turbojet::codec::{Decoded, decode};
 use turbojet::{Direction, FileMessageLog, LogFile, LogFilter, LogRecord, LogRecords, Message};
 
-use super::{ApiError, State, bad};
+use super::{ApiError, Caller, State, bad};
 use crate::book::OrderDetail;
 use crate::service::Service;
 
@@ -126,14 +126,15 @@ pub(super) struct OrderMessagesQuery {
 /// initiator a reload has stopped has no session to search, so only the client's side is found.
 pub(super) async fn order_messages(
     axum::extract::State(state): AxumState,
+    caller: Caller,
     order_id: Result<UrlPath<String>, PathRejection>,
     query: Result<Query<OrderMessagesQuery>, QueryRejection>,
 ) -> Result<Json<Page>, ApiError> {
     let UrlPath(order_id) = order_id.map_err(|e| bad(e.body_text()))?;
     let Query(query) = query.map_err(|e| bad(e.body_text()))?;
     let dir = log_dir(&*state.service()?)?;
-    let detail = super::read::find_detail(&state, &order_id).await?;
-    // The service again, not held over `find_detail`'s database read: a read doesn't keep a
+    let detail = super::read::find_detail_for(&state, &caller, &order_id).await?;
+    // The service again, not held over `find_detail_for`'s database read: a read doesn't keep a
     // stopping gateway's service alive.
     let venue = state.service()?.venue_session(&detail.order.venue).map(|venue| venue.id().to_string());
     let after = query.after.as_deref().map(Cursor::decode).transpose()?;
@@ -655,6 +656,9 @@ mod tests {
         let path = format!("/api/orders/{name}/messages?colour=red");
         assert_eq!(fixture.get(&path).await.status, StatusCode::BAD_REQUEST);
         assert_eq!(fixture.get("/api/orders/NOPE1/messages").await.status, StatusCode::NOT_FOUND);
+        // Another client's order, for a caller scoped to FUNDB: refused as its detail is.
+        let scoped = fixture.get_as(&fixture.scoped, &format!("/api/orders/{name}/messages")).await;
+        assert_eq!(scoped.status, StatusCode::FORBIDDEN);
 
         let unlogged = super::super::read::tests::fixture().await;
         for path in [format!("/api/messages?{DAY}"), format!("/api/orders/{name}/messages")] {
@@ -895,6 +899,9 @@ mod tests {
         );
         let path = format!("/api/orders/{name}/messages");
         let page = fixture.ok(&path).await;
+        // FUNDA's viewer, scoped to the order's client, finds the same.
+        let scoped = fixture.get_as(&fixture.scoped_viewer, &path).await;
+        assert_eq!((scoped.status, &scoped.body), (StatusCode::OK, &page));
         let found: Vec<_> = page["messages"]
             .as_array()
             .unwrap()

@@ -592,6 +592,12 @@ impl Caller {
         }
     }
 
+    /// The CompIDs whose clients the caller may see; `None`, every client's. As it acts, so it
+    /// reads: a read naming a client outside these is refused, one naming none narrowed to them.
+    pub(crate) fn view_scope(&self) -> Option<&[String]> {
+        self.clients.as_deref()
+    }
+
     /// Whether the caller may act on `target`: an unscoped caller on anything, a scoped one on
     /// its own CompIDs' clients only (so never on [`Scope::All`]).
     pub(crate) fn may_act_on<T: Target + ?Sized>(&self, target: &T) -> bool {

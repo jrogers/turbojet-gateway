@@ -3678,6 +3678,10 @@ fn orders_are_filtered_by_each_field() {
     assert_eq!(ids(&book.orders(&OrderFilter { client: Some(funda), ..all.clone() })), [1, 2]);
     let desk2 = Scope::Session(desk("DESK2"));
     assert_eq!(ids(&book.orders(&OrderFilter { client: Some(desk2), ..all.clone() })), [2]);
+    let comp_ids = |ids: &[&str]| Some(ids.iter().map(|&id| id.into()).collect());
+    assert_eq!(ids(&book.orders(&OrderFilter { comp_ids: comp_ids(&["FUNDB"]), ..all.clone() })), [3]);
+    assert_eq!(ids(&book.orders(&OrderFilter { comp_ids: comp_ids(&["FUNDB", "FUNDA"]), ..all.clone() })), [1, 2, 3]);
+    assert!(book.orders(&OrderFilter { comp_ids: comp_ids(&["FUNDC"]), ..all.clone() }).is_empty());
     assert_eq!(ids(&book.orders(&OrderFilter { symbol: Some("MSFT".into()), ..all.clone() })), [3]);
     assert_eq!(ids(&book.orders(&OrderFilter { status: Some(Status::Filled), ..all.clone() })), [2]);
     assert!(book.orders(&OrderFilter { venue: Some("LSE".into()), ..all }).is_empty());

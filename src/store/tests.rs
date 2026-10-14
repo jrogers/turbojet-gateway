@@ -810,6 +810,7 @@ fn created_in(from: DateTime<Utc>, to: DateTime<Utc>) -> StoredOrders {
         from,
         to,
         client: None,
+        comp_ids: None,
         venue: None,
         symbol: None,
         status: None,
@@ -877,6 +878,10 @@ async fn stored_orders_are_read_by_creation_and_filters() {
     assert_eq!(ids_of(&store, with(&|q| q.client = Some(ScopeName::Session(funda_42.session().into())))).await, [3]);
     assert_eq!(ids_of(&store, with(&|q| q.client = Some(ScopeName::CompId("FUNDA".into())))).await, [1, 3, 4, 6]);
     assert_eq!(ids_of(&store, with(&|q| q.client = Some(ScopeName::All))).await, [1, 2, 3, 4, 5, 6]);
+    let comp_ids = |ids: &[&str]| Some(ids.iter().map(|&id| id.into()).collect());
+    assert_eq!(ids_of(&store, with(&|q| q.comp_ids = comp_ids(&["FUNDB"]))).await, [2, 5]);
+    assert_eq!(ids_of(&store, with(&|q| q.comp_ids = comp_ids(&["FUNDB", "FUNDA"]))).await, [1, 2, 3, 4, 5, 6]);
+    assert!(ids_of(&store, with(&|q| q.comp_ids = comp_ids(&[]))).await.is_empty());
     assert_eq!(ids_of(&store, with(&|q| q.venue = Some("NYSE".into()))).await, [2, 4]);
     assert_eq!(ids_of(&store, with(&|q| q.symbol = Some("MSFT".into()))).await, [2, 3]);
     assert_eq!(ids_of(&store, with(&|q| q.status = Some(Status::Filled))).await, [2, 3, 6]);
@@ -1008,6 +1013,7 @@ async fn stored_orders_read_by_creation_without_sorting() {
     let bare = created_in(on(0, 0), on(1, 0));
     let full = StoredOrders {
         client: Some(ScopeName::Session(ClientId::from("FUNDA").session().into())),
+        comp_ids: Some(vec!["FUNDA".into(), "FUNDB".into()]),
         venue: Some("NASDAQ".into()),
         symbol: Some("AAPL".into()),
         status: Some(Status::New),
