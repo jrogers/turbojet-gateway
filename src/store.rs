@@ -113,8 +113,10 @@ impl Store {
     /// The database can't be reached, refuses the statements, or has another schema version.
     pub async fn open(url: &str) -> io::Result<Self> {
         sqlx::any::install_default_drivers();
-        let sqlite = url.starts_with("sqlite:");
-        let postgres = url.starts_with("postgres:") || url.starts_with("postgresql:");
+        // In any case, as sqlx picks its driver.
+        let scheme = url.split(':').next().unwrap_or_default().to_ascii_lowercase();
+        let sqlite = scheme == "sqlite";
+        let postgres = scheme == "postgres" || scheme == "postgresql";
         // One connection to write, as one writer task writes and `load` runs once at start; reads
         // of history have their own pool (`reads`). No idle timeout or lifetime, so a
         // `sqlite::memory:` database, which is its connection's, lives as long as the store.

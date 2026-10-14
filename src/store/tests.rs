@@ -657,6 +657,14 @@ fn a_urls_password_is_hidden() {
     assert_eq!(without_password("sqlite::memory:"), "sqlite::memory:");
 }
 
+/// A URL's scheme is read in any case, as sqlx reads it: an in-memory SQLite database's reads
+/// share the writer's connection, so they find its tables.
+#[tokio::test]
+async fn a_schemes_case_does_not_matter() {
+    let store = Store::open("SQLite::memory:").await.unwrap();
+    assert!(store.order("o1").await.unwrap().is_none());
+}
+
 /// Creating the tables says whether the database was new, which `open` logs.
 #[tokio::test]
 async fn creating_says_whether_the_database_was_new() {
