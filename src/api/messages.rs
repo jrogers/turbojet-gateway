@@ -1055,7 +1055,7 @@ mod tests {
         let past = crate::store::tests::dated(103, &fundb, None, true, past(3));
         fixture.service.store().unwrap().write(&[past]).await.unwrap();
         crate::edge::tests::book_order_as(fixture.service.gateway(), "FUNDB", "B1");
-        assert!(fixture.service.gateway().block(crate::book::Scope::CompId("FUNDB".into())).await);
+        assert!(fixture.service.gateway().block(crate::book::Scope::CompId("FUNDB".into())));
         fixture.service.client_session(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB")).pause(None);
         let order =
             |minute, comp_id, id| (at(8, 9, minute), Direction::Inbound, Some(comp_id), fix(&[(35, "D"), (11, id)]));

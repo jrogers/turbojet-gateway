@@ -498,11 +498,11 @@ mod tests {
         let snapshot = next_json(&mut client).await;
         let id = snapshot["orders"][0]["id"].as_u64().unwrap();
         let gateway = fixture.service.gateway();
-        gateway.cancel_order(crate::book::OrderId(id)).await.unwrap();
+        gateway.cancel_order(crate::book::OrderId(id)).unwrap();
         let event = until(&mut client, |message| message["type"] == "order").await;
         assert_eq!(event["id"], id);
         assert_ne!(event, snapshot["orders"][0]);
-        assert!(gateway.block(Scope::All).await);
+        assert!(gateway.block(Scope::All));
         let blocked = until(&mut client, |message| message["type"] == "blocked").await;
         assert_eq!(blocked, serde_json::json!({ "type": "blocked", "scope": "all" }));
     }
@@ -573,7 +573,7 @@ mod tests {
         let gateway = fixture.service.gateway();
         crate::edge::tests::book_input(gateway, crate::edge::tests::new_order_from("FUNDB", "B1"));
         for comp_id in ["FUNDA", "FUNDB"] {
-            assert!(gateway.block(Scope::CompId(comp_id.into())).await);
+            assert!(gateway.block(Scope::CompId(comp_id.into())));
         }
         let (addr, _stop) = serve(fixture.app.clone()).await;
         let snapshot_as = async |bearer: &str| {

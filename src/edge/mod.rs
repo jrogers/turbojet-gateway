@@ -401,72 +401,60 @@ impl Gateway {
     /// Blocks the clients in `scope`: their new orders are rejected until [`unblock`](Self::unblock)
     /// lifts this scope (see [`Input::Block`]). Their working orders stay; see
     /// [`cancel_all`](Self::cancel_all). `false` if `scope` was blocked already, which changes
-    /// nothing. Returns once the block is committed, with a database, either way: a block made
-    /// by an earlier call may still be on its way.
-    pub async fn block(self: &Arc<Self>, scope: Scope) -> bool {
-        let changed = {
-            let mut state = self.lock();
-            let changed = !state.book.blocked().contains(&scope);
-            if changed {
-                warn!(?scope, "blocking clients");
-                self.handle_locked(&mut state, [Input::Block { scope }], None);
-            } else {
-                info!(?scope, "blocked already");
-            }
-            changed
-        };
-        self.committed().await;
+    /// nothing. In effect at once; [`committed`](Self::committed) says when it has committed, with
+    /// a database.
+    pub fn block(self: &Arc<Self>, scope: Scope) -> bool {
+        let mut state = self.lock();
+        let changed = !state.book.blocked().contains(&scope);
+        if changed {
+            warn!(?scope, "blocking clients");
+            self.handle_locked(&mut state, [Input::Block { scope }], None);
+        } else {
+            info!(?scope, "blocked already");
+        }
         changed
     }
 
     /// The kill switch: blocks the clients in `scope` and cancels their live orders at the
     /// venues, as one step, so no order slips in between. Each client hears of each order's end
     /// as the venue's Canceled comes back. [`cancelling`](Self::cancelling) lists the cancels
-    /// still going. Returns once the block and the cancels sent are committed, with a database.
-    pub async fn cancel_all(self: &Arc<Self>, scope: Scope) {
+    /// still going. Committed as [`block`](Self::block) is.
+    pub fn cancel_all(self: &Arc<Self>, scope: Scope) {
         warn!(?scope, "blocking clients and cancelling their orders");
         self.handle_all([Input::Block { scope: scope.clone() }, Input::CancelAll { scope }]);
-        self.committed().await;
     }
 
     /// Lifts the block of exactly `scope`: a block of a session's CompID, or of everyone, stays.
-    /// `false` if `scope` wasn't blocked, which changes nothing. Returns once the unblock is
-    /// committed, with a database, either way, as [`block`](Self::block) does.
-    pub async fn unblock(self: &Arc<Self>, scope: Scope) -> bool {
-        let changed = {
-            let mut state = self.lock();
-            let changed = state.book.blocked().contains(&scope);
-            if changed {
-                warn!(?scope, "unblocking clients");
-                self.handle_locked(&mut state, [Input::Unblock { scope }], None);
-            } else {
-                info!(?scope, blocked = ?state.book.blocked(), "nothing to unblock");
-            }
-            changed
-        };
-        self.committed().await;
+    /// `false` if `scope` wasn't blocked, which changes nothing. Committed as
+    /// [`block`](Self::block) is.
+    pub fn unblock(self: &Arc<Self>, scope: Scope) -> bool {
+        let mut state = self.lock();
+        let changed = state.book.blocked().contains(&scope);
+        if changed {
+            warn!(?scope, "unblocking clients");
+            self.handle_locked(&mut state, [Input::Unblock { scope }], None);
+        } else {
+            info!(?scope, blocked = ?state.book.blocked(), "nothing to unblock");
+        }
         changed
     }
 
     /// The gateway's own cancel of one order, as [`cancel_all`](Self::cancel_all) sends for each,
     /// without a block. A stuck cancel starts again with its tries counted afresh, which makes
-    /// this the way to retry one; one in flight is left to finish. Returns once the cancel sent is
-    /// committed, with a database.
+    /// this the way to retry one; one in flight is left to finish. Committed as
+    /// [`block`](Self::block) is.
     ///
     /// # Errors
     ///
     /// If the book doesn't hold the order, or it's done.
-    pub async fn cancel_order(self: &Arc<Self>, order: OrderId) -> Result<(), CancelError> {
-        {
-            let mut state = self.lock();
-            let found = state.book.order(order).ok_or(CancelError::UnknownOrder)?;
-            if found.status.is_done() {
-                return Err(CancelError::Done);
-            }
-            warn!(order = %found.name, client = %found.client, "cancelling an order");
-            self.handle_locked(&mut state, [Input::CancelOrder { order }], None);
+    pub fn cancel_order(self: &Arc<Self>, order: OrderId) -> Result<(), CancelError> {
+        let mut state = self.lock();
+        let found = state.book.order(order).ok_or(CancelError::UnknownOrder)?;
+        if found.status.is_done() {
+            return Err(CancelError::Done);
         }
-        self.committed().await;
+        warn!(order = %found.name, client = %found.client, "cancelling an order");
+        self.handle_locked(&mut state, [Input::CancelOrder { order }], None);
         Ok(())
     }
 
@@ -496,25 +484,22 @@ impl Gateway {
         send_status_request(state.venues.get(&venue), &output, self.clock.now().into())
     }
 
-    /// Cancels an order its venue has said it doesn't know: see [`Input::Resolve`]. Returns once
-    /// the cancel is committed, with a database.
+    /// Cancels an order its venue has said it doesn't know: see [`Input::Resolve`]. Committed as
+    /// [`block`](Self::block) is.
     ///
     /// # Errors
     ///
     /// If the book doesn't hold the order, it's done, or its venue hasn't said it doesn't know it.
-    pub async fn resolve(self: &Arc<Self>, order: OrderId) -> Result<(), ResolveError> {
-        {
-            let mut state = self.lock();
-            let found = state.book.order(order).ok_or(ResolveError::UnknownOrder)?;
-            if found.status.is_done() {
-                return Err(ResolveError::Done);
-            }
-            if !state.book.is_unknown_at_venue(order) {
-                return Err(ResolveError::NotUnknownAtVenue);
-            }
-            self.handle_locked(&mut state, [Input::Resolve { order }], None);
+    pub fn resolve(self: &Arc<Self>, order: OrderId) -> Result<(), ResolveError> {
+        let mut state = self.lock();
+        let found = state.book.order(order).ok_or(ResolveError::UnknownOrder)?;
+        if found.status.is_done() {
+            return Err(ResolveError::Done);
         }
-        self.committed().await;
+        if !state.book.is_unknown_at_venue(order) {
+            return Err(ResolveError::NotUnknownAtVenue);
+        }
+        self.handle_locked(&mut state, [Input::Resolve { order }], None);
         Ok(())
     }
 
@@ -605,6 +590,11 @@ impl Gateway {
         if let Some(writer) = &self.writer {
             writer.committed().await;
         }
+    }
+
+    /// Whether every change to the book so far commits within `wait`: at once without a database.
+    pub async fn committed_within(&self, wait: Duration) -> bool {
+        tokio::time::timeout(wait, self.committed()).await.is_ok()
     }
 
     /// The scopes blocked now.
@@ -1571,7 +1561,7 @@ pub(crate) mod tests {
         let venue = initiator(&venue_addr, "JETBRIDGE", "VENUE", Arc::new(VenueApp(gateway.clone())));
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         book_order(&gateway);
-        gateway.cancel_all(Scope::All).await;
+        gateway.cancel_all(Scope::All);
         assert!(gateway.cancels_waiting.load(Ordering::Acquire));
         // The venue isn't connected: the tick sends nothing, and leaves it to the logon.
         gateway.send_waiting_cancels();
@@ -1597,10 +1587,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn block_and_unblock_say_whether_they_changed_anything() {
         let gateway = gateway();
-        assert!(gateway.block(Scope::All).await);
-        assert!(!gateway.block(Scope::All).await);
-        assert!(!gateway.unblock(Scope::CompId("FUNDA".into())).await);
-        assert!(gateway.unblock(Scope::All).await);
+        assert!(gateway.block(Scope::All));
+        assert!(!gateway.block(Scope::All));
+        assert!(!gateway.unblock(Scope::CompId("FUNDA".into())));
+        assert!(gateway.unblock(Scope::All));
         assert!(gateway.blocked().is_empty());
     }
 
@@ -1624,7 +1614,7 @@ pub(crate) mod tests {
             book.handle(refused, &mut Vec::new());
         }
         assert!(gateway.cancelling()[0].1.stuck);
-        assert_eq!(gateway.cancel_order(OrderId(1)).await, Ok(()));
+        assert_eq!(gateway.cancel_order(OrderId(1)), Ok(()));
         let (_, cancel) = &gateway.cancelling()[0];
         assert_eq!((cancel.tries, cancel.unsent, cancel.stuck), (0, true, false));
     }
@@ -1632,10 +1622,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn cancelling_an_unknown_or_done_order_is_refused() {
         let gateway = gateway();
-        assert_eq!(gateway.cancel_order(OrderId(1)).await, Err(CancelError::UnknownOrder));
+        assert_eq!(gateway.cancel_order(OrderId(1)), Err(CancelError::UnknownOrder));
         // No venue set: rejected, so done.
         send_order(&gateway, "C1");
-        assert_eq!(gateway.cancel_order(OrderId(1)).await, Err(CancelError::Done));
+        assert_eq!(gateway.cancel_order(OrderId(1)), Err(CancelError::Done));
         assert!(gateway.cancelling().is_empty());
     }
 
@@ -1659,14 +1649,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resolving_needs_the_venue_to_have_said_it_doesnt_know_the_order() {
         let gateway = gateway();
-        assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::UnknownOrder));
+        assert_eq!(gateway.resolve(OrderId(1)), Err(ResolveError::UnknownOrder));
         book_order(&gateway);
-        assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::NotUnknownAtVenue));
+        assert_eq!(gateway.resolve(OrderId(1)), Err(ResolveError::NotUnknownAtVenue));
         let downstream = gateway.order(OrderId(1)).unwrap().requests[0].downstream.clone();
         unknown_at_venue(&gateway, &downstream);
-        assert_eq!(gateway.resolve(OrderId(1)).await, Ok(()));
+        assert_eq!(gateway.resolve(OrderId(1)), Ok(()));
         assert_eq!(gateway.order(OrderId(1)).unwrap().order.status, crate::book::Status::Canceled);
-        assert_eq!(gateway.resolve(OrderId(1)).await, Err(ResolveError::Done));
+        assert_eq!(gateway.resolve(OrderId(1)), Err(ResolveError::Done));
     }
 
     /// A session with a SubID is found by the session as it shows, and names a session scope.
@@ -2300,19 +2290,18 @@ pub(crate) mod tests {
         assert!(undelivered(&store).await.is_empty());
     }
 
-    /// An operator's call returns only once its change has committed.
+    /// An operator's call is in effect at once, and `committed_within` says whether it has
+    /// committed: not while the database's gate is shut, and once it opens.
     #[tokio::test]
-    async fn an_operator_call_returns_once_its_change_has_committed() {
+    async fn an_operator_call_is_in_effect_before_it_has_committed() {
         let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         store.hooks.gate.send_replace(false);
-        let mut blocking = tokio::spawn({
-            let gateway = gateway.clone();
-            async move { gateway.block(Scope::All).await }
-        });
-        assert!(timeout(Duration::from_millis(100), &mut blocking).await.is_err(), "returned before committing");
+        assert!(gateway.block(Scope::All));
+        assert_eq!(gateway.blocked(), [Scope::All]);
+        assert!(!gateway.committed_within(Duration::from_millis(100)).await, "committed while the gate was shut");
         assert!(store.load().await.unwrap().blocked.is_empty());
         store.hooks.gate.send_replace(true);
-        timeout(Duration::from_secs(5), blocking).await.expect("not committed").unwrap();
+        assert!(gateway.committed_within(Duration::from_secs(5)).await, "not committed");
         assert_eq!(store.load().await.unwrap().blocked, [Scope::All]);
     }
 
@@ -2321,9 +2310,10 @@ pub(crate) mod tests {
     async fn without_a_database_the_book_keeps_no_changes() {
         let gateway = gateway();
         send_order(&gateway, "C1");
-        gateway.cancel_all(Scope::All).await;
-        assert!(gateway.unblock(Scope::All).await);
+        gateway.cancel_all(Scope::All);
+        assert!(gateway.unblock(Scope::All));
         assert_eq!(gateway.lock().book.take_changes(), crate::book::Changes::default());
+        assert!(gateway.committed_within(Duration::ZERO).await);
     }
 
     /// A request the venue's session drops unsent keeps the client's order in flight until the
@@ -2462,7 +2452,7 @@ pub(crate) mod tests {
         for msg in [venue_report("OLDOLD1", 0), venue_report("OLDOLD1", 10)] {
             venue.on_message(&mut Context::new(&sessions.venue.handle()), &msg).unwrap();
         }
-        before.block(Scope::CompId("FUNDB".into())).await;
+        before.block(Scope::CompId("FUNDB".into()));
         before.committed().await;
 
         let after = restarted(&store, "NEWNEW").await;
@@ -3057,10 +3047,10 @@ pub(crate) mod tests {
     async fn a_block_and_an_unblock_are_published_once_each() {
         let gateway = gateway();
         let mut events = gateway.subscribe();
-        gateway.block(Scope::All).await;
-        gateway.block(Scope::All).await;
-        gateway.unblock(Scope::All).await;
-        gateway.unblock(Scope::All).await;
+        gateway.block(Scope::All);
+        gateway.block(Scope::All);
+        gateway.unblock(Scope::All);
+        gateway.unblock(Scope::All);
         let want = [GatewayEvent::Blocked { scope: Scope::All }, GatewayEvent::Unblocked { scope: Scope::All }];
         assert_eq!(published(&mut events), want);
     }

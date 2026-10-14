@@ -764,7 +764,7 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
 
     let gateway = setup.service.gateway().clone();
     let session = Scope::Session(ClientId::new(&SessionId::new("FIX.4.4", GATEWAY, CLIENT)));
-    gateway.cancel_all(session.clone()).await;
+    gateway.cancel_all(session.clone());
     assert_eq!(gateway.blocked(), std::slice::from_ref(&session));
     for n in ["1", "2"] {
         let sent: v44::OrderCancelRequest = setup.venue.events.parse().await;
@@ -789,7 +789,7 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
     assert_unbooked_reject(&rejected, "C3", &setup.id("R1"));
     assert_eq!(rejected.text.as_deref(), Some("blocked by an operator"));
     assert_eq!(rejected.ord_rej_reason, Some(Code::Known(v44::OrdRejReason::Other)));
-    assert!(gateway.unblock(session).await);
+    assert!(gateway.unblock(session));
     assert_eq!(setup.order("C4").await.cl_ord_id, &*setup.id("3"));
 }
 
@@ -797,7 +797,7 @@ async fn the_kill_switch_cancels_a_sessions_orders_and_blocks_it() {
 #[tokio::test]
 async fn a_comp_id_block_covers_a_session_that_logs_on_later() {
     let setup = Setup::new().await;
-    setup.service.gateway().block(Scope::CompId(CLIENT.into())).await;
+    setup.service.gateway().block(Scope::CompId(CLIENT.into()));
     let (desk, mut events) = client(&setup.service, "FIX.4.4", Some("DESK1"));
     tokio::spawn(desk.clone().run());
     events.logged_on().await;

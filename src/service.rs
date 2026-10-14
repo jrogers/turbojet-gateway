@@ -1339,7 +1339,7 @@ mod tests {
         write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
         let path = dir.path().join("jetbridge.toml");
         let (service, serving) = Service::start(&path).await.unwrap();
-        service.gateway().block(book::Scope::All).await;
+        service.gateway().block(book::Scope::All);
         service.shutdown().await;
         serving.abort();
         drop(service);

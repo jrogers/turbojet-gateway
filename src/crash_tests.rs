@@ -671,7 +671,7 @@ async fn a_block_and_its_cancels_carry_on_across_a_crash() {
     let scope = book::Scope::Session(client);
     let gateway = setup.gateway().service.gateway().clone();
     let cancelling = scope.clone();
-    setup.gateway().run(async move { gateway.cancel_all(cancelling).await }).await;
+    setup.gateway().run(async move { gateway.cancel_all(cancelling) }).await;
     let mut cancels = Vec::new();
     for _ in 0..2 {
         let sent: v44::OrderCancelRequest = setup.venue_events.parse().await;
@@ -700,7 +700,7 @@ async fn a_block_and_its_cancels_carry_on_across_a_crash() {
     assert_eq!((rejected.cl_ord_id.as_deref(), rejected.text.as_deref()), (Some("C3"), Some("blocked by an operator")));
 
     let gateway = setup.gateway().service.gateway().clone();
-    assert!(setup.gateway().run(async move { gateway.unblock(scope).await }).await);
+    assert!(setup.gateway().run(async move { gateway.unblock(scope) }).await);
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::Canceled, Decimal::ZERO)]);
@@ -709,8 +709,8 @@ async fn a_block_and_its_cancels_carry_on_across_a_crash() {
 }
 
 /// The kill switch's cancels stored by the venue's session but not committed when the gateway
-/// crashes (so the operator's call never returned): after the restart the orphaned cancels are
-/// found, and the orders are cancelled; the block is lost with the call.
+/// crashes (the API would have answered the operator 202, not committed): after the restart the
+/// orphaned cancels are found, and the orders are cancelled; the block is lost.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_switch_that_never_committed_still_cancels_after_a_crash() {
     let mut setup = Setup::new().await;
@@ -718,7 +718,7 @@ async fn a_kill_switch_that_never_committed_still_cancels_after_a_crash() {
     setup.gateway().committed().await;
     setup.gateway().store().hooks.gate.send_replace(false);
     let gateway = setup.gateway().service.gateway().clone();
-    setup.gateway().runtime.spawn(async move { gateway.cancel_all(book::Scope::All).await });
+    setup.gateway().runtime.spawn(async move { gateway.cancel_all(book::Scope::All) });
     let sent: v44::OrderCancelRequest = setup.venue_events.parse().await;
     assert_eq!(sent.orig_cl_ord_id.as_str(), first);
 

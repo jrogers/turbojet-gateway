@@ -12,20 +12,24 @@
 //! LocationID) as `%2F`, so it stays one segment of the path.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use turbojet::{SequenceError, SequenceNumbers, SessionHandle};
 use turbojet_config::Changes;
 
 use super::auth::{Caller, Target};
+use super::listener::IDLE;
 use super::{ApiError, Mutation, Outcome, State, audited};
 use crate::auth::Role;
 use crate::book::{OrderId, Scope, ScopeName};
 use crate::config::RiskTable;
+use crate::edge::writer::MAX_COMMIT_WAIT;
 use crate::edge::{CancelError, Gateway, ResolveError, StatusError};
 use crate::limits::{self, Edit, EditError, Limits};
 use crate::service::{ConfigSummary, Edited, Reloaded, Service};
@@ -33,6 +37,14 @@ use crate::service::{ConfigSummary, Edited, Reloaded, Service};
 type AxumState = axum::extract::State<State>;
 type Body<B> = Result<Json<B>, JsonRejection>;
 type Id = Result<Path<String>, PathRejection>;
+
+/// How long a block, unblock or cancel waits for its change to commit before answering 202, the
+/// change in effect and committed when the database answers: far above a healthy commit
+/// (milliseconds) and the writer's [`MAX_COMMIT_WAIT`], and well under the listener's [`IDLE`],
+/// which would cut the answer off. Shorter in tests, to keep them short.
+const COMMIT_REPLY_WAIT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(5) };
+const _: () = assert!(cfg!(test) || COMMIT_REPLY_WAIT.as_millis() > MAX_COMMIT_WAIT.as_millis());
+const _: () = assert!(COMMIT_REPLY_WAIT.as_millis() < IDLE.as_millis());
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,14 +224,14 @@ fn numbers(result: Result<SequenceNumbers, SequenceError>) -> Result<Numbers, Ap
 }
 
 /// `POST /api/orders/{order_id}/cancel {reason}`: the gateway's own cancel of the order whose
-/// OrderID(37) is `order_id` (see [`Gateway::cancel_order`]); 404 if the book doesn't hold it,
-/// 409 if it's done.
+/// OrderID(37) is `order_id` (see [`Gateway::cancel_order`]); 204 once committed, or 202 (see
+/// [`committed`]). 404 if the book doesn't hold it, 409 if it's done.
 pub(super) async fn cancel_order(
     axum::extract::State(state): AxumState,
     caller: Caller,
     order_id: Id,
     body: Body<Reason>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let (order_id, parsed_id) = parse_id(order_id);
     let (body, parsed) = parse(body);
     let gateway = state.service()?.gateway().clone();
@@ -232,11 +244,11 @@ pub(super) async fn cancel_order(
     let mutation =
         Mutation { action: "cancel_order", target: order_id, params: serde_json::Value::Null, reason: body.reason };
     audited_on(&state, &caller, mutation, found, |order| async move {
-        gateway.cancel_order(order).await.map_err(|e| match e {
+        gateway.cancel_order(order).map_err(|e| match e {
             CancelError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, unknown),
             CancelError::Done => ApiError::new(StatusCode::CONFLICT, e.to_string()),
         })?;
-        Ok((StatusCode::NO_CONTENT, None))
+        Ok(committed(&gateway).await)
     })
     .await
 }
@@ -274,14 +286,14 @@ pub(super) async fn request_status(
 
 /// `POST /api/orders/{order_id}/resolve {reason}`: cancels the order whose OrderID(37) is
 /// `order_id`, which its venue has said it doesn't know (see [`Gateway::resolve`]); 204 once the
-/// cancel is committed. 404 if the book doesn't hold the order, 409 if it's done or the venue
-/// hasn't said so.
+/// cancel is committed, or 202 (see [`committed`]). 404 if the book doesn't hold the order, 409
+/// if it's done or the venue hasn't said so.
 pub(super) async fn resolve(
     axum::extract::State(state): AxumState,
     caller: Caller,
     order_id: Id,
     body: Body<Reason>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let (order_id, parsed_id) = parse_id(order_id);
     let (body, parsed) = parse(body);
     let gateway = state.service()?.gateway().clone();
@@ -294,11 +306,11 @@ pub(super) async fn resolve(
     let mutation =
         Mutation { action: "resolve", target: order_id, params: serde_json::Value::Null, reason: body.reason };
     audited_on(&state, &caller, mutation, found, |order| async move {
-        gateway.resolve(order).await.map_err(|e| match e {
+        gateway.resolve(order).map_err(|e| match e {
             ResolveError::UnknownOrder => ApiError::new(StatusCode::NOT_FOUND, unknown),
             ResolveError::Done | ResolveError::NotUnknownAtVenue => ApiError::new(StatusCode::CONFLICT, e.to_string()),
         })?;
-        Ok((StatusCode::NO_CONTENT, None))
+        Ok(committed(&gateway).await)
     })
     .await
 }
@@ -312,52 +324,83 @@ fn find_order(caller: &Caller, gateway: &Gateway, order_id: Option<&str>) -> Res
     if caller.may_act_on(&order.order.client) { Ok(order.order.id) } else { Err(out_of_scope(caller, order_id)) }
 }
 
-/// Whether a block or unblock changed anything.
+/// Whether a block or unblock changed anything, and whether it has committed.
 #[derive(Debug, Serialize)]
 pub(super) struct Changed {
     changed: bool,
+    committed: bool,
 }
 
 /// `POST /api/risk/block {reason, scope}`: rejects the new orders of the clients in `scope`; see
-/// [`Gateway::block`].
+/// [`Gateway::block`]. 200 once committed, or 202 (see [`committed`]).
 pub(super) async fn block(
     axum::extract::State(state): AxumState,
     caller: Caller,
     body: Body<ScopeBody>,
-) -> Result<Json<Changed>, ApiError> {
+) -> Result<(StatusCode, Json<Changed>), ApiError> {
     on_scope(&state, &caller, "block", body, |gateway, scope| async move {
-        let changed = gateway.block(scope).await;
-        Ok((Json(Changed { changed }), (!changed).then(|| "unchanged: already blocked".to_string())))
+        let changed = gateway.block(scope);
+        Ok(changed_committed(&gateway, changed, "unchanged: already blocked").await)
     })
     .await
 }
 
 /// `POST /api/risk/unblock {reason, scope}`: lifts the block of exactly `scope`; see
-/// [`Gateway::unblock`].
+/// [`Gateway::unblock`]. 200 once committed, or 202 (see [`committed`]).
 pub(super) async fn unblock(
     axum::extract::State(state): AxumState,
     caller: Caller,
     body: Body<ScopeBody>,
-) -> Result<Json<Changed>, ApiError> {
+) -> Result<(StatusCode, Json<Changed>), ApiError> {
     on_scope(&state, &caller, "unblock", body, |gateway, scope| async move {
-        let changed = gateway.unblock(scope).await;
-        Ok((Json(Changed { changed }), (!changed).then(|| "unchanged: not blocked".to_string())))
+        let changed = gateway.unblock(scope);
+        Ok(changed_committed(&gateway, changed, "unchanged: not blocked").await)
     })
     .await
 }
 
 /// `POST /api/risk/cancel-all {reason, scope}`: the kill switch, blocking the clients in `scope`
-/// and cancelling their orders; see [`Gateway::cancel_all`].
+/// and cancelling their orders; see [`Gateway::cancel_all`]. 204 once committed, or 202 (see
+/// [`committed`]).
 pub(super) async fn cancel_all(
     axum::extract::State(state): AxumState,
     caller: Caller,
     body: Body<ScopeBody>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     on_scope(&state, &caller, "cancel_all", body, |gateway, scope| async move {
-        gateway.cancel_all(scope).await;
-        Ok((StatusCode::NO_CONTENT, None))
+        gateway.cancel_all(scope);
+        Ok(committed(&gateway).await)
     })
     .await
+}
+
+/// The audit log's note on an action not committed within [`COMMIT_REPLY_WAIT`].
+const NOT_COMMITTED: &str = "applied, not yet committed: the database hasn't answered";
+
+/// 204 once what `gateway` has changed so far has committed, waiting up to [`COMMIT_REPLY_WAIT`];
+/// otherwise 202 `{"committed": false}`, the change in effect and committed when the database
+/// answers, with the audit log's note saying so.
+async fn committed(gateway: &Gateway) -> (Response, Option<String>) {
+    if gateway.committed_within(COMMIT_REPLY_WAIT).await {
+        (StatusCode::NO_CONTENT.into_response(), None)
+    } else {
+        let body = Json(serde_json::json!({ "committed": false }));
+        ((StatusCode::ACCEPTED, body).into_response(), Some(NOT_COMMITTED.to_string()))
+    }
+}
+
+/// A block's or unblock's answer, as [`committed`] gives it but 200 once committed, with whether
+/// it `changed` anything; `unchanged` is the audit log's note if it didn't.
+async fn changed_committed(
+    gateway: &Gateway,
+    changed: bool,
+    unchanged: &str,
+) -> ((StatusCode, Json<Changed>), Option<String>) {
+    let committed = gateway.committed_within(COMMIT_REPLY_WAIT).await;
+    let status = if committed { StatusCode::OK } else { StatusCode::ACCEPTED };
+    let notes = [(!changed).then_some(unchanged), (!committed).then_some(NOT_COMMITTED)];
+    let note = notes.into_iter().flatten().collect::<Vec<_>>().join("; ");
+    ((status, Json(Changed { changed, committed })), (!note.is_empty()).then_some(note))
 }
 
 /// What a reload took.
@@ -777,7 +820,7 @@ mod tests {
 
     use turbojet::fields::Decimal;
 
-    use super::super::read::tests::{Fixture, fixture};
+    use super::super::read::tests::{Fixture, fixture, fixture_with};
     use super::super::tests::{Answer, send};
     use super::*;
     use crate::book::{ExecType, Input, OrderId, Status, VenueReport};
@@ -1116,7 +1159,8 @@ mod tests {
         let fixture = fixture().await;
         let gateway = fixture.service.gateway();
         let funda = r#"{"reason":"testing","scope":"comp:FUNDA"}"#;
-        assert_eq!(fixture.expect("/api/risk/block", funda, StatusCode::OK).await["changed"], true);
+        let body = fixture.expect("/api/risk/block", funda, StatusCode::OK).await;
+        assert_eq!(body, serde_json::json!({ "changed": true, "committed": true }));
         assert_eq!(gateway.blocked(), [Scope::CompId("FUNDA".into())]);
         assert_eq!(fixture.expect("/api/risk/block", funda, StatusCode::OK).await["changed"], false);
         assert_eq!(fixture.last_result(), "unchanged: already blocked");
@@ -1143,6 +1187,40 @@ mod tests {
             assert!(fixture.last_result().starts_with("refused: "), "{body}");
         }
         assert_eq!(fixture.last_result(), "refused: no session:nobody");
+    }
+
+    /// With the database's gate shut, a block, a second one and the kill switch each answer 202
+    /// `committed: false` within `COMMIT_REPLY_WAIT` (and a margin), in effect at once; the
+    /// changes commit once the gate opens.
+    #[tokio::test]
+    async fn an_action_the_database_holds_up_answers_202() {
+        let fixture = fixture_with("[database]\nurl = \"sqlite::memory:\"\n").await;
+        let store = fixture.service.store().unwrap().clone();
+        let funda = r#"{"reason":"testing","scope":"comp:FUNDA"}"#;
+        let expect_soon = async |path: &str| {
+            let asked = std::time::Instant::now();
+            let body = fixture.expect(path, funda, StatusCode::ACCEPTED).await;
+            assert!(asked.elapsed() < COMMIT_REPLY_WAIT + Duration::from_secs(1), "{path}: {:?}", asked.elapsed());
+            body
+        };
+        store.hooks.gate.send_replace(false);
+
+        let body = expect_soon("/api/risk/block").await;
+        assert_eq!(body, serde_json::json!({ "changed": true, "committed": false }));
+        assert_eq!(fixture.last_result(), NOT_COMMITTED);
+        assert_eq!(fixture.service.gateway().blocked(), [Scope::CompId("FUNDA".into())]);
+        let body = expect_soon("/api/risk/block").await;
+        assert_eq!(body, serde_json::json!({ "changed": false, "committed": false }));
+        assert_eq!(fixture.last_result(), format!("unchanged: already blocked; {NOT_COMMITTED}"));
+        assert_eq!(expect_soon("/api/risk/cancel-all").await, serde_json::json!({ "committed": false }));
+        assert_eq!(fixture.last_result(), NOT_COMMITTED);
+        assert!(store.load().await.unwrap().blocked.is_empty());
+
+        store.hooks.gate.send_replace(true);
+        assert!(fixture.service.gateway().committed_within(Duration::from_secs(5)).await);
+        assert_eq!(store.load().await.unwrap().blocked, [Scope::CompId("FUNDA".into())]);
+        let body = fixture.expect("/api/risk/block", funda, StatusCode::OK).await;
+        assert_eq!(body, serde_json::json!({ "changed": false, "committed": true }));
     }
 
     /// An operator scoped to FUNDB acts on FUNDB, and is refused `all`, FUNDA's order and

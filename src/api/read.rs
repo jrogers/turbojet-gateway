@@ -1079,7 +1079,7 @@ pub(super) mod tests {
             Scope::Session(ClientId::from("FUNDB")),
         ];
         for scope in blocks {
-            assert!(gateway.block(scope).await);
+            assert!(gateway.block(scope));
         }
         fixture.service.client_session(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB")).pause(None);
         let read = async |bearer: &str, path: &str| {
