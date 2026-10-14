@@ -28,6 +28,10 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
   const live = useLive()
   // `undefined` until read; `null` for a 404.
   const [detail, setDetail] = useState<OrderDetail | null>()
+  const heading = useRef<HTMLHeadingElement>(null)
+  // Set by an action done: focus goes to the heading once its dialog has closed, as the button
+  // that opened it may be gone.
+  const refocus = useRef(false)
   const [error, setError] = useState<string>()
   // One more reads the order again: after an action, which changes it.
   const [reads, setReads] = useState(0)
@@ -59,20 +63,24 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
         else setError(message(e))
       },
     )
+    return () => {
+      asking.current = undefined
+    }
   }, [orderId, live.snapshots, reads])
 
-  // An event for it changes its fields; the requests stay as last read, which events don't carry.
-  // ponytail: an event that came before a read's answer but after the server wrote it is
-  // overwritten by that answer until the next event or snapshot; a version on OrderView would
-  // tell them apart.
+  // After the dialog's own cleanup, which focuses where it was opened from.
   useEffect(() => {
-    if (latest) setDetail((detail) => detail && { ...detail, ...latest })
-  }, [latest])
+    if (action === undefined && refocus.current) {
+      refocus.current = false
+      heading.current?.focus()
+    }
+  }, [action])
 
   async function confirm(reason: string) {
     if (!action) return
     await ACTIONS[action].post(orderId, reason)
     setNotice(ACTIONS[action].done)
+    refocus.current = true
     setReads((reads) => reads + 1)
   }
 
@@ -90,7 +98,10 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
     )
   }
 
-  const acts = me.role !== 'viewer' && detail !== undefined && !done(detail.status)
+  // The store's latest event over the last read: an event changes the fields, and the requests,
+  // which events don't carry, stay as read.
+  const shown: OrderDetail | undefined = detail && latest ? { ...detail, ...latest } : detail
+  const acts = me.role !== 'viewer' && shown !== undefined && !done(shown.status)
   const choose = (kind: Action) => {
     setNotice(undefined)
     setAction(kind)
@@ -101,14 +112,17 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
       <p>
         <a href="#/orders">Orders</a>
       </p>
-      <h1>Order {orderId}</h1>
+      <h1 ref={heading} tabIndex={-1}>
+        Order {orderId}
+      </h1>
       {error && (
         <p className="error" role="alert">
           {error}
         </p>
       )}
-      {notice && <p role="status">{notice}</p>}
-      {detail === undefined ? (
+      {/* Always there, so a screen reader hears its text change. */}
+      <p role="status">{notice}</p>
+      {shown === undefined ? (
         !error && <p className="muted">Loading…</p>
       ) : (
         <>
@@ -120,16 +134,16 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
               <button type="button" onClick={() => choose('status')}>
                 Ask status
               </button>
-              {detail.unknown_at_venue && (
+              {shown.unknown_at_venue && (
                 <button type="button" onClick={() => choose('resolve')}>
                   Resolve
                 </button>
               )}
             </p>
           )}
-          <Fields order={detail} />
+          <Fields order={shown} />
           <h2>Requests to the venue</h2>
-          <Requests order={detail} />
+          <Requests order={shown} />
         </>
       )}
       <h2>Messages</h2>
@@ -254,7 +268,7 @@ function Messages({ orderId }: { orderId: string }) {
             <thead>
               <tr>
                 <th>Time (UTC)</th>
-                <th>Dir</th>
+                <th>Direction</th>
                 <th>Session</th>
                 <th>MsgType</th>
                 <th>Message</th>
@@ -273,6 +287,12 @@ function Messages({ orderId }: { orderId: string }) {
                         <code className="raw">{hit.raw}</code>
                       </summary>
                       <table className="tags">
+                        <thead className="visually-hidden">
+                          <tr>
+                            <th>Tag</th>
+                            <th>Value</th>
+                          </tr>
+                        </thead>
                         <tbody>
                           {hit.fields.map(([tag, value], i) => (
                             <tr key={i}>
@@ -292,6 +312,11 @@ function Messages({ orderId }: { orderId: string }) {
       )}
       <p className="muted">
         {busy ? 'Reading…' : hits.length === 0 && !error ? 'No messages.' : null}{' '}
+        {page === undefined && error && !busy && (
+          <button type="button" onClick={() => read(null)}>
+            Retry
+          </button>
+        )}
         {page?.next != null ? (
           <button type="button" onClick={() => read(page.next)} disabled={busy}>
             More

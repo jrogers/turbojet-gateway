@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import * as api from './api.ts'
@@ -150,7 +151,7 @@ test('messages page on from next, then check for newer from follow', async () =>
   expect(rows[1].textContent).toContain('2026-10-14 09:00:07.123out')
   // The tag=value table, under the raw message.
   const tags = [...rows[0].querySelectorAll('table.tags tr')].map((row) => row.textContent)
-  expect(tags).toEqual(['35D', '11C7'])
+  expect(tags).toEqual(['TagValue', '35D', '11C7'])
   expect(screen.getByRole('button', { name: 'Check for newer' })).toBeTruthy()
 })
 
@@ -204,6 +205,8 @@ test('an action posts the reason with the CSRF token, reads the order again, and
   await act(async () => fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' })))
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(screen.getByRole('status').textContent).toBe('Resolved: the order is canceled.')
+  // The Resolve button that opened the dialog is gone: focus goes to the heading.
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
   const posts = calls.filter((c) => c.key.startsWith('POST'))
   expect(posts.map((c) => [c.key, c.init.body, (c.init.headers as Record<string, string>)['X-CSRF-Token']])).toEqual([
     [`POST ${PATH}/resolve`, '{"reason":"venue lost it"}', 'tok'],
@@ -229,4 +232,48 @@ test('cancel and status post to their own paths', async () => {
     expect(screen.getByRole('status').textContent).toBe(status)
   }
   expect(calls.filter((c) => c.key.startsWith('POST')).map((c) => c.key)).toEqual([`POST ${PATH}/cancel`, `POST ${PATH}/status`])
+})
+
+test('an event the store had before the read answered shows over the read’s fields', async () => {
+  await show(who('operator'), snapshot([view({ status: 'partially_filled', cum_qty: '40', unknown_at_venue: true })]))
+  expect(field('Status')).toBe('partially filledunknown at venue')
+  expect(field('Filled')).toBe('40')
+  expect(field('Venue’s OrderID')).toBe('V1')
+  expect(screen.getByText('JB1')).toBeTruthy()
+  expect(buttons()).toEqual(['Cancel', 'Ask status', 'Resolve'])
+})
+
+test('an older read answering after a newer one is dropped', async () => {
+  const answers: ((order: OrderDetail) => void)[] = []
+  vi.stubGlobal('fetch', (url: string) =>
+    url === PATH
+      ? new Promise<Response>((resolve) => answers.push((order) => resolve(json(order))))
+      : Promise.resolve(json(empty)),
+  )
+  const state = snapshot()
+  const { rerender } = render(page('O/7', who('viewer'), state))
+  const again = reduce(state, { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false })
+  rerender(page('O/7', who('viewer'), again))
+  expect(answers).toHaveLength(2)
+  await act(async () => answers[1](detail({ status: 'filled' })))
+  await act(async () => answers[0](detail({ status: 'new' })))
+  expect(field('Status')).toBe('filled')
+})
+
+test('messages under StrictMode show once', async () => {
+  routes[`GET ${PATH}/messages`] = () => json({ messages: [hit('8=FIX.4.4|35=D|')], next: null, follow: null })
+  render(<StrictMode>{page('O/7', who('viewer'), snapshot())}</StrictMode>)
+  await act(async () => {})
+  expect(document.querySelectorAll('table.messages > tbody > tr')).toHaveLength(1)
+})
+
+test('a failed messages read can be retried', async () => {
+  routes[`GET ${PATH}/messages`] = () => json({ error: 'no message log' }, 404)
+  await show()
+  expect(screen.getByRole('alert').textContent).toBe('no message log')
+  routes[`GET ${PATH}/messages`] = () => json({ messages: [hit('8=FIX.4.4|35=D|')], next: null, follow: null })
+  await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Retry' })))
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
+  expect(screen.getByText('8=FIX.4.4|35=D|')).toBeTruthy()
 })

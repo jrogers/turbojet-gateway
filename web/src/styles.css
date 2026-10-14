@@ -338,3 +338,14 @@ table.tags td {
   padding: 0 0.6rem 0 0;
   font-family: ui-monospace, monospace;
 }
+
+/* For screen readers only: a table's header row the layout doesn't show. */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
