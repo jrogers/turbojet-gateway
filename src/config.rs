@@ -171,13 +171,12 @@ pub struct MessageLog {
 impl MessageLog {
     /// Opens the log, creating its directory if need be. Passwords are masked: Turbojet's default.
     fn open(&self) -> std::io::Result<FileMessageLog> {
-        let defaults = FileLogOptions::default();
-        let options = FileLogOptions {
-            file_bytes_max: self.file_bytes_max.map_or(defaults.file_bytes_max, NonZeroU64::get),
-            retention: self.retention,
-            compress: self.compress,
-            ..defaults
-        };
+        let mut options = FileLogOptions::default();
+        if let Some(bytes) = self.file_bytes_max {
+            options.file_bytes_max = bytes.get();
+        }
+        options.retention = self.retention;
+        options.compress = self.compress;
         FileMessageLog::open(&self.dir, options)
     }
 }

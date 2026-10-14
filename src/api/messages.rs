@@ -586,7 +586,10 @@ mod tests {
             let now = now.clone();
             move || *now.lock().unwrap()
         });
-        let log = FileMessageLog::open(dir, FileLogOptions { clock, compress, ..FileLogOptions::default() }).unwrap();
+        let mut options = FileLogOptions::default();
+        options.clock = clock;
+        options.compress = compress;
+        let log = FileMessageLog::open(dir, options).unwrap();
         for (time, direction, comp_id, frame) in records {
             *now.lock().unwrap() = *time;
             let session = comp_id.map(|comp_id| SessionId::new("FIX.4.4", "JETBRIDGE", comp_id));
