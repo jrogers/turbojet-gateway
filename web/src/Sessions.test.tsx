@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
-import { afterEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import * as api from './api.ts'
 import Reason from './Reason.tsx'
 import Sessions, { NUMBERS_EVERY } from './Sessions.tsx'
@@ -45,6 +45,26 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+/**
+ * Answers each fetch with `answer`, recording the calls, but the sequence numbers' reads: those
+ * answer the store's sessions, unrecorded.
+ */
+function serve(answer: () => Response) {
+  const calls: { url: string; init: RequestInit }[] = []
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+    if (url === '/api/sessions') return json(live.sessions)
+    calls.push({ url, init })
+    return answer()
+  })
+  return calls
+}
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status })
+
+beforeEach(() => {
+  serve(() => new Response(null, { status: 500 }))
+})
+
 test('shows clients and venues from the store', () => {
   show(who('viewer'))
   const [clients, venues] = screen.getAllByRole('table')
@@ -69,17 +89,6 @@ test('shows the actions by role, and a venue only to an unscoped one', () => {
   expect(buttons('NASDAQ')).toEqual([])
 })
 
-/** Answers each fetch with `answer`, recording the calls. */
-function serve(answer: () => Response) {
-  const calls: { url: string; init: RequestInit }[] = []
-  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
-    calls.push({ url, init })
-    return answer()
-  })
-  return calls
-}
-
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status })
 
 test('a resend posts the reason and from, with the CSRF token, and says how it went', async () => {
   let calls = serve(() => json({ user: 'u', role: 'operator', clients: null, csrf: 'tok' }))
@@ -143,30 +152,58 @@ test('the reason dialog needs a reason, and Escape cancels it', () => {
   expect(close).toHaveBeenCalledOnce()
 })
 
-test('the sequence numbers are read again while shown, and a resend gives its own', async () => {
+test('the sequence numbers are read on showing, then again while the page is seen', async () => {
   vi.useFakeTimers()
   try {
-    const answers = [
-      json([{ ...session('client', FUNDA), next_incoming: 20, next_outgoing: 40 }, session('venue', VENUE)]),
-      json({ next_incoming: 21, next_outgoing: 41 }),
+    const reads = [
+      [{ ...session('client', FUNDA), next_incoming: 20, next_outgoing: 40 }, session('venue', VENUE)],
+      [{ ...session('client', FUNDA), next_incoming: 22, next_outgoing: 42 }, session('venue', VENUE)],
     ]
-    const calls = serve(() => answers.shift()!)
+    const calls: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      calls.push(url)
+      return url === '/api/sessions' ? json(reads.shift()) : json({ next_incoming: 21, next_outgoing: 41 })
+    })
+    let hidden = false
+    vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden)
     const { unmount } = show(who('operator'))
-    expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on1234PauseResend`)
-    await act(() => vi.advanceTimersByTimeAsync(NUMBERS_EVERY))
-    expect(calls.map((c) => c.url)).toEqual(['/api/sessions'])
+    await act(() => vi.advanceTimersByTimeAsync(0))
+    expect(calls).toEqual(['/api/sessions'])
     expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on2040PauseResend`)
 
+    // A resend's answer is shown at once.
     fireEvent.click(within(row(FUNDA)).getByRole('button', { name: 'Resend' }))
     fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'gap' } })
     fireEvent.change(screen.getByLabelText('From MsgSeqNum'), { target: { value: '3' } })
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm' })))
     expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on2141PauseResend`)
 
+    // Not read while the page is hidden.
+    hidden = true
+    await act(() => vi.advanceTimersByTimeAsync(NUMBERS_EVERY * 2))
+    expect(calls).toHaveLength(2)
+    hidden = false
+    await act(() => vi.advanceTimersByTimeAsync(NUMBERS_EVERY))
+    expect(calls).toHaveLength(3)
+    expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on2242PauseResend`)
+
     unmount()
     await vi.advanceTimersByTimeAsync(NUMBERS_EVERY * 3)
-    expect(calls).toHaveLength(2)
+    expect(calls).toHaveLength(3)
   } finally {
     vi.useRealTimers()
+    vi.restoreAllMocks()
   }
+})
+
+test('a dialog the browser closes is closed for the parent too, but not by its own unmounting', () => {
+  const close = vi.fn()
+  const { unmount } = render(<Reason title="Pause" onConfirm={async () => {}} onClose={close} />)
+  const dialog = screen.getByRole('dialog') as HTMLDialogElement
+  dialog.open = false
+  fireEvent(dialog, new Event('close'))
+  expect(close).toHaveBeenCalledOnce()
+  unmount()
+  fireEvent(dialog, new Event('close'))
+  expect(close).toHaveBeenCalledOnce()
 })

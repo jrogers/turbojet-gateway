@@ -39,8 +39,9 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
-  expect(stray).toEqual([])
+  const seen = stray
   stray = []
+  expect(seen).toEqual([])
 })
 
 test('shows login without a session, and the app once logged in', async () => {
@@ -85,7 +86,7 @@ test('the shell shows the role and clients, or all clients, and logs out', async
 })
 
 test('routes switch with the hash, orders by default', async () => {
-  serve({ 'GET /api/me': () => json(alice) })
+  serve({ 'GET /api/me': () => json(alice), 'GET /api/sessions': () => json([]) })
   render(<App />)
   expect((await screen.findByRole('heading')).textContent).toBe('Orders')
 
@@ -149,7 +150,11 @@ test('says so when the gateway cannot be reached at start', async () => {
 })
 
 test('the shell keeps the live socket while logged in, and says when it is down', async () => {
-  serve({ 'GET /api/me': () => json(alice), 'POST /api/logout': () => new Response(null, { status: 204 }) })
+  serve({
+    'GET /api/me': () => json(alice),
+    'GET /api/sessions': () => json([]),
+    'POST /api/logout': () => new Response(null, { status: 204 }),
+  })
   window.location.hash = '#/sessions'
   render(<App />)
   await screen.findByText('operator')

@@ -4,8 +4,9 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
  * A modal asking the reason for an action, which the API requires and audits. `children` are the
  * action's other fields. On submit it calls `onConfirm` with the reason, and closes once that
  * succeeds; a failure stays open, showing its message, to try again or cancel. Escape or Cancel
- * closes it, but not while the action is under way. A native modal `<dialog>`: the page behind is
- * inert. Focus starts on the reason, and goes back where it was on closing.
+ * closes it, but not while the action is under way; if the browser closes it anyway, the parent is
+ * told. A native modal `<dialog>`: the page behind is inert. Focus starts on the reason, and goes
+ * back where it was on closing.
  */
 export default function Reason({
   title,
@@ -22,12 +23,17 @@ export default function Reason({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const dialog = useRef<HTMLDialogElement>(null)
+  // Set as it unmounts: its own close() fires `close` too, later, which mustn't close the parent's
+  // next action.
+  const gone = useRef(false)
 
   useEffect(() => {
     const before = document.activeElement
     const shown = dialog.current!
+    gone.current = false
     shown.showModal()
     return () => {
+      gone.current = true
       shown.close()
       if (before instanceof HTMLElement) before.focus()
     }
@@ -56,6 +62,12 @@ export default function Reason({
         // Escape: closing is the parent's to do, by unmounting.
         e.preventDefault()
         if (!busy) onClose()
+      }}
+      // The browser may close it regardless (Chrome does on a second Escape): unmount it then, or
+      // the next action would reuse it, closed. Not for a close of its own: unmounting, or
+      // StrictMode's remount, which has shown it again by the time the event comes.
+      onClose={() => {
+        if (!gone.current && !dialog.current?.open) onClose()
       }}
     >
       <form onSubmit={submit}>

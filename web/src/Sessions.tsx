@@ -28,14 +28,18 @@ export default function Sessions({ me }: { me: Me }) {
   const [numbers, setNumbers] = useState<Map<string, Numbers>>(new Map())
 
   useEffect(() => {
-    const timer = setInterval(() => {
+    // At once, so they're fresh on opening, then every NUMBERS_EVERY while the page is seen.
+    const read = () => {
+      if (document.hidden) return
       api.sessions().then(
         (sessions) =>
           setNumbers(new Map(sessions.map((s) => [key(s), { next_incoming: s.next_incoming, next_outgoing: s.next_outgoing }]))),
         // A 401 has ended the session already; anything else, the next read may do better.
         () => {},
       )
-    }, NUMBERS_EVERY)
+    }
+    read()
+    const timer = setInterval(read, NUMBERS_EVERY)
     return () => clearInterval(timer)
   }, [])
 
