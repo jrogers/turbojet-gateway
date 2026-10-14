@@ -406,7 +406,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// The database refuses a statement or a commit; batches committed before stay pruned.
+    /// The database refuses a statement or a commit; batches committed before stay pruned. A
+    /// batch with no answer in [`DATABASE_TIMEOUT`] fails, and its connection is dropped.
     pub async fn prune(&self, before: DateTime<Utc>, batch: usize) -> io::Result<Pruned> {
         assert!((1..=1_000).contains(&batch), "a prune batch of {batch} orders: 1 to 1,000");
         let batch = u64::try_from(batch).expect("at most 1,000");
@@ -424,8 +425,11 @@ impl Store {
     /// One transaction of [`prune`](Self::prune): up to `batch` orders, found once into a
     /// temporary table, as `load`'s `held`. How many it deleted.
     async fn prune_batch(&self, before: &str, batch: u64) -> io::Result<u64> {
-        self.on_writer("starting a prune", async |connection| Self::prune_batch_on(connection, before, batch).await)
-            .await
+        // Timed as a whole: the batch is bounded, and the book's writer waits on it.
+        self.on_writer("starting a prune", async |connection| {
+            timed("pruning orders", Self::prune_batch_on(connection, before, batch)).await
+        })
+        .await
     }
 
     /// [`prune_batch`](Self::prune_batch), on `connection`.

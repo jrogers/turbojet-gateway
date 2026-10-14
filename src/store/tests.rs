@@ -975,6 +975,31 @@ async fn pruning_runs_batches_until_none_are_left() {
     assert_eq!(store.pruned_through().await.unwrap(), Some(time(0, 5)));
 }
 
+/// A prune on a held connection that went silent while idle fails within the store's timeout,
+/// rather than holding the writer's connection, and the write after commits on a new one. The
+/// silence is found by the batch's begin, its first statement: the held connection isn't pinged.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_connection_silent_before_a_prune_fails_it_and_the_next_write_commits() {
+    let Some(url) = postgres().await else { return };
+    let relay = Relay::new(&url).await;
+    let store = Store::open(&relay.url).await.unwrap();
+    let funda = ClientId::from("FUNDA");
+    let mut written: Vec<Changes> =
+        (1..=3).map(|id| dated(id, &funda, Some(Day(time(1, 0))), true, time(0, u32::try_from(id).unwrap()))).collect();
+    written.push(current(&funda, Day(time(3, 0))));
+    store.write(&written).await.unwrap();
+    relay.silence();
+    let limit = DATABASE_TIMEOUT * 3;
+    let failed =
+        tokio::time::timeout(limit, store.prune(time(2, 0), 2)).await.expect("not held by the silent connection");
+    assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    let next = dated(4, &funda, Some(Day(time(3, 0))), true, time(2, 1));
+    let written_after = tokio::time::timeout(limit, store.write(std::slice::from_ref(&next))).await;
+    written_after.expect("a new connection, not the silent one's place").unwrap();
+    assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [1, 2, 3, 4]);
+}
+
 /// A database from before the `pruned` table gains it when opened.
 #[tokio::test]
 async fn opening_an_older_database_adds_the_pruned_table() {
