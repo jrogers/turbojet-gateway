@@ -1199,6 +1199,50 @@ async fn an_order_unknown_at_its_venue_is_resolved() {
     );
 }
 
+/// An order of the client's previous trading day, which the book dropped at the roll, is read
+/// back over the API from the database: in a time range, and by its OrderID.
+///
+/// The roll is the gateway's own, on the real clock: `day_end` is reloaded to a few seconds
+/// ahead before the client's first order, so its first day ends then, and the tick rolls it.
+/// `day_end` is to the second, so the test waits up to three.
+#[tokio::test]
+async fn an_order_of_a_past_day_is_read_from_the_database() {
+    let mut setup = Setup::with(Options { api: true, database: true, ..Options::default() }).await;
+    let token = operator(&setup).await;
+    let config = setup.dir.path().join("jetbridge.toml");
+    let day_end = (chrono::Utc::now() + chrono::TimeDelta::seconds(3)).format("%H:%M:%S UTC");
+    let rest = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("day_end = \"{day_end}\"\n{rest}")).unwrap();
+    setup.reload().await;
+    let from = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    setup.working_order().await;
+    setup.venue.send(fill(&setup.id("1"), "E-1", 100, 100));
+    let filled: v44::ExecutionReport = setup.events.parse().await;
+    assert_eq!(filled.ord_status, v44::OrdStatus::Filled);
+    let gateway = setup.service.gateway();
+    let order = setup.id("1");
+    let rolled = async {
+        while gateway.order_id(&order).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    timeout(Duration::from_secs(3) + 2 * WAIT, rolled).await.expect("the day didn't roll");
+    timeout(WAIT, gateway.committed()).await.expect("not committed");
+
+    let addr = setup.service.api_addr().unwrap();
+    let today = get(addr, "/api/orders", &token).await;
+    assert_eq!(today["orders"], serde_json::json!([]), "the book still holds it");
+    let to = (chrono::Utc::now() + chrono::TimeDelta::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let page = get(addr, &format!("/api/orders?from={from}&to={to}&client=comp:{CLIENT}"), &token).await;
+    let orders = page["orders"].as_array().unwrap();
+    let [past] = orders.as_slice() else { panic!("{page}") };
+    assert_eq!((&past["order_id"], &past["status"]), (&order.as_str().into(), &"filled".into()));
+    let detail = get(addr, &format!("/api/orders/{order}"), &token).await;
+    assert_eq!((&detail["status"], &detail["unknown_at_venue"]), (&"filled".into(), &false.into()));
+    assert_eq!(detail["requests"][0]["kind"], "new", "{detail}");
+}
+
 /// An operator with an API token, the users file reloaded: the token.
 async fn operator(setup: &Setup) -> String {
     let users_path = setup.dir.path().join("users.toml");
