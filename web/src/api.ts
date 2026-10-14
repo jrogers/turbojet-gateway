@@ -187,9 +187,12 @@ export const setClientLimits = (compId: string, reason: string, set: LimitsSet) 
 export const deleteClientLimits = (compId: string, reason: string) =>
   request<EditedView>('DELETE', `/api/risk/limits/client/${segment(compId)}`, { reason })
 
-/** An action's outcome, `done`, saying so if the answer says it isn't committed yet. */
-export const outcome = (done: string, answer: Committed | void) =>
-  answer?.committed === false ? `${done} Applied; not yet saved to the database.` : done
+/**
+ * An action's outcome, `done`, saying so if the answer says it isn't committed yet: applied, or,
+ * if it changed nothing (`applied` false), only not saved.
+ */
+export const outcome = (done: string, answer: Committed | void, applied = true) =>
+  answer?.committed === false ? `${done} ${applied ? 'Applied; not yet' : 'Not yet'} saved to the database.` : done
 
 /** What a failure says: an `Error`'s message, or anything else as text. */
 export const message = (e: unknown) => (e instanceof Error ? e.message : String(e))

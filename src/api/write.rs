@@ -374,8 +374,9 @@ pub(super) async fn cancel_all(
     .await
 }
 
-/// The audit log's note on an action not committed within [`COMMIT_REPLY_WAIT`].
-const NOT_COMMITTED: &str = "applied, not yet committed: the database hasn't answered";
+/// The audit log's note on an action not committed within [`COMMIT_REPLY_WAIT`], after what it
+/// did: `applied`, or why nothing changed.
+const NOT_COMMITTED: &str = "not yet committed: the database hasn't answered";
 
 /// 204 once what `gateway` has changed so far has committed, waiting up to [`COMMIT_REPLY_WAIT`];
 /// otherwise 202 `{"committed": false}`, the change in effect and committed when the database
@@ -385,7 +386,7 @@ async fn committed(gateway: &Gateway) -> (Response, Option<String>) {
         (StatusCode::NO_CONTENT.into_response(), None)
     } else {
         let body = Json(serde_json::json!({ "committed": false }));
-        ((StatusCode::ACCEPTED, body).into_response(), Some(NOT_COMMITTED.to_string()))
+        ((StatusCode::ACCEPTED, body).into_response(), Some(format!("applied, {NOT_COMMITTED}")))
     }
 }
 
@@ -398,9 +399,13 @@ async fn changed_committed(
 ) -> ((StatusCode, Json<Changed>), Option<String>) {
     let committed = gateway.committed_within(COMMIT_REPLY_WAIT).await;
     let status = if committed { StatusCode::OK } else { StatusCode::ACCEPTED };
-    let notes = [(!changed).then_some(unchanged), (!committed).then_some(NOT_COMMITTED)];
-    let note = notes.into_iter().flatten().collect::<Vec<_>>().join("; ");
-    ((status, Json(Changed { changed, committed })), (!note.is_empty()).then_some(note))
+    let note = match (changed, committed) {
+        (true, true) => None,
+        (false, true) => Some(unchanged.to_string()),
+        (true, false) => Some(format!("applied, {NOT_COMMITTED}")),
+        (false, false) => Some(format!("{unchanged}; {NOT_COMMITTED}")),
+    };
+    ((status, Json(Changed { changed, committed })), note)
 }
 
 /// What a reload took.
@@ -1207,13 +1212,13 @@ mod tests {
 
         let body = expect_soon("/api/risk/block").await;
         assert_eq!(body, serde_json::json!({ "changed": true, "committed": false }));
-        assert_eq!(fixture.last_result(), NOT_COMMITTED);
+        assert_eq!(fixture.last_result(), format!("applied, {NOT_COMMITTED}"));
         assert_eq!(fixture.service.gateway().blocked(), [Scope::CompId("FUNDA".into())]);
         let body = expect_soon("/api/risk/block").await;
         assert_eq!(body, serde_json::json!({ "changed": false, "committed": false }));
         assert_eq!(fixture.last_result(), format!("unchanged: already blocked; {NOT_COMMITTED}"));
         assert_eq!(expect_soon("/api/risk/cancel-all").await, serde_json::json!({ "committed": false }));
-        assert_eq!(fixture.last_result(), NOT_COMMITTED);
+        assert_eq!(fixture.last_result(), format!("applied, {NOT_COMMITTED}"));
         assert!(store.load().await.unwrap().blocked.is_empty());
 
         store.hooks.gate.send_replace(true);

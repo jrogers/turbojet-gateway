@@ -775,8 +775,8 @@ sees Orders, Sessions, Risk, Messages and Routes in the nav; an admin without `-
 Audit, and a Reload button in the header. A user with `--clients` sees and acts on only its clients,
 as the API narrows it. A reload that changes a user's clients shows at its live socket's next
 snapshot, when the console also reads the user's role again. Viewers read; operators and admins act,
-each action with a reason. One the database hasn't committed within 5 seconds says "Applied; not
-yet saved to the database.":
+each action with a reason. One the database hasn't committed within 5 seconds says it's not yet
+saved to the database:
 
 - **Orders**, the blotter: the working orders, newest first, filtered by client, venue, symbol and
   status; with "working only" off, today's done orders too; with dates, past days' orders from the

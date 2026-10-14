@@ -282,12 +282,12 @@ test('block and unblock post the reason and scope with the CSRF token, and say h
   // Read again at once.
   expect(calls.filter((c) => c.key === 'GET /api/risk')).toHaveLength(2)
 
-  // Not committed in time: in effect, and said so.
+  // Not committed in time, an earlier change with it: said so, though this changed nothing.
   changed = false
   fireEvent.click(screen.getByRole('button', { name: 'Unblock' }))
   fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'calm' } })
   await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm' })))
-  expect(screen.getByRole('status').textContent).toBe("comp:FUNDA wasn't blocked. Applied; not yet saved to the database.")
+  expect(screen.getByRole('status').textContent).toBe("comp:FUNDA wasn't blocked. Not yet saved to the database.")
 
   const posts = calls.filter((c) => c.init.method === 'POST')
   expect(posts.map((c) => [c.key, c.init.body])).toEqual([
