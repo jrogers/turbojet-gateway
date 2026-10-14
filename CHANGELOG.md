@@ -121,3 +121,16 @@ Notable changes to Jetbridge.
   pass back as `after`. An order's detail and messages are found after the book drops it.
 - The first start of this version on a database indexes its requests sent by time, once, for
   reading past orders: on a large database that start takes longer.
+- A user limited to some CompIDs (`--clients`) now reads only their clients, as it already acted
+  only on them: its orders, messages, sessions, risk, limits and live socket are narrowed to them,
+  and a read naming another client is 403. Venue sessions and the routes stay visible to every
+  user. `GET /api/audit` needs an admin without `--clients`. A user's clients are kept sorted and
+  without repeats.
+- Alarms carry `client`: the session of the order an alarm is about, or `null`. A scoped user's
+  live socket gets the gateway-wide alarms and those about its clients' orders.
+- **Security:** a client whose CompID, SubID or LocationID, or the SubID or LocationID it
+  addresses the gateway by, contains '/', ':' or '>' is refused at logon. Its session's name
+  could print the same as another session's, so under `unknown = "admit"` a client logging on as
+  `FUNDA/X` could take over the restored orders and risk counts of FUNDA's desk X. After upgrading,
+  an existing client with such a name is refused at logon, and its restored orders stay
+  unclaimed.

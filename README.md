@@ -441,11 +441,26 @@ jetbridge user remove alice --users users.toml
 - **Roles**: `viewer` reads; `operator` also pauses, resumes and resends sessions, cancels orders
   and asks venues where they stand, resolves orders a venue doesn't know, and blocks, unblocks
   and cancels clients; `admin` also sets and resets sequence numbers, edits the risk limits,
-  reloads and reads the audit log.
-- **`--clients`** limits a user to acting on those CompIDs' client sessions, orders and scopes,
-  and, for an admin, their limit tables. Such a user still reads everything, and can't act on a
+  reloads and, without `--clients`, reads the audit log.
+- **`--clients`** limits what a user sees as well as what it does: those CompIDs' client
+  sessions, orders and scopes, and, for an admin, their limit tables. Such a user can't act on a
   venue's session, on `all`, or on the default limits or a reload, which reach every client.
-  Without it a user acts on every client; the API shows its `clients` as `null`.
+  Without it a user sees and acts on every client; the API shows its `clients` as `null`, and
+  with it, sorted and without repeats, as the users file keeps them. A scoped user's reads:
+  - `GET /api/orders`, past ones too, holds its clients' orders only. A `client` naming another
+    client, or `all`, is 403 ("alice may see only clients FUNDA, not comp:FUNDB"), and so is
+    another client's order by its OrderID, with its `/messages`. An order of its own shows its
+    messages on both sides, the venue's too.
+  - `GET /api/messages` searches its clients' sessions only, past ones too; a `session` naming
+    another client's, or a venue's, is 403. Messages logged before a Logon, with no session, are
+    left out.
+  - `GET /api/sessions` lists its clients' sessions and every venue's. `GET /api/risk` has its
+    clients' sessions, CompIDs and blocks (blocks of `all` too), with the defaults and reference
+    prices; `GET /api/risk/limits` its clients' tables and the defaults.
+  - `GET /api/routes` is every route; `GET /api/routes/test` refuses (403) a `client` not its own.
+  - `GET /api/audit` is refused (403): it needs an admin without `--clients`.
+  - `GET /api/live` sends what those reads show, and the alarms about its clients' orders; see
+    [Live events](#live-events).
 - **Passwords** are at least 12 bytes, kept as argon2 hashes. **Tokens** (`jb_...`) are kept as
   their SHA-256 only, so a lost token is revoked and replaced, not recovered.
 - **Logging in.** A script sends `Authorization: Bearer <token>` on each request. A browser
@@ -487,7 +502,7 @@ jetbridge user remove alice --users users.toml
 | `PATCH /api/risk/limits/defaults`, `/client/{comp_id}` | admin | `{set}`: edits the limits in `jetbridge.toml`, then reloads |
 | `DELETE /api/risk/limits/client/{comp_id}` | admin | removes a CompID's limits from `jetbridge.toml`, then reloads |
 | `POST /api/reload` | admin | rereads the files, as SIGHUP does, and says what changed |
-| `GET /api/audit` | admin | `?since=&limit=`: the audit log's last entries |
+| `GET /api/audit` | admin, without `--clients` | `?since=&limit=`: the audit log's last entries |
 
 - **Every change needs a reason**: each POST, PATCH and DELETE but login and logout takes a JSON
   body with a non-empty `reason` (up to 1,000 bytes), or is refused (400).
@@ -634,14 +649,23 @@ each change, in the order it happened:
 - `{"type":"order", ...}`: an order's whole view, as `GET /api/orders` has it, to put in place of
   the one held, or add.
 - `{"type":"blocked","scope":...}` and `{"type":"unblocked","scope":...}`.
-- `{"type":"alarm","time","kind","text"}`, `kind` one of `gateway_unavailable`,
+- `{"type":"alarm","time","kind","client","text"}`, `kind` one of `gateway_unavailable`,
   `gateway_available`, `stuck_cancel`, `orphan`, `overfill`, `unknown_order`, `unknown_at_venue`
   (a venue answered a status request saying it doesn't know a live order), `fill_on_done_order`
   (a venue reported a fill on an order the book has as done, after a resolve or crossing the
-  venue's own cancel: not applied) and `venue_store_reset`. Each is in the log too.
+  venue's own cancel: not applied) and `venue_store_reset`. Each is in the log too. `client` is
+  the session of the order the alarm is about (`stuck_cancel`, `overfill`, `unknown_at_venue`,
+  `fill_on_done_order`), or `null`.
 - `{"type":"session","side","id","event"}` for the session keyed by `side` (`client` or `venue`)
   and `id`: `connected`, `logged_on`, `logging_out`, `resend_started`, `resend_finished`,
   `disconnected`, `paused`, `resumed`, or `refused` with a `reason`.
+
+A user with `--clients` gets the snapshot and events of its clients' sessions and orders, every
+venue's session, its clients' blocks and those of `all`, and of the alarms, `gateway_unavailable`,
+`gateway_available`, `venue_store_reset` and those whose `client` is its own: `orphan` and
+`unknown_order` go only to users without `--clients`. When a reload changes a user's clients, an
+open socket gets a snapshot under the new ones within 10 seconds; until then it keeps sending what
+the old ones showed.
 
 The first few events may repeat what the snapshot shows. A socket that falls behind skips what it
 missed and gets a new snapshot; one that falls behind again within a second is closed with code

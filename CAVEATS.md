@@ -330,6 +330,17 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - `GET /api/sessions` lists a client session only while it's connected or paused, so a client
   that has never connected, or disconnected without being paused, isn't listed and can't be
   paused (404). Pausing logs the session out: it shows as disconnected and paused.
+- A user with `--clients` reads only its clients, but every venue's session status and every
+  route: a route or a venue's name can say who trades there.
+- A scoped user's 403 for another client's OrderID, or a session name in a search, tells it that
+  order or name exists, as a write's refusal already does.
+- A message search knows a venue's sessions by the venues running now. A venue a reload stopped,
+  whose CompID is also a client's, has its past sessions' messages shown to that client's scoped
+  users as if they were the client's.
+- A change to a user's clients reaches its open live sockets within 10 seconds, as a new snapshot;
+  until then a socket of a user losing a client keeps sending that client's events.
+- `orphan` and `unknown_order` alarms go only to users without `--clients`: they can concern any
+  client, so a scoped user's console doesn't show them.
 - `GET /api/audit` reads only the days it needs, but each of those days' files whole. Without
   `audit_retention` the daily files are kept for ever. A file moved away is created afresh at
   the next line, and the old one's entries are no longer read back.
