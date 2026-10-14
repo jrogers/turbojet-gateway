@@ -446,7 +446,7 @@ jetbridge user remove alice --users users.toml
   sessions, orders and scopes, and, for an admin, their limit tables. Such a user can't act on a
   venue's session, on `all`, or on the default limits or a reload, which reach every client.
   Without it a user sees and acts on every client; the API shows its `clients` as `null`, and
-  with it, sorted and without repeats, as the users file keeps them. A scoped user's reads:
+  with it, sorted and without repeats. A scoped user's reads:
   - `GET /api/orders`, past ones too, holds its clients' orders only. A `client` naming another
     client, or `all`, is 403 ("alice may see only clients FUNDA, not comp:FUNDB"), and so is
     another client's order by its OrderID, with its `/messages`. An order of its own shows its

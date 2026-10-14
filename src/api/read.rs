@@ -284,7 +284,8 @@ pub(super) fn unseen(caller: &Caller, target: &str) -> ApiError {
 
 /// Whether `session`, a session as Turbojet shows it (`BEGIN:SENDER->TARGET`, a side's SubID and
 /// LocationID after a `/` each, a qualifier after a `:`), has `comp_id` as its TargetCompID: the
-/// client's, as the acceptor sees it.
+/// client's, as the acceptor sees it. Splitting on the first `->` is safe: the sender's side is the
+/// gateway's own CompID, from its configuration, not a client's.
 pub(super) fn names_target(session: &str, comp_id: &str) -> bool {
     let rest = session.split_once("->").and_then(|(_, target)| target.strip_prefix(comp_id));
     rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', ':']))
@@ -418,7 +419,7 @@ pub(super) async fn risk_limits(
 ) -> Result<Json<RiskTables>, ApiError> {
     let mut tables = state.service()?.risk_tables();
     if let Some(comp_ids) = caller.view_scope() {
-        tables.client.retain(|comp_id, _| comp_ids.contains(comp_id));
+        tables.client.retain(|comp_id, _| is_one_of(comp_id, comp_ids));
     }
     Ok(Json(tables))
 }
