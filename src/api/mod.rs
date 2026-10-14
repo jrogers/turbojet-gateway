@@ -17,7 +17,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::Query;
 use axum::extract::rejection::QueryRejection;
-use axum::http::{StatusCode, Uri};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::serve::ListenerExt;
@@ -34,6 +34,8 @@ use crate::config::{Api, Error};
 use crate::service::Service;
 
 mod auth;
+#[cfg(feature = "console")]
+mod console;
 mod listener;
 mod live;
 mod messages;
@@ -110,7 +112,7 @@ impl IntoResponse for ApiError {
 }
 
 /// The API's routes. Only health and login are open: every other route goes in `authenticated`,
-/// behind [`auth::authenticate`].
+/// behind [`auth::authenticate`]. Paths no route has go to [`fallback`].
 fn router(state: State) -> axum::Router {
     let authenticated = axum::Router::new()
         .route("/api/me", get(auth::me))
@@ -145,9 +147,20 @@ fn router(state: State) -> axum::Router {
         .route("/api/health", get(health))
         .route("/api/login", post(auth::login))
         .merge(authenticated)
-        .fallback(async |uri: Uri| ApiError::new(StatusCode::NOT_FOUND, format!("no such path: {}", uri.path())))
+        .fallback(fallback)
         .method_not_allowed_fallback(async || ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"))
         .with_state(state)
+}
+
+/// A path no route has: the web console's outside `/api` (with the `console` feature), else a 404.
+/// Every `/api` path stays the API's, so a mistyped one is never the console's page.
+async fn fallback(request: axum::extract::Request) -> Response {
+    let path = request.uri().path();
+    #[cfg(feature = "console")]
+    if path != "/api" && !path.starts_with("/api/") {
+        return console::serve(request.method(), path);
+    }
+    ApiError::new(StatusCode::NOT_FOUND, format!("no such path: {path}")).into_response()
 }
 
 #[derive(Debug, Serialize)]
@@ -488,7 +501,7 @@ pub(crate) mod tests {
     }
 
     /// The API's routes, and `/test/peer` answering the client's address as handlers see it.
-    fn app() -> (axum::Router, tempfile::TempDir) {
+    pub(crate) fn app() -> (axum::Router, tempfile::TempDir) {
         let auth = Auth::new(std::path::PathBuf::new(), crate::auth::Users::default(), false, false);
         let (state, dir) = state(Arc::new(auth));
         let app =

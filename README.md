@@ -74,6 +74,14 @@ cargo run --release --features tls -- --config examples/jetbridge.toml
 
 Build with `--features gzip` to compress the [message log](#message-log)'s files.
 
+Build with `--features console` to serve the web console at the API's address. It builds the
+console into the binary, so build that first, with Node 25 or later:
+
+```sh
+(cd web && npm ci && npm run build)
+cargo build --release --features console
+```
+
 Jetbridge builds against Turbojet by path, so it expects a Turbojet checkout next to it
 (`../turbojet`). It needs Rust 1.89 or later.
 

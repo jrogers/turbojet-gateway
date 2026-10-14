@@ -11,6 +11,9 @@ publish = false
 tls = ["turbojet/tls", "turbojet-config/tls", "dep:tokio-rustls"]
 # `[message_log] compress`: gzip the message log's finished files.
 gzip = ["turbojet/gzip"]
+# The web console, served at the API's address. Embeds web/dist, so build it first (`npm ci &&
+# npm run build` in web/); --all-features includes this.
+console = []
 
 [dependencies]
 # The API's password hashes (argon2id, PHC strings): slow on purpose.
