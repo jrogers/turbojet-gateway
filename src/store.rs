@@ -41,9 +41,9 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// for a connection lost without a reset, which would otherwise wait on the operating system's
 /// TCP timeouts.
 #[cfg(not(test))]
-pub(crate) const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-pub(crate) const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Awaits `future`, failing with [`io::ErrorKind::TimedOut`] after [`DATABASE_TIMEOUT`].
 async fn timed<T>(doing: &'static str, future: impl Future<Output = io::Result<T>>) -> io::Result<T> {
