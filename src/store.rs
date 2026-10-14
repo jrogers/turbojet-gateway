@@ -36,9 +36,10 @@ use crate::book::{
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// How long the store waits on the database for one statement, a write's begin or commit, a
-/// prune batch, an order's read, or a connection from its pool, before giving up. A statement is a row or a
-/// bounded batch, so this is far past any healthy one; it's there for a connection lost
-/// without a reset, which would otherwise wait on the operating system's TCP timeouts.
+/// prune batch, an order's read, or a connection from its pool, before giving up. Each is a row
+/// or a bounded batch, so this is far past any healthy one (but see `Store::orders`); it's there
+/// for a connection lost without a reset, which would otherwise wait on the operating system's
+/// TCP timeouts.
 #[cfg(not(test))]
 pub(crate) const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -516,6 +517,9 @@ impl Store {
             Value::Text(text) => query.bind(text.as_str()),
             Value::Integer(integer) => query.bind(*integer),
         });
+        // ponytail: the limit bounds the rows returned, not those scanned: a filter few orders
+        // match, over a wide range of unpruned history, may healthily take past DATABASE_TIMEOUT,
+        // and fails. A longer timeout for reads, or an index on what it filters, if that bites.
         let rows = self.on_reads("reading past orders", async |c| {
             timed("reading past orders", async { query.fetch_all(c).await.map_err(database("reading past orders")) })
                 .await

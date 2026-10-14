@@ -1323,7 +1323,9 @@ async fn a_connection_silent_in_a_history_read_fails_it_and_a_read_after_answers
             let store = store.clone();
             async move { found(&store, by_name).await }
         });
-        let waiting = "SELECT COUNT(*) FROM pg_locks WHERE relation = 'orders'::regclass AND NOT granted";
+        let waiting = "SELECT COUNT(*) FROM pg_locks WHERE relation = 'orders'::regclass AND NOT granted \
+                       AND pid <> pg_backend_pid() \
+                       AND database = (SELECT oid FROM pg_database WHERE datname = current_database())";
         let held = async {
             while sqlx::query_scalar::<_, i64>(waiting).fetch_one(&mut *lock).await.unwrap() == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1344,6 +1346,8 @@ async fn a_connection_silent_in_a_history_read_fails_it_and_a_read_after_answers
             };
             tokio::time::timeout(limit, ended).await.expect("the server ends the session idle in its transaction");
         }
+        // Two tries: a reads connection silenced while idle, were there one, fails a try, its
+        // ping on being taken running out the acquire timeout, and is dropped.
         let mut answered = false;
         for _ in 0..2 {
             match tokio::time::timeout(limit, found(&store, by_name)).await {
