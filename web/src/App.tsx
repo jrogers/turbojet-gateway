@@ -72,7 +72,7 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
   const route = useRoute()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
-  const [dismissed, setDismissed] = useState<Dismissed>(new Set())
+  const [dismissed, setDismissed] = useState<Dismissed>(() => new Set())
 
   // Back to login once logged out, or on a 401: the session had ended already. Any other failure
   // keeps the session, and says so.

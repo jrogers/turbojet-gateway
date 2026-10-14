@@ -1,4 +1,5 @@
 import { useLive } from './store.ts'
+import { utc } from './time.ts'
 import type { Alarm } from './types.ts'
 
 /**
@@ -12,17 +13,20 @@ const ids = new WeakMap<Alarm, number>()
 let lastId = 0
 const id = (alarm: Alarm) => ids.get(alarm) ?? (ids.set(alarm, ++lastId), lastId)
 
-/** A time to the second, UTC. */
-const when = (time: string) => time.slice(0, 19).replace('T', ' ')
 
-/** The header's count of the alarms not dismissed; nothing when there are none. */
+/** The header's count of the alarms not dismissed; nothing shown when there are none. */
 export function AlarmCount({ dismissed }: { dismissed: Dismissed }) {
   const { alarms } = useLive()
   const count = alarms.filter((alarm) => !dismissed.has(alarm)).length
-  if (count === 0) return null
+  // Always there, so a screen reader hears the count change, and so new alarms, without the focus
+  // moving.
   return (
-    <span className="badge warn">
-      {count} {count === 1 ? 'alarm' : 'alarms'}
+    <span aria-live="polite">
+      {count > 0 && (
+        <span className="badge warn">
+          {count} {count === 1 ? 'alarm' : 'alarms'}
+        </span>
+      )}
     </span>
   )
 }
@@ -49,9 +53,9 @@ export default function Alarms({ dismissed, onDismiss }: { dismissed: Dismissed;
           <ul>
             {shown.map((alarm) => (
               <li key={id(alarm)}>
-                <time dateTime={alarm.time}>{when(alarm.time)}</time> <span className="kind">{alarm.kind.replaceAll('_', ' ')}</span>
+                <time dateTime={alarm.time}>{utc(alarm.time)}</time> <span className="kind">{alarm.kind.replaceAll('_', ' ')}</span>
                 {alarm.client && <span className="client"> {alarm.client}</span>} <span className="text">{alarm.text}</span>{' '}
-                <button type="button" onClick={() => dismiss(alarm)} aria-label={`Dismiss the ${alarm.kind.replaceAll('_', ' ')} alarm of ${when(alarm.time)}`}>
+                <button type="button" onClick={() => dismiss(alarm)} aria-label={`Dismiss the ${alarm.kind.replaceAll('_', ' ')} alarm of ${utc(alarm.time)}`}>
                   Dismiss
                 </button>
               </li>

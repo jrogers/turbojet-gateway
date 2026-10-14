@@ -246,7 +246,8 @@ test('alarms show newest first, counted in the header, until dismissed; a snapsh
   })
   // A new alarm doesn't take the focus.
   expect(document.activeElement).toBe(focused)
-  expect(screen.getByText('2 alarms')).toBeTruthy()
+  // Announced, from a region there before it came.
+  expect(screen.getByText('2 alarms').parentElement!.getAttribute('aria-live')).toBe('polite')
   const items = () =>
     Array.from(screen.getByRole('region', { name: 'Alarms' }).querySelectorAll('li')).map((li) => li.textContent)
   expect(items()).toEqual([

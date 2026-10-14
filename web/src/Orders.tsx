@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from 'reac
 import * as api from './api.ts'
 import { orderHref } from './router.ts'
 import { done, useLive } from './store.ts'
+import { utc } from './time.ts'
 import type { OrderView, Status } from './types.ts'
 
 const STATUSES: Status[] = [
@@ -290,7 +291,7 @@ export default function Orders() {
 const Row = memo(function Row({ order }: { order: OrderView }) {
   return (
     <tr>
-      <td>{order.created.slice(0, 19).replace('T', ' ')}</td>
+      <td>{utc(order.created)}</td>
       <td>
         <a href={orderHref(order.order_id)}>{order.order_id}</a>
       </td>

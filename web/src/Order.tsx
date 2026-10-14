@@ -3,6 +3,7 @@ import * as api from './api.ts'
 import { StatusText } from './Orders.tsx'
 import Reason from './Reason.tsx'
 import { done, useLive } from './store.ts'
+import { utc } from './time.ts'
 import type { Hit, Me, OrderDetail } from './types.ts'
 
 type Action = 'cancel' | 'status' | 'resolve'
@@ -13,8 +14,6 @@ const ACTIONS: Record<Action, { title: string; post: (orderId: string, reason: s
   resolve: { title: 'Resolve order', post: api.resolve, done: 'Resolved: the order is canceled.' },
 }
 
-/** A time to the second, UTC. */
-const when = (time: string) => time.slice(0, 19).replace('T', ' ')
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -174,7 +173,7 @@ function Fields({ order }: { order: OrderDetail }) {
     ['Price', order.price ?? ''],
     ['Filled', order.cum_qty],
     ['Avg px', order.avg_px],
-    ['Created (UTC)', when(order.created)],
+    ['Created (UTC)', utc(order.created)],
   ]
   return (
     <dl className="fields">
@@ -210,7 +209,7 @@ function Requests({ order }: { order: OrderDetail }) {
               <td>{request.kind}</td>
               <td>{request.origin}</td>
               <td>{request.cl_ord_id ?? ''}</td>
-              <td>{when(request.sent_at)}</td>
+              <td>{utc(request.sent_at)}</td>
               <td>{request.answered ? 'yes' : 'no'}</td>
             </tr>
           ))}
@@ -281,7 +280,7 @@ function Messages({ orderId }: { orderId: string }) {
             <tbody>
               {hits.map((hit, at) => (
                 <tr key={at}>
-                  <td>{hit.time.slice(0, 23).replace('T', ' ')}</td>
+                  <td>{utc(hit.time, 3)}</td>
                   <td>{hit.direction}</td>
                   <td>{hit.session ?? ''}</td>
                   <td>{hit.msg_type ?? ''}</td>
