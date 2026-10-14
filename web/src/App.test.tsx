@@ -30,6 +30,15 @@ function serve(routes: Record<string, () => Response>) {
   return calls
 }
 
+/**
+ * The live socket opened last, once one is: the shell's text can show before its effects have
+ * run, which open it.
+ */
+async function opened(): Promise<FakeSocket> {
+  await waitFor(() => expect(FakeSocket.opened).not.toHaveLength(0))
+  return FakeSocket.opened[FakeSocket.opened.length - 1]
+}
+
 beforeEach(() => {
   window.location.hash = ''
   FakeSocket.opened = []
@@ -158,7 +167,7 @@ test('the shell keeps the live socket while logged in, and says when it is down'
   window.location.hash = '#/sessions'
   render(<App />)
   await screen.findByText('operator')
-  const socket = FakeSocket.opened[FakeSocket.opened.length - 1]
+  const socket = await opened()
   act(() => {
     socket.open()
     socket.send({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false })
@@ -175,7 +184,7 @@ test('a live socket lost shows a banner until it opens again', async () => {
   serve({ 'GET /api/me': () => json(alice) })
   render(<App />)
   await screen.findByText('operator')
-  const socket = FakeSocket.opened[FakeSocket.opened.length - 1]
+  const socket = await opened()
   act(() => socket.open())
   act(() => socket.end(1001, 'the gateway is stopping'))
   expect(screen.getByRole('status').textContent).toBe('Disconnected, reconnecting…')
@@ -189,7 +198,7 @@ test('a live socket refused by policy returns to login, saying why', async () =>
   serve({ 'GET /api/me': () => json(alice) })
   render(<App />)
   await screen.findByText('operator')
-  const socket = FakeSocket.opened[FakeSocket.opened.length - 1]
+  const socket = await opened()
   act(() => {
     socket.open()
     socket.end(1008, 'the session has ended: log in again')
@@ -207,6 +216,6 @@ test('under StrictMode the shell leaves one live socket open', async () => {
   )
   await screen.findByText('operator')
   // Mounted, unmounted and mounted again: two opened, the first closed.
-  expect(FakeSocket.opened).toHaveLength(2)
+  await waitFor(() => expect(FakeSocket.opened).toHaveLength(2))
   expect(FakeSocket.opened.filter((socket) => !socket.closed)).toHaveLength(1)
 })
