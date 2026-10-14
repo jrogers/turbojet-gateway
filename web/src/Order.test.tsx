@@ -128,6 +128,21 @@ test('a missing order says so, with a link back', async () => {
   expect(screen.getByRole('link', { name: 'Back to the blotter' }).getAttribute('href')).toBe('#/orders')
 })
 
+test("an order out of the user's clients, after a rescope, shows nothing of it", async () => {
+  routes[`GET ${PATH}/messages`] = () => json({ messages: [hit('8=FIX.4.4|35=D|11=C7|')], next: null, follow: null })
+  const { rerender } = await show()
+  expect(screen.getByText('JB1')).toBeTruthy()
+  expect(screen.getByText('8=FIX.4.4|35=D|11=C7|')).toBeTruthy()
+
+  routes[`GET ${PATH}`] = () => json({ error: 'not one of your clients' }, 403)
+  await act(async () => rerender(page('O/7', who('viewer'), reduce(snapshot(), { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients: ['FUNDB'] }))))
+  expect(screen.getByRole('alert').textContent).toBe('not one of your clients')
+  expect(screen.queryByText('JB1')).toBeNull()
+  expect(screen.queryByText('8=FIX.4.4|35=D|11=C7|')).toBeNull()
+  expect(screen.queryByText('Status')).toBeNull()
+  expect(screen.getByRole('link', { name: 'Back to the blotter' })).toBeTruthy()
+})
+
 test('messages page on from next, then check for newer from follow', async () => {
   const pages: Page[] = [
     { messages: [hit('8=FIX.4.4|35=D|11=C7|')], next: 'n1', follow: null },

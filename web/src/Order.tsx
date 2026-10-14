@@ -26,8 +26,10 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
  */
 export default function Order({ orderId, me }: { orderId: string; me: Me }) {
   const live = useLive()
-  // `undefined` until read; `null` for a 404.
+  // `undefined` until read; `null` for a 404 or a 403 (out of the user's clients, perhaps since a
+  // reload), with `missing` saying why.
   const [detail, setDetail] = useState<OrderDetail | null>()
+  const [missing, setMissing] = useState('No such order.')
   const heading = useRef<HTMLHeadingElement>(null)
   // Set by an action done: focus goes to the heading once its dialog has closed, as the button
   // that opened it may be gone.
@@ -59,8 +61,10 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
       },
       (e: unknown) => {
         if (asking.current !== at) return
-        if (e instanceof api.ApiError && e.status === 404) setDetail(null)
-        else setError(message(e))
+        if (e instanceof api.ApiError && (e.status === 404 || e.status === 403)) {
+          setDetail(null)
+          setMissing(e.status === 403 ? e.message : 'No such order.')
+        } else setError(message(e))
       },
     )
     return () => {
@@ -89,7 +93,7 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
       <>
         <h1>Order {orderId}</h1>
         <p className="error" role="alert">
-          No such order.
+          {missing}
         </p>
         <p>
           <a href="#/orders">Back to the blotter</a>
