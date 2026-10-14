@@ -455,8 +455,9 @@ jetbridge user remove alice --users users.toml
     another client's, or a venue's, is 403. Messages logged before a Logon, with no session, are
     left out.
   - `GET /api/sessions` lists its clients' sessions and every venue's. `GET /api/risk` has its
-    clients' sessions, CompIDs and blocks (blocks of `all` too), with the defaults and reference
-    prices; `GET /api/risk/limits` its clients' tables and the defaults.
+    clients' sessions, CompIDs and blocks (blocks of `all` too), with the defaults and every
+    symbol's reference price, its last fill whichever client's it was; `GET /api/risk/limits` its
+    clients' tables and the defaults.
   - `GET /api/routes` is every route; `GET /api/routes/test` refuses (403) a `client` not its own.
   - `GET /api/audit` is refused (403): it needs an admin without `--clients`.
   - `GET /api/live` sends what those reads show, and the alarms about its clients' orders; see
