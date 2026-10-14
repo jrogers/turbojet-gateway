@@ -24,7 +24,7 @@ const who = (role: Me['role'], clients: string[] | null = null): Me => ({ user: 
 
 const page = (me: Me, state = snapshot(me.clients)) => (
   <LiveContext.Provider value={{ ...state, link: 'open' }}>
-    <Risk me={me} />
+    <Risk me={me} reloads={0} />
   </LiveContext.Provider>
 )
 
@@ -274,4 +274,20 @@ test('Cancel closes the dialog, and focus goes back to its button', async () => 
   fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(document.activeElement).toBe(within(section()).getByRole('button', { name: 'Edit FUNDA' }))
+})
+
+test('a console reload reads the risk and the limits again', async () => {
+  const calls = serve()
+  const me = who('admin')
+  const { rerender } = render(page(me))
+  await within(section()).findByText('FUNDA')
+  const reads = () => calls.map((c) => c.key).sort()
+  expect(reads()).toEqual(['GET /api/risk', 'GET /api/risk/limits'])
+  rerender(
+    <LiveContext.Provider value={{ ...snapshot(), link: 'open' }}>
+      <Risk me={me} reloads={1} />
+    </LiveContext.Provider>,
+  )
+  await act(async () => {})
+  expect(reads()).toEqual(['GET /api/risk', 'GET /api/risk', 'GET /api/risk/limits', 'GET /api/risk/limits'])
 })

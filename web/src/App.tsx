@@ -197,7 +197,7 @@ function Screen({ route, me, reloads }: { route: Route; me: Me; reloads: number 
     case 'sessions':
       return <Sessions me={me} />
     case 'risk':
-      return <Risk me={me} />
+      return <Risk me={me} reloads={reloads} />
     case 'messages':
       return <Messages me={me} />
     case 'routes':

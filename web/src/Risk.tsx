@@ -19,7 +19,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
  * kill switch (block and cancel all), each with a reason; a scoped one only its clients', as the
  * API allows. Below, the limits as written, which an admin edits (`Limits.tsx`).
  */
-export default function Risk({ me }: { me: Me }) {
+export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
   const live = useLive()
   // `undefined` until read; `null` after a 403 or 404, with `error` saying why.
   const [risk, setRisk] = useState<RiskView | null>()
@@ -35,8 +35,9 @@ export default function Risk({ me }: { me: Me }) {
   const [reads, reread] = useReducer((n: number) => n + 1, 0)
 
   // At once, then every RISK_EVERY while the page is seen and on its becoming seen, and again on
-  // each snapshot or `reread`. A read answering after a newer one was asked, or after unmounting,
-  // is dropped. A 403 or 404 stops the reads until the next snapshot: the scope must change first.
+  // each snapshot, console reload or `reread`. A read answering after a newer one was asked, or
+  // after unmounting, is dropped. A 403 or 404 stops the reads until the next snapshot or reload:
+  // the scope must change first.
   const asking = useRef<object>(undefined)
   useEffect(() => {
     let stopped = false
@@ -68,7 +69,7 @@ export default function Risk({ me }: { me: Me }) {
       document.removeEventListener('visibilitychange', read)
       asking.current = undefined
     }
-  }, [live.snapshots, reads])
+  }, [live.snapshots, reloads, reads])
 
   useEffect(() => {
     if (action === undefined && refocus.current) {
@@ -211,6 +212,7 @@ export default function Risk({ me }: { me: Me }) {
         <h2 id="limits-title">Limits</h2>
         <RiskLimits
           me={me}
+          reloads={reloads}
           heading={heading}
           onDone={(text) => {
             setDone(text)

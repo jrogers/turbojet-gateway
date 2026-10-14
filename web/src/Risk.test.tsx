@@ -28,7 +28,7 @@ const who = (role: Me['role'], clients: string[] | null = null): Me => ({ user: 
 
 const page = (me: Me, state: LiveState) => (
   <LiveContext.Provider value={{ ...state, link: 'open' }}>
-    <Risk me={me} />
+    <Risk me={me} reloads={0} />
   </LiveContext.Provider>
 )
 

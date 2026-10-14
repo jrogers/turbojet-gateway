@@ -420,6 +420,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   snapshot and action: no live event carries notionals, so between reads they lag.
 - A limit edit from the risk screen rewrites `jetbridge.toml` and reloads: see
   [Editing the limits over the API](#editing-the-limits-over-the-api).
+- The risk screen reads the limits table on opening, at each snapshot, edit and reload from the
+  console, and when the page is shown again. A SIGHUP, or another admin's reload or edit, changes
+  it unseen until then.
 - The audit screen and Reload are for admins without `--clients` only, as the API allows: both
   reach every client.
 - The audit screen can't page back: it shows the last `limit` entries from since, at most 1,000.

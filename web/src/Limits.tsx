@@ -60,11 +60,14 @@ function valueOf(key: Key, text: string, on: boolean, remove: boolean): LimitsSe
  */
 export default function Limits({
   me,
+  reloads,
   heading,
   onDone,
 }: {
   /** Its clients as the last snapshot said, as the shell merges them. */
   me: Me
+  /** Counts the console's reloads: each reads the tables again. */
+  reloads: number
   /** Focused after an edit. */
   heading: RefObject<HTMLHeadingElement | null>
   /** Says how an edit went, and reads the risk again. */
@@ -85,8 +88,8 @@ export default function Limits({
   const refocus = useRef(false)
   const [reads, reread] = useReducer((n: number) => n + 1, 0)
 
-  // On showing, on being seen again, on each snapshot (the scope may have changed), and on each
-  // edit opened or done. An answer to a read since outdone, or after unmounting, is dropped. A
+  // On showing, on being seen again, on each snapshot (the scope may have changed) and console
+  // reload, and on each edit opened or done. An answer to a read since outdone, or after unmounting, is dropped. A
   // 403 or 404 clears the tables, and any edit open on them.
   const asking = useRef<object>(undefined)
   useEffect(() => {
@@ -120,7 +123,7 @@ export default function Limits({
       document.removeEventListener('visibilitychange', read)
       asking.current = undefined
     }
-  }, [live.snapshots, reads])
+  }, [live.snapshots, reloads, reads])
 
   useEffect(() => {
     if (editing === undefined && refocus.current) {
