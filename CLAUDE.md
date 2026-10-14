@@ -23,6 +23,7 @@ Jetbridge is a FIX connectivity gateway built on the Turbojet engine, from crate
   turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
   ```
   It rewrites `Cargo.lock`'s Turbojet entries to the path; don't commit those. In the main
-  checkout it applies to the worktrees under `.worktrees/` too.
+  checkout it applies to the worktrees under `.worktrees/` too. The checkout's version must match
+  `0.3`, or cargo ignores the patch with only a warning.
 - Engine bugs found here are fixed in the Turbojet repo, in their own commits; Jetbridge takes the
   fix from the next release, or meanwhile through the local patch.

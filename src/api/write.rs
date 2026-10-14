@@ -38,10 +38,10 @@ type AxumState = axum::extract::State<State>;
 type Body<B> = Result<Json<B>, JsonRejection>;
 type Id = Result<Path<String>, PathRejection>;
 
-/// How long a block, unblock or cancel waits for its change to commit before answering 202, the
-/// change in effect and committed when the database answers: far above a healthy commit
-/// (milliseconds) and the writer's [`MAX_COMMIT_WAIT`], and well under the listener's [`IDLE`],
-/// which would cut the answer off. Shorter in tests, to keep them short.
+/// How long an operator action (block, unblock, cancel-all, cancel, resolve) waits for its change
+/// to commit before answering 202, the change in effect and committed when the database answers:
+/// far above a healthy commit (milliseconds) and the writer's [`MAX_COMMIT_WAIT`], and well under
+/// the listener's [`IDLE`], which would cut the answer off. Shorter in tests, to keep them short.
 const COMMIT_REPLY_WAIT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(5) };
 const _: () = assert!(cfg!(test) || COMMIT_REPLY_WAIT.as_millis() > MAX_COMMIT_WAIT.as_millis());
 const _: () = assert!(COMMIT_REPLY_WAIT.as_millis() < IDLE.as_millis());
