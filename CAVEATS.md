@@ -88,12 +88,19 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   message held behind it stops reading 256 messages past it, new orders are rejected as
   "gateway unavailable", operator calls don't return, and shutdown waits for it too: a second
   Ctrl-C or SIGTERM exits.
-- A PostgreSQL connection the server or network closes is a failing write like any other: the
-  retry opens a new one. A commit whose answer the connection lost is written again; every row is
-  written by key, so each is still written once. One lost silently, with no reset, holds the
-  write, with the effects above: there's no keepalive or timeout on it, so it waits on the
-  operating system's TCP retransmission timeout (around 15 minutes on Linux's defaults), or
-  indefinitely if the request was sent and the gateway is waiting on its reply.
+- A lost PostgreSQL connection, closed or lost silently with no reset, fails the write in hand
+  within 10 seconds, and the retry opens a new one: the effects above last that long, then until
+  the database answers. A commit whose answer was lost is written again; every row is written by
+  key, so each is still written once. Prune batches and reads of past orders have the same 10
+  seconds. A start's load has none: a database that stops answering during a start holds the
+  start.
+- A PostgreSQL session lost silently while idle, outside a transaction, holds no locks, but keeps
+  one of the server's connections until its TCP keepalive gives up, about 2 hours by default; the
+  server's `tcp_keepalives_idle`, `tcp_keepalives_interval` and `tcp_keepalives_count` shorten
+  that.
+- A prune batch (200 orders) not done in 10 seconds fails, with a warning, and goes again at the
+  next run: storage that slow fails every run. A read of past orders whose filter few match, over
+  a wide range of history, can take longer, and fails.
 - One gateway per database: two writing to one, SQLite or PostgreSQL, overwrite each other's
   book. Nothing checks.
 - On PostgreSQL, how a start's load, pruning and reads of past orders run is the server's
