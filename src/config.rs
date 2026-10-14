@@ -109,6 +109,7 @@ impl std::error::Error for Error {}
 pub struct DatabaseUrl(String);
 
 impl DatabaseUrl {
+    /// The URL as written, password and all: for opening the store, not for printing.
     pub fn as_str(&self) -> &str {
         &self.0
     }
