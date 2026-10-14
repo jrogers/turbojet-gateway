@@ -1,8 +1,14 @@
 /**
  * An RFC 3339 time as the API writes it (UTC), shown to the second, or with `digits` of its
- * fraction: `2026-10-14 09:30:01`.
+ * fraction, padded with zeros where it has fewer: `2026-10-14 09:30:01`, `2026-10-14 09:30:01.200`.
  */
-export const utc = (time: string, digits = 0) => time.slice(0, digits > 0 ? 20 + digits : 19).replace('T', ' ')
+export function utc(time: string, digits = 0): string {
+  const seconds = time.slice(0, 19).replace('T', ' ')
+  if (digits === 0) return seconds
+  // The API leaves out a zero fraction, and writes as many digits as it has.
+  const fraction = /^\.(\d+)/.exec(time.slice(19))?.[1] ?? ''
+  return `${seconds}.${fraction.slice(0, digits).padEnd(digits, '0')}`
+}
 
 /** A `datetime-local` value (`2026-10-14T09:30`, maybe with seconds) as UTC, in ms; NaN if not one. */
 export function utcTime(value: string): number {

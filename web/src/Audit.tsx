@@ -114,7 +114,7 @@ function Entries({ entries, limit }: { entries: AuditEntry[]; limit: number }) {
           <tbody>
             {entries.map((entry, i) => (
               <tr key={i}>
-                <td>{utc(entry.time)}</td>
+                <td>{utc(entry.time, 3)}</td>
                 <td>{entry.user ?? ''}</td>
                 <td>{entry.role ?? ''}</td>
                 <td>{entry.ip}</td>

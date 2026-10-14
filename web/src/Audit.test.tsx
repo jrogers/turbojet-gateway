@@ -63,9 +63,9 @@ test('shows the last entries newest first, params as compact JSON, missing field
   render(<Audit />)
   await screen.findByRole('table')
   expect(rows()).toEqual([
-    ['2026-10-11 09:32:00', '', '', '192.0.2.1', 'login', '', '', '', 'refused: wrong password'],
+    ['2026-10-11 09:32:00.000', '', '', '192.0.2.1', 'login', '', '', '', 'refused: wrong password'],
     [
-      '2026-10-11 09:31:00',
+      '2026-10-11 09:31:00.000',
       'alice',
       'operator',
       '192.0.2.1',
@@ -75,7 +75,7 @@ test('shows the last entries newest first, params as compact JSON, missing field
       'runaway algo',
       'allowed',
     ],
-    ['2026-10-11 09:30:00', 'alice', 'operator', '192.0.2.1', 'block', 'comp:FUNDA', '', 'runaway algo', 'allowed'],
+    ['2026-10-11 09:30:00.123', 'alice', 'operator', '192.0.2.1', 'block', 'comp:FUNDA', '', 'runaway algo', 'allowed'],
   ])
   expect(screen.getByText('3, newest first.')).toBeTruthy()
 })
