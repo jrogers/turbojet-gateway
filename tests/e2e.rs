@@ -1204,22 +1204,35 @@ async fn an_order_unknown_at_its_venue_is_resolved() {
 ///
 /// The roll is the gateway's own, on the real clock: `day_end` is reloaded to a few seconds
 /// ahead before the client's first order, so its first day ends then, and the tick rolls it.
-/// `day_end` is to the second, so the test waits up to three.
+/// The day is fixed at that first order, so the order and its fill must be handled before
+/// `day_end`: an attempt whose setup overran it starts again with a longer margin, up to 12 s.
 #[tokio::test]
 async fn an_order_of_a_past_day_is_read_from_the_database() {
-    let mut setup = Setup::with(Options { api: true, database: true, ..Options::default() }).await;
-    let token = operator(&setup).await;
-    let config = setup.dir.path().join("jetbridge.toml");
-    let day_end = (chrono::Utc::now() + chrono::TimeDelta::seconds(3)).format("%H:%M:%S UTC");
-    let rest = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(&config, format!("day_end = \"{day_end}\"\n{rest}")).unwrap();
-    setup.reload().await;
-    let from = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    use chrono::{SubsecRound, TimeDelta, Utc};
+    let mut attempt = None;
+    for margin in [3, 6, 12] {
+        let mut setup = Setup::with(Options { api: true, database: true, ..Options::default() }).await;
+        let token = operator(&setup).await;
+        let config = setup.dir.path().join("jetbridge.toml");
+        // To the second, as `day_end` is written.
+        let day_end = Utc::now().trunc_subsecs(0) + TimeDelta::seconds(margin);
+        let rest = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("day_end = \"{}\"\n{rest}", day_end.format("%H:%M:%S UTC"))).unwrap();
+        setup.reload().await;
+        let from = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    setup.working_order().await;
-    setup.venue.send(fill(&setup.id("1"), "E-1", 100, 100));
-    let filled: v44::ExecutionReport = setup.events.parse().await;
-    assert_eq!(filled.ord_status, v44::OrdStatus::Filled);
+        setup.working_order().await;
+        setup.venue.send(fill(&setup.id("1"), "E-1", 100, 100));
+        let filled: v44::ExecutionReport = setup.events.parse().await;
+        assert_eq!(filled.ord_status, v44::OrdStatus::Filled);
+        // The gateway handled the order and the fill on this clock, before the client heard it:
+        // they're of the day that ends at `day_end`, so the roll drops the order.
+        if Utc::now() < day_end {
+            attempt = Some((setup, token, from, day_end));
+            break;
+        }
+    }
+    let (setup, token, from, day_end) = attempt.expect("setup never fit inside the day");
     let gateway = setup.service.gateway();
     let order = setup.id("1");
     let rolled = async {
@@ -1227,13 +1240,15 @@ async fn an_order_of_a_past_day_is_read_from_the_database() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
-    timeout(Duration::from_secs(3) + 2 * WAIT, rolled).await.expect("the day didn't roll");
+    // Until `day_end`, then the tick's second and some.
+    let wait = (day_end - Utc::now()).to_std().unwrap_or_default() + 2 * WAIT;
+    timeout(wait, rolled).await.expect("the day didn't roll");
     timeout(WAIT, gateway.committed()).await.expect("not committed");
 
     let addr = setup.service.api_addr().unwrap();
     let today = get(addr, "/api/orders", &token).await;
     assert_eq!(today["orders"], serde_json::json!([]), "the book still holds it");
-    let to = (chrono::Utc::now() + chrono::TimeDelta::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let to = (Utc::now() + TimeDelta::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let page = get(addr, &format!("/api/orders?from={from}&to={to}&client=comp:{CLIENT}"), &token).await;
     let orders = page["orders"].as_array().unwrap();
     let [past] = orders.as_slice() else { panic!("{page}") };
