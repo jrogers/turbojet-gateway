@@ -10,7 +10,9 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
  * from `next`; at the end, while the range is still to come, "Check for newer" reads on from
  * `follow`. Each shows as plain text, never as HTML: the wire is the counterparties' to write. It
  * reads its first page once, on mounting: key it by what it searches, so a new search starts
- * afresh. A 403 or 404 clears what was shown.
+ * afresh. A 403 (rescoped since) or 404 (no message log, or no such order) clears what was shown,
+ * and Retry starts again from the first page. Keeping the hits and clearing only the paging would
+ * show the first page twice, as Retry reads it again onto them.
  */
 export default function MessageList({ fetchPage }: { fetchPage: (after: string | null) => Promise<Page> }) {
   const [hits, setHits] = useState<Hit[]>([])

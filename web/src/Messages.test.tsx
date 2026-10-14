@@ -66,12 +66,13 @@ afterEach(() => {
   expect(seen).toEqual([])
 })
 
-const show = (me = who()) =>
-  render(
-    <LiveContext.Provider value={{ ...live, link: 'open' }}>
-      <Messages me={me} />
-    </LiveContext.Provider>,
-  )
+const screenFor = (me: Me) => (
+  <LiveContext.Provider value={{ ...live, link: 'open' }}>
+    <Messages me={me} />
+  </LiveContext.Provider>
+)
+
+const show = (me = who()) => render(screenFor(me))
 
 const type = (label: string, value: string, at = 0) => fireEvent.change(screen.getAllByLabelText(label)[at], { target: { value } })
 
@@ -111,6 +112,11 @@ test('the query repeats tag, lists the MsgTypes, and gives the times as UTC', ()
     ['until', '2026-10-08T17:00:00.000Z'],
     ['limit', '50'],
   ])
+  // A fraction, as a finer step gives.
+  expect(searchParams({ ...blank, since: '2026-10-08T09:00:30.5', until: '2026-10-08T10:00' })).toEqual([
+    ['since', '2026-10-08T09:00:30.500Z'],
+    ['until', '2026-10-08T10:00:00.000Z'],
+  ])
   // Until defaults to a day after since.
   expect(searchParams(blank)).toEqual([
     ['since', '2026-10-08T09:00:00.000Z'],
@@ -137,8 +143,42 @@ test('a range over a day is refused without asking', async () => {
   type('Since (UTC)', '2026-10-08T09:00')
   type('Until (UTC; a day after since if empty)', '2026-10-09T10:00')
   await searchNow()
-  expect(screen.getByRole('alert').textContent).toBe('A search covers 24 hours at most.')
+  const alert = screen.getByRole('alert')
+  expect(alert.textContent).toBe('A search covers 24 hours at most.')
   expect(document.querySelector('table.messages')).toBeNull()
+  // Since and until name it; other fields' errors don't.
+  for (const label of ['Since (UTC)', 'Until (UTC; a day after since if empty)']) {
+    const input = screen.getByLabelText(label)
+    expect(input.getAttribute('aria-invalid')).toBe('true')
+    expect(input.getAttribute('aria-describedby')).toBe(alert.id)
+  }
+  type('Until (UTC; a day after since if empty)', '2026-10-08T10:00')
+  // A tag's error is the form's, not theirs. (A limit out of bounds the browser stops first.)
+  type('Tag 1', 'x')
+  type('Value 1', '1')
+  await searchNow()
+  expect(screen.getByRole('alert').textContent).toBe('Tag condition x=1 needs a tag number and a value.')
+  expect(screen.getByLabelText('Since (UTC)').getAttribute('aria-invalid')).toBeNull()
+  expect(screen.getByLabelText('Since (UTC)').getAttribute('aria-describedby')).toBeNull()
+})
+
+test('tag rows are numbered; focus follows adding and removing them', () => {
+  serve({})
+  show()
+  const add = screen.getByRole('button', { name: 'Add tag condition' })
+  fireEvent.click(add)
+  expect(document.activeElement).toBe(screen.getByLabelText('Tag 2'))
+  fireEvent.click(add)
+  expect(document.activeElement).toBe(screen.getByLabelText('Tag 3'))
+  type('Tag 3', '55')
+  // The row before's Remove, then, with no row before, Add.
+  fireEvent.click(screen.getByRole('button', { name: 'Remove tag condition 2' }))
+  expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Remove tag condition 1' }))
+  expect((screen.getByLabelText('Tag 2') as HTMLInputElement).value).toBe('55')
+  fireEvent.click(screen.getByRole('button', { name: 'Remove tag condition 1' }))
+  expect(document.activeElement).toBe(add)
+  expect(screen.getByLabelText('Tag 1')).toBeTruthy()
+  expect(screen.queryByLabelText('Tag 2')).toBeNull()
 })
 
 test('the form asks with repeated tags, and pages on through the list', async () => {
@@ -152,11 +192,11 @@ test('the form asks with repeated tags, and pages on through the list', async ()
   type('Session', FUNDA)
   type('MsgType', 'D,F')
   type('Since (UTC)', '2026-10-08T09:00')
-  type('Tag', '11')
-  type('Value', 'C7')
+  type('Tag 1', '11')
+  type('Value 1', 'C7')
   fireEvent.click(screen.getByRole('button', { name: 'Add tag condition' }))
-  type('Tag', '55', 1)
-  type('Value', 'MSFT', 1)
+  type('Tag 2', '55')
+  type('Value 2', 'MSFT')
   await searchNow()
   expect(rawShown()).toEqual(['8=FIX.4.4|35=D|'])
   await act(async () => fireEvent.click(screen.getByRole('button', { name: 'More' })))
@@ -207,4 +247,33 @@ test('a 400 shows the API’s text', async () => {
   type('Since (UTC)', '2026-10-08T09:00')
   await searchNow()
   expect(screen.getByRole('alert').textContent).toBe('a search covers 24 hours at most')
+})
+
+test('without a message log, the 404 is shown', async () => {
+  serve({ [`/api/messages?${SINCE}&${UNTIL}`]: () => json({ error: 'no message log' }, 404) })
+  show()
+  type('Since (UTC)', '2026-10-08T09:00')
+  await searchNow()
+  expect(screen.getByRole('alert').textContent).toBe('no message log')
+  expect(document.querySelector('table.messages')).toBeNull()
+  expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy()
+})
+
+test('the user’s clients changing searches again; the same clients again do not', async () => {
+  const query = `/api/messages?${SINCE}&${UNTIL}`
+  let answer: Page = { messages: [hit('8=FIX.4.4|35=D|')], next: null, follow: null }
+  const calls = serve({ [query]: () => json(answer) })
+  const { rerender } = show(who(['FUNDA']))
+  type('Since (UTC)', '2026-10-08T09:00')
+  await searchNow()
+  expect(rawShown()).toEqual(['8=FIX.4.4|35=D|'])
+
+  answer = { messages: [], next: null, follow: null }
+  await act(async () => rerender(screenFor(who(['FUNDB']))))
+  expect(calls).toEqual([query, query])
+  expect(rawShown()).toEqual([])
+  expect(screen.getByText('No messages.')).toBeTruthy()
+
+  await act(async () => rerender(screenFor(who(['FUNDB']))))
+  expect(calls).toHaveLength(2)
 })

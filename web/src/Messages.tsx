@@ -1,4 +1,4 @@
-import { useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import * as api from './api.ts'
 import MessageList from './MessageList.tsx'
 import { useLive } from './store.ts'
@@ -36,6 +36,17 @@ function utcTime(value: string): number {
   return Date.parse(`${value}Z`)
 }
 
+/** `search`'s since and until in ms, until a day after since if empty, or why the API would refuse them. */
+export function range(search: Pick<Search, 'since' | 'until'>): [number, number] | string {
+  if (search.since === '') return 'Since is required.'
+  const since = utcTime(search.since)
+  const until = search.until === '' ? since + RANGE_MAX : utcTime(search.until)
+  if (Number.isNaN(since) || Number.isNaN(until)) return 'Since and until are a date and a time.'
+  if (until <= since) return 'Until must be after since.'
+  if (until - since > RANGE_MAX) return 'A search covers 24 hours at most.'
+  return [since, until]
+}
+
 /**
  * `search`'s query for `GET /api/messages`, as `api::messages::parse` takes it: `session`, one
  * `tag` per condition, the MsgTypes as one `msg_type` list, and `since` and `until` as UTC RFC 3339.
@@ -43,12 +54,9 @@ function utcTime(value: string): number {
  * conditions, a limit out of bounds.
  */
 export function searchParams(search: Search): [string, string][] | string {
-  if (search.since === '') return 'Since is required.'
-  const since = utcTime(search.since)
-  const until = search.until === '' ? since + RANGE_MAX : utcTime(search.until)
-  if (Number.isNaN(since) || Number.isNaN(until)) return 'Since and until are a date and a time.'
-  if (until <= since) return 'Until must be after since.'
-  if (until - since > RANGE_MAX) return 'A search covers 24 hours at most.'
+  const times = range(search)
+  if (typeof times === 'string') return times
+  const [since, until] = times
 
   const session = search.session.trim()
   const msgTypes = search.msgTypes
@@ -89,26 +97,39 @@ const today = () => `${new Date().toISOString().slice(0, 10)}T00:00`
 /**
  * The message log, searched: by session, direction, MsgTypes and tag conditions, over a day at
  * most. A scoped user's search finds only its clients' sessions, as the API narrows it; naming
- * another's is refused, with the API's text. Searched again if a snapshot changes the user's
- * clients.
+ * another's is refused, with the API's text. Searched again if the user's clients change: `me`'s
+ * are login's until a snapshot, then the snapshot's.
  */
 export default function Messages({ me }: { me: Me }) {
   const live = useLive()
   // `n` counts the searches asked, so asking the same again reads it afresh.
   const [search, setSearch] = useState<{ params: [string, string][]; n: number }>()
-  const [invalid, setInvalid] = useState<string>()
+  // Why the form can't be asked, and whether that's its range, which since and until then name.
+  const [invalid, setInvalid] = useState<{ text: string; range: boolean }>()
   // The tag rows' keys: rows are added and removed, so not their positions.
   const [rows, setRows] = useState<number[]>([0])
   const nextRow = useRef(1)
+  // Each row's Tag input and Remove button, by key, and the Add button: where focus goes as rows
+  // come and go, once they're rendered.
+  const tagInputs = useRef(new Map<number, HTMLInputElement>())
+  const removes = useRef(new Map<number, HTMLButtonElement>())
+  const addButton = useRef<HTMLButtonElement>(null)
+  const focusNext = useRef<() => HTMLElement | null | undefined>(undefined)
   // Suggestions: a scoped user may search only its clients' sessions. Past ones can be typed.
   const sessions = live.sessions.filter((session) => me.clients === null || session.side === 'client')
+
+  useEffect(() => {
+    const target = focusNext.current?.()
+    focusNext.current = undefined
+    target?.focus()
+  }, [rows])
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
     const text = (name: string) => String(form.get(name) ?? '')
     const values = form.getAll('value').map(String)
-    const params = searchParams({
+    const fields: Search = {
       session: text('session'),
       direction: text('direction'),
       msgTypes: text('msg_type'),
@@ -116,9 +137,11 @@ export default function Messages({ me }: { me: Me }) {
       since: text('since'),
       until: text('until'),
       limit: text('limit'),
-    })
+    }
+    const params = searchParams(fields)
     if (typeof params === 'string') {
-      setInvalid(params)
+      setInvalid({ text: params, range: typeof range(fields) === 'string' })
+      // On purpose: results left under a form they no longer match would read as its answer.
       setSearch(undefined)
     } else {
       setInvalid(undefined)
@@ -127,9 +150,21 @@ export default function Messages({ me }: { me: Me }) {
   }
 
   const addRow = () => {
-    setRows((rows) => [...rows, nextRow.current])
+    const row = nextRow.current
     nextRow.current += 1
+    focusNext.current = () => tagInputs.current.get(row)
+    setRows((rows) => [...rows, row])
   }
+
+  // Focus to the row before's Remove, or with none, to Add: the button pressed has gone.
+  const removeRow = (row: number, at: number) => {
+    const before = rows[at - 1]
+    focusNext.current = () => (before === undefined ? addButton.current : removes.current.get(before))
+    setRows((rows) => rows.filter((r) => r !== row))
+  }
+
+  // Since and until name the error when it's theirs.
+  const rangeInvalid = invalid?.range ? { 'aria-invalid': true, 'aria-describedby': 'search-error' } : {}
 
   return (
     <>
@@ -158,11 +193,11 @@ export default function Messages({ me }: { me: Me }) {
         </label>
         <label>
           Since (UTC)
-          <input type="datetime-local" step="1" name="since" defaultValue={today()} required />
+          <input type="datetime-local" step="1" name="since" defaultValue={today()} required {...rangeInvalid} />
         </label>
         <label>
           Until (UTC; a day after since if empty)
-          <input type="datetime-local" step="1" name="until" />
+          <input type="datetime-local" step="1" name="until" {...rangeInvalid} />
         </label>
         <label>
           Limit
@@ -173,23 +208,35 @@ export default function Messages({ me }: { me: Me }) {
           {rows.map((row, at) => (
             <div key={row} className="filters">
               <label>
-                Tag
-                <input name="tag" inputMode="numeric" placeholder="11" />
+                Tag {at + 1}
+                <input
+                  name="tag"
+                  inputMode="numeric"
+                  placeholder="11"
+                  ref={(input) => {
+                    if (input) tagInputs.current.set(row, input)
+                    return () => void tagInputs.current.delete(row)
+                  }}
+                />
               </label>
               <label>
-                Value
+                Value {at + 1}
                 <input name="value" />
               </label>
               <button
                 type="button"
                 aria-label={`Remove tag condition ${at + 1}`}
-                onClick={() => setRows((rows) => rows.filter((r) => r !== row))}
+                onClick={() => removeRow(row, at)}
+                ref={(button) => {
+                  if (button) removes.current.set(row, button)
+                  return () => void removes.current.delete(row)
+                }}
               >
                 Remove
               </button>
             </div>
           ))}
-          <button type="button" onClick={addRow} disabled={rows.length >= CONDITIONS_MAX}>
+          <button type="button" ref={addButton} onClick={addRow} disabled={rows.length >= CONDITIONS_MAX}>
             Add tag condition
           </button>
         </fieldset>
@@ -198,13 +245,13 @@ export default function Messages({ me }: { me: Me }) {
         </button>
       </form>
       {invalid && (
-        <p className="error" role="alert">
-          {invalid}
+        <p className="error" role="alert" id="search-error">
+          {invalid.text}
         </p>
       )}
       {search && (
         <MessageList
-          key={`${search.n} ${JSON.stringify(live.clients)}`}
+          key={`${search.n} ${JSON.stringify(me.clients)}`}
           fetchPage={(after) => api.messages(after === null ? search.params : [...search.params, ['after', after]])}
         />
       )}
