@@ -5,7 +5,8 @@
 //!
 //! Batches queue on one channel, unbounded in type but bounded in practice by the holds: a
 //! session stops reading 256 messages past its oldest held one, so a database that's down or slow
-//! slows the counterparties, not the gateway's memory. While the oldest uncommitted batch has
+//! slows the counterparties, not the gateway's memory. Each operator action waiting on a commit
+//! adds an empty batch too, bounded by the API's rate of requests. While the oldest uncommitted batch has
 //! waited longer than [`MAX_COMMIT_WAIT`], the gateway rejects new orders (see
 //! [`Book::set_unavailable`](crate::book::Book::set_unavailable)).
 
