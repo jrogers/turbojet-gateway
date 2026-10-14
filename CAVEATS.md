@@ -89,10 +89,11 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   "gateway unavailable", operator calls don't return, and shutdown waits for it too: a second
   Ctrl-C or SIGTERM exits.
 - A PostgreSQL connection the server or network closes is a failing write like any other: the
-  retry opens a new one. A commit whose answer the connection lost is written again, which writes
-  each row once. One lost silently, with no reset, holds the write: there's no keepalive or
-  timeout on it, so it waits on the operating system's TCP retransmission timeout (around 15
-  minutes on Linux's defaults), or for good while awaiting a reply.
+  retry opens a new one. A commit whose answer the connection lost is written again; every row is
+  written by key, so each is still written once. One lost silently, with no reset, holds the
+  write, with the effects above: there's no keepalive or timeout on it, so it waits on the
+  operating system's TCP retransmission timeout (around 15 minutes on Linux's defaults), or
+  indefinitely if the request was sent and the gateway is waiting on its reply.
 - One gateway per database: two writing to one, SQLite or PostgreSQL, overwrite each other's
   book. Nothing checks.
 - On PostgreSQL, how a start's load, pruning and reads of past orders run is the server's

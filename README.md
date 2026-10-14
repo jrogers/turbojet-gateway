@@ -46,9 +46,9 @@ reports back, keeping each order's state as it goes.
   orders and their ClOrdIDs go, and the session's ClOrdID count and filled notional start again.
 - **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
   cancelled when its session drops and it doesn't log back on in time, and at shutdown.
-- **A database**, optional (SQLite, or PostgreSQL with `--features postgres`): the book, blocks, risk counts and undelivered reports
-  survive a restart, and the restart sorts out what a crash left half done with the venues. Past
-  days' orders stay readable over the API until pruned.
+- **A database**, optional (SQLite, or PostgreSQL with `--features postgres`): the book, blocks,
+  risk counts and undelivered reports survive a restart, and the restart sorts out what a crash
+  left half done with the venues. Past days' orders stay readable over the API until pruned.
 - **An operator API**, optional: HTTP and JSON, with local users in three roles, an audit log of
   every change, and a websocket of the book's and the sessions' changes as they happen.
   Operators can also ask a venue where an order stands; admins can edit the risk limits and set
@@ -219,23 +219,26 @@ retention = "400d"
   changed one. See Pruning, below.
 - Without a `[database]`, the gateway keeps everything in memory, and a restart forgets it.
 
-On PostgreSQL:
+**On PostgreSQL.**
 
 ```toml
 [database]
 url = "postgres://jetbridge@db.internal/jetbridge?sslmode=verify-full"
 ```
 
-- The database must already exist (`?mode=rwc` is SQLite's); the tables are created on the
-  first start, in the user's default schema (its `search_path`).
+- The database must already exist (`?mode=rwc` is SQLite's), and the user needs CREATE on its
+  default schema (its `search_path`): on PostgreSQL 15 and later, `public` grants that only to the
+  database's owner. The tables are created on the first start.
 - The password can be in the URL, as `password=`, or in `PGPASSWORD` or `~/.pgpass`, which sqlx
-  reads. It's masked in the log either way. sqlx logs a parameter it doesn't know with its
-  value, as one it ignores, so a misspelt `passwd=` puts the password in the log.
-- TLS needs the `tls` feature: without it, `sslmode=require` doesn't connect, and the default,
-  `prefer` (unless `PGSSLMODE` sets another), connects in the clear: queries, data, and the
+  reads; in the URL it's masked in the log. Spell it `password`: sqlx logs a parameter it doesn't
+  know with its value, so a misspelt `passwd=` puts the password in the log.
+- TLS needs the `tls` feature: without it, `sslmode=require` doesn't connect. The default,
+  `prefer` (unless `PGSSLMODE` sets another), then connects in the clear: queries, data, and the
   password itself if the server asks for it by its `password` method. `verify-full` and
-  `verify-ca` check the server's certificate against the operating system's roots and any `sslrootcert=`.
-- Each gateway holds three connections: one to write and two, read-only, to read past orders.
+  `verify-ca` check the server's certificate against the operating system's roots and any
+  `sslrootcert=`.
+- Each gateway holds three connections (one to write, two read-only to read past orders), within
+  the server's `max_connections`.
 
 **Orders don't wait for the database.** Orders go to venues and reports to clients without
 waiting for it; the changes are committed in the background, many at a time. Each message that
