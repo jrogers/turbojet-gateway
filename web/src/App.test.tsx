@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
@@ -190,4 +191,17 @@ test('a live socket refused by policy returns to login, saying why', async () =>
   })
   expect(screen.getByRole('alert').textContent).toBe('the session has ended: log in again')
   expect(screen.getByLabelText('User')).toBeTruthy()
+})
+
+test('under StrictMode the shell leaves one live socket open', async () => {
+  serve({ 'GET /api/me': () => json(alice) })
+  render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+  await screen.findByText('operator')
+  // Mounted, unmounted and mounted again: two opened, the first closed.
+  expect(FakeSocket.opened).toHaveLength(2)
+  expect(FakeSocket.opened.filter((socket) => !socket.closed)).toHaveLength(1)
 })

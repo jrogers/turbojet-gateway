@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import * as api from './api.ts'
 import { FakeSocket, fake } from './fake-socket.ts'
-import { backoff, connect, FIRST_WAIT, MAX_WAIT, POLICY, type Status } from './live.ts'
+import { AGAIN, backoff, connect, FIRST_WAIT, MAX_WAIT, POLICY, type Status } from './live.ts'
 import type { LiveMessage } from './types.ts'
 
 let messages: LiveMessage[]
@@ -66,6 +66,32 @@ test('reconnects after a close, waiting longer each time, and from the first aft
   last().send({ type: 'blocked', scope: 'all' })
   last().end(1001)
   waitFor(1_000)
+})
+
+test('a socket closed as too slow backs off, though it brought messages', () => {
+  for (const wait of [1_000, 2_000, 4_000]) {
+    last().open()
+    last().send({ type: 'blocked', scope: 'all' })
+    last().end(AGAIN, 'too slow to keep up: reconnect')
+    waitFor(wait)
+  }
+})
+
+test("a frame that isn't JSON is skipped", () => {
+  last().open()
+  last().onmessage?.call(last() as unknown as WebSocket, new MessageEvent('message', { data: '{not json' }))
+  last().send({ type: 'unblocked', scope: 'all' })
+  expect(messages).toEqual([{ type: 'unblocked', scope: 'all' }])
+})
+
+test('a close before opening, with the session still good, keeps trying, waiting longer', async () => {
+  const fetch = vi.fn(async () => new Response(JSON.stringify({ user: 'u', role: 'viewer', clients: null }), { status: 200 }))
+  vi.stubGlobal('fetch', fetch)
+  for (const wait of [1_000, 2_000, 4_000]) {
+    last().end(1006)
+    waitFor(wait)
+  }
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
 })
 
 test('a policy close ends the session, saying why, and stops', () => {

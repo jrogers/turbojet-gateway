@@ -53,6 +53,9 @@ export function reduce(state: LiveState, message: LiveMessage): LiveState {
       }
     case 'order': {
       const { type: _, ...order } = message
+      // ponytail: a copy of the working orders per event, O(page) each; a burst of fills on a full
+      // page is O(page²). Batch events per animation frame, or give orders their own context, if
+      // that shows.
       const orders = new Map(state.orders)
       if (done(order.status)) orders.delete(order.id)
       else orders.set(order.id, order)
@@ -78,7 +81,11 @@ export function reduce(state: LiveState, message: LiveMessage): LiveState {
   }
 }
 
-/** `sessions` with `change` applied to the one it names, added if new: a client's first connection. */
+/**
+ * `sessions` with `change` applied to the one it names, added if new (a client's first
+ * connection). A client disconnected and not paused is dropped, as the snapshot leaves it out:
+ * venues are always listed, and paused clients so they can be resumed.
+ */
 function changed(sessions: SessionView[], change: SessionChange): SessionView[] {
   const at = sessions.findIndex((session) => session.side === change.side && session.id === change.id)
   const session: SessionView = sessions[at] ?? {
@@ -94,6 +101,11 @@ function changed(sessions: SessionView[], change: SessionChange): SessionView[] 
   const next = { ...session }
   switch (change.event) {
     case 'connected':
+      next.status = 'connected'
+      // A session connected since the snapshot shows resends too. `since` is when it's heard of,
+      // the reducer's one impurity.
+      next.activity = { since: new Date().toISOString(), last_received: null, last_sent: null, resending: false }
+      break
     case 'logged_on':
     case 'logging_out':
       next.status = change.event
@@ -114,6 +126,9 @@ function changed(sessions: SessionView[], change: SessionChange): SessionView[] 
       // `refused` (its disconnection follows), or a newer event: nothing shown changes.
       return sessions
   }
+  if (next.side === 'client' && next.status === 'disconnected' && !next.paused) {
+    return at < 0 ? sessions : sessions.toSpliced(at, 1)
+  }
   return at < 0 ? [...sessions, next] : sessions.with(at, next)
 }
 
@@ -127,7 +142,8 @@ export const useLive = () => useContext(LiveContext)
 
 /**
  * Opens `/api/live` while mounted, and gives its state to those below. `open` makes the socket:
- * a fake one in tests.
+ * a fake one in tests. It must be a stable function (defined once, outside a component): a new one
+ * each render closes the socket and opens another.
  */
 export function LiveProvider({ children, open }: { children: ReactNode; open?: Opener }) {
   const [state, dispatch] = useReducer(reduce, initial)

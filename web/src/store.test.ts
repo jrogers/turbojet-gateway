@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest'
 import { initial, MAX_ALARMS, reduce, type LiveState } from './store.ts'
-import type { Alarm, LiveMessage, OrderView, SessionView, Snapshot } from './types.ts'
+import type { Alarm, LiveMessage, OrderView, SessionChange, SessionView, Snapshot } from './types.ts'
 
 const order = (id: number, status: OrderView['status'] = 'new'): OrderView => ({
   id,
@@ -47,7 +47,13 @@ const snapshot = (over: Partial<Snapshot> = {}): Snapshot => ({
   ...over,
 })
 
-const alarm = (kind: Alarm['kind'], text = ''): LiveMessage => ({ type: 'alarm', time: '2026-10-14T09:00:00Z', kind, client: null, text })
+const alarm = (kind: Alarm['kind'], text = ''): LiveMessage => ({
+  type: 'alarm',
+  time: '2026-10-14T09:00:00Z',
+  kind,
+  client: null,
+  text,
+})
 
 const apply = (state: LiveState, ...messages: LiveMessage[]) => messages.reduce(reduce, state)
 
@@ -117,4 +123,38 @@ test("an event it doesn't know changes nothing", () => {
   const state = apply(initial, snapshot())
   expect(reduce(state, { type: 'session', side: 'client', id: FUNDA, event: 'refused', reason: 'bad password' })).toBe(state)
   expect(reduce(state, { type: 'something_new' } as unknown as LiveMessage)).toBe(state)
+})
+
+test('a session connected since the snapshot shows its resends', () => {
+  const state = apply(
+    initial,
+    snapshot(),
+    { type: 'session', side: 'venue', id: VENUE, event: 'disconnected' },
+    { type: 'session', side: 'venue', id: VENUE, event: 'connected' },
+    { type: 'session', side: 'venue', id: VENUE, event: 'resend_started' },
+  )
+  expect(state.sessions[1]).toMatchObject({ status: 'connected', activity: { resending: true, last_received: null } })
+})
+
+test('a client disconnected and not paused is dropped, as a snapshot leaves it out; a venue stays', () => {
+  const event = (side: SessionView['side'], id: string, event: SessionChange['event']): LiveMessage => ({
+    type: 'session',
+    side,
+    id,
+    event,
+  })
+  const ids = (state: LiveState) => state.sessions.map((s) => `${s.side} ${s.id}`)
+  const start = apply(initial, snapshot())
+  const down = apply(start, event('client', FUNDA, 'disconnected'), event('venue', VENUE, 'disconnected'))
+  expect(ids(down)).toEqual([`venue ${VENUE}`])
+
+  // Paused, it stays, to be resumed; resumed while disconnected, it goes.
+  const paused = apply(start, event('client', FUNDA, 'paused'), event('client', FUNDA, 'disconnected'))
+  expect(ids(paused)).toEqual([`client ${FUNDA}`, `venue ${VENUE}`])
+  expect(ids(apply(paused, event('client', FUNDA, 'resumed')))).toEqual([`venue ${VENUE}`])
+  // And comes back when it connects.
+  expect(ids(apply(paused, event('client', FUNDA, 'resumed'), event('client', FUNDA, 'connected')))).toEqual([
+    `venue ${VENUE}`,
+    `client ${FUNDA}`,
+  ])
 })

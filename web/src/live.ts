@@ -13,6 +13,7 @@ export type Status = 'connecting' | 'open' | 'reconnecting'
 // `api::live`'s close codes (RFC 6455): its auth recheck refusing is POLICY; AWAY (stopping, or no
 // answer to pings) and AGAIN (too slow) are worth trying again, as is anything else.
 export const POLICY = 1008
+export const AGAIN = 1013
 
 /** The first wait before reconnecting, and the longest, in ms. */
 export const FIRST_WAIT = 1_000
@@ -30,9 +31,10 @@ export function backoff(failures: number, random = Math.random): number {
 
 /**
  * Opens `/api/live` on the page's host, handing each message to `onMessage`, and opens it again
- * after a close, waiting longer after each failure in a row. A socket that brings a message is a
- * good one, and starts the waits again from the first. A policy close is the session ending: it
- * goes to login and isn't tried again. Answers what closes it for good.
+ * after a close, waiting longer after each failure in a row. A socket that brought a message is a
+ * good one, and starts the waits again from the first, unless it was closed as too slow. A
+ * policy close is the session ending: it goes to login and isn't tried again. Answers what
+ * closes it for good.
  */
 export function connect({
   onMessage,
@@ -51,14 +53,22 @@ export function connect({
   function start() {
     timer = undefined
     let opened = false
+    let heard = false
     const current = (socket = open(url))
     current.onopen = () => {
       opened = true
       onStatus('open')
     }
     current.onmessage = (event: MessageEvent) => {
-      failures = 0
-      onMessage(JSON.parse(event.data as string) as LiveMessage)
+      heard = true
+      let message: LiveMessage
+      try {
+        message = JSON.parse(event.data as string) as LiveMessage
+      } catch {
+        // Not what the gateway sends: skipped, the next snapshot puts anything missed right.
+        return
+      }
+      onMessage(message)
     }
     current.onclose = (event: CloseEvent) => {
       socket = undefined
@@ -66,6 +76,8 @@ export function connect({
       // A refused upgrade (a 401 among them) shows only as a close before opening: asking who we
       // are ends the session if that's why, rather than retrying it for ever.
       if (!opened) api.me().catch(() => {})
+      // A socket that brought messages was good, but one closed as too slow must back off too.
+      if (heard && event.code !== AGAIN) failures = 0
       failures += 1
       onStatus('reconnecting')
       timer = setTimeout(start, backoff(failures))
