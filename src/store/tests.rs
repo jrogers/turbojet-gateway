@@ -10,6 +10,45 @@ async fn memory() -> Store {
     Store::open("sqlite::memory:").await.unwrap()
 }
 
+/// A new, empty store: on PostgreSQL in a schema of its own if [`postgres`] names one, else
+/// SQLite in memory.
+async fn store() -> Store {
+    match postgres().await {
+        Some(url) => Store::open(&url).await.unwrap(),
+        None => memory().await,
+    }
+}
+
+/// A URL a store can be closed and opened again at: a new PostgreSQL schema as [`store`]'s, or a
+/// SQLite file in a directory of its own, kept as long as the directory.
+async fn reopenable() -> (String, Option<tempfile::TempDir>) {
+    if let Some(url) = postgres().await {
+        return (url, None);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    (format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display()), Some(dir))
+}
+
+/// With the `postgres` feature and `JETBRIDGE_POSTGRES_URL` set, a new schema on that database,
+/// as a URL whose connections use it: the database is one the tests may fill. Schemas are
+/// left behind.
+#[cfg(feature = "postgres")]
+async fn postgres() -> Option<String> {
+    let url = std::env::var("JETBRIDGE_POSTGRES_URL").ok().filter(|url| !url.is_empty())?;
+    let schema = format!("jetbridge_test_{:016x}", getrandom::u64().unwrap());
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+    pool.execute(format!("CREATE SCHEMA {schema}").as_str()).await.unwrap();
+    pool.close().await;
+    let separator = if url.contains('?') { '&' } else { '?' };
+    Some(format!("{url}{separator}options[search_path]={schema}"))
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn postgres() -> Option<String> {
+    None
+}
+
 /// What a store of every change in `changes` holds, its next OrderId at least 1 as the store's
 /// is (an empty snapshot's is 0).
 fn applied(changes: &[Changes]) -> Snapshot {
@@ -159,7 +198,7 @@ fn every_sent() -> Vec<(CompactString, Sent)> {
 /// set and empty: what the store reads back is what was written, decimals' scales too.
 #[tokio::test]
 async fn every_row_reads_back_as_written() {
-    let store = memory().await;
+    let store = store().await;
     // No day for FUNDA, so every one of its orders is held, done or not.
     let funda = ClientId::from("FUNDA");
     let fundb = ClientId::from("FUNDB");
@@ -218,7 +257,7 @@ fn every_code_reads_back_as_its_value_and_no_two_share_one() {
 /// writes; a list of blocks replaces the last, and no list keeps it.
 #[tokio::test]
 async fn later_rows_win_and_blocks_are_replaced() {
-    let store = memory().await;
+    let store = store().await;
     let funda = ClientId::from("FUNDA");
     let row = |status, cum_qty: &str| {
         let mut order = order(1, &funda, true);
@@ -259,7 +298,7 @@ async fn later_rows_win_and_blocks_are_replaced() {
 /// a batch again, as the writer retries one, changes nothing.
 #[tokio::test]
 async fn delivered_reports_are_deleted_and_a_rewrite_changes_nothing() {
-    let store = memory().await;
+    let store = store().await;
     let row = |n: u8| Undelivered { client: ClientId::from("FUNDA"), message: vec![n] };
     let first = Changes { undelivered: vec![(1, row(1)), (2, row(2)), (3, row(3))], ..Changes::default() };
     let second = Changes { delivered: vec![1], ..Changes::default() };
@@ -314,7 +353,7 @@ async fn merged_changes_write_what_the_changes_do() {
     assert_eq!(merged.delivered, [1, 3, 9]);
     assert_eq!(applied(std::slice::from_ref(&merged)), applied(&written));
 
-    let (one, each) = (memory().await, memory().await);
+    let (one, each) = (store().await, store().await);
     one.write(std::slice::from_ref(&merged)).await.unwrap();
     each.write(&written).await.unwrap();
     assert_eq!(one.load().await.unwrap(), each.load().await.unwrap());
@@ -376,7 +415,7 @@ fn order_row(id: u64) -> OrderRow {
 /// again writes it all.
 #[tokio::test]
 async fn a_write_failing_inside_its_transaction_leaves_nothing() {
-    let store = memory().await;
+    let store = store().await;
     let changes = Changes { orders: every_order(&ClientId::from("FUNDA")), ..Changes::default() };
     store.hooks.failures_in_transaction.store(1, std::sync::atomic::Ordering::Release);
     assert!(store.write(std::slice::from_ref(&changes)).await.is_err());
@@ -388,15 +427,14 @@ async fn a_write_failing_inside_its_transaction_leaves_nothing() {
 /// An empty store's next OrderId is 1.
 #[tokio::test]
 async fn an_empty_store_loads_an_empty_snapshot() {
-    assert_eq!(memory().await.load().await.unwrap(), applied(&[]));
+    assert_eq!(store().await.load().await.unwrap(), applied(&[]));
 }
 
-/// A file keeps what was written across a reopen, and a database of another schema version is
+/// A database keeps what was written across a reopen, and one of another schema version is
 /// refused and left as it was.
 #[tokio::test]
-async fn a_file_reopens_and_another_schema_version_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let url = format!("sqlite://{}?mode=rwc", dir.path().join("jetbridge.db").display());
+async fn a_database_reopens_and_another_schema_version_is_refused() {
+    let (url, _dir) = reopenable().await;
     let row = OrderRow { order: order(7, &ClientId::from("FUNDA"), true), day: Some(Day(time(17, 0))) };
     let changes = Changes { orders: vec![row], ..Changes::default() };
     let store = Store::open(&url).await.unwrap();
@@ -419,7 +457,7 @@ async fn a_file_reopens_and_another_schema_version_is_refused() {
 /// a book restored from either is the same book.
 #[tokio::test]
 async fn a_book_restored_from_the_store_is_the_book_restored_from_its_changes() {
-    let store = memory().await;
+    let store = store().await;
     let mut written = Vec::new();
     let mut step = async |book: &mut Book, inputs: Vec<Input>| -> Vec<Output> {
         // Each input's changes taken apart and written together, as the writer will.
@@ -553,6 +591,8 @@ fn days_started(client: &ClientId, hour: u32) -> Input {
     Input::DaysStarted { days: vec![(client.clone(), Day(time(hour, 0)))] }
 }
 
+// ponytail: SQLite's plans only; PostgreSQL's aren't asserted. Add EXPLAIN checks if a large
+// PostgreSQL database loads or prunes slowly.
 /// Loading reads orders by index, never the whole history: no step of its plan scans `orders`.
 #[tokio::test]
 async fn loading_never_scans_every_order() {
@@ -574,7 +614,7 @@ async fn loading_never_scans_every_order() {
 /// A ClOrdID row with no day is keyed by the sentinel, not NULL: writing it again replaces it.
 #[tokio::test]
 async fn a_cl_ord_id_with_no_day_is_one_row() {
-    let store = memory().await;
+    let store = store().await;
     let funda = ClientId::from("FUNDA");
     let row = |order| ClOrdIdRow { client: funda.clone(), day: None, cl_ord_id: "X".into(), order: OrderId(order) };
     let orders = vec![
@@ -630,7 +670,7 @@ async fn creating_says_whether_the_database_was_new() {
 /// handled, aren't unknown; the rest are, each once, in the order asked, past one query's worth of IDs.
 #[tokio::test]
 async fn unknown_downstreams_are_those_without_a_request_sent() {
-    let store = memory().await;
+    let store = store().await;
     store.write(&[Changes { sent: every_sent(), ..Changes::default() }]).await.unwrap();
     let mut asked: Vec<CompactString> = (0..LOOKUP_CHUNK + 10).map(|n| format!("X{n}").into()).collect();
     asked.splice(0..0, ["2-2".into(), "9".into(), "1".into(), "9".into()]);
@@ -684,7 +724,7 @@ async fn ids(store: &Store, sql: &str) -> Vec<i64> {
 /// doesn't move back for a later prune of earlier requests.
 #[tokio::test]
 async fn pruning_deletes_done_orders_of_past_days_and_load_is_unchanged() {
-    let store = memory().await;
+    let store = store().await;
     let (funda, fundb) = (ClientId::from("FUNDA"), ClientId::from("FUNDB"));
     let (day1, day2, day3) = (Day(time(1, 0)), Day(time(2, 0)), Day(time(3, 0)));
     let written = [
@@ -745,7 +785,7 @@ async fn pruning_deletes_done_orders_of_past_days_and_load_is_unchanged() {
 /// Batches run until one is short: a batch of 2 prunes all 5 orders it may.
 #[tokio::test]
 async fn pruning_runs_batches_until_none_are_left() {
-    let store = memory().await;
+    let store = store().await;
     let funda = ClientId::from("FUNDA");
     let mut written: Vec<Changes> =
         (1..=6).map(|id| dated(id, &funda, Some(Day(time(1, 0))), true, time(0, u32::try_from(id).unwrap()))).collect();
@@ -759,8 +799,7 @@ async fn pruning_runs_batches_until_none_are_left() {
 /// A database from before the `pruned` table gains it when opened.
 #[tokio::test]
 async fn opening_an_older_database_adds_the_pruned_table() {
-    let dir = tempfile::tempdir().unwrap();
-    let url = format!("sqlite://{}?mode=rwc", dir.path().join("jetbridge.db").display());
+    let (url, _dir) = reopenable().await;
     let store = Store::open(&url).await.unwrap();
     sqlx::query("DROP TABLE pruned").execute(&store.pool).await.unwrap();
     store.pool.close().await;
@@ -769,6 +808,8 @@ async fn opening_an_older_database_adds_the_pruned_table() {
     assert_eq!(store.prune(time(2, 0), 1).await.unwrap(), Pruned { orders: 0 });
 }
 
+// ponytail: SQLite's plans only; PostgreSQL's aren't asserted. Add EXPLAIN checks if a large
+// PostgreSQL database loads or prunes slowly.
 /// Pruning reads past days' orders by the `orders_day` range, in its order: not by `orders_live`,
 /// nor sorting all of history each batch.
 #[tokio::test]
@@ -786,7 +827,7 @@ async fn pruning_reads_by_day() {
 /// prunes it.
 #[tokio::test]
 async fn pruning_keeps_an_old_days_order_sent_since_the_cutoff() {
-    let store = memory().await;
+    let store = store().await;
     let funda = ClientId::from("FUNDA");
     let cutoff = time(2, 0);
     let written = [
@@ -860,7 +901,7 @@ async fn history(store: &Store) -> ClientId {
 /// a session is that session only, a CompID each of its sessions.
 #[tokio::test]
 async fn stored_orders_are_read_by_creation_and_filters() {
-    let store = memory().await;
+    let store = store().await;
     let funda_42 = history(&store).await;
     let all = created_in(on(0, 0), on(3, 0));
     assert_eq!(ids_of(&store, all.clone()).await, [1, 2, 3, 4, 5, 6]);
@@ -904,7 +945,7 @@ async fn stored_orders_are_read_by_creation_and_filters() {
 /// across two.
 #[tokio::test]
 async fn stored_orders_page_by_creation_then_order_id() {
-    let store = memory().await;
+    let store = store().await;
     history(&store).await;
     let cases = [
         (on(0, 0), false, vec![1, 2, 3, 4, 5, 6]),
@@ -934,7 +975,7 @@ async fn stored_orders_page_by_creation_then_order_id() {
 /// what the page shows. Once the cancel is answered, it's no longer pending.
 #[tokio::test]
 async fn a_replaced_order_shows_once_with_every_request() {
-    let store = memory().await;
+    let store = store().await;
     let funda = ClientId::from("FUNDA");
     // `order(.., true)` has a pending replace and the gateway's cancel.
     let mut row = OrderRow { order: order(7, &funda, true), day: None };
@@ -991,8 +1032,8 @@ async fn a_replaced_order_shows_once_with_every_request() {
 /// read pool is read-only.
 #[tokio::test]
 async fn reads_of_history_dont_wait_for_the_writer() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display())).await.unwrap();
+    let (url, _dir) = reopenable().await;
+    let store = Store::open(&url).await.unwrap();
     let funda = ClientId::from("FUNDA");
     store.write(&[dated(1, &funda, None, true, on(0, 9))]).await.unwrap();
     let mut writing = store.pool.begin().await.unwrap();
@@ -1014,6 +1055,8 @@ fn a_read_only_url_replaces_its_mode() {
     assert_eq!(read_only("sqlite://j.db?cache=shared&mode=rw"), "sqlite://j.db?cache=shared&mode=ro");
 }
 
+// ponytail: SQLite's plans only; PostgreSQL's aren't asserted. Add EXPLAIN checks if a large
+// PostgreSQL database loads or prunes slowly.
 /// Past orders are read along the `sent_new` range, in its order or backwards, every filter and
 /// the cursor set or none: the orders and the cancels each by key, nothing scanned and no sort.
 #[tokio::test]

@@ -1922,6 +1922,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx-core",
+ "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.119",
  "tokio",
@@ -2417,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "turbojet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2432,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "turbojet-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "tokio",
@@ -2443,14 +2444,14 @@ dependencies = [
 
 [[package]]
 name = "turbojet-fix42"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "turbojet",
 ]
 
 [[package]]
 name = "turbojet-fix44"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "turbojet",
 ]

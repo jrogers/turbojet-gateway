@@ -11,6 +11,8 @@ publish = false
 tls = ["turbojet/tls", "turbojet-config/tls", "dep:tokio-rustls"]
 # `[message_log] compress`: gzip the message log's finished files.
 gzip = ["turbojet/gzip"]
+# PostgreSQL for the `[database] url`, as well as SQLite.
+postgres = ["sqlx/postgres"]
 # The web console, served at the API's address. Embeds web/dist, so build it first (`npm ci &&
 # npm run build` in web/); --all-features includes this.
 console = []
