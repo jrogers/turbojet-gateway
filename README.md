@@ -237,8 +237,8 @@ url = "postgres://jetbridge@db.internal/jetbridge?sslmode=verify-full"
   password itself if the server asks for it by its `password` method. `verify-full` and
   `verify-ca` check the server's certificate against the operating system's roots and any
   `sslrootcert=`.
-- Each gateway holds three connections (one to write, two read-only to read past orders), within
-  the server's `max_connections`.
+- Each gateway uses up to three connections (one to write, two read-only to read past orders),
+  within the server's `max_connections`.
 
 **Orders don't wait for the database.** Orders go to venues and reports to clients without
 waiting for it; the changes are committed in the background, many at a time. Each message that
