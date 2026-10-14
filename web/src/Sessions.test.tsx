@@ -207,3 +207,20 @@ test('a dialog the browser closes is closed for the parent too, but not by its o
   fireEvent(dialog, new Event('close'))
   expect(close).toHaveBeenCalledOnce()
 })
+
+test('an action done after the browser closed its dialog closes nothing more', async () => {
+  let succeed = () => {}
+  const confirm = () => new Promise<void>((resolve) => (succeed = resolve))
+  const close = vi.fn()
+  render(<Reason title="Pause" onConfirm={confirm} onClose={close} />)
+  fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'why' } })
+  fireEvent.submit(screen.getByRole('dialog'))
+  const dialog = screen.getByRole('dialog') as HTMLDialogElement
+  dialog.open = false
+  fireEvent(dialog, new Event('close'))
+  expect(close).toHaveBeenCalledOnce()
+  // The parent unmounts it, as it would, then the action succeeds.
+  cleanup()
+  await act(async () => succeed())
+  expect(close).toHaveBeenCalledOnce()
+})

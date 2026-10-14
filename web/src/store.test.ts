@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { initial, MAX_ALARMS, reduce, type LiveState } from './store.ts'
+import { initial, MAX_ALARMS, MAX_FINISHED, reduce, type LiveState } from './store.ts'
 import type { Alarm, LiveMessage, OrderView, SessionChange, SessionView, Snapshot } from './types.ts'
 
 const order = (id: number, status: OrderView['status'] = 'new'): OrderView => ({
@@ -164,4 +164,12 @@ test('a client disconnected and not paused is dropped, as a snapshot leaves it o
     `venue ${VENUE}`,
     `client ${FUNDA}`,
   ])
+})
+
+test('the finished orders kept are the latest, so many at most', () => {
+  const fills = Array.from({ length: MAX_FINISHED + 2 }, (_, n): LiveMessage => ({ type: 'order', ...order(n + 1, 'filled') }))
+  const state = apply(initial, snapshot(), ...fills)
+  expect(state.finished.size).toBe(MAX_FINISHED)
+  expect([...state.finished.keys()].slice(0, 2)).toEqual([3, 4])
+  expect(state.finished.has(MAX_FINISHED + 2)).toBe(true)
 })

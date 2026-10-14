@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import * as api from './api.ts'
 import { orderHref } from './router.ts'
 import { done, useLive } from './store.ts'
@@ -23,7 +23,7 @@ const DAY = 86_400_000
 
 /**
  * What the blotter shows: the API's filters, and with `from` (a `YYYY-MM-DD` day, UTC) past
- * orders up to the end of day `to` (`from` if empty).
+ * orders up to the end of day `to` (`from` if empty). `working` is live only.
  */
 interface Query {
   client: string
@@ -45,21 +45,25 @@ interface Loaded {
 
 /**
  * `query`'s parameters for `GET /api/orders`, or why it can't be asked: a client that isn't a
- * scope, or a range the API refuses.
+ * scope, or a range the API refuses. Newest first, but live and working only: those page on up
+ * from the snapshot's, which is lowest first.
  */
 function params(query: Query): Record<string, string | boolean | undefined> | string {
   if (query.client !== '' && !/^(all|comp:.+|session:.+)$/.test(query.client)) {
     return 'Client is comp:COMPID or session:SESSION.'
   }
   const { client, venue, symbol, status } = query
-  const filters = { client, venue, symbol, status, working: query.working || undefined }
-  if (query.from === '') return filters
+  const filters = { client, venue, symbol, status }
+  if (query.from === '') {
+    if (query.to !== '') return 'To needs a from date.'
+    return query.working ? { ...filters, working: true } : { ...filters, desc: true }
+  }
   const from = Date.parse(`${query.from}T00:00:00Z`)
   const to = Date.parse(`${query.to || query.from}T00:00:00Z`) + DAY
   if (Number.isNaN(from) || Number.isNaN(to)) return 'The dates are YYYY-MM-DD.'
   if (to <= from) return 'To is before from.'
   if (to - from > MAX_DAYS * DAY) return `A range covers ${MAX_DAYS} days at most.`
-  return { ...filters, from: new Date(from).toISOString(), to: new Date(to).toISOString() }
+  return { ...filters, desc: true, from: new Date(from).toISOString(), to: new Date(to).toISOString() }
 }
 
 /**
@@ -90,8 +94,8 @@ function matches(order: OrderView, query: Query): boolean {
   )
 }
 
-/** Newest first; the API's times have from none to nine fractional digits, so not as text. */
-const newestFirst = (a: OrderView, b: OrderView) => Date.parse(b.created) - Date.parse(a.created) || b.id - a.id
+/** Newest first: by the book's `id`, in booking order, as `desc` pages them. */
+const newestFirst = (a: OrderView, b: OrderView) => b.id - a.id
 
 /**
  * The blotter. Live by default: the store's working orders, and with "working only" off today's
@@ -106,6 +110,8 @@ export default function Orders() {
   const [loaded, setLoaded] = useState<Loaded>()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  // The From field as typed: past orders ignore "working only", so it's disabled with a date.
+  const [from, setFrom] = useState('')
   const past = query.from !== ''
   const asked = params(query)
 
@@ -149,12 +155,19 @@ export default function Orders() {
   // ponytail: every row merged, filtered and sorted again per live event, O(rows log rows); fine
   // for a few thousand. Keep the merged map in state, updated per event, if that shows.
   const rows = useMemo(() => {
-    if (past) return [...(loaded?.orders ?? [])].sort(newestFirst)
-    const shown = new Map((loaded?.orders ?? []).map((order) => [order.id, order]))
+    // Past ones in the server's order, newest first.
+    if (past) return loaded?.orders ?? []
+    const pages = loaded?.orders ?? []
+    const shown = new Map(pages.map((order) => [order.id, order]))
+    // The pages read newest first reach down only so far: a live order below the newest read and
+    // not on them is in a page not read yet. Working only, the store's are the first page, and
+    // those read go on up from them.
+    const above = query.working ? -Infinity : pages.reduce((newest, order) => Math.max(newest, order.id), -Infinity)
     // The live events are newer than any page read: a working order's in `orders`, a done one's in
-    // `finished`, and those done since read stay shown, unless working only.
-    for (const order of live.finished.values()) shown.set(order.id, order)
-    for (const order of live.orders.values()) shown.set(order.id, order)
+    // `finished`.
+    for (const order of [...live.finished.values(), ...live.orders.values()]) {
+      if (order.id > above || shown.has(order.id)) shown.set(order.id, order)
+    }
     return [...shown.values()].filter((order) => matches(order, query)).sort(newestFirst)
   }, [past, loaded, live.orders, live.finished, query])
 
@@ -200,13 +213,13 @@ export default function Orders() {
             ))}
           </select>
         </label>
-        <label className="check">
-          <input type="checkbox" name="working" defaultChecked />
+        <label className="check" title={from === '' ? undefined : 'Live only: past orders are as last written.'}>
+          <input type="checkbox" name="working" defaultChecked disabled={from !== ''} />
           Working only
         </label>
         <label>
           From (UTC)
-          <input type="date" name="from" />
+          <input type="date" name="from" value={from} onChange={(e) => setFrom(e.target.value)} />
         </label>
         <label>
           To (UTC, inclusive)
@@ -218,7 +231,7 @@ export default function Orders() {
       </form>
       <p className="muted">
         {past
-          ? `Created from ${query.from} to the end of ${query.to || query.from}, UTC midnights, as last written: not live.`
+          ? `Created from ${query.from} to the end of ${query.to || query.from}, UTC midnights, as last written: not live, working or not.`
           : 'Live: today’s orders. Pick dates for past ones.'}
       </p>
       {error && (
@@ -270,8 +283,11 @@ export default function Orders() {
   )
 }
 
-/** An order's row. Amounts as the API wrote them: decimals, never floats. */
-function Row({ order }: { order: OrderView }) {
+/**
+ * An order's row. Amounts as the API wrote them: decimals, never floats. Memoised: an event
+ * changes one order, and the rest keep their objects.
+ */
+const Row = memo(function Row({ order }: { order: OrderView }) {
   return (
     <tr>
       <td>{order.created.slice(0, 19).replace('T', ' ')}</td>
@@ -301,4 +317,4 @@ function Row({ order }: { order: OrderView }) {
       </td>
     </tr>
   )
-}
+})

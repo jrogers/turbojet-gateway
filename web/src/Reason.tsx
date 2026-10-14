@@ -6,7 +6,8 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
  * succeeds; a failure stays open, showing its message, to try again or cancel. Escape or Cancel
  * closes it, but not while the action is under way; if the browser closes it anyway, the parent is
  * told. A native modal `<dialog>`: the page behind is inert. Focus starts on the reason, and goes
- * back where it was on closing.
+ * back where it was on closing. `onClose` should be idempotent, as setting the parent's state to
+ * none is: closings can race, the browser's and the component's own.
  */
 export default function Reason({
   title,
@@ -46,7 +47,8 @@ export default function Reason({
     setError(undefined)
     try {
       await onConfirm(reason.trim())
-      onClose()
+      // Not if closed meanwhile, by the browser: the parent may have a new action open.
+      if (!gone.current) onClose()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setBusy(false)

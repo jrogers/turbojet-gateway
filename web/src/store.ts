@@ -2,6 +2,9 @@ import { createContext, createElement, useContext, useEffect, useReducer, useSta
 import { connect, type Opener, type Status as LinkStatus } from './live.ts'
 import type { Alarm, LiveMessage, OrderView, SessionChange, SessionView, Status } from './types.ts'
 
+/** The finished orders kept: the oldest go first. */
+export const MAX_FINISHED = 1_000
+
 /** The alarms kept, newest first. */
 export const MAX_ALARMS = 100
 
@@ -13,7 +16,8 @@ export interface LiveState {
   /** The working orders, by `id`. */
   orders: Map<number, OrderView>
   /**
-   * The orders done since the last snapshot, by `id`, as their last event said: so a screen
+   * The orders done since the last snapshot, by `id`, as their last event said, the latest
+   * [`MAX_FINISHED`] at most: so a screen
    * showing done orders read over HTTP can show their latest. A snapshot clears them: its scope
    * may have changed, and events may have been missed, so screens read again (`snapshots`).
    */
@@ -66,12 +70,15 @@ export function reduce(state: LiveState, message: LiveMessage): LiveState {
     case 'order': {
       const { type: _, ...order } = message
       // ponytail: a copy of the working orders per event, O(page) each, and of the finished ones
-      // per order done, O(the day's); a burst of fills on a full page is O(page²). Batch events
+      // per order done, O(MAX_FINISHED); a burst of fills on a full page is O(page²). Batch events
       // per animation frame, or give orders their own context, if that shows.
       const orders = new Map(state.orders)
       if (!done(order.status)) return { ...state, orders: orders.set(order.id, order) }
       orders.delete(order.id)
-      return { ...state, orders, finished: new Map(state.finished).set(order.id, order) }
+      const finished = new Map(state.finished).set(order.id, order)
+      // A Map keeps the order keys were added in: the first is the oldest.
+      if (finished.size > MAX_FINISHED) finished.delete(finished.keys().next().value!)
+      return { ...state, orders, finished }
     }
     case 'blocked':
       return state.blocked.includes(message.scope) ? state : { ...state, blocked: [...state.blocked, message.scope] }
