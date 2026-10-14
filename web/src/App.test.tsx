@@ -106,24 +106,27 @@ test('routes switch with the hash, orders by default', async () => {
   render(<App />)
   expect((await screen.findByRole('heading')).textContent).toBe('Orders')
 
+  // The shell's commit can be in the DOM before its effects have run, so its hashchange listener
+  // may not be there yet: useSyncExternalStore then sees the new hash as it subscribes, a moment
+  // later. So each navigation waits for its screen rather than expecting it at once.
   const go = (hash: string) =>
     act(() => {
       window.location.hash = hash
       window.dispatchEvent(new HashChangeEvent('hashchange'))
     })
   go('#/sessions')
-  expect(screen.getByRole('heading').textContent).toBe('Sessions')
+  await screen.findByRole('heading', { level: 1, name: 'Sessions' })
   expect(screen.getByRole('link', { name: 'Sessions' }).getAttribute('aria-current')).toBe('page')
   go('#/risk')
-  expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Risk')
+  await screen.findByRole('heading', { level: 1, name: 'Risk' })
   expect(screen.getByRole('link', { name: 'Risk' }).getAttribute('aria-current')).toBe('page')
   expect(await screen.findByText('not now')).toBeTruthy()
   go('#/orders/A%2F1')
-  expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Order A/1')
+  await screen.findByRole('heading', { level: 1, name: 'Order A/1' })
   expect(within(screen.getByRole('navigation')).getByRole('link', { name: 'Orders' }).getAttribute('aria-current')).toBe('page')
   expect(await screen.findByText('No such order.')).toBeTruthy()
   go('#/nowhere')
-  expect(screen.getByRole('heading').textContent).toBe('Orders')
+  await screen.findByRole('heading', { level: 1, name: 'Orders' })
 })
 
 test('a logout that fails keeps the shell and says why', async () => {

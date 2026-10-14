@@ -107,10 +107,10 @@ export default function Limits({
           if (e instanceof api.ApiError && (e.status === 403 || e.status === 404)) {
             setTables(null)
             setAnswer(undefined)
-            setEditing((editing) => {
-              if (editing) refocus.current = true
-              return undefined
-            })
+            // Heard only if an edit was open: closing it runs the focus effect. If none was,
+            // `open` clears the flag before the next one.
+            refocus.current = true
+            setEditing(undefined)
           }
           setError(message(e))
         },
@@ -142,6 +142,7 @@ export default function Limits({
     setRemove(false)
   }
   const open = (editing: Editing) => {
+    refocus.current = false
     choose(KEYS[0])
     setEditing(editing)
     reread()
