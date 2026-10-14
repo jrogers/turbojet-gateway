@@ -1,4 +1,5 @@
 import type {
+  AuditEntry,
   Changed,
   EditedView,
   LimitsSet,
@@ -8,7 +9,10 @@ import type {
   OrdersPage,
   Page,
   RiskTables,
+  ReloadView,
   RiskView,
+  RouteTest,
+  RouteView,
   SessionView,
 } from './types.ts'
 
@@ -123,6 +127,12 @@ export async function logout() {
 export const sessions = () => request<SessionView[]>('GET', '/api/sessions')
 export const risk = () => request<RiskView>('GET', '/api/risk')
 /** The limits as `jetbridge.toml` writes them: edit from these, not `RiskView`'s, which are merged. */
+export const routes = () => request<RouteView[]>('GET', '/api/routes')
+/** Where an order of `client` (a CompID) would go: routing only, no risk or blocks. */
+export const routeTest = (client: string, exDestination: string, symbol: string) =>
+  request<RouteTest>('GET', `/api/routes/test${query({ client, ex_destination: exDestination, symbol })}`)
+/** [unscoped admin] The last `limit` entries from `since` (RFC 3339), oldest first. */
+export const audit = (since: string, limit: number) => request<AuditEntry[]>('GET', `/api/audit${query({ since, limit })}`)
 export const riskLimits = () => request<RiskTables>('GET', '/api/risk/limits')
 
 /**
@@ -145,6 +155,13 @@ export const pause = (id: string, reason: string) => request<void>('POST', `/api
 export const resume = (id: string, reason: string) => request<void>('POST', `/api/sessions/${segment(id)}/resume`, { reason })
 export const resend = (id: string, reason: string, from: number) =>
   request<Numbers>('POST', `/api/sessions/${segment(id)}/resend`, { reason, from })
+/** [admin] Either number or both; a number left out is kept. */
+export const sequence = (id: string, reason: string, numbers: { next_incoming?: number; next_outgoing?: number }) =>
+  request<Numbers>('POST', `/api/sessions/${segment(id)}/sequence`, { reason, ...numbers })
+/** [admin] Both numbers to 1, only while disconnected. */
+export const reset = (id: string, reason: string) => request<Numbers>('POST', `/api/sessions/${segment(id)}/reset`, { reason })
+/** [unscoped admin] Rereads the files; 422, saying why, when one was kept. */
+export const reload = (reason: string) => request<ReloadView>('POST', '/api/reload', { reason })
 export const cancelOrder = (orderId: string, reason: string) =>
   request<void>('POST', `/api/orders/${segment(orderId)}/cancel`, { reason })
 export const requestStatus = (orderId: string, reason: string) =>

@@ -321,3 +321,38 @@ export interface EditedView {
 
 /** A limit edit's `set`: each key's new value, `null` to remove it. */
 export type LimitsSet = { [K in keyof RiskTable]?: RiskTable[K] | null }
+
+/** `api::read::RouteView`: a `[[route]]` as written; one of `venue` and `reject` set. */
+export interface RouteView {
+  client: string | null
+  ex_destination: string | null
+  symbol: string | null
+  venue: string | null
+  reject: string | null
+}
+
+/** `router::Target`. */
+export type Target = { venue: string } | { reject: string }
+
+/** `api::read::RouteTest`: `GET /api/routes/test`. All `null` when no route matches. */
+export interface RouteTest {
+  /** The rule's index in `GET /api/routes`. */
+  rule: number | null
+  route: RouteView | null
+  target: Target | null
+}
+
+/** `audit::Entry`: one line of the audit log. */
+export interface AuditEntry {
+  time: string
+  /** `null` for a refusal before the caller was identified. */
+  user: string | null
+  role: Role | null
+  ip: string
+  action: string
+  target: string | null
+  /** The request's other arguments, `null` if none. */
+  params: unknown
+  reason: string | null
+  result: string
+}

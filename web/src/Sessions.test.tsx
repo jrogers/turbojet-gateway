@@ -86,8 +86,59 @@ test('shows the actions by role, and a venue only to an unscoped one', () => {
   cleanup()
 
   show(who('admin', ['FUNDA']))
-  expect(buttons(FUNDA)).toEqual(['Pause', 'Resend'])
+  expect(buttons(FUNDA)).toEqual(['Pause', 'Resend', 'Set numbers', 'Reset to 1'])
   expect(buttons('NASDAQ')).toEqual([])
+  cleanup()
+
+  show(who('admin'))
+  expect(buttons('NASDAQ')).toEqual(['Resume', 'Resend', 'Set numbers', 'Reset to 1'])
+})
+
+test('set numbers takes either or both, each 1 or more, and shows the answer in the row', async () => {
+  const calls = serve(() => json({ next_incoming: 12, next_outgoing: 100 }))
+  show(who('admin'))
+  fireEvent.click(within(row(FUNDA)).getByRole('button', { name: 'Set numbers' }))
+  const dialog = screen.getByRole('dialog')
+  expect(within(dialog).getByRole('heading').textContent).toBe(`Set the sequence numbers of ${FUNDA}`)
+  fireEvent.change(within(dialog).getByLabelText('Reason'), { target: { value: 'agreed with FUNDA' } })
+  const confirm = within(dialog).getByRole('button', { name: 'Confirm' }) as HTMLButtonElement
+  // Neither given yet.
+  expect(confirm.disabled).toBe(true)
+  const nextIn = within(dialog).getByLabelText('Next in')
+  const nextOut = within(dialog).getByLabelText('Next out')
+  fireEvent.change(nextOut, { target: { value: '0' } })
+  expect(confirm.disabled).toBe(true)
+  fireEvent.change(nextOut, { target: { value: '100' } })
+  fireEvent.change(nextIn, { target: { value: '1.5' } })
+  expect(confirm.disabled).toBe(true)
+  fireEvent.change(nextIn, { target: { value: '' } })
+  expect(confirm.disabled).toBe(false)
+  await act(async () => fireEvent.click(confirm))
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(screen.getByRole('status').textContent).toBe(`Set the sequence numbers of ${FUNDA}: next in 12, next out 100.`)
+  expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on12100PauseResendSet numbersReset to 1`)
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
+  expect(calls.map((c) => [c.url, c.init.body])).toEqual([
+    [`/api/sessions/${encodeURIComponent(FUNDA)}/sequence`, '{"reason":"agreed with FUNDA","next_outgoing":100}'],
+  ])
+})
+
+test('reset to 1 warns that it resets both, and says why it was refused', async () => {
+  let calls = serve(() => json({ error: 'the session is connected; disconnect it first' }, 409))
+  show(who('admin'))
+  fireEvent.click(within(row('NASDAQ')).getByRole('button', { name: 'Reset to 1' }))
+  const dialog = screen.getByRole('dialog')
+  expect(dialog.textContent).toContain('Resets both next in and next out to 1')
+  fireEvent.change(within(dialog).getByLabelText('Reason'), { target: { value: 'new week' } })
+  const confirm = within(dialog).getByRole('button', { name: 'Reset to 1' })
+  fireEvent.click(confirm)
+  expect((await within(dialog).findByRole('alert')).textContent).toBe('the session is connected; disconnect it first')
+
+  calls = serve(() => json({ next_incoming: 1, next_outgoing: 1 }))
+  fireEvent.click(confirm)
+  expect((await screen.findByRole('status')).textContent).toBe('Reset the sequence numbers of NASDAQ: next in 1, next out 1.')
+  expect(row('NASDAQ').textContent).toBe('NASDAQlogged on11pausedResumeResendSet numbersReset to 1')
+  expect(calls.map((c) => [c.url, c.init.body])).toEqual([[`/api/sessions/${encodeURIComponent(VENUE)}/reset`, '{"reason":"new week"}']])
 })
 
 
