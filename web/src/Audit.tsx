@@ -9,8 +9,6 @@ export const AUDIT_MAX = 1_000
 /** `api::AUDIT_READ_DEFAULT`. */
 const AUDIT_DEFAULT = 100
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
-
 /**
  * The audit log [unscoped admin], newest first: the last `limit` entries from `since`, as
  * `GET /api/audit` reads it. It can't page further back, so a full read says older ones are left
@@ -35,7 +33,7 @@ export default function Audit() {
       (e: unknown) => {
         if (!current) return
         setEntries(null)
-        setError(message(e))
+        setError(api.message(e))
       },
     )
     return () => {

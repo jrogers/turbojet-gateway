@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { login } from './api.ts'
+import { login, message } from './api.ts'
 import type { Me } from './types.ts'
 
 /**
@@ -19,7 +19,7 @@ export default function Login({ onLogin, notice }: { onLogin: (me: Me) => void; 
     try {
       onLogin(await login(user, password))
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(message(e))
       setBusy(false)
     }
   }

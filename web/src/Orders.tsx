@@ -119,7 +119,7 @@ export default function Orders() {
     if (!reads) return
     api.orders(asked).then(
       (page) => asking.current === at && setLoaded(page),
-      (e: unknown) => asking.current === at && setError(e instanceof Error ? e.message : String(e)),
+      (e: unknown) => asking.current === at && setError(api.message(e)),
     ).finally(() => asking.current === at && setBusy(false))
   }, [query, live.snapshots])
 
@@ -135,7 +135,7 @@ export default function Orders() {
       if (asking.current !== at) return
       setLoaded((before) => ({ orders: [...(before?.orders ?? []), ...page.orders], next: page.next }))
     } catch (e) {
-      if (asking.current === at) setError(e instanceof Error ? e.message : String(e))
+      if (asking.current === at) setError(api.message(e))
     } finally {
       if (asking.current === at) setBusy(false)
     }

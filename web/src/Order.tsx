@@ -16,8 +16,6 @@ const ACTIONS: Record<Action, { title: string; post: (orderId: string, reason: s
 }
 
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
-
 /**
  * An order's page: its fields, kept live by the store's events for it, its requests to the venue
  * as last read, and its messages on both sides from the message log. An operator or admin may
@@ -64,7 +62,7 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
         if (e instanceof api.ApiError && (e.status === 404 || e.status === 403)) {
           setDetail(null)
           setMissing(e.status === 403 ? e.message : 'No such order.')
-        } else setError(message(e))
+        } else setError(api.message(e))
       },
     )
     return () => {

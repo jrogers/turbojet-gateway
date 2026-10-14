@@ -182,3 +182,6 @@ export const setClientLimits = (compId: string, reason: string, set: LimitsSet) 
   request<EditedView>('PATCH', `/api/risk/limits/client/${segment(compId)}`, { reason, set })
 export const deleteClientLimits = (compId: string, reason: string) =>
   request<EditedView>('DELETE', `/api/risk/limits/client/${segment(compId)}`, { reason })
+
+/** What a failure says: an `Error`'s message, or anything else as text. */
+export const message = (e: unknown) => (e instanceof Error ? e.message : String(e))

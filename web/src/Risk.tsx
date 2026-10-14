@@ -11,8 +11,6 @@ export const RISK_EVERY = 5_000
 
 type Action = { kind: 'block' | 'unblock' | 'cancel-all'; scope: string }
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
-
 /**
  * Risk: each session's open and filled notional beside its limits, the reference prices, and the
  * blocks, live from the store. An operator or admin may block a scope, lift a block, or pull the
@@ -57,7 +55,7 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
             stopped = true
             setRisk(null)
           }
-          setError(message(e))
+          setError(api.message(e))
         },
       )
     }

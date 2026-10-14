@@ -3,8 +3,6 @@ import * as api from './api.ts'
 import { utc } from './time.ts'
 import type { Hit, Page } from './types.ts'
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
-
 /**
  * Messages from the log, oldest first, a page at a time from `fetchPage(after)`: "More" reads on
  * from `next`; at the end, while the range is still to come, "Check for newer" reads on from
@@ -37,7 +35,7 @@ export default function MessageList({ fetchPage }: { fetchPage: (after: string |
         setHits([])
         setPage(undefined)
       }
-      setError(message(e))
+      setError(api.message(e))
     } finally {
       if (reading.current === at) setBusy(false)
     }

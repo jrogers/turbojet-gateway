@@ -25,7 +25,6 @@ type Editing = { kind: 'set'; table: string | null } | { kind: 'delete'; table: 
 /** What the last edit answered, and of which table. */
 type Answer = { table: string | null; edited: EditedView }
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const nameOf = (table: string | null) => (table === null ? 'the defaults' : table)
 const numeric = (key: Key) => (key === 'symbols' || key === 'self_trade' ? undefined : 'num')
 
@@ -115,7 +114,7 @@ export default function Limits({
             refocus.current = true
             setEditing(undefined)
           }
-          setError(message(e))
+          setError(api.message(e))
         },
       )
     }

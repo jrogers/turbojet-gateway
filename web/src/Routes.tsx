@@ -3,8 +3,6 @@ import * as api from './api.ts'
 import { useLive } from './store.ts'
 import type { Me, RouteTest, RouteView } from './types.ts'
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
-
 const FIELDS = ['client', 'ex_destination', 'symbol', 'venue', 'reject'] as const
 
 /** The same rule: every field alike. */
@@ -62,7 +60,7 @@ export default function Routes({ me, reloads }: { me: Me; reloads: number }) {
           shown.current = null
           setRoutes(null)
         }
-        setError(message(e))
+        setError(api.message(e))
       },
     )
     return () => {
@@ -104,7 +102,7 @@ export default function Routes({ me, reloads }: { me: Me; reloads: number }) {
       (e: unknown) => {
         if (testing.current !== at) return
         setTested(undefined)
-        setTestError(message(e))
+        setTestError(api.message(e))
       },
     )
   }

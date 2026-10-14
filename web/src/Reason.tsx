@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { message } from './api.ts'
 
 /**
  * A modal asking the reason for an action, which the API requires and audits. `children` are the
@@ -59,7 +60,7 @@ export default function Reason({
       // Not if closed meanwhile, by the browser: the parent may have a new action open.
       if (!gone.current) onClose()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(message(e))
       setBusy(false)
     }
   }

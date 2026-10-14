@@ -47,7 +47,7 @@ export default function App() {
         setMe(null)
         // A 401 here is no session yet, not one ended: just log in. Anything else is worth saying.
         const unauthorized = e instanceof api.ApiError && e.status === 401
-        setNotice(unauthorized ? undefined : e instanceof Error ? e.message : String(e))
+        setNotice(unauthorized ? undefined : api.message(e))
       },
     )
     return () => {
@@ -114,7 +114,7 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
       onLogout()
     } catch (e) {
       if (e instanceof api.ApiError && e.status === 401) return onLogout()
-      setError(e instanceof Error ? e.message : String(e))
+      setError(api.message(e))
       setBusy(false)
     }
   }
