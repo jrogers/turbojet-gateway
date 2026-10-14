@@ -1,7 +1,8 @@
 //! `GET /api/live` [viewer]: a websocket of what changes, for a console. It sends a snapshot,
-//! `{"type":"snapshot", sessions, orders, orders_next, blocked, unavailable, clients}`, then each event as
-//! it happens: the gateway's (`order`, `blocked`, `unblocked` and `alarm`; see [`GatewayEvent`])
-//! and the client and venue sessions' (`session`). What the client sends is ignored.
+//! `{"type":"snapshot", sessions, orders, orders_next, blocked, unavailable, clients}`, then
+//! each event as it happens: the gateway's (`order`, `blocked`, `unblocked` and `alarm`; see
+//! [`GatewayEvent`]) and the client and venue sessions' (`session`). What the client sends is
+//! ignored.
 //!
 //! A viewer scoped to some clients (see [`Caller::view_scope`]) is sent what concerns them: their
 //! orders, sessions and blocks (and blocks of all), every venue session, and the alarms
