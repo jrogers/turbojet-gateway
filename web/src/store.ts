@@ -12,6 +12,11 @@ export interface LiveState {
   sessions: SessionView[]
   /** The working orders, by `id`. */
   orders: Map<number, OrderView>
+  /**
+   * The orders done since the console opened, by `id`, as their last event said: so a screen
+   * showing done orders read over HTTP can show their latest. A snapshot keeps them.
+   */
+  finished: Map<number, OrderView>
   /** The snapshot's: with a full page, the `after` for `GET /api/orders?working=true`. */
   ordersNext: number | null
   /** Scopes as written: `all`, `comp:COMPID`, `session:SESSION`. */
@@ -25,6 +30,7 @@ export const initial: LiveState = {
   ready: false,
   sessions: [],
   orders: new Map(),
+  finished: new Map(),
   ordersNext: null,
   blocked: [],
   unavailable: false,
@@ -32,11 +38,11 @@ export const initial: LiveState = {
 }
 
 /** `book::Status::is_done`: no longer working. */
-const done = (status: Status) => status === 'filled' || status === 'canceled' || status === 'expired' || status === 'rejected'
+export const done = (status: Status) => status === 'filled' || status === 'canceled' || status === 'expired' || status === 'rejected'
 
 /**
  * `message` applied to `state`, as `api::live` says a console does: a snapshot replaces all but
- * the alarms, an order event replaces its order (or adds it, or drops it once done), and the rest
+ * the alarms, an order event replaces its order (or adds it, or moves it to `finished` once done), and the rest
  * change what they name. Pure: `state` isn't changed.
  */
 export function reduce(state: LiveState, message: LiveMessage): LiveState {
@@ -53,13 +59,13 @@ export function reduce(state: LiveState, message: LiveMessage): LiveState {
       }
     case 'order': {
       const { type: _, ...order } = message
-      // ponytail: a copy of the working orders per event, O(page) each; a burst of fills on a full
-      // page is O(page²). Batch events per animation frame, or give orders their own context, if
-      // that shows.
+      // ponytail: a copy of the working orders per event, O(page) each, and of the finished ones
+      // per order done, O(the day's); a burst of fills on a full page is O(page²). Batch events
+      // per animation frame, or give orders their own context, if that shows.
       const orders = new Map(state.orders)
-      if (done(order.status)) orders.delete(order.id)
-      else orders.set(order.id, order)
-      return { ...state, orders }
+      if (!done(order.status)) return { ...state, orders: orders.set(order.id, order) }
+      orders.delete(order.id)
+      return { ...state, orders, finished: new Map(state.finished).set(order.id, order) }
     }
     case 'blocked':
       return state.blocked.includes(message.scope) ? state : { ...state, blocked: [...state.blocked, message.scope] }

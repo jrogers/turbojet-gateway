@@ -79,6 +79,8 @@ test('a snapshot, then events, give the state they say', () => {
   expect([...state.orders.keys()]).toEqual([2, 3])
   expect(state.orders.get(2)?.status).toBe('partially_filled')
   expect(state.orders.get(2)).not.toHaveProperty('type')
+  expect([...state.finished.keys()]).toEqual([1])
+  expect(state.finished.get(1)?.status).toBe('canceled')
   expect(state.blocked).toEqual(['all'])
   expect(state.unavailable).toBe(true)
   expect(state.alarms.map((a) => a.kind)).toEqual(['gateway_unavailable'])
@@ -108,6 +110,7 @@ test("a lag's snapshot replaces all but the alarms", () => {
   expect(state.blocked).toEqual(['comp:FUNDB'])
   expect(state.unavailable).toBe(true)
   expect(state.alarms.map((a) => a.text)).toEqual(['kept'])
+  expect(apply(state, { type: 'order', ...order(9, 'filled') }, snapshot()).finished.get(9)?.status).toBe('filled')
 })
 
 test('alarms are kept newest first, so many at most; the gateway coming back is available', () => {
