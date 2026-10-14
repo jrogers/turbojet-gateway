@@ -646,11 +646,12 @@ must name the host it's sent to, over `https` when the cookie is `Secure`). A to
 in the URL. The socket first sends a snapshot,
 
 ```json
-{"type":"snapshot","sessions":[...],"orders":[...],"orders_next":null,"blocked":["comp:FUNDA"],"unavailable":false}
+{"type":"snapshot","sessions":[...],"orders":[...],"orders_next":null,"blocked":["comp:FUNDA"],"unavailable":false,"clients":["FUNDA"]}
 ```
 
 with the sessions as `GET /api/sessions` has them and the working orders, up to 1,000: with a full
-page, `orders_next` is the `after` to read the rest from `GET /api/orders?working=true`. Then
+page, `orders_next` is the `after` to read the rest from `GET /api/orders?working=true`.
+`clients` is the user's clients as of the snapshot (`null` for a user without `--clients`). Then
 each change, in the order it happened:
 
 - `{"type":"order", ...}`: an order's whole view, as `GET /api/orders` has it, to put in place of
@@ -671,8 +672,9 @@ A user with `--clients` gets the snapshot and events of its clients' sessions an
 venue's session, its clients' blocks and those of `all`, and of the alarms, `gateway_unavailable`,
 `gateway_available`, `venue_store_reset` and those whose `client` is its own: `orphan` and
 `unknown_order` go only to users without `--clients`. When a reload changes a user's clients, an
-open socket gets a snapshot under the new ones within 10 seconds; until then it keeps sending what
-the old ones showed.
+open socket gets a snapshot under the new ones within 10 seconds, its `clients` the new ones; until
+then it keeps sending what the old ones showed. No snapshot repeats the alarms: those raised for a
+client the user no longer has are for the console to drop.
 
 The first few events may repeat what the snapshot shows. A socket that falls behind skips what it
 missed and gets a new snapshot; one that falls behind again within a second is closed with code

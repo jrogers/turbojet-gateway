@@ -120,6 +120,8 @@ Notable changes to Jetbridge.
   most), from the database, so it needs a `[database]`; its pages' `next` is then a string to
   pass back as `after`. An order's detail and messages are found after the book drops it.
 - `GET /api/orders?desc=true` pages newest first, the book's orders and past ones alike.
+- The live socket's snapshot carries `clients`, the user's clients it was taken under (`null` for
+  all), so a console can tell when a reload rescoped it.
 - A web console in `web/` (React and TypeScript, Node 25 or later to build), served at the API's
   address by a gateway built with `--features console`: the blotter live and past days', an
   order's page with cancel, status and resolve, the sessions with pause, resume and resend, and

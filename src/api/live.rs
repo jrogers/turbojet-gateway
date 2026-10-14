@@ -1,5 +1,5 @@
 //! `GET /api/live` [viewer]: a websocket of what changes, for a console. It sends a snapshot,
-//! `{"type":"snapshot", sessions, orders, orders_next, blocked, unavailable}`, then each event as
+//! `{"type":"snapshot", sessions, orders, orders_next, blocked, unavailable, clients}`, then each event as
 //! it happens: the gateway's (`order`, `blocked`, `unblocked` and `alarm`; see [`GatewayEvent`])
 //! and the client and venue sessions' (`session`). What the client sends is ignored.
 //!
@@ -7,6 +7,8 @@
 //! orders, sessions and blocks (and blocks of all), every venue session, and the alarms
 //! [`Alarm::visible_to`](crate::book::Alarm::visible_to) them. Each recheck reads the viewer's
 //! clients again, and a change sends a snapshot under the new scope, so nothing outside it stays.
+//! The snapshot's `clients` says the scope it was taken under, so a console can drop what it held
+//! from outside it (the alarms, which no snapshot repeats) and show the user's clients as they are.
 //!
 //! A console applies the events to the snapshot in the order they come. An `order` event is the
 //! order's whole view, to put in place of the one held (or add); `blocked` and `unblocked` add and
@@ -209,6 +211,8 @@ struct Snapshot {
     orders_next: Option<u64>,
     blocked: Vec<Scope>,
     unavailable: bool,
+    /// The viewer's clients, the CompIDs it's scoped to as of this snapshot; `None` (`null`), all.
+    clients: Option<Vec<String>>,
 }
 
 /// What happened to a session: a [`SessionEvent`].
@@ -335,7 +339,8 @@ fn snapshot(state: &State, comp_ids: Option<&[String]>) -> Step {
     }
     let orders_next = if orders.len() == MAX_ORDERS_PER_PAGE { orders.last().map(|order| order.id.0) } else { None };
     let sessions = session_views(&service, comp_ids);
-    json(&Snapshot { sessions, orders, orders_next, blocked, unavailable })
+    let clients = comp_ids.map(<[String]>::to_vec);
+    json(&Snapshot { sessions, orders, orders_next, blocked, unavailable, clients })
 }
 
 /// Whether a viewer of the clients of `comp_ids` (`None`, all) is sent `event`: its clients'
@@ -576,15 +581,27 @@ mod tests {
             let column = |name: &str, field: &str| -> Vec<_> {
                 snapshot[name].as_array().unwrap().iter().map(|row| row[field].as_str().unwrap().to_string()).collect()
             };
-            (column("orders", "client"), snapshot["blocked"].clone(), column("sessions", "id"))
+            (
+                column("orders", "client"),
+                snapshot["blocked"].clone(),
+                column("sessions", "id"),
+                snapshot["clients"].clone(),
+            )
         };
         let client = |comp_id: &str| format!("FIX.4.4:JETBRIDGE->{comp_id}");
         let venue = fixture.service.venue_session("NASDAQ").unwrap().id().to_string();
         let all = (vec![client("FUNDA"), client("FUNDB")], serde_json::json!(["comp:FUNDA", "comp:FUNDB"]));
-        assert_eq!(snapshot_as(&fixture.viewer).await, (all.0, all.1, vec![client("FUNDA"), venue.clone()]));
-        let funda = (vec![client("FUNDA")], serde_json::json!(["comp:FUNDA"]), vec![client("FUNDA"), venue.clone()]);
+        let unscoped = (all.0, all.1, vec![client("FUNDA"), venue.clone()], serde_json::Value::Null);
+        assert_eq!(snapshot_as(&fixture.viewer).await, unscoped);
+        let funda = (
+            vec![client("FUNDA")],
+            serde_json::json!(["comp:FUNDA"]),
+            vec![client("FUNDA"), venue.clone()],
+            serde_json::json!(["FUNDA"]),
+        );
         assert_eq!(snapshot_as(&fixture.scoped_viewer).await, funda);
-        let fundb = (vec![client("FUNDB")], serde_json::json!(["comp:FUNDB"]), vec![venue]);
+        let fundb =
+            (vec![client("FUNDB")], serde_json::json!(["comp:FUNDB"]), vec![venue], serde_json::json!(["FUNDB"]));
         assert_eq!(snapshot_as(&fixture.scoped).await, fundb);
     }
 
@@ -669,7 +686,8 @@ mod tests {
             HeaderMap::from_iter([(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap())]);
         let (gateway, events, _sessions) = channels(16);
         let (mut client, _stop) = open_run(state.clone(), events, viewer("val", Some(&["FUNDA"]), headers)).await;
-        assert_eq!(next_json(&mut client).await["orders"].as_array().unwrap().len(), 1);
+        let first = next_json(&mut client).await;
+        assert_eq!((first["orders"].as_array().unwrap().len(), &first["clients"]), (1, &serde_json::json!(["FUNDA"])));
 
         let text = std::fs::read_to_string(&path).unwrap();
         let changed = text.replace(r#"clients = ["FUNDA"]"#, r#"clients = ["FUNDB"]"#);
@@ -679,7 +697,7 @@ mod tests {
         tokio::time::pause();
         tokio::time::advance(RECHECK).await;
         let snapshot = next_json(&mut client).await;
-        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!((&snapshot["type"], &snapshot["clients"]), (&"snapshot".into(), &serde_json::json!(["FUNDB"])));
         let [order] = snapshot["orders"].as_array().unwrap().as_slice() else { panic!("{snapshot}") };
         assert_eq!(order["client"], "FIX.4.4:JETBRIDGE->FUNDB");
         let (orders, _, _) = fixture.service.gateway().working_view(None);
