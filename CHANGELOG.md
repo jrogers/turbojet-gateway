@@ -151,5 +151,5 @@ Notable changes to Jetbridge.
   an existing client with such a name is refused at logon, and its restored orders stay
   unclaimed: an operator can cancel them, or resolve those a venue doesn't know, or have the
   counterparty log on under a name without those characters.
-- **Security:** a database URL's password given as a `password` query parameter, or holding `/`,
-  was logged unmasked.
+- **Security:** a database URL's password given as a `password` query parameter (its name
+  percent-encoded or not), or holding `/`, `?` or `@`, was logged unmasked.
