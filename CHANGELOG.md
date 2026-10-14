@@ -119,3 +119,5 @@ Notable changes to Jetbridge.
 - `GET /api/orders` reads past orders with `from` and `to` (RFC 3339, a range of 31 days at
   most), from the database, so it needs a `[database]`; its pages' `next` is then a string to
   pass back as `after`. An order's detail and messages are found after the book drops it.
+- The first start of this version on a database indexes its requests sent by time, once, for
+  reading past orders: on a large database that start takes longer.

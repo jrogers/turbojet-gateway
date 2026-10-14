@@ -57,6 +57,8 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - Without `[database] retention` the database is never pruned: done orders, the requests sent
   and ClOrdIDs used stay in it as history, so it grows for as long as the gateway trades. A start
   loads only live orders and each client's current day.
+- The first start of a version that reads past orders indexes the requests sent, once, to read
+  them by creation time: on a large database that start is slower.
 - Pruned orders are gone from the database for good, with their requests sent and ClOrdIDs, and
   no longer read over the API.
 - Done orders with no trading day (booked before their client's first day began) are never

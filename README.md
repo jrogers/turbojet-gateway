@@ -510,8 +510,8 @@ jetbridge user remove alice --users users.toml
   pass it back as `after` as it is, with the same query. Write a `+` in a time's offset as `%2B`
   (`from=2026-10-01T09:00:00%2B02:00`), or it reads as a space. Refused (400): `to` without
   `from`, `from` not before `to`, a range over 31 days, and any range without a `[database]`.
-- **An order the book no longer holds**, `GET /api/orders/{order_id}` and its `/messages` find in
-  the database. It shows `unknown_at_venue: false`, since that mark is kept in memory only, and
+- **An order the book no longer holds**, `GET /api/orders/{order_id}` and its `/messages` find it
+  in the database. It shows `unknown_at_venue: false`, since that mark is kept in memory only, and
   its messages are found while the message log keeps them.
 - **A routing dry run**, `GET /api/routes/test`, answers `{rule, route, target}`: `rule` is the
   index in `GET /api/routes` of the first route the order would match, `route` that route, and
