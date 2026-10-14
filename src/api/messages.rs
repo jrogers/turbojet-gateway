@@ -1039,6 +1039,70 @@ mod tests {
         assert_eq!(answer.body["error"], "val may see only clients FUNDA, not FIX.4.4:JETBRIDGE->FUNDB");
     }
 
+    /// Every read as an unscoped caller and one scoped to FUNDA, with FUNDB's paused session,
+    /// orders (booked and past), messages, limits, a block and a route about: unscoped, each answer
+    /// is 200, most showing FUNDB; scoped, it leaves FUNDB out, or is 403 where FUNDB is named. The
+    /// routes are everyone's. The audit log is read as an admin and an admin scoped to FUNDB.
+    #[tokio::test]
+    async fn every_read_by_scope() {
+        let config = "[message_log]\ndir = \"log\"\n[[route]]\nclient = \"FUNDB\"\nvenue = \"NASDAQ\"\n\
+                      [risk.client.FUNDA]\nmax_order_qty = 1000\n[risk.client.FUNDB]\nmax_order_qty = 1000\n";
+        let fixture = with_history(config).await;
+        let fundb = crate::book::ClientId::from("FUNDB");
+        let past = crate::store::tests::dated(103, &fundb, None, true, past(3));
+        fixture.service.store().unwrap().write(&[past]).await.unwrap();
+        crate::edge::tests::book_order_as(fixture.service.gateway(), "FUNDB", "B1");
+        assert!(fixture.service.gateway().block(crate::book::Scope::CompId("FUNDB".into())).await);
+        fixture.service.client_session(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB")).pause(None);
+        let order =
+            |minute, comp_id, id| (at(8, 9, minute), Direction::Inbound, Some(comp_id), fix(&[(35, "D"), (11, id)]));
+        log(&fixture.dirs.0.path().join("log"), &[order(0, "FUNDA", "A"), order(1, "FUNDB", "B")]);
+        let orders = fixture.ok("/api/orders?client=comp:FUNDB").await;
+        let b1 = orders["orders"][0]["order_id"].as_str().unwrap().to_string();
+
+        /// What an answer must be: 200 showing FUNDB, 200 without it, or this status.
+        #[derive(Clone, Copy, Debug)]
+        enum Want {
+            Shows,
+            Hides,
+            Is(StatusCode),
+        }
+        use Want::{Hides, Is, Shows};
+        let forbidden = Is(StatusCode::FORBIDDEN);
+        let viewers = (fixture.viewer.as_str(), fixture.scoped_viewer.as_str());
+        let admins = (fixture.admin.as_str(), fixture.scoped_admin.as_str());
+        let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z";
+        let fundb_session = "session=FIX.4.4:JETBRIDGE-%3EFUNDB";
+        let rows = [
+            ("/api/sessions".to_string(), viewers, Shows, Hides),
+            ("/api/orders".to_string(), viewers, Shows, Hides),
+            (format!("/api/orders?{range}"), viewers, Shows, Hides),
+            ("/api/orders?client=comp:FUNDB".to_string(), viewers, Shows, forbidden),
+            (format!("/api/orders/{b1}"), viewers, Shows, forbidden),
+            (format!("/api/orders/{b1}/messages"), viewers, Is(StatusCode::OK), forbidden),
+            ("/api/orders/A103".to_string(), viewers, Shows, forbidden),
+            (format!("/api/messages?{DAY}"), viewers, Shows, Hides),
+            (format!("/api/messages?{DAY}&{fundb_session}"), viewers, Shows, forbidden),
+            ("/api/risk".to_string(), viewers, Shows, Hides),
+            ("/api/risk/limits".to_string(), viewers, Shows, Hides),
+            ("/api/routes".to_string(), viewers, Shows, Shows),
+            ("/api/routes/test?client=FUNDB&symbol=AAPL".to_string(), viewers, Is(StatusCode::OK), forbidden),
+            ("/api/audit".to_string(), admins, Is(StatusCode::OK), forbidden),
+        ];
+        for (path, (unscoped, scoped), unscoped_want, scoped_want) in rows {
+            for (caller, bearer, want) in [("unscoped", unscoped, unscoped_want), ("scoped", scoped, scoped_want)] {
+                let answer = fixture.get_as(bearer, &path).await;
+                let shows = answer.body.to_string().contains("FUNDB");
+                let ok = match want {
+                    Shows => answer.status == StatusCode::OK && shows,
+                    Hides => answer.status == StatusCode::OK && !shows,
+                    Is(status) => answer.status == status,
+                };
+                assert!(ok, "{path} as {caller}: wanted {want:?}, got {} {}", answer.status, answer.body);
+            }
+        }
+    }
+
     /// A viewer scoped to NASDAQ, the venue's CompID, finds none of the venue's messages: its
     /// session prints as a client NASDAQ's would, and is left out as the venue's.
     #[tokio::test]

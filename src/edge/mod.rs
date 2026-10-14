@@ -1492,11 +1492,11 @@ pub(crate) mod tests {
     /// Order 1 in the book, from FUNDA, as if sent to [`VENUE`]: what the book asked to send is
     /// dropped.
     pub(crate) fn book_order(gateway: &Gateway) {
-        book_order_as(gateway, "C1");
+        book_order_as(gateway, "FUNDA", "C1");
     }
 
-    /// [`book_order`], the order `cl_ord_id`, booked at the book's time.
-    fn book_order_as(gateway: &Gateway, cl_ord_id: &str) {
+    /// [`book_order`], client `client`'s order `cl_ord_id`, booked at the book's time.
+    pub(crate) fn book_order_as(gateway: &Gateway, client: &str, cl_ord_id: &str) {
         let request = crate::book::OrderRequest {
             cl_ord_id: cl_ord_id.into(),
             account: None,
@@ -1509,7 +1509,7 @@ pub(crate) mod tests {
             time_in_force: None,
         };
         gateway.lock().book.handle(
-            Input::NewOrder { client: "FUNDA".into(), request, redelivered: false, sent: None },
+            Input::NewOrder { client: client.into(), request, redelivered: false, sent: None },
             &mut Vec::new(),
         );
     }
@@ -1517,7 +1517,7 @@ pub(crate) mod tests {
     /// [`book_order`], the order `cl_ord_id`, booked now by the wall clock.
     pub(crate) fn book_order_now(gateway: &Gateway, cl_ord_id: &str) {
         gateway.lock().book.set_now(chrono::Utc::now());
-        book_order_as(gateway, cl_ord_id);
+        book_order_as(gateway, "FUNDA", cl_ord_id);
     }
 
     /// The venue's acknowledgement of the order sent as `downstream`, naming it `venue_order_id`.
