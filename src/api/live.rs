@@ -39,9 +39,9 @@ use serde::Serialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::info;
-use turbojet::{SessionEvent, SessionEventKind, SessionId};
+use turbojet::{SessionEvent, SessionEventKind};
 
-use super::read::{SessionSide, SessionView, session_views};
+use super::read::{SessionSide, SessionView, session_views, shows_client};
 use super::{ApiError, Caller, State};
 use crate::book::{GatewayEvent, MAX_ORDERS_PER_PAGE, OrderView, Scope, is_one_of};
 
@@ -348,11 +348,6 @@ fn shows(comp_ids: Option<&[String]>, event: &GatewayEvent) -> bool {
         GatewayEvent::Blocked { scope } | GatewayEvent::Unblocked { scope } => scope.concerns(comp_ids),
         GatewayEvent::Alarm(alarm) => alarm.visible_to(Some(comp_ids)),
     }
-}
-
-/// Whether a viewer of the clients of `comp_ids` (`None`, all) is shown client session `id`.
-pub(super) fn shows_client(comp_ids: Option<&[String]>, id: &SessionId) -> bool {
-    comp_ids.is_none_or(|comp_ids| is_one_of(&id.target_comp_id, comp_ids))
 }
 
 fn json(value: &impl Serialize) -> Step {
