@@ -278,7 +278,8 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   clients, each with its own ClOrdIDs and reports; routes match their CompID, so they route alike.
 - Every client speaks the acceptor's BeginString.
 - A CompID may log on with up to 16 sessions; a logon on a 17th is refused. A logon whose SubID
-  or LocationID contains '/' is refused too, since it could print the same as another session.
+  or LocationID (its own, or the one it addresses the gateway by) or CompID contains '/', ':' or
+  '>' is refused too, since it could print the same as another session.
 - Each session that logs on keeps a report queue and its task until a restart, and each that
   orders its trading day in the book and the database. A restart counts, against the 16, only the
   sessions with live orders, undelivered reports or a block of their own. Listing the

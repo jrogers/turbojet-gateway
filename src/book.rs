@@ -316,7 +316,7 @@ impl Scope {
     }
 }
 
-/// Whether `comp_id` is one of `comp_ids`: a scoped caller's.
+/// Whether `comp_id` is one of `comp_ids`.
 pub fn is_one_of<S: AsRef<str>>(comp_id: &str, comp_ids: &[S]) -> bool {
     comp_ids.iter().any(|id| id.as_ref() == comp_id)
 }

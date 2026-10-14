@@ -645,16 +645,22 @@ impl Gateway {
     }
 
     /// Whether the acceptor's session `id` may log on: a session seen before may; a new one if
-    /// its CompID has fewer than [`MAX_SESSIONS_PER_COMP_ID`] and its SubID and LocationID have
-    /// no '/'. With one, `FUNDA` SubID `A/B` and `FUNDA` SubID `A` LocationID `B` print the same,
-    /// and would be one client. Records the session, checked and added under one lock.
+    /// its CompID has fewer than [`MAX_SESSIONS_PER_COMP_ID`] and nothing the client names in its
+    /// Logon (its CompID, SubID and LocationID, and the SubID and LocationID it addresses us by)
+    /// has a '/', ':' or '>'. The session's printed name is how a restored client and the message
+    /// log know it, so it must name one session only: with a '/', `FUNDA/X` and `FUNDA` SubID `X`
+    /// print the same, with a ':' `FUNDA:Q` and `FUNDA` with qualifier `Q`, and with a '>' (of
+    /// `->`) our SubID `S->T` to CompID `U` and our SubID `S` to CompID `T->U`. Records the
+    /// session, checked and added under one lock.
     fn admit(&self, id: &SessionId) -> Result<(), String> {
         let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
         if clients.contains_key(id) {
             return Ok(());
         }
-        if [&id.target_sub_id, &id.target_location_id].into_iter().flatten().any(|part| part.contains('/')) {
-            return Err(format!("session {id}: a SubID or LocationID with '/' isn't accepted"));
+        let named = [&id.target_sub_id, &id.target_location_id, &id.sender_sub_id, &id.sender_location_id];
+        let mut named = named.into_iter().flatten().chain([&id.target_comp_id]);
+        if named.any(|part| part.contains(['/', ':', '>'])) {
+            return Err(format!("session {id}: a CompID, SubID or LocationID with '/', ':' or '>' isn't accepted"));
         }
         let mut restored = self.restored.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(client) = restored.remove(&id.to_string()) {
@@ -1170,14 +1176,28 @@ pub(crate) mod tests {
         assert_eq!(logon(&app, &session("FIX.4.4", "FUNDB")), Ok(()));
     }
 
-    /// The session would print as FUNDA's DESK SubID with LocationID 1, which is another session.
+    /// Each would print as another session: FUNDA's DESK SubID with LocationID 1, FUNDA's DESK
+    /// SubID, FUNDA with a qualifier, or a session addressed by another SubID.
     #[test]
-    fn a_sub_id_or_location_id_with_a_slash_is_refused() {
+    fn a_name_that_prints_as_another_session_is_refused() {
         let app = ClientApp(gateway());
-        assert!(logon(&app, &desk("DESK/1")).is_err());
-        let located = SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA").with_target_location_id("LDN/2");
-        assert!(logon(&app, &SessionHandle::disconnected(located)).is_err());
+        let id = |comp_id: &str| SessionId::new("FIX.4.4", "JETBRIDGE", comp_id);
+        let refused = [
+            id("FUNDA").with_target_sub_id("DESK/1"),
+            id("FUNDA").with_target_location_id("LDN/2"),
+            id("FUNDA/DESK"),
+            id("FUNDA:Q"),
+            id("FUNDA").with_target_sub_id("DESK:Q"),
+            id("T->FUNDA"),
+            id("FUNDA").with_sender_sub_id("S->T"),
+            id("FUNDA").with_sender_location_id("LDN/2"),
+        ];
+        for id in refused {
+            let refused = logon(&app, &SessionHandle::disconnected(id.clone())).unwrap_err();
+            assert!(refused.ends_with("isn't accepted"), "{id}: {refused}");
+        }
         assert_eq!(logon(&app, &desk("DESK")), Ok(()));
+        assert_eq!(logon(&app, &SessionHandle::disconnected(id("FUNDA").with_sender_sub_id("S"))), Ok(()));
     }
 
     #[test]
@@ -2503,6 +2523,24 @@ pub(crate) mod tests {
         assert!(logon(&app, &desk("DAY-ONLY")).is_err());
         assert_eq!(logon(&app, &desk("DESK0")), Ok(()));
         assert_eq!(logon(&app, &session("FIX.4.4", "FUNDB")), Ok(()));
+    }
+
+    /// A restored client is known by its session's printed name: a CompID printing as it (FUNDA's
+    /// DESK as `FUNDA/DESK`) is refused, not given the client, which FUNDA's DESK still gets.
+    #[tokio::test]
+    async fn a_restored_client_isnt_taken_by_a_name_printing_as_its() {
+        let store = Store::open("sqlite::memory:").await.unwrap();
+        let funda_desk = ClientId::new(desk("DESK").id());
+        let changes =
+            crate::book::Changes { blocked: Some(vec![Scope::Session(funda_desk.clone())]), ..Default::default() };
+        store.write(&[changes]).await.unwrap();
+        let gateway = restarted(&store, "NEWNEW").await;
+        let app = ClientApp(gateway.clone());
+        let lookalike = SessionHandle::disconnected(SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA/DESK"));
+        assert_eq!(lookalike.id().to_string(), funda_desk.to_string());
+        assert!(logon(&app, &lookalike).is_err());
+        assert_eq!(logon(&app, &desk("DESK")), Ok(()));
+        assert_eq!(gateway.client_of(desk("DESK").id()), funda_desk);
     }
 
     /// At restore, a stored report that doesn't decode has its row deleted, as has one past a
