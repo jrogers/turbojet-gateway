@@ -34,8 +34,11 @@ export default function Reason({
   // next action.
   const gone = useRef(false)
 
+  // What had focus, taken as it first renders: by the time an effect runs, React has focused the
+  // reason (`autoFocus`) already.
+  const [before] = useState(() => document.activeElement)
+
   useEffect(() => {
-    const before = document.activeElement
     const shown = dialog.current!
     gone.current = false
     shown.showModal()
