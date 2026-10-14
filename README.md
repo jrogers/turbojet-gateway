@@ -595,8 +595,9 @@ in force, merged. An admin changes them with a `PATCH` to `/api/risk/limits/defa
 - **The answer** is `{table, reload}`: the table as the file now has it (`null` once deleted),
   and what the reload did, as `POST /api/reload` answers it; a reload that kept a file answers 422,
   though the edit is written (audited as failed, saying so). An admin with `--clients` gets
-  `reload` as `null`, and a 422 without why, since both can name other clients: the audit log has
-  it, and an admin without `--clients` can see it with `POST /api/reload`. Edits and reloads run one at a time,
+  `reload` as `null`, and a 422 for the rest of the file without why, since both can name other
+  clients: the audit log has it, and an admin without `--clients` can see it with
+  `POST /api/reload`. A bad key or value in the table it edits is said, to any admin. Edits and reloads run one at a time,
   and one sent during shutdown answers 503. Audited as `set_limits`, with the keys set and their
   values and the keys removed, or `delete_limits`, on `risk.defaults` or `risk.client.COMPID`.
 

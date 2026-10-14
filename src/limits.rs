@@ -37,6 +37,9 @@ pub enum EditError {
     NoTable(String),
     /// The file, edited, doesn't load, or wouldn't edit: why.
     Refused(String),
+    /// The table edited is wrong on its own (a key it doesn't take, a value the loader refuses):
+    /// why, naming the key. Unlike [`Refused`](Self::Refused), it says nothing of other tables.
+    Invalid(String),
     /// Reading or writing the file failed.
     Io(String),
 }
@@ -46,7 +49,7 @@ impl fmt::Display for EditError {
         match self {
             Self::Stopping => f.write_str("the gateway is stopping"),
             Self::NoTable(comp_id) => write!(f, "no [risk.client.{comp_id}]"),
-            Self::Refused(why) | Self::Io(why) => f.write_str(why),
+            Self::Refused(why) | Self::Invalid(why) | Self::Io(why) => f.write_str(why),
         }
     }
 }
@@ -89,6 +92,14 @@ impl Edit {
         }
         let values = set.iter().map(|(key, value)| value_for(key, value)).collect::<Result<_, _>>()?;
         Ok(Self::Set { table, values })
+    }
+
+    /// The table this edit is to.
+    pub fn limits(&self) -> Limits {
+        match self {
+            Self::Set { table, .. } => table.clone(),
+            Self::Delete { comp_id } => Limits::Client(comp_id.clone()),
+        }
     }
 
     /// The table this edit leaves in `risk`, the file's as edited; `None` if it has none.

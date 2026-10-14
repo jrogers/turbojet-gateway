@@ -309,8 +309,9 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// The gateway is stopping, the edit can't be made or the file wouldn't load with it (it's
-    /// left as it was), or the file can't be read or written.
+    /// The gateway is stopping, the edit can't be made, the table edited is wrong on its own
+    /// ([`EditError::Invalid`]) or the file wouldn't load with it (it's left as it was), or the
+    /// file can't be read or written.
     pub fn edit_limits(&self, edit: &limits::Edit) -> Result<Edited, EditError> {
         let _reloading = self.reloading.lock().unwrap_or_else(PoisonError::into_inner);
         if self.stopping.load(Ordering::SeqCst) {
@@ -322,6 +323,8 @@ impl Service {
             EditError::Refused(why) => EditError::Refused(format!("{}: {why}", self.path.display())),
             e => e,
         })?;
+        // The table's own checks first: their error names only it, so any caller may be told it.
+        config::check_risk_table(&edited, &edit.limits().to_string()).map_err(EditError::Invalid)?;
         let venues = self.set_venues();
         // Quiet: the reload below logs what's worth a warning.
         let reread =

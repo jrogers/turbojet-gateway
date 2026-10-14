@@ -428,6 +428,9 @@ pub(super) struct EditedView {
 /// The start of a limit edit's 422 once the file is written, its reload having kept a file.
 const WRITTEN: &str = "the edit is written, but the reload";
 
+/// The start of a limit edit's 422 when the file, edited, wouldn't load (or wouldn't edit).
+const REFUSED: &str = "the edit is refused:";
+
 /// `PATCH /api/risk/limits/defaults {reason, set: {key: value | null}}` [unscoped admin]: sets
 /// the defaults' keys, removing those set to `null`, in `jetbridge.toml`, and reloads; see
 /// [`Service::edit_limits`]. The keys and their values are the file's: an amount is a JSON number
@@ -517,6 +520,8 @@ async fn set_limits(
 ///
 /// An admin with clients isn't shown the reload, nor why the file was refused or a reload kept a
 /// file: the sessions, warnings and errors can name other clients. The audit log has them whole.
+/// It is shown what's wrong with the table it edited ([`EditError::Invalid`]), which names only
+/// that table.
 async fn edit_limits(
     state: &State,
     caller: &Caller,
@@ -529,14 +534,13 @@ async fn edit_limits(
     }
     match answer {
         Ok(Json(view)) => Ok(Json(EditedView { reload: None, ..view })),
-        Err(mut e) if e.status == StatusCode::UNPROCESSABLE_ENTITY => {
-            e.message = if e.message.starts_with(WRITTEN) {
-                format!("{WRITTEN} kept a file; an unscoped admin can see why (POST /api/reload)")
-            } else {
-                "the edit is refused: the file wouldn't load with it; an unscoped admin can see why \
-                 (POST /api/reload)"
-                    .to_string()
-            };
+        Err(mut e) if e.message.starts_with(WRITTEN) => {
+            e.message = format!("{WRITTEN} kept a file; an unscoped admin can see why (POST /api/reload)");
+            Err(e)
+        }
+        Err(mut e) if e.message.starts_with(REFUSED) => {
+            e.message =
+                format!("{REFUSED} the file wouldn't load with it; an unscoped admin can see why (POST /api/reload)");
             Err(e)
         }
         Err(e) => Err(e),
@@ -559,7 +563,10 @@ async fn edit_limits_whole(
             let status = match e {
                 EditError::Stopping => StatusCode::SERVICE_UNAVAILABLE,
                 EditError::NoTable(_) => StatusCode::NOT_FOUND,
-                EditError::Refused(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                EditError::Refused(why) => {
+                    return ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("{REFUSED} {why}"));
+                }
+                EditError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
                 EditError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
             ApiError::new(status, e.to_string())
@@ -1185,9 +1192,9 @@ mod tests {
     }
 
     /// A scoped admin's edit answers its table but not the reload, which would name FUNDC, a
-    /// counterparty added meanwhile; and a reload keeping the sessions file, or a file refusing
-    /// the edit, answers 422 without saying why, as both could name other clients. The audit log
-    /// says why.
+    /// counterparty added meanwhile; a bad value in its own table, 422 with why; and a reload
+    /// keeping the sessions file, or the rest of the file refusing the edit, 422 without saying
+    /// why, as both could name other clients. The audit log says why.
     #[tokio::test]
     async fn a_scoped_admins_edit_names_no_other_client() {
         let fixture = fixture().await;
@@ -1199,6 +1206,11 @@ mod tests {
         let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, credit).await;
         assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
         assert_eq!(answer.body, serde_json::json!({ "table": { "credit": 5 }, "reload": null }));
+        // What's wrong with its own table names only that: it's said.
+        let negative = r#"{"reason":"testing","set":{"credit":-5}}"#;
+        let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, negative).await;
+        assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", answer.body);
+        assert_eq!(answer.body["error"], "risk.client.FUNDB.credit: -5 is not positive");
 
         std::fs::write(dir.join("sessions.toml"), format!("{sessions}[counterparty.FUNDC]\nbogus = \n")).unwrap();
         let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, credit).await;

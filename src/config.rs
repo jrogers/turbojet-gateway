@@ -405,6 +405,24 @@ impl RiskTables {
     }
 }
 
+/// Checks the risk table `under` names in `text` (`risk.defaults` or `risk.client.COMPID`) on its
+/// own: its keys and values, which don't depend on the rest of the file. A table that isn't there,
+/// or text that doesn't parse, passes: loading the whole file says why.
+///
+/// # Errors
+///
+/// The table has an unknown key, or a value the loader refuses: why, naming the key.
+pub fn check_risk_table(text: &str, under: &str) -> Result<(), String> {
+    let Ok(file) = toml::from_str::<toml::Table>(text) else { return Ok(()) };
+    let mut item = Some(&file);
+    for key in under.split('.') {
+        item = item.and_then(|table| table.get(key)).and_then(toml::Value::as_table);
+    }
+    let Some(table) = item else { return Ok(()) };
+    let table: RiskTable = toml::Value::Table(table.clone()).try_into().map_err(|e| format!("{under}: {e}"))?;
+    table.limits(under, &Limits::default()).map(drop).map_err(|e| e.to_string())
+}
+
 impl RiskTable {
     /// The table's limits, `under` naming it in errors, with `defaults`' for the keys it leaves out.
     fn limits(&self, under: &str, defaults: &Limits) -> Result<Limits, Error> {
