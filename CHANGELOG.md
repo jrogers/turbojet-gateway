@@ -69,10 +69,9 @@ Notable changes to Jetbridge.
   PossResend.
 - A venue report that changes nothing (a repeated ack) is dropped rather than forwarded under a
   new ExecID (restatements, replaces and DoneForDay still go).
-- A kill switch, as async library calls on the gateway, which with a database return once their
-  change has committed: block a client session, a CompID or everyone (new orders rejected;
-  cancels and replaces that don't raise the quantity pass), cancel their orders at the venues,
-  and unblock. The gateway's own cancels are retried when a venue refuses
+- A kill switch, as library calls on the gateway: block a client session, a CompID or everyone
+  (new orders rejected; cancels and replaces that don't raise the quantity pass), cancel their
+  orders at the venues, and unblock. The gateway's own cancels are retried when a venue refuses
   them (three tries in all), sent when a down venue logs back on, and listed while they're going;
   clients get an unsolicited Canceled report per order.
 - Cancel on disconnect: a client session with `cancel_on_disconnect` in the sessions file has
@@ -147,6 +146,8 @@ Notable changes to Jetbridge.
 - A database connection lost without a reset fails the write in hand within 10 seconds, rather
   than holding the book's writer for minutes, or for good. Prune batches and reads of past orders
   time out the same way.
+- An operator's action answers within 5 seconds during a database outage: 202, `committed:
+  false`, the change in effect and committed when the database answers.
 - **Security:** a client whose CompID, SubID or LocationID, or the SubID or LocationID it
   addresses the gateway by, contains '/', ':' or '>' is refused at logon. Its session's name
   could print the same as another session's, so under `unknown = "admit"` a client logging on as

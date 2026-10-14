@@ -405,8 +405,8 @@ under way ends when it was going to.
 
 An operator can stop a client trading, over the [API](#api) or with library calls on the
 running gateway (`Service::gateway()`). Each takes a `Scope`: one client session, a CompID (all
-its sessions, including ones that log on later), or everyone. They're async, and with a database
-they return once their change has committed.
+its sessions, including ones that log on later), or everyone. Each takes effect at once; with a
+database, `committed()` completes once it has committed.
 
 - `cancel_all(scope)` blocks the scope and cancels its clients' live orders at their venues, in
   one step. Each client gets an unsolicited Canceled report for each order as its venue confirms
@@ -520,11 +520,11 @@ jetbridge user remove alice --users users.toml
 | `POST /api/sessions/{id}/pause` | operator | logs the session out and keeps it out until resumed |
 | `POST /api/sessions/{id}/resume` | operator | lets it log on again |
 | `POST /api/sessions/{id}/resend` | operator | `{from}`: asks the counterparty to send again from that MsgSeqNum; answers the sequence numbers |
-| `POST /api/orders/{order_id}/cancel` | operator | the gateway's own cancel of one order; retries a stuck one |
+| `POST /api/orders/{order_id}/cancel` | operator | the gateway's own cancel of one order; retries a stuck one; answers 204 |
 | `POST /api/orders/{order_id}/status` | operator | asks the order's venue where it stands; answers 202 |
 | `POST /api/orders/{order_id}/resolve` | operator | cancels, at the gateway, an order its venue doesn't know; answers 204 |
-| `POST /api/risk/block`, `/unblock` | operator | `{scope}`: see [Kill switch](#kill-switch); answers `{"changed"}` |
-| `POST /api/risk/cancel-all` | operator | `{scope}`: blocks the scope and cancels its orders |
+| `POST /api/risk/block`, `/unblock` | operator | `{scope}`: see [Kill switch](#kill-switch); answers `{"changed", "committed"}` |
+| `POST /api/risk/cancel-all` | operator | `{scope}`: blocks the scope and cancels its orders; answers 204 |
 | `POST /api/sessions/{id}/sequence` | admin | `{next_incoming, next_outgoing}`, either or both: sets the session's sequence numbers |
 | `POST /api/sessions/{id}/reset` | admin | sets both sequence numbers to 1 and clears the session's resend store |
 | `PATCH /api/risk/limits/defaults`, `/client/{comp_id}` | admin | `{set}`: edits the limits in `jetbridge.toml`, then reloads |
@@ -534,6 +534,11 @@ jetbridge user remove alice --users users.toml
 
 - **Every change needs a reason**: each POST, PATCH and DELETE but login and logout takes a JSON
   body with a non-empty `reason` (up to 1,000 bytes), or is refused (400).
+- **A database that doesn't answer** holds up a block, unblock, kill switch, cancel or resolve's
+  answer for 5 seconds at most. Each takes effect at once and answers once its change has
+  committed: 200 or 204. Past 5 seconds it answers 202 with `"committed": false` (a block or
+  unblock's `{"changed", "committed"}` too), the change in effect and committed when the database
+  answers; a crash before then can lose it.
 - **Scopes** are `all`, `comp:COMPID` or `session:SESSION`, a session as `GET /api/sessions` shows
   it (`session:FIX.4.4:JETBRIDGE->FUNDA`). A session scope names one the gateway has seen.
 - **A session in a path** is its `id` percent-encoded as `encodeURIComponent` does, `>` as `%3E` and
@@ -574,8 +579,8 @@ jetbridge user remove alice --users users.toml
   answer to that alarm once it's settled with the venue: the gateway cancels the order itself,
   keeping its fills and freeing its exposure, and the client gets an unsolicited Canceled with
   Text(58) "canceled by the gateway: the venue doesn't know the order". It answers 204 once that
-  has committed; 404 for an order the book doesn't hold, and 409 for one that's done or that its
-  venue hasn't said it doesn't know. Audited as `resolve`.
+  has committed, or 202 (see above); 404 for an order the book doesn't hold, and 409 for one
+  that's done or that its venue hasn't said it doesn't know. Audited as `resolve`.
 - **Sequence numbers.** `sequence` takes `next_incoming`, `next_outgoing` or both (numbers from
   1). The outgoing one only moves forward; a logged-on counterparty is told with a gap fill.
   `reset` works only while the session is disconnected: pause it first. For a reset agreed with
@@ -734,7 +739,8 @@ done. The lines go in `audit_dir`, a file a day, `audit-YYYY-MM-DD.jsonl` by the
 ```
 
 `result` is `allowed` or `refused: <why>`. An allowed change that didn't simply get done gets a
-second line: `failed: <why>`, or what happened instead, such as `unchanged: already blocked`.
+second line: `failed: <why>`, or what happened instead, such as `unchanged: already blocked` or
+`applied, not yet committed: the database hasn't answered`.
 Refusals for a user's role, scope or a missing reason are recorded too, and so are failed and
 limited logins, wrong tokens, and wrong CSRF tokens or `Origin`s, at most 120 a minute of these
 (the rest are in the tracing log only). A failed login whose name isn't a user's is recorded as
@@ -769,7 +775,8 @@ sees Orders, Sessions, Risk, Messages and Routes in the nav; an admin without `-
 Audit, and a Reload button in the header. A user with `--clients` sees and acts on only its clients,
 as the API narrows it. A reload that changes a user's clients shows at its live socket's next
 snapshot, when the console also reads the user's role again. Viewers read; operators and admins act,
-each action with a reason:
+each action with a reason. One the database hasn't committed within 5 seconds says "Applied; not
+yet saved to the database.":
 
 - **Orders**, the blotter: the working orders, newest first, filtered by client, venue, symbol and
   status; with "working only" off, today's done orders too; with dates, past days' orders from the
