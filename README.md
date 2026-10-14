@@ -47,8 +47,8 @@ reports back, keeping each order's state as it goes.
 - **Cancel on disconnect**, set per counterparty in the sessions file: a client's orders are
   cancelled when its session drops and it doesn't log back on in time, and at shutdown.
 - **A database**, optional (SQLite): the book, blocks, risk counts and undelivered reports
-  survive a restart, and the restart sorts out what a crash left half done with the venues. Old
-  done orders can be pruned from it.
+  survive a restart, and the restart sorts out what a crash left half done with the venues. Past
+  days' orders stay readable over the API until pruned.
 - **An operator API**, optional: HTTP and JSON, with local users in three roles, an audit log of
   every change, and a websocket of the book's and the sessions' changes as they happen.
   Operators can also ask a venue where an order stands; admins can edit the risk limits and set
@@ -347,7 +347,8 @@ Each client session has a trading day. When it ends, the session starts the next
 - its count of ClOrdIDs against the 1,000,000 a day starts again from its live orders' ClOrdIDs;
 - what it has filled, for `credit`, starts again at zero.
 
-Symbols' last fill prices are every client's, and carry over.
+Symbols' last fill prices are every client's, and carry over. With a database, the done orders
+forgotten can still be read over the [API](#endpoints), until pruned.
 
 A session's day ends at `day_end` in `jetbridge.toml`, or sooner, when its schedule's period
 (from the sessions file) ends: whichever comes first. `day_end` is a time, `HH:MM` or
@@ -464,8 +465,8 @@ jetbridge user remove alice --users users.toml
 | `GET /api/health` | none | `{"version"}` |
 | `POST /api/login`, `POST /api/logout`, `GET /api/me` | none, any, any | see above |
 | `GET /api/sessions` | viewer | client sessions connected or paused, then every venue's: status, sequence numbers, activity, `paused` |
-| `GET /api/orders` | viewer | the book's orders: `?client=&venue=&symbol=&status=&working=true&after=&limit=` |
-| `GET /api/orders/{order_id}` | viewer | one order by its OrderID(37), with every request sent for it and the venue's OrderID |
+| `GET /api/orders` | viewer | the book's orders, or with `from` past ones: `?client=&venue=&symbol=&status=&working=true&from=&to=&after=&limit=` |
+| `GET /api/orders/{order_id}` | viewer | one order by its OrderID(37), past ones too, with every request sent for it and the venue's OrderID |
 | `GET /api/orders/{order_id}/messages` | viewer | `?limit=&after=`: the order's messages, both sides'; see [Searching the message log](#searching-the-message-log) |
 | `GET /api/messages` | viewer | `?session=&direction=&msg_type=&tag=&since=&until=&limit=&after=`: the message log, searched |
 | `GET /api/risk` | viewer | the limits in force, each session's open and filled notional, reference prices, blocks |
@@ -499,8 +500,19 @@ jetbridge user remove alice --users users.toml
   answers `{orders, next}`, 100 by default and up to 1,000 with `limit`, and `next` is the `after`
   for the following page (`null` after a short page; a full page may be followed by an empty one).
   `client` is a scope (a session the gateway hasn't seen gives an empty page); `status` is `new`,
-  `partially_filled`, `filled`, `canceled` and so on. The orders are the book's: working ones and
-  each client's done orders of its current trading day.
+  `partially_filled`, `filled`, `canceled` and so on. Without `from`, the orders are the book's:
+  working ones and each client's done orders of its current trading day.
+- **Past orders**, with a [database](#database): `GET /api/orders?from=&to=` reads the orders
+  created from `from` up to `to`, both RFC 3339 times, `to` now by default. A range covers 31
+  days at most, and may reach into the future. They're the database's orders, past days' and
+  today's, oldest first, filtered as above; `client` may name a session that isn't connected now.
+  Each is as last written, and an order pruned is gone. Here `next` is a string, not a number:
+  pass it back as `after` as it is, with the same query. Write a `+` in a time's offset as `%2B`
+  (`from=2026-10-01T09:00:00%2B02:00`), or it reads as a space. Refused (400): `to` without
+  `from`, `from` not before `to`, a range over 31 days, and any range without a `[database]`.
+- **An order the book no longer holds**, `GET /api/orders/{order_id}` and its `/messages` find in
+  the database. It shows `unknown_at_venue: false`, since that mark is kept in memory only, and
+  its messages are found while the message log keeps them.
 - **A routing dry run**, `GET /api/routes/test`, answers `{rule, route, target}`: `rule` is the
   index in `GET /api/routes` of the first route the order would match, `route` that route, and
   `target` `{"venue": NAME}` or `{"reject": TEXT}`; all three are `null` when none matches (the

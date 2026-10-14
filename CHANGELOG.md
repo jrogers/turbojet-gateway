@@ -116,3 +116,6 @@ Notable changes to Jetbridge.
 - `[database] retention`, optional: every hour the gateway deletes the done orders of trading
   days that ended longer ago than that, with their requests sent and ClOrdIDs. Without it nothing
   is deleted.
+- `GET /api/orders` reads past orders with `from` and `to` (RFC 3339, a range of 31 days at
+  most), from the database, so it needs a `[database]`; its pages' `next` is then a string to
+  pass back as `after`. An order's detail and messages are found after the book drops it.

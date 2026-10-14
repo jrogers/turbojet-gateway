@@ -57,7 +57,8 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - Without `[database] retention` the database is never pruned: done orders, the requests sent
   and ClOrdIDs used stay in it as history, so it grows for as long as the gateway trades. A start
   loads only live orders and each client's current day.
-- Pruned orders are gone from the database for good, with their requests sent and ClOrdIDs.
+- Pruned orders are gone from the database for good, with their requests sent and ClOrdIDs, and
+  no longer read over the API.
 - Done orders with no trading day (booked before their client's first day began) are never
   pruned, and neither is the table of orphans handled, which is small and grows only by crashes.
 - Orders become prunable a trading day at a time, when their day ended, and their last request
@@ -306,9 +307,23 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   password login for a minute with five wrong passwords, and a flood of failed logins from 10,000
   names, or 10,000 addresses, blocks password logins from new ones until they age out. Tokens
   aren't limited.
-- The blotter (`GET /api/orders`, `GET /api/orders/{order_id}`) reads the book: working orders and
-  each client's done orders of its current trading day. Earlier days are in the database, if there
-  is one, but not readable over the API.
+- The blotter (`GET /api/orders`) reads the book: working orders and each client's done orders of
+  its current trading day. Earlier days are read with `from` and `to`, from the database, so only
+  with a `[database]`; without one they're gone.
+- A range reads the orders as last written, until pruned, and lags the book by up to a commit: an
+  order just booked or changed may be missing from it, or in its earlier state.
+- An order dropped from the book at its client's day roll may, until its last change commits,
+  read as missing from `GET /api/orders/{order_id}` and its messages, or in its last committed
+  state.
+- A range is read in creation order, and a filter few orders match may read every order in the
+  range before a page is full, so a range covers 31 days at most.
+- An order's creation time is when its original request was sent. One sent again at its venue's
+  logon after a restart (see [Database and recovery](#database-and-recovery)) takes a new one, so
+  a range read page by page while that happens can show it twice, or miss it. It's rare.
+- An order read from the database shows `unknown_at_venue: false`: that mark is kept in memory
+  only.
+- An RFC 3339 time in a query with a `+` offset needs it written `%2B`: a bare `+` reads as a
+  space, and the time is refused.
 - `GET /api/sessions` lists a client session only while it's connected or paused, so a client
   that has never connected, or disconnected without being paused, isn't listed and can't be
   paused (404). Pausing logs the session out: it shows as disconnected and paused.
@@ -393,6 +408,7 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - A build without the `gzip` feature skips `.log.gz` files in a search, with a warning logged.
 - An order's messages are searched for a day from its creation: later ones, a GTC order's say,
   are found with `GET /api/messages` by tag. A done order from before its client's current
-  trading day isn't in the book, so it has no `{order_id}`: search for it by tag too. A venue
+  trading day is found in the database, if there is one; without one, search for it by tag. A
+  past order's messages are found only while the message log keeps them. A venue
   whose initiator a reload stopped has no session to search, so only the client's side of its
   orders is found.
