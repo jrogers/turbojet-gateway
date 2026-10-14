@@ -289,6 +289,13 @@ impl Store {
         // them are of the same commit.
         let mut transaction = self.begin_snapshot(connection).await.map_err(database("starting a load"))?;
         let connection = &mut *transaction;
+        if self.postgres {
+            // Decoding between fetches counts as idle; a load takes no locks a writer waits on.
+            connection
+                .execute("SET LOCAL idle_in_transaction_session_timeout = 0")
+                .await
+                .map_err(database("starting a load"))?;
+        }
         let mut snapshot = Snapshot::default();
         // The held IDs found once, by index; dropped with the transaction should a read fail.
         connection
