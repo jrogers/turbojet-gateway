@@ -6,7 +6,7 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
  * succeeds; a failure stays open, showing its message, to try again or cancel. Escape or Cancel
  * closes it, but not while the action is under way; if the browser closes it anyway, the parent is
  * told. A native modal `<dialog>`: the page behind is inert. Focus starts on the reason, and goes
- * back where it was on closing. `onClose` should be idempotent, as setting the parent's state to
+ * back where it was on closing. `ready` false keeps Confirm disabled, as the children say. `onClose` should be idempotent, as setting the parent's state to
  * none is: closings can race, the browser's and the component's own.
  */
 export default function Reason({
@@ -14,9 +14,11 @@ export default function Reason({
   children,
   onConfirm,
   onClose,
+  ready = true,
 }: {
   title: string
   children?: ReactNode
+  ready?: boolean
   onConfirm: (reason: string) => Promise<void>
   onClose: () => void
 }) {
@@ -42,7 +44,7 @@ export default function Reason({
 
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (reason.trim() === '' || busy) return
+    if (reason.trim() === '' || busy || !ready) return
     setBusy(true)
     setError(undefined)
     try {
@@ -88,7 +90,7 @@ export default function Reason({
           <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
-          <button type="submit" className="primary" disabled={busy || reason.trim() === ''}>
+          <button type="submit" className="primary" disabled={busy || reason.trim() === '' || !ready}>
             Confirm
           </button>
         </div>
