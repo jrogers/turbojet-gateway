@@ -88,8 +88,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   message held behind it stops reading 256 messages past it, new orders are rejected as
   "gateway unavailable", operator actions over the API answer 202, not committed, after 5
   seconds, and shutdown waits for it too: a second Ctrl-C or SIGTERM exits. An action answered
-  202 is in effect, but a crash before the database answers loses it: a block is lifted, though
-  a kill switch's cancels the venues' sessions stored still go, as orphans (below).
+  202 is in effect, but a crash before the database answers loses it: a block is lifted, and of
+  a kill switch's cancels, only those a venue's session had stored still cancel their orders,
+  found at the restart as orphans (below); the rest are lost, and their orders keep working.
 - A PostgreSQL connection closed, or lost silently with no reset, fails the write in hand within 10
   seconds, and the retry opens a new one: the effects above last until the database answers, and up
   to 10 seconds past that. A commit whose answer was lost is written again; every row is written by
