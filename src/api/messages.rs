@@ -1039,6 +1039,23 @@ mod tests {
         assert_eq!(answer.body["error"], "val may see only clients FUNDA, not FIX.4.4:JETBRIDGE->FUNDB");
     }
 
+    /// A viewer scoped to NASDAQ, the venue's CompID, finds none of the venue's messages: its
+    /// session prints as a client NASDAQ's would, and is left out as the venue's.
+    #[tokio::test]
+    async fn a_venues_messages_arent_a_clients_of_its_comp_id() {
+        let (fixture, dir) = logged().await;
+        let order =
+            |minute, comp_id, id| (at(8, 9, minute), Direction::Inbound, Some(comp_id), fix(&[(35, "D"), (11, id)]));
+        log(&dir, &[order(0, "FUNDA", "A"), order(1, "NASDAQ", "V")]);
+        let page = fixture.get_as(&fixture.venue_viewer, &format!("/api/messages?{DAY}")).await;
+        assert_eq!((page.status, &page.body["messages"]), (StatusCode::OK, &serde_json::json!([])));
+        let named = fixture
+            .get_as(&fixture.venue_viewer, &format!("/api/messages?{DAY}&session=FIX.4.4:JETBRIDGE-%3ENASDAQ"))
+            .await;
+        assert_eq!(named.status, StatusCode::FORBIDDEN);
+        assert_eq!(search(&fixture, &format!("/api/messages?{DAY}")).await.0, ["A", "V"]);
+    }
+
     /// A client's session is one with a scoped CompID as its target that isn't a venue's: a
     /// venue whose CompID is also a client's isn't covered.
     #[test]

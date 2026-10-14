@@ -513,13 +513,15 @@ pub(super) mod tests {
     pub(in crate::api) struct Fixture {
         pub(in crate::api) app: axum::Router,
         /// Bearer headers' values: a viewer's, a viewer's scoped to FUNDA, an operator's, an
-        /// operator's scoped to FUNDB, an admin's, and an admin's scoped to FUNDB.
+        /// operator's scoped to FUNDB, an admin's, an admin's scoped to FUNDB, and a viewer's scoped
+        /// to NASDAQ, the venue's CompID.
         pub(in crate::api) viewer: String,
         pub(in crate::api) scoped_viewer: String,
         pub(in crate::api) operator: String,
         pub(in crate::api) scoped: String,
         pub(in crate::api) admin: String,
         pub(in crate::api) scoped_admin: String,
+        pub(in crate::api) venue_viewer: String,
         pub(in crate::api) service: Arc<Service>,
         pub(in crate::api) state: State,
         _client: Initiator,
@@ -574,6 +576,7 @@ pub(super) mod tests {
         let scoped = bearer("sam", Role::Operator, &["FUNDB"]);
         let admin = bearer("ada", Role::Admin, &[]);
         let scoped_admin = bearer("abe", Role::Admin, &["FUNDB"]);
+        let venue_viewer = bearer("ned", Role::Viewer, &["NASDAQ"]);
         let (mut state, audit_dir) =
             super::super::tests::state(Arc::new(Auth::new(Default::default(), users, false, false)));
         state.service = Arc::downgrade(&service);
@@ -587,6 +590,7 @@ pub(super) mod tests {
             scoped,
             admin,
             scoped_admin,
+            venue_viewer,
             service,
             state,
             _client: client,
