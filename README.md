@@ -232,8 +232,9 @@ url = "postgres://jetbridge@db.internal/jetbridge?sslmode=verify-full"
   reads. It's masked in the log either way. sqlx logs a parameter it doesn't know with its
   value, as one it ignores, so a misspelt `passwd=` puts the password in the log.
 - TLS needs the `tls` feature: without it, `sslmode=require` doesn't connect, and the default,
-  `prefer`, connects in the clear, password included. `verify-full` and `verify-ca` check the
-  server's certificate against the operating system's roots and any `sslrootcert=`.
+  `prefer` (unless `PGSSLMODE` sets another), connects in the clear: queries, data, and the
+  password itself if the server asks for it by its `password` method. `verify-full` and
+  `verify-ca` check the server's certificate against the operating system's roots and any `sslrootcert=`.
 - Each gateway holds three connections: one to write and two, read-only, to read past orders.
 
 **Orders don't wait for the database.** Orders go to venues and reports to clients without
