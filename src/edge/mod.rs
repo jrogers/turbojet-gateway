@@ -577,11 +577,12 @@ impl Gateway {
         self.lock().book.unavailable()
     }
 
-    /// The working orders (a page at most: see [`Book::orders`]), the scopes blocked, and whether
-    /// new orders are rejected, read together: a live view's snapshot.
-    pub fn working_view(&self) -> (Vec<OrderView>, Vec<Scope>, bool) {
+    /// The working orders (a page at most: see [`Book::orders`]), of the clients of `comp_ids` if
+    /// given, the scopes blocked, and whether new orders are rejected, read together: a live view's
+    /// snapshot.
+    pub fn working_view(&self, comp_ids: Option<Vec<CompactString>>) -> (Vec<OrderView>, Vec<Scope>, bool) {
         let state = self.lock();
-        let orders = state.book.orders(&OrderFilter { working: true, ..OrderFilter::default() });
+        let orders = state.book.orders(&OrderFilter { working: true, comp_ids, ..OrderFilter::default() });
         (orders, state.book.blocked().to_vec(), state.book.unavailable())
     }
 

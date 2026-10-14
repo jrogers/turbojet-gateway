@@ -508,7 +508,7 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
             values.push(Value::Text(comp_id.to_string()));
             placeholders.push(format!("${}", values.len()));
         }
-        // None is a list that matches nothing, and `IN ()` isn't SQL everywhere: `IN (NULL)` is.
+        // An empty list matches nothing, and `IN ()` isn't SQL everywhere: `IN (NULL)` is.
         let list = if placeholders.is_empty() { "NULL".to_string() } else { placeholders.join(", ") };
         sql.push_str(&format!(" AND o.client_comp_id IN ({list})"));
     }

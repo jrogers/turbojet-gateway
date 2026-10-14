@@ -19,9 +19,10 @@ use tracing::error;
 use turbojet::fields::CompactString;
 use turbojet::{SessionId, SessionStatus};
 
-use super::write::{in_scope, out_of_scope};
 use super::{ApiError, Caller, State, bad};
-use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
+use crate::book::{
+    MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status, is_one_of,
+};
 use crate::config::RiskTables;
 use crate::edge::Gateway;
 use crate::router::{Rule, Target};
@@ -124,7 +125,7 @@ pub(super) async fn sessions(
 
 /// What [`sessions`] answers: the clients' of `comp_ids` alone, if given.
 pub(super) fn session_views(service: &Service, comp_ids: Option<&[String]>) -> Vec<SessionView> {
-    let shown = |id: &SessionId| comp_ids.is_none_or(|comp_ids| comp_ids.iter().any(|c| *c == *id.target_comp_id));
+    let shown = |id: &SessionId| comp_ids.is_none_or(|comp_ids| is_one_of(&id.target_comp_id, comp_ids));
     let mut clients = service.client_statuses();
     clients.retain(|status| shown(&status.id));
     clients.sort_by_cached_key(|status| status.id.to_string());
@@ -212,7 +213,9 @@ pub(super) async fn orders(
         Some(text) => Some(text.parse::<ScopeName>().map_err(|e| bad(e.to_string()))?),
         None => None,
     };
-    if let Some(name) = &client {
+    if let Some(name) = &client
+        && caller.view_scope().is_some()
+    {
         may_see_named(&caller, state.service()?.gateway(), name)?;
     }
     let comp_ids = caller.view_scope().map(|comp_ids| comp_ids.iter().map(|id| id.as_str().into()).collect());
@@ -262,10 +265,16 @@ fn may_see_named(caller: &Caller, gateway: &Gateway, name: &ScopeName) -> Result
             Some(client) => caller.may_act_on(&client),
             None => comp_ids.iter().any(|comp_id| names_target(session, comp_id)),
         },
-        ScopeName::CompId(comp_id) => return in_scope(caller, comp_id),
+        ScopeName::CompId(comp_id) => caller.may_act_on(comp_id.as_str()),
         ScopeName::All => false,
     };
-    if seen { Ok(()) } else { Err(out_of_scope(caller, &name.to_string())) }
+    if seen { Ok(()) } else { Err(unseen(caller, &name.to_string())) }
+}
+
+/// 403 for a scoped caller reading what isn't theirs: `target`. The read twin of a write's.
+fn unseen(caller: &Caller, target: &str) -> ApiError {
+    let clients = caller.view_scope().unwrap_or_default().join(", ");
+    ApiError::new(StatusCode::FORBIDDEN, format!("{} may see only clients {clients}, not {target}", caller.user))
 }
 
 /// Whether `session`, a session as Turbojet shows it (`BEGIN:SENDER->TARGET`, a side's SubID and
@@ -361,7 +370,7 @@ pub(super) async fn order(
 /// [`find_detail`] for `caller`: 403 if the order's client is outside its scope.
 pub(super) async fn find_detail_for(state: &State, caller: &Caller, order_id: &str) -> Result<OrderDetail, ApiError> {
     let detail = find_detail(state, order_id).await?;
-    if caller.may_act_on(&detail.order.client) { Ok(detail) } else { Err(out_of_scope(caller, order_id)) }
+    if caller.may_act_on(&detail.order.client) { Ok(detail) } else { Err(unseen(caller, &format!("order {order_id}"))) }
 }
 
 /// The order whose OrderID(37) is `order_id`, the book's or else the database's; 404 if neither
@@ -933,12 +942,14 @@ pub(super) mod tests {
             let answer = fixture.get_as(bearer, &format!("/api/orders{query}")).await;
             assert_eq!(answer.status, StatusCode::FORBIDDEN, "{query}: {}", answer.body);
         }
+        let answer = fixture.get_as(funda, "/api/orders?client=comp:FUNDB").await;
+        assert_eq!(answer.body["error"], "val may see only clients FUNDA, not comp:FUNDB");
 
         let name = fixture.ok("/api/orders").await["orders"][0]["order_id"].as_str().unwrap().to_string();
         assert_eq!(fixture.get_as(funda, &format!("/api/orders/{name}")).await.status, StatusCode::OK);
         let answer = fixture.get_as(fundb, &format!("/api/orders/{name}")).await;
         assert_eq!(answer.status, StatusCode::FORBIDDEN);
-        assert_eq!(answer.body["error"], format!("sam may act only on clients FUNDB, not {name}"));
+        assert_eq!(answer.body["error"], format!("sam may see only clients FUNDB, not order {name}"));
     }
 
     /// As [`a_scoped_caller_reads_its_clients_orders`], from the database, with a past order of
@@ -997,8 +1008,9 @@ pub(super) mod tests {
     }
 
     /// Sessions, risk and limits as FUNDA's viewer, FUNDB's operator and unscoped: a scoped
-    /// caller's clients' sessions, notionals, limits and blocks alone (`all` covering them too),
-    /// while the venues, the defaults and the reference prices are everyone's.
+    /// caller's clients' sessions (FUNDB's paused one too), notionals, limits and blocks (of a
+    /// CompID or a session) alone, `all` covering them too, while the venues, the defaults and the
+    /// reference prices are everyone's.
     #[tokio::test]
     async fn a_scoped_caller_reads_its_clients_sessions_and_risk() {
         let fixture = fixture().await;
@@ -1010,9 +1022,18 @@ pub(super) mod tests {
         let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
         assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);
         let gateway = fixture.service.gateway();
-        for scope in [Scope::CompId("FUNDA".into()), Scope::CompId("FUNDB".into()), Scope::All] {
+        let funda = ClientId::new(&fixture.service.client_statuses()[0].id);
+        let blocks = [
+            Scope::CompId("FUNDA".into()),
+            Scope::CompId("FUNDB".into()),
+            Scope::All,
+            Scope::Session(funda),
+            Scope::Session(ClientId::from("FUNDB")),
+        ];
+        for scope in blocks {
             assert!(gateway.block(scope).await);
         }
+        fixture.service.client_session(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB")).pause(None);
         let read = async |bearer: &str, path: &str| {
             let answer = fixture.get_as(bearer, path).await;
             assert_eq!(answer.status, StatusCode::OK, "{path}: {}", answer.body);
@@ -1021,21 +1042,31 @@ pub(super) mod tests {
         let keys = |value: &serde_json::Value| value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
         let funda_session = "FIX.4.4:JETBRIDGE->FUNDA";
         let cases = [
-            (fixture.scoped_viewer.as_str(), vec!["client", "venue"], vec![funda_session], vec!["FUNDA"]),
-            (fixture.scoped.as_str(), vec!["venue"], vec![], vec!["FUNDB"]),
-            (fixture.viewer.as_str(), vec!["client", "venue"], vec![funda_session], vec!["FUNDA", "FUNDB"]),
+            (fixture.scoped_viewer.as_str(), vec![funda_session], vec!["FUNDA"]),
+            (fixture.scoped.as_str(), vec![], vec!["FUNDB"]),
+            (fixture.viewer.as_str(), vec![funda_session], vec!["FUNDA", "FUNDB"]),
         ];
-        for (bearer, sides, risk_sessions, comp_ids) in cases {
+        for (bearer, risk_sessions, comp_ids) in cases {
             let sessions = read(bearer, "/api/sessions").await;
-            let shown: Vec<_> = sessions.as_array().unwrap().iter().map(|s| s["side"].as_str().unwrap()).collect();
-            assert_eq!(shown, sides);
+            let shown: Vec<_> = sessions.as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+            let expected: Vec<_> = comp_ids.iter().map(|c| format!("FIX.4.4:JETBRIDGE->{c}")).collect();
+            assert_eq!(shown, [expected, vec!["FIX.4.4:JETBRIDGE->NASDAQ".to_string()]].concat());
             let risk = read(bearer, "/api/risk").await;
             let shown: Vec<_> =
                 risk["sessions"].as_array().unwrap().iter().map(|s| s["client"].as_str().unwrap()).collect();
             assert_eq!(shown, risk_sessions);
             assert_eq!(keys(&risk["by_comp_id"]), comp_ids);
-            let blocked: Vec<_> =
-                comp_ids.iter().map(|comp_id| format!("comp:{comp_id}")).chain(["all".into()]).collect();
+            let blocked = [
+                "comp:FUNDA",
+                "comp:FUNDB",
+                "all",
+                "session:FIX.4.4:JETBRIDGE->FUNDA",
+                "session:FIX.4.4:JETBRIDGE->FUNDB",
+            ];
+            let blocked: Vec<_> = blocked
+                .into_iter()
+                .filter(|name| name == &"all" || comp_ids.iter().any(|c| name.ends_with(*c)))
+                .collect();
             assert_eq!(risk["blocked"], serde_json::json!(blocked));
             assert!(risk["defaults"].is_object(), "{risk}");
             assert!(risk["references"].is_object(), "{risk}");

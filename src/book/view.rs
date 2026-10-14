@@ -9,7 +9,7 @@ use turbojet::fields::{CompactString, Decimal, format_compact};
 
 use super::{
     Book, CancelKind, ClientId, GatewayCancel, OrdType, Order, OrderId, Origin, Scope, Sent, Side, Status, VenueId,
-    limit_price,
+    is_one_of, limit_price,
 };
 use crate::risk::Limits;
 
@@ -43,7 +43,7 @@ impl OrderFilter {
     fn matches(&self, order: &Order) -> bool {
         self.after.is_none_or(|after| order.id.0 > after.0)
             && self.client.as_ref().is_none_or(|scope| scope.covers(&order.client))
-            && self.comp_ids.as_ref().is_none_or(|comp_ids| comp_ids.iter().any(|id| id == order.client.comp_id()))
+            && self.comp_ids.as_ref().is_none_or(|comp_ids| is_one_of(order.client.comp_id(), comp_ids))
             && self.venue.as_ref().is_none_or(|venue| order.venue == *venue)
             && self.symbol.as_ref().is_none_or(|symbol| order.request.symbol == *symbol)
             && self.status.is_none_or(|status| order.status == status)
@@ -162,14 +162,9 @@ impl RiskView {
     /// Keeps what concerns the clients of `comp_ids` alone: their limits, their sessions, and the
     /// blocks covering any of them. The defaults and reference prices are everyone's, so stay.
     pub fn retain_for(&mut self, comp_ids: &[String]) {
-        let mine = |comp_id: &str| comp_ids.iter().any(|id| id == comp_id);
-        self.by_comp_id.retain(|comp_id, _| mine(comp_id));
-        self.sessions.retain(|session| mine(session.client.comp_id()));
-        self.blocked.retain(|scope| match scope {
-            Scope::Session(client) => mine(client.comp_id()),
-            Scope::CompId(comp_id) => mine(comp_id),
-            Scope::All => true,
-        });
+        self.by_comp_id.retain(|comp_id, _| is_one_of(comp_id, comp_ids));
+        self.sessions.retain(|session| is_one_of(session.client.comp_id(), comp_ids));
+        self.blocked.retain(|scope| scope.concerns(comp_ids));
     }
 }
 

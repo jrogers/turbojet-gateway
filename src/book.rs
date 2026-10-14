@@ -305,6 +305,20 @@ impl Scope {
             Self::All => true,
         }
     }
+
+    /// Whether the scope covers any client of `comp_ids`: what a caller scoped to them is shown.
+    pub fn concerns(&self, comp_ids: &[String]) -> bool {
+        match self {
+            Self::Session(client) => is_one_of(client.comp_id(), comp_ids),
+            Self::CompId(comp_id) => is_one_of(comp_id, comp_ids),
+            Self::All => true,
+        }
+    }
+}
+
+/// Whether `comp_id` is one of `comp_ids`: a scoped caller's.
+pub fn is_one_of<S: AsRef<str>>(comp_id: &str, comp_ids: &[S]) -> bool {
+    comp_ids.iter().any(|id| id.as_ref() == comp_id)
 }
 
 /// As its [`ScopeName`] writes it, which parses back to that name. Copies a session's name: for
