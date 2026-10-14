@@ -492,6 +492,38 @@ async fn a_write_failing_inside_its_transaction_leaves_nothing() {
     assert_eq!(store.load().await.unwrap(), applied(&[changes]));
 }
 
+/// A connection that goes silent in the middle of a write, with no reset, fails that write
+/// within the store's timeout rather than holding it, and is dropped: the same write again opens
+/// a new connection and commits, once the server has ended the silent one's session, which held
+/// the rows' locks.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_connection_silent_in_a_write_fails_it_and_the_next_commits() {
+    let Some(url) = postgres().await else { return };
+    let relay = Relay::new(&url).await;
+    let store = Store::open(&relay.url).await.unwrap();
+    let first = Changes { orders: vec![order_row(1)], ..Changes::default() };
+    let second = Changes { orders: vec![order_row(2)], ..Changes::default() };
+    store.write(std::slice::from_ref(&first)).await.unwrap();
+    // Held after its statements, before its commit: silenced there.
+    store.hooks.gate_in_transaction.send_replace(false);
+    let writing = tokio::spawn({
+        let (store, second) = (store.clone(), second.clone());
+        async move { store.write(&[second]).await }
+    });
+    while store.hooks.gate_in_transaction.receiver_count() == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    relay.silence();
+    store.hooks.gate_in_transaction.send_replace(true);
+    let limit = DATABASE_TIMEOUT * 3;
+    let failed = tokio::time::timeout(limit, writing).await.expect("not held by the silent connection").unwrap();
+    assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    let retried = tokio::time::timeout(limit, store.write(std::slice::from_ref(&second))).await;
+    retried.expect("a new connection, not the silent one's place").unwrap();
+    assert_eq!(store.load().await.unwrap(), applied(&[first, second]));
+}
+
 /// An idle connection that went silent fails the next write within the store's timeout, and the
 /// one after commits on a new connection.
 #[cfg(feature = "postgres")]

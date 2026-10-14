@@ -165,6 +165,15 @@ impl Store {
                     if sqlite {
                         configure_sqlite(connection).await?;
                     }
+                    if postgres {
+                        // The server never learns that a client lost without a reset is gone: its
+                        // session would hold its transaction's locks, and the write's retry would
+                        // wait on them, until the server's TCP keepalive gave up, hours by default.
+                        let timeout = DATABASE_TIMEOUT.as_millis();
+                        connection
+                            .execute(format!("SET idle_in_transaction_session_timeout = {timeout}").as_str())
+                            .await?;
+                    }
                     Ok(())
                 })
             })
