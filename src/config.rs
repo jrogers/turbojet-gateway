@@ -103,6 +103,23 @@ impl Error {
 
 impl std::error::Error for Error {}
 
+/// A `[database] url`, whose `Debug` masks its password: a `{:?}` of a config shouldn't print it.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct DatabaseUrl(String);
+
+impl DatabaseUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DatabaseUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&crate::store::without_password(&self.0), f)
+    }
+}
+
 /// A configuration, loaded and checked.
 #[derive(Debug)]
 pub struct Loaded {
@@ -116,7 +133,7 @@ pub struct Loaded {
     /// When a session with no schedule ends its trading day: see [`day_end`].
     pub day_end: SessionSchedule,
     /// The `[database]` URL the book is kept in, if any: read at start only.
-    pub database: Option<String>,
+    pub database: Option<DatabaseUrl>,
     /// `[database] retention`: how long after its trading day ends a done order is kept; for
     /// ever if left out. At least [`DATABASE_RETENTION_MIN`].
     pub retention: Option<Duration>,
@@ -231,7 +248,7 @@ pub struct Reread {
     /// Not opened: a reload keeps the log in use.
     pub message_log: Option<MessageLog>,
     /// Not opened: a reload keeps the database in use.
-    pub database: Option<String>,
+    pub database: Option<DatabaseUrl>,
     /// Taken: see [`Loaded::retention`].
     pub retention: Option<Duration>,
 }
@@ -343,7 +360,7 @@ struct File {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Database {
-    url: String,
+    url: DatabaseUrl,
     #[serde(default, deserialize_with = "database_retention")]
     retention: Option<Duration>,
 }
@@ -548,7 +565,7 @@ impl File {
     }
 
     /// `[database]`'s URL and retention.
-    fn database(&self) -> (Option<String>, Option<Duration>) {
+    fn database(&self) -> (Option<DatabaseUrl>, Option<Duration>) {
         self.database.as_ref().map_or((None, None), |database| (Some(database.url.clone()), database.retention))
     }
 
@@ -713,9 +730,24 @@ reject = "no route"
         };
         assert_eq!(load_database("sessions = \"sessions.toml\""), None);
         let with = "sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"";
-        assert_eq!(load_database(with).as_deref(), Some("sqlite://j.db?mode=rwc"));
+        assert_eq!(load_database(with).as_ref().map(DatabaseUrl::as_str), Some("sqlite://j.db?mode=rwc"));
         let error = load_error("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db\"\npath = \"x\"");
         assert!(error.contains("unknown field `path`"), "{error}");
+    }
+
+    /// A loaded or reread config's `Debug` shows the database URL without its password.
+    #[test]
+    fn the_database_password_stays_out_of_debug() {
+        let sessions = format!("{SESSIONS}store = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n");
+        let jetbridge =
+            "sessions = \"sessions.toml\"\n[database]\nurl = \"postgres://jet:s3cret@db/j?password=s3cret\"";
+        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", &sessions)]);
+        let loaded = format!("{:?}", load(&dir.path().join("jetbridge.toml")).unwrap());
+        let reread = format!("{:?}", reread(Path::new("jetbridge.toml"), jetbridge, &[], false).unwrap());
+        for debug in [loaded, reread] {
+            assert!(!debug.contains("s3cret"), "{debug}");
+            assert!(debug.contains("db/j"), "{debug}");
+        }
     }
 
     /// `[database] retention` is optional, read as `[message_log]`'s, and at least a day, at load

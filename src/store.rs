@@ -1397,7 +1397,7 @@ fn undecodable(column: &str, why: sqlx::Error) -> io::Error {
 /// fails to parse may well have, can't end it early. Masks too much rather than too little: a
 /// URL with a `:` before an `@` that isn't its userinfo's (a SQLite path's, say) loses what's
 /// between.
-fn without_password(url: &str) -> String {
+pub(crate) fn without_password(url: &str) -> String {
     let url = url
         .split_once("://")
         .and_then(|(scheme, rest)| {

@@ -83,7 +83,7 @@ pub struct Service {
     initiators: Initiators,
     local_addr: SocketAddr,
     /// The `[database] url` the gateway started with: a reload doesn't change it.
-    database: Option<String>,
+    database: Option<config::DatabaseUrl>,
     /// The `[message_log]` the gateway started with, its log held by the sessions file: a reload
     /// doesn't change it.
     message_log: Option<config::MessageLog>,
@@ -147,7 +147,7 @@ impl Service {
         // First, so a database that won't open stops nothing half-started.
         let (database, writing) = match &loaded.database {
             Some(url) => {
-                let (store, snapshot, writer, writing) = start_writer(url, max_commit_wait).await?;
+                let (store, snapshot, writer, writing) = start_writer(url.as_str(), max_commit_wait).await?;
                 (Some((store, snapshot, writer)), Some(writing))
             }
             None => (None, None),
@@ -382,7 +382,7 @@ impl Service {
                 self.gateway.set_day_end(day_end);
                 *self.retention.lock().unwrap_or_else(PoisonError::into_inner) = retention;
                 warnings.extend(self.reload_api(api.as_ref()));
-                warnings.extend(self.needing_restart(message_log.as_ref(), database.as_deref()));
+                warnings.extend(self.needing_restart(message_log.as_ref(), database.as_ref()));
                 Ok(summary)
             }
             Err(e) => {
@@ -403,12 +403,16 @@ impl Service {
 
     /// What changed in the reloaded file but waits for a restart, logged: the `[message_log]` and
     /// the `[database] url`, which the gateway keeps as it started.
-    fn needing_restart(&self, message_log: Option<&config::MessageLog>, database: Option<&str>) -> Vec<String> {
+    fn needing_restart(
+        &self,
+        message_log: Option<&config::MessageLog>,
+        database: Option<&config::DatabaseUrl>,
+    ) -> Vec<String> {
         let mut warnings = Vec::new();
         if message_log != self.message_log.as_ref() {
             warnings.push("[message_log] changed, which needs a restart: the log in use is kept".to_string());
         }
-        if database != self.database.as_deref() {
+        if database != self.database.as_ref() {
             warnings.push("[database] url changed, which needs a restart: the database in use is kept".to_string());
         }
         for warning in &warnings {
