@@ -819,17 +819,23 @@ mod tests {
     }
 
     /// Every endpoint as each role calls it: no one (401), a viewer (403), an operator, an
-    /// operator scoped to FUNDB (403: FUNDA's session, order and CompID, and the venue), and an
-    /// admin; sequence numbers and a reload are an admin's only. An allowed call answers success,
-    /// or on a row marked so, 409 (a second resend while the first is under way). Pausing FUNDA
-    /// comes last, as it logs FUNDA out.
+    /// operator scoped to FUNDB (403: FUNDA's session, order and CompID, and the venue), an
+    /// admin, and an admin scoped to FUNDB (FUNDB's limits alone); sequence numbers, a reload and
+    /// the audit log are an unscoped admin's only. The reads with a role or scope rule are here
+    /// too: the audit log, and a route test of FUNDA's. An allowed call answers success, or on a
+    /// row marked so, 409 (a second resend while the first is under way). Pausing FUNDA comes
+    /// last, as it logs FUNDA out.
     #[tokio::test]
     async fn every_endpoint_by_role() {
         let fixture = fixture().await;
         let (venue, order) = (fixture.venue().await, fixture.order_name().await);
         let (none, forbidden) = (Some(StatusCode::UNAUTHORIZED), Some(StatusCode::FORBIDDEN));
-        let operator = [none, forbidden, None, forbidden, None];
-        let admin = [none, forbidden, forbidden, forbidden, None];
+        let operator = [none, forbidden, None, forbidden, None, forbidden];
+        let admin = [none, forbidden, forbidden, forbidden, None, forbidden];
+        let fundb_admin = [none, forbidden, forbidden, forbidden, None, None];
+        let funda_viewer = [none, None, None, forbidden, None, forbidden];
+        // FUNDB's limits, deleted by the admin before the scoped admin's turn: 404, past its scope.
+        let deleted = [none, forbidden, forbidden, forbidden, None, Some(StatusCode::NOT_FOUND)];
         let funda = r#"{"reason":"testing","scope":"comp:FUNDA"}"#;
         let rows = [
             ("POST", format!("/api/sessions/{FUNDA}/resend"), r#"{"reason":"testing","from":1}"#, operator, true),
@@ -862,11 +868,13 @@ mod tests {
                 "PATCH",
                 "/api/risk/limits/client/FUNDB".to_string(),
                 r#"{"reason":"testing","set":{"credit":5}}"#,
-                admin,
+                fundb_admin,
                 false,
             ),
-            ("DELETE", "/api/risk/limits/client/FUNDB".to_string(), REASON, admin, false),
+            ("DELETE", "/api/risk/limits/client/FUNDB".to_string(), REASON, deleted, false),
             ("POST", "/api/reload".to_string(), REASON, admin, false),
+            ("GET", "/api/audit".to_string(), "", admin, false),
+            ("GET", "/api/routes/test?client=FUNDA&symbol=AAPL".to_string(), "", funda_viewer, false),
             ("POST", format!("/api/sessions/{FUNDA}/pause"), REASON, operator, false),
         ];
         let callers = [
@@ -875,6 +883,7 @@ mod tests {
             ("operator", &fixture.operator),
             ("scoped", &fixture.scoped),
             ("admin", &fixture.admin),
+            ("scoped admin", &fixture.scoped_admin),
         ];
         for (method, path, body, wants, conflict) in rows {
             for ((caller, bearer), want) in callers.iter().zip(wants) {
@@ -1117,7 +1126,8 @@ mod tests {
     }
 
     /// An admin scoped to FUNDB edits FUNDB's limits, and is refused FUNDA's, the defaults and a
-    /// reload, which reach every client as `all` does; the file is left as it was.
+    /// reload, which reach every client as `all` does, and the audit log, which is every
+    /// client's; each refusal is audited, and the file is left as it was.
     #[tokio::test]
     async fn a_scoped_admin_edits_only_its_clients_limits() {
         let fixture = fixture().await;
@@ -1135,6 +1145,8 @@ mod tests {
         assert_eq!(fixture.last_result(), "refused: abe may act only on clients FUNDB, not risk.defaults");
         assert_eq!(as_scoped("POST", "/api/reload", REASON).await, StatusCode::FORBIDDEN);
         assert_eq!(fixture.last_result(), "refused: abe may act only on clients FUNDB, not a reload");
+        assert_eq!(as_scoped("GET", "/api/audit", "").await, StatusCode::FORBIDDEN);
+        assert_eq!(fixture.last_result(), "refused: abe may see only clients FUNDB, not the audit log");
         assert_eq!(fixture.config(), config);
         assert_eq!(as_scoped("DELETE", fundb, REASON).await, StatusCode::OK);
     }

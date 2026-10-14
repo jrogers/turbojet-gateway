@@ -276,13 +276,17 @@ struct AuditQuery {
 
 /// `GET /api/audit?since=&limit=` [admin]: the audit log's last `limit` entries (at most
 /// [`MAX_READ`](crate::audit::MAX_READ), by default [`AUDIT_READ_DEFAULT`]) from `since`, oldest
-/// first.
+/// first. Not for a scoped admin: the log is every client's.
 async fn read_audit(
     axum::extract::State(state): axum::extract::State<State>,
     caller: Caller,
     query: Result<Query<AuditQuery>, QueryRejection>,
 ) -> Result<Json<Vec<Entry>>, ApiError> {
-    if let Err(error) = caller.require(Role::Admin) {
+    let allowed = caller.require(Role::Admin).and_then(|()| match caller.view_scope() {
+        Some(_) => Err(read::unseen(&caller, "the audit log")),
+        None => Ok(()),
+    });
+    if let Err(error) = allowed {
         return Err(state.refused(entry_for(&caller, "read_audit", None), error).await);
     }
     let Query(query) = query.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;

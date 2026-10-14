@@ -21,6 +21,7 @@ use tracing::{error, warn};
 use turbojet::codec::{Decoded, decode};
 use turbojet::{Direction, FileMessageLog, LogFile, LogFilter, LogRecord, LogRecords, Message};
 
+use super::read::{names_target, unseen};
 use super::{ApiError, Caller, State, bad};
 use crate::book::OrderDetail;
 use crate::service::Service;
@@ -98,15 +99,57 @@ pub(super) struct Hit {
 /// [`PAGE_DEFAULT`], at most [`PAGE_MAX`]). `session` (as logged) and `tag` (`11=ABC`) repeat;
 /// `msg_type` repeats or takes a list (`D,F`); `direction` is `in` or `out`. `since` (RFC 3339)
 /// is required, `until` is `since` and [`RANGE_MAX`] by default, and the range is at most that.
+/// A scoped caller's search finds only its clients' sessions (see [`Clients`]): a `session` that
+/// isn't one is 403.
 pub(super) async fn messages(
     axum::extract::State(state): AxumState,
+    caller: Caller,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
 ) -> Result<Json<Page>, ApiError> {
     // Pairs, not a struct, as `session`, `msg_type` and `tag` repeat.
     let Query(pairs) = query.map_err(|e| bad(e.body_text()))?;
-    let dir = log_dir(&*state.service()?)?;
-    let search = parse(&pairs)?;
+    let (dir, search) = {
+        let service = state.service()?;
+        let dir = log_dir(&service)?;
+        let mut search = parse(&pairs)?;
+        if let Some(comp_ids) = caller.view_scope() {
+            let venues = service
+                .venues()
+                .iter()
+                .filter_map(|name| service.venue_session(name))
+                .map(|venue| venue.id().to_string())
+                .collect();
+            let clients = Clients { comp_ids: comp_ids.to_vec(), venues };
+            let mut named = search.filters.iter().flat_map(|filter| &filter.sessions);
+            if let Some(session) = named.find(|session| !clients.cover(session)) {
+                return Err(unseen(&caller, session));
+            }
+            search.clients = Some(clients);
+        }
+        (dir, search)
+    };
     run(&state, dir, search).await
+}
+
+/// The sessions a scoped caller's search finds: those of its clients, named as the acceptor logs
+/// them (`BEGIN:JETBRIDGE->CLIENT`). A venue's session is named the same way, Jetbridge's CompID
+/// then the venue's, so a venue whose CompID is a client's would pass as that client: the venues'
+/// sessions are refused by name first. A venue a reload has stopped isn't known, and one with a
+/// client's CompID would then pass.
+#[derive(Debug)]
+struct Clients {
+    comp_ids: Vec<String>,
+    /// The running venues' sessions, as logged.
+    venues: Vec<String>,
+}
+
+impl Clients {
+    /// Whether `session`, as logged, is one of the clients': not a venue's, and with one of
+    /// their CompIDs as its target.
+    fn cover(&self, session: &str) -> bool {
+        !self.venues.iter().any(|venue| venue == session)
+            && self.comp_ids.iter().any(|comp_id| names_target(session, comp_id))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +256,9 @@ struct Search {
     range: LogFilter,
     limit: usize,
     after: Option<Cursor>,
+    /// For a scoped caller: only its clients' sessions, so not a record without one. Checked as
+    /// the other conditions are, so a record it leaves out counts toward the byte budget.
+    clients: Option<Clients>,
 }
 
 impl Search {
@@ -253,7 +299,7 @@ impl Search {
                 header
             })
             .collect();
-        Ok(Self { filters, headers, range, limit, after })
+        Ok(Self { filters, headers, range, limit, after, clients: None })
     }
 }
 
@@ -482,6 +528,10 @@ fn hit(record: LogRecord, search: &Search) -> Option<Hit> {
     let LogRecord::Message { time, direction, session, frame } = record else { return None };
     // FIXP frames: Jetbridge's sessions are all FIX.
     if !search.range.in_range(time) || !frame.starts_with(b"8=") {
+        return None;
+    }
+    let covered = |clients: &Clients| session.as_deref().is_some_and(|session| clients.cover(session));
+    if !search.clients.as_ref().is_none_or(covered) {
         return None;
     }
     if !search.headers.iter().any(|header| header.matches_message(direction, session.as_deref(), None)) {
@@ -939,6 +989,69 @@ mod tests {
         log(&dir, &[msg(at(86_400), Direction::Inbound, client, &[(35, "D"), (11, "N1")])]);
         let page = fixture.ok(&format!("{path}?after={follow}")).await;
         assert_eq!(page["messages"], serde_json::json!([]));
+    }
+
+    /// A search as FUNDA's viewer and FUNDB's operator finds their own clients' messages alone:
+    /// not another client's, a venue's or one logged before a Logon, whether `session` is given
+    /// or not, and paging over what it leaves out. A `session` that isn't one of its clients' is
+    /// 403. Unscoped, it finds them all.
+    #[tokio::test]
+    async fn a_scoped_callers_search_finds_its_clients_alone() {
+        let (fixture, dir) = logged().await;
+        let order = |minute, comp_id, id| (at(8, 9, minute), Direction::Inbound, comp_id, fix(&[(35, "D"), (11, id)]));
+        log(
+            &dir,
+            &[
+                order(0, Some("FUNDA"), "A"),
+                order(1, Some("FUNDB"), "B"),
+                order(2, Some("NASDAQ"), "V"),
+                order(3, None, "N"),
+                order(4, Some("FUNDA"), "A2"),
+            ],
+        );
+        let (funda, fundb) = (fixture.scoped_viewer.as_str(), fixture.scoped.as_str());
+        let session = |comp_id: &str| format!("&session=FIX.4.4:JETBRIDGE-%3E{comp_id}");
+        let ids = async |bearer: &str, query: &str| {
+            let answer = fixture.get_as(bearer, &format!("/api/messages?{DAY}{query}")).await;
+            assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
+            let hits = answer.body["messages"].as_array().unwrap().iter().map(|hit| cl_ord_id(hit).to_string());
+            (hits.collect::<Vec<_>>(), answer.body["next"].as_str().map(str::to_owned))
+        };
+        assert_eq!(ids(funda, "").await.0, ["A", "A2"]);
+        assert_eq!(ids(funda, &session("FUNDA")).await.0, ["A", "A2"]);
+        assert_eq!(ids(fundb, "").await.0, ["B"]);
+        assert_eq!(ids(fixture.viewer.as_str(), "").await.0, ["A", "B", "V", "N", "A2"]);
+        let (first, next) = ids(funda, "&limit=1").await;
+        assert_eq!(first, ["A"]);
+        assert_eq!(ids(funda, &format!("&limit=1&after={}", next.unwrap())).await.0, ["A2"]);
+
+        let refused = [
+            (funda, session("FUNDB")),
+            (funda, session("NASDAQ")),
+            (funda, format!("{}{}", session("FUNDA"), session("FUNDB"))),
+            (fundb, session("FUNDA")),
+        ];
+        for (bearer, query) in refused {
+            let answer = fixture.get_as(bearer, &format!("/api/messages?{DAY}{query}")).await;
+            assert_eq!(answer.status, StatusCode::FORBIDDEN, "{query}: {}", answer.body);
+        }
+        let answer = fixture.get_as(funda, &format!("/api/messages?{DAY}{}", session("FUNDB"))).await;
+        assert_eq!(answer.body["error"], "val may see only clients FUNDA, not FIX.4.4:JETBRIDGE->FUNDB");
+    }
+
+    /// A client's session is one with a scoped CompID as its target that isn't a venue's: a
+    /// venue whose CompID is also a client's isn't covered.
+    #[test]
+    fn a_venues_session_is_never_a_clients() {
+        let clients = Clients {
+            comp_ids: vec!["FUNDA".into(), "NASDAQ".into()],
+            venues: vec!["FIX.4.4:JETBRIDGE->NASDAQ".into()],
+        };
+        assert!(clients.cover("FIX.4.4:JETBRIDGE->FUNDA"));
+        assert!(clients.cover("FIX.4.4:JETBRIDGE->FUNDA/DESK"));
+        assert!(clients.cover("FIX.4.2:JETBRIDGE->NASDAQ"));
+        assert!(!clients.cover("FIX.4.4:JETBRIDGE->NASDAQ"));
+        assert!(!clients.cover("FIX.4.4:JETBRIDGE->FUNDB"));
     }
 
     /// A past order the book has dropped, from the database: its messages are searched from its

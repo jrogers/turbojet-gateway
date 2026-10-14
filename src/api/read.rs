@@ -272,7 +272,7 @@ fn may_see_named(caller: &Caller, gateway: &Gateway, name: &ScopeName) -> Result
 }
 
 /// 403 for a scoped caller reading what isn't theirs: `target`. The read twin of a write's.
-fn unseen(caller: &Caller, target: &str) -> ApiError {
+pub(super) fn unseen(caller: &Caller, target: &str) -> ApiError {
     let clients = caller.view_scope().unwrap_or_default().join(", ");
     ApiError::new(StatusCode::FORBIDDEN, format!("{} may see only clients {clients}, not {target}", caller.user))
 }
@@ -280,7 +280,7 @@ fn unseen(caller: &Caller, target: &str) -> ApiError {
 /// Whether `session`, a session as Turbojet shows it (`BEGIN:SENDER->TARGET`, a side's SubID and
 /// LocationID after a `/` each, a qualifier after a `:`), has `comp_id` as its TargetCompID: the
 /// client's, as the acceptor sees it.
-fn names_target(session: &str, comp_id: &str) -> bool {
+pub(super) fn names_target(session: &str, comp_id: &str) -> bool {
     let rest = session.split_once("->").and_then(|(_, target)| target.strip_prefix(comp_id));
     rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', ':']))
 }
@@ -469,12 +469,17 @@ pub(super) struct RouteTest {
 }
 
 /// `GET /api/routes/test?client=&ex_destination=&symbol=`: where the router would send such an
-/// order, and by which rule. Routing only: blocks, ClOrdID limits and risk aren't checked.
+/// order, and by which rule. Routing only: blocks, ClOrdID limits and risk aren't checked. 403 for
+/// a `client` a scoped caller may not see.
 pub(super) async fn route_test(
     axum::extract::State(state): AxumState,
+    caller: Caller,
     query: Result<Query<RouteTestQuery>, QueryRejection>,
 ) -> Result<Json<RouteTest>, ApiError> {
     let Query(query) = query.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    if !caller.may_act_on(query.client.as_str()) {
+        return Err(unseen(&caller, &query.client));
+    }
     let router = state.service()?.gateway().router();
     let matched = router.route_rule(&query.client, query.ex_destination.as_deref(), &query.symbol);
     Ok(Json(RouteTest {
@@ -878,7 +883,8 @@ pub(super) mod tests {
     }
 
     /// A dry run names the first rule matching by client, ExDestination or symbol, and its target;
-    /// none matching is null throughout, and `client` and `symbol` are required.
+    /// none matching is null throughout, and `client` and `symbol` are required. A scoped caller
+    /// tests only its clients' orders.
     #[tokio::test]
     async fn a_route_test_names_the_first_matching_rule() {
         let fixture = fixture().await;
@@ -906,6 +912,14 @@ pub(super) mod tests {
         for bad in ["symbol=AAPL", "client=FUNDA", "client=FUNDA&symbol=AAPL&colour=red"] {
             assert_eq!(fixture.get(&format!("/api/routes/test?{bad}")).await.status, StatusCode::BAD_REQUEST, "{bad}");
         }
+
+        // FUNDA's viewer tests FUNDA's orders alone, and sees every rule.
+        let as_funda = async |path: &str| fixture.get_as(&fixture.scoped_viewer, path).await;
+        assert_eq!(as_funda("/api/routes/test?client=FUNDA&symbol=AAPL").await.body["rule"], 2);
+        let answer = as_funda("/api/routes/test?client=FUNDB&symbol=AAPL").await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(answer.body["error"], "val may see only clients FUNDA, not FUNDB");
+        assert_eq!(as_funda("/api/routes").await.body.as_array().unwrap().len(), 3);
     }
 
     /// The resting FUNDA order, read as FUNDA's viewer, FUNDB's operator and unscoped: a scoped
