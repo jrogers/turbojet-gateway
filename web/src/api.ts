@@ -1,4 +1,4 @@
-import type { Me, Numbers, OrderDetail, OrdersPage, Page, SessionView } from './types.ts'
+import type { Changed, Me, Numbers, OrderDetail, OrdersPage, Page, RiskView, SessionView } from './types.ts'
 
 /**
  * A refusal or failure: the status, and the API's `{"error": ...}` (`api::ApiError`), or the
@@ -109,6 +109,7 @@ export async function logout() {
 }
 
 export const sessions = () => request<SessionView[]>('GET', '/api/sessions')
+export const risk = () => request<RiskView>('GET', '/api/risk')
 
 /**
  * `GET /api/orders` with the filters given: `client`, `venue`, `symbol`, `status`, `working`,
@@ -131,3 +132,8 @@ export const requestStatus = (orderId: string, reason: string) =>
   request<void>('POST', `/api/orders/${segment(orderId)}/status`, { reason })
 export const resolve = (orderId: string, reason: string) =>
   request<void>('POST', `/api/orders/${segment(orderId)}/resolve`, { reason })
+// A scope is `all`, `comp:COMPID` or `session:SESSION`, as written.
+export const block = (scope: string, reason: string) => request<Changed>('POST', '/api/risk/block', { reason, scope })
+export const unblock = (scope: string, reason: string) => request<Changed>('POST', '/api/risk/unblock', { reason, scope })
+/** The kill switch: blocks `scope` and cancels its orders; 204. */
+export const cancelAll = (scope: string, reason: string) => request<void>('POST', '/api/risk/cancel-all', { reason, scope })

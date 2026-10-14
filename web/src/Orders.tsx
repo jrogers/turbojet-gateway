@@ -71,7 +71,7 @@ function params(query: Query): Record<string, string | boolean | undefined> | st
  * `api::read::names_target`: whether `session` (`BEGIN:SENDER->TARGET`, maybe `/SUB`, `:QUAL`)
  * has `compId` as its TargetCompID, the client's.
  */
-function namesTarget(session: string, compId: string): boolean {
+export function namesTarget(session: string, compId: string): boolean {
   const at = session.indexOf('->')
   if (at < 0) return false
   const target = session.slice(at + 2)

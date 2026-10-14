@@ -396,3 +396,25 @@ table.tags td {
   clip-path: inset(50%);
   white-space: nowrap;
 }
+
+/* Risk: the blocks, each with its Unblock, and the kill switch, red. */
+
+ul.blocks {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 0.75rem;
+}
+
+ul.blocks li {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.2rem 0;
+}
+
+button.danger {
+  background: var(--error);
+  border-color: var(--error);
+  color: var(--bg);
+  font-weight: 600;
+}

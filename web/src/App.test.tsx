@@ -1,5 +1,5 @@
 import { StrictMode } from 'react'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
 import * as api from './api.ts'
@@ -98,6 +98,7 @@ test('routes switch with the hash, orders by default', async () => {
   serve({
     'GET /api/me': () => json(alice),
     'GET /api/sessions': () => json([]),
+    'GET /api/risk': () => json({ error: 'not now' }, 503),
     'GET /api/orders/A%2F1': () => json({ error: 'no order A/1' }, 404),
     'GET /api/orders/A%2F1/messages': () => json({ error: 'no order A/1' }, 404),
   })
@@ -112,8 +113,13 @@ test('routes switch with the hash, orders by default', async () => {
   go('#/sessions')
   expect(screen.getByRole('heading').textContent).toBe('Sessions')
   expect(screen.getByRole('link', { name: 'Sessions' }).getAttribute('aria-current')).toBe('page')
+  go('#/risk')
+  expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Risk')
+  expect(screen.getByRole('link', { name: 'Risk' }).getAttribute('aria-current')).toBe('page')
+  expect(await screen.findByText('not now')).toBeTruthy()
   go('#/orders/A%2F1')
   expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Order A/1')
+  expect(within(screen.getByRole('navigation')).getByRole('link', { name: 'Orders' }).getAttribute('aria-current')).toBe('page')
   expect(await screen.findByText('No such order.')).toBeTruthy()
   go('#/nowhere')
   expect(screen.getByRole('heading').textContent).toBe('Orders')

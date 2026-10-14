@@ -178,6 +178,45 @@ export interface Numbers {
   next_outgoing: number
 }
 
+/** `risk::Limits`: one CompID's limits, every key written, `null` (or `false`) for no check. */
+export interface Limits {
+  max_order_qty: Decimal | null
+  max_notional: Decimal | null
+  symbols: string[] | null
+  /** A percentage either side of the symbol's reference price. */
+  price_band: Decimal | null
+  credit: Decimal | null
+  self_trade: boolean
+}
+
+/** `book::view::SessionRisk`: a session's open notional and what it has filled in its day. */
+export interface SessionRisk {
+  /** The session (`book::ClientId`, as it shows). */
+  client: string
+  open: Decimal
+  filled: Decimal
+}
+
+/**
+ * `book::view::RiskView`: `GET /api/risk`. A scoped user's clients' only (`RiskView::retain_for`):
+ * the defaults and reference prices are everyone's.
+ */
+export interface RiskView {
+  defaults: Limits
+  /** Each with the defaults' keys it doesn't set filled in: the limits as merged. */
+  by_comp_id: Record<string, Limits>
+  sessions: SessionRisk[]
+  /** Each symbol's last fill price. */
+  references: Record<string, Decimal>
+  /** Scopes as written, in the order blocked. */
+  blocked: string[]
+}
+
+/** `api::write::Changed`: what a block or unblock answers. */
+export interface Changed {
+  changed: boolean
+}
+
 /** `api::live::Snapshot`: the socket's first message, and again after it falls behind. */
 export interface Snapshot {
   type: 'snapshot'
