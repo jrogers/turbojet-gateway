@@ -662,6 +662,7 @@ fn a_urls_password_is_hidden() {
     assert_eq!(without_password("postgres://jet:pa/ss@db/j"), "postgres://jet:***@db/j", "a '/' in the password");
     assert_eq!(without_password("postgres://jet:pa?ss@db/j"), "postgres://jet:***@db/j", "a '?' in the password");
     assert_eq!(without_password("postgres://jet:s@cret@db/j"), "postgres://jet:***@db/j");
+    assert_eq!(without_password("postgres://u@h/d?pass%77ord=secret"), "postgres://u@h/d?pass%77ord=***", "encoded");
 }
 
 /// Opening suggests `?mode=rwc` for SQLite only, says when the build lacks the URL's backend, and

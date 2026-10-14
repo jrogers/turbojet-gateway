@@ -1224,7 +1224,8 @@ fn without_password(url: &str) -> String {
     let parameters: Vec<String> = query
         .split('&')
         .map(|parameter| match parameter.split_once('=') {
-            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=***"),
+            // sqlx decodes a key, so `pass%77ord` is a password too: any key with a `%` is masked.
+            Some((key, _)) if key.eq_ignore_ascii_case("password") || key.contains('%') => format!("{key}=***"),
             _ => parameter.to_string(),
         })
         .collect();
