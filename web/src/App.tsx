@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import * as api from './api.ts'
 import Login from './Login.tsx'
+import Orders from './Orders.tsx'
 import Sessions from './Sessions.tsx'
 import { LiveProvider, useLive } from './store.ts'
 import { useRoute, type Route } from './router.ts'
@@ -116,11 +117,11 @@ function Banner() {
   )
 }
 
-// Orders' placeholders until their screens are written (tasks 4 and 5).
+// The order's placeholder until its screen is written (task 5).
 function Screen({ route, me }: { route: Route; me: Me }) {
   switch (route.screen) {
     case 'orders':
-      return <h1>Orders</h1>
+      return <Orders />
     case 'sessions':
       return <Sessions me={me} />
     case 'order':

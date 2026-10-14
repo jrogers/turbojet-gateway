@@ -250,3 +250,44 @@ td.actions button + button {
   justify-content: flex-end;
   gap: 0.5rem;
 }
+
+/* Orders: the filters, and an order's flags as badges after its status. */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.filters label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.filters label.check {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding-bottom: 0.35rem;
+}
+
+.badge {
+  margin-left: 0.4rem;
+  padding: 0 0.3rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.badge.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.badge.error {
+  border-color: var(--error);
+  color: var(--error);
+}
