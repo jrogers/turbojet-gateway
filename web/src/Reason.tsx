@@ -6,8 +6,10 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
  * succeeds; a failure stays open, showing its message, to try again or cancel. Escape or Cancel
  * closes it, but not while the action is under way; if the browser closes it anyway, the parent is
  * told. A native modal `<dialog>`: the page behind is inert. Focus starts on the reason, and goes
- * back where it was on closing. `ready` false keeps Confirm disabled, as the children say. `onClose` should be idempotent, as setting the parent's state to
- * none is: closings can race, the browser's and the component's own.
+ * back where it was on closing. `children` come after the reason, so it's typed first. `ready`
+ * false keeps Confirm disabled, as the children say; `confirmLabel` names it. `onClose` should be
+ * idempotent, as setting the parent's state to none is: closings can race, the browser's and the
+ * component's own.
  */
 export default function Reason({
   title,
@@ -15,10 +17,12 @@ export default function Reason({
   onConfirm,
   onClose,
   ready = true,
+  confirmLabel = 'Confirm',
 }: {
   title: string
   children?: ReactNode
   ready?: boolean
+  confirmLabel?: string
   onConfirm: (reason: string) => Promise<void>
   onClose: () => void
 }) {
@@ -76,11 +80,11 @@ export default function Reason({
     >
       <form onSubmit={submit}>
         <h2 id="reason-title">{title}</h2>
-        {children}
         <label>
           Reason
           <input autoFocus required value={reason} onChange={(e) => setReason(e.target.value)} />
         </label>
+        {children}
         {error && (
           <p className="error" role="alert">
             {error}
@@ -91,7 +95,7 @@ export default function Reason({
             Cancel
           </button>
           <button type="submit" className="primary" disabled={busy || reason.trim() === '' || !ready}>
-            Confirm
+            {confirmLabel}
           </button>
         </div>
       </form>

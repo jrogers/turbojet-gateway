@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useReducer, useRef, useState } from 'react'
 import * as api from './api.ts'
 import { namesTarget } from './Orders.tsx'
 import Reason from './Reason.tsx'
@@ -11,6 +11,9 @@ export const RISK_EVERY = 5_000
 type Action = { kind: 'block' | 'unblock' | 'cancel-all'; scope: string }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+/** A session's TargetCompID, the client's: `BEGIN:SENDER->TARGET`, maybe `/SUB`, `:QUAL`. */
+const targetCompId = (session: string) => session.slice(session.indexOf('->') + 2).split(/[/:]/)[0]
 
 /**
  * Risk: each session's open and filled notional beside its limits, the reference prices, and the
@@ -30,13 +33,17 @@ export default function Risk({ me }: { me: Me }) {
   const heading = useRef<HTMLHeadingElement>(null)
   // Set by an action done: focus goes to the heading once its dialog has closed.
   const refocus = useRef(false)
+  // One more reads again at once: after an action, or a limit edit.
+  const [reads, reread] = useReducer((n: number) => n + 1, 0)
 
-  // At once, then every RISK_EVERY while the page is seen, and again on each snapshot. A read
-  // answering after a newer one was asked, or after unmounting, is dropped.
+  // At once, then every RISK_EVERY while the page is seen and on its becoming seen, and again on
+  // each snapshot or `reread`. A read answering after a newer one was asked, or after unmounting,
+  // is dropped. A 403 or 404 stops the reads until the next snapshot: the scope must change first.
   const asking = useRef<object>(undefined)
   useEffect(() => {
+    let stopped = false
     const read = () => {
-      if (document.hidden) return
+      if (document.hidden || stopped) return
       const at = {}
       asking.current = at
       api.risk().then(
@@ -47,18 +54,23 @@ export default function Risk({ me }: { me: Me }) {
         },
         (e: unknown) => {
           if (asking.current !== at) return
-          if (e instanceof api.ApiError && (e.status === 403 || e.status === 404)) setRisk(null)
+          if (e instanceof api.ApiError && (e.status === 403 || e.status === 404)) {
+            stopped = true
+            setRisk(null)
+          }
           setError(message(e))
         },
       )
     }
     read()
     const timer = setInterval(read, RISK_EVERY)
+    document.addEventListener('visibilitychange', read)
     return () => {
       clearInterval(timer)
+      document.removeEventListener('visibilitychange', read)
       asking.current = undefined
     }
-  }, [live.snapshots])
+  }, [live.snapshots, reads])
 
   useEffect(() => {
     if (action === undefined && refocus.current) {
@@ -68,10 +80,10 @@ export default function Risk({ me }: { me: Me }) {
   }, [action])
 
   const acts = me.role !== 'viewer'
-  const choose = (kind: Action['kind'], scope: string) => {
+  const choose = (kind: Action['kind'], target: string) => {
     setDone(undefined)
     setTyped('')
-    setAction({ kind, scope })
+    setAction({ kind, scope: target })
   }
 
   async function confirm(reason: string) {
@@ -88,14 +100,21 @@ export default function Risk({ me }: { me: Me }) {
       setDone(changed ? `Unblocked ${scope}.` : `${scope} wasn't blocked.`)
     }
     refocus.current = true
+    reread()
   }
 
-  // The scopes the form offers; the API refuses a scoped user any other.
-  const clientSessions = live.sessions.filter((s) => s.side === 'client').map((s) => `session:${s.id}`)
-  const offered =
-    me.clients === null
-      ? ['all', ...Object.keys(risk?.by_comp_id ?? {}).map((c) => `comp:${c}`), ...clientSessions]
-      : [...me.clients.map((c) => `comp:${c}`), ...clientSessions]
+  // The scopes the form offers; the API refuses a scoped user any other. The clients as the last
+  // snapshot said, as a reload may have changed them since login.
+  const clients = live.clients === undefined ? me.clients : live.clients
+  const sessions = [
+    ...new Set([...live.sessions.filter((s) => s.side === 'client').map((s) => s.id), ...(risk?.sessions ?? []).map((s) => s.client)]),
+  ]
+  const compIds = clients ?? [...new Set([...Object.keys(risk?.by_comp_id ?? {}), ...sessions.map(targetCompId)])]
+  const offered = [
+    ...(clients === null ? ['all'] : []),
+    ...compIds.map((c) => `comp:${c}`),
+    ...sessions.map((s) => `session:${s}`),
+  ]
 
   const limitsOf = (session: string): Limits => {
     const compId = Object.keys(risk!.by_comp_id).find((c) => namesTarget(session, c))
@@ -127,7 +146,7 @@ export default function Risk({ me }: { me: Me }) {
               <li key={blocked}>
                 <code>{blocked}</code>
                 {/* `all` is no scoped user's to lift, as the API says. */}
-                {acts && (me.clients === null || blocked !== 'all') && (
+                {acts && (clients === null || blocked !== 'all') && (
                   <button type="button" onClick={() => choose('unblock', blocked)}>
                     Unblock
                   </button>
@@ -167,7 +186,7 @@ export default function Risk({ me }: { me: Me }) {
               disabled={scope.trim() === ''}
               onClick={() => choose('cancel-all', scope.trim())}
             >
-              Cancel all
+              Cancel all orders…
             </button>
           </form>
         )}
@@ -200,13 +219,20 @@ export default function Risk({ me }: { me: Me }) {
           onConfirm={confirm}
           onClose={() => setAction(undefined)}
           ready={action.kind !== 'cancel-all' || typed === action.scope}
+          confirmLabel={action.kind === 'cancel-all' ? 'Cancel all orders' : undefined}
         >
           {action.kind === 'cancel-all' && (
             <>
               <p>Blocks {action.scope} and cancels its clients’ working orders at their venues.</p>
               <label>
                 Type {action.scope} to confirm
-                <input value={typed} onChange={(e) => setTyped(e.target.value)} />
+                <input
+                  autoComplete="off"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  value={typed}
+                  onChange={(e) => setTyped(e.target.value)}
+                />
               </label>
             </>
           )}

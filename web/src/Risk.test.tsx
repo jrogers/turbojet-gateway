@@ -3,7 +3,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 import * as api from './api.ts'
 import Risk, { RISK_EVERY } from './Risk.tsx'
 import { initial, LiveContext, reduce, type LiveState } from './store.ts'
-import type { Limits, LiveMessage, Me, RiskView } from './types.ts'
+import type { Limits, LiveMessage, Me, RiskView, SessionView } from './types.ts'
 
 const FUNDA = 'FIX.4.4:JETBRIDGE->FUNDA'
 const FUNDB = 'FIX.4.4:JETBRIDGE->FUNDB/desk'
@@ -21,8 +21,8 @@ const fixture: RiskView = {
   blocked: [],
 }
 
-const snapshot = (blocked: string[] = []): LiveState =>
-  reduce(initial, { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked, unavailable: false, clients: null })
+const snapshot = (blocked: string[] = [], clients: string[] | null = null, sessions: SessionView[] = []): LiveState =>
+  reduce(initial, { type: 'snapshot', sessions, orders: [], orders_next: null, blocked, unavailable: false, clients })
 
 const who = (role: Me['role'], clients: string[] | null = null): Me => ({ user: 'u', role, clients })
 
@@ -73,6 +73,33 @@ test('shows each session against its limits as merged, and the reference prices,
   expect(cells('AAPL')).toEqual(['AAPL', '10.250000000000000001'])
 })
 
+test('a 404 clears what was shown, says why, and stops the reads until a snapshot', async () => {
+  vi.useFakeTimers()
+  try {
+    let answer = () => json(fixture)
+    const calls = serve({ 'GET /api/risk': () => answer() })
+    const { rerender } = render(page(who('viewer'), snapshot()))
+    await act(() => vi.advanceTimersByTimeAsync(0))
+    expect(screen.getByText(FUNDA)).toBeTruthy()
+    answer = () => json({ error: 'not found' }, 404)
+    await act(() => vi.advanceTimersByTimeAsync(RISK_EVERY))
+    expect(screen.getByRole('alert').textContent).toBe('not found')
+    expect(screen.queryAllByRole('table')).toEqual([])
+    await act(() => vi.advanceTimersByTimeAsync(RISK_EVERY * 3))
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(calls).toHaveLength(2)
+
+    answer = () => json(fixture)
+    rerender(page(who('viewer'), reduce(snapshot(), snapshotMessage())))
+    await act(() => vi.advanceTimersByTimeAsync(0))
+    expect(calls).toHaveLength(3)
+    expect(screen.getByText(FUNDA)).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
 test('a 403 clears what was shown, and says why', async () => {
   let answer = () => json(fixture)
   serve({ 'GET /api/risk': () => answer() })
@@ -96,7 +123,7 @@ const snapshotMessage = (): Extract<LiveMessage, { type: 'snapshot' }> => ({
   clients: null,
 })
 
-test('reads on showing, then every few seconds while seen, and not once gone', async () => {
+test('reads on showing, every few seconds while seen and on being seen again, and not once gone', async () => {
   vi.useFakeTimers()
   try {
     const calls = serve({ 'GET /api/risk': () => json(fixture) })
@@ -112,12 +139,15 @@ test('reads on showing, then every few seconds while seen, and not once gone', a
     await act(() => vi.advanceTimersByTimeAsync(RISK_EVERY * 3))
     expect(calls).toHaveLength(2)
     hidden = false
-    await act(() => vi.advanceTimersByTimeAsync(RISK_EVERY))
+    await act(async () => document.dispatchEvent(new Event('visibilitychange')))
     expect(calls).toHaveLength(3)
+    await act(() => vi.advanceTimersByTimeAsync(RISK_EVERY))
+    expect(calls).toHaveLength(4)
 
     unmount()
+    document.dispatchEvent(new Event('visibilitychange'))
     await vi.advanceTimersByTimeAsync(RISK_EVERY * 3)
-    expect(calls).toHaveLength(3)
+    expect(calls).toHaveLength(4)
   } finally {
     vi.useRealTimers()
     vi.restoreAllMocks()
@@ -166,16 +196,55 @@ test('the actions show by role, and a scoped user is offered only its CompIDs', 
 
   render(page(who('operator'), snapshot(['all'])))
   await screen.findByText(FUNDA)
-  expect(buttons()).toEqual(['Unblock', 'Block', 'Cancel all'])
-  expect(screen.getByRole('button', { name: 'Cancel all' }).className).toBe('danger')
-  expect(offered()).toEqual(['all', 'comp:FUNDB'])
+  expect(buttons()).toEqual(['Unblock', 'Block', 'Cancel all orders…'])
+  expect(screen.getByRole('button', { name: 'Cancel all orders…' }).className).toBe('danger')
+  // Those with limits of their own, then those of the sessions.
+  expect(offered()).toEqual(['all', 'comp:FUNDB', 'comp:FUNDA', `session:${FUNDA}`, `session:${FUNDB}`])
   cleanup()
 
-  render(page(who('admin', ['FUNDA']), snapshot(['all', 'comp:FUNDA'])))
+  serve({ 'GET /api/risk': () => json({ ...fixture, by_comp_id: {}, sessions: [fixture.sessions[0]] }) })
+  render(page(who('admin', ['FUNDA']), snapshot(['all', 'comp:FUNDA'], ['FUNDA'])))
   await screen.findByText(FUNDA)
-  expect(buttons()).toEqual(['Unblock', 'Block', 'Cancel all'])
+  expect(buttons()).toEqual(['Unblock', 'Block', 'Cancel all orders…'])
   expect(within(screen.getByText('comp:FUNDA').closest('li')!).getByRole('button').textContent).toBe('Unblock')
-  expect(offered()).toEqual(['comp:FUNDA'])
+  expect(offered()).toEqual(['comp:FUNDA', `session:${FUNDA}`])
+})
+
+const client = (id: string): SessionView => ({
+  side: 'client',
+  id,
+  venue: null,
+  status: 'logged_on',
+  next_incoming: null,
+  next_outgoing: null,
+  activity: null,
+  paused: false,
+})
+
+test("the CompIDs offered are the live sessions' too, and the snapshot's clients over login's", async () => {
+  serve({ 'GET /api/risk': () => json({ ...fixture, by_comp_id: {}, sessions: [] }) })
+  const offered = () => [...document.querySelectorAll('datalist option')].map((o) => (o as HTMLOptionElement).value)
+  const sessions = [client('FIX.4.2:JETBRIDGE->DESK1:q'), client('FIX.4.4:JETBRIDGE->DESK1'), client('FIX.4.4:JETBRIDGE->DESK2/s/l')]
+  render(page(who('operator'), snapshot([], null, sessions)))
+  await act(async () => {})
+  expect(offered()).toEqual(['all', 'comp:DESK1', 'comp:DESK2', ...sessions.map((s) => `session:${s.id}`)])
+  cleanup()
+
+  // Logged in unscoped, rescoped since by a reload: the snapshot says so.
+  render(page(who('operator'), snapshot(['all'], ['DESK2'], sessions.slice(2))))
+  await act(async () => {})
+  expect(offered()).toEqual(['comp:DESK2', `session:${sessions[2].id}`])
+  expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['Block', 'Cancel all orders…'])
+})
+
+test('Enter in the scope opens Block, not the kill switch', async () => {
+  serve({ 'GET /api/risk': () => json(fixture) })
+  render(page(who('operator'), snapshot()))
+  await screen.findByText(FUNDA)
+  const field = screen.getByLabelText('Scope') as HTMLInputElement
+  fireEvent.change(field, { target: { value: 'all' } })
+  fireEvent.submit(field.form!)
+  expect(within(screen.getByRole('dialog')).getByRole('heading').textContent).toBe('Block all')
 })
 
 test('block and unblock post the reason and scope with the CSRF token, and say how it went', async () => {
@@ -199,6 +268,8 @@ test('block and unblock post the reason and scope with the CSRF token, and say h
   expect(screen.getByRole('status').textContent).toBe('Blocked session:X.')
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
+  // Read again at once.
+  expect(calls.filter((c) => c.key === 'GET /api/risk')).toHaveLength(2)
 
   changed = false
   fireEvent.click(screen.getByRole('button', { name: 'Unblock' }))
@@ -224,13 +295,22 @@ test('the kill switch needs its scope typed exactly, then posts', async () => {
   render(page(who('operator'), snapshot()))
   await screen.findByText(FUNDA)
   fireEvent.change(screen.getByLabelText('Scope'), { target: { value: 'comp:FUNDA' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Cancel all' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel all orders…' }))
   const dialog = screen.getByRole('dialog')
   expect(within(dialog).getByRole('heading').textContent).toBe('Cancel all orders of comp:FUNDA')
-  const confirm = within(dialog).getByRole('button', { name: 'Confirm' }) as HTMLButtonElement
-  fireEvent.change(within(dialog).getByLabelText('Reason'), { target: { value: 'runaway algo' } })
+  const confirm = within(dialog).getByRole('button', { name: 'Cancel all orders' }) as HTMLButtonElement
+  // The reason first, then the scope typed.
+  const reason = within(dialog).getByLabelText('Reason')
+  expect(document.activeElement).toBe(reason)
+  fireEvent.change(reason, { target: { value: 'runaway algo' } })
   expect(confirm.disabled).toBe(true)
   const typed = within(dialog).getByLabelText('Type comp:FUNDA to confirm')
+  expect(reason.compareDocumentPosition(typed) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  expect([typed.getAttribute('autocomplete'), typed.getAttribute('spellcheck'), typed.getAttribute('autocapitalize')]).toEqual([
+    'off',
+    'false',
+    'off',
+  ])
   fireEvent.change(typed, { target: { value: 'comp:FUND' } })
   expect(confirm.disabled).toBe(true)
   // Enter in a field doesn't get past it either.
@@ -247,6 +327,7 @@ test('the kill switch needs its scope typed exactly, then posts', async () => {
   await act(async () => fireEvent.click(confirm))
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(screen.getByRole('status').textContent).toMatch(/^Blocked comp:FUNDA and sent cancels/)
+  expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }))
   const posts = calls.filter((c) => c.init.method === 'POST')
   expect(posts).toHaveLength(2)
   expect(posts[1].key).toBe('POST /api/risk/cancel-all')
