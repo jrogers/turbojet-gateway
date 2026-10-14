@@ -1081,6 +1081,8 @@ mod tests {
             (format!("/api/orders/{b1}"), viewers, Shows, forbidden),
             (format!("/api/orders/{b1}/messages"), viewers, Is(StatusCode::OK), forbidden),
             ("/api/orders/A103".to_string(), viewers, Shows, forbidden),
+            ("/api/orders/A103/messages".to_string(), viewers, Is(StatusCode::OK), forbidden),
+            (format!("/api/orders?{range}&client=comp:FUNDB"), viewers, Shows, forbidden),
             (format!("/api/messages?{DAY}"), viewers, Shows, Hides),
             (format!("/api/messages?{DAY}&{fundb_session}"), viewers, Shows, forbidden),
             ("/api/risk".to_string(), viewers, Shows, Hides),
