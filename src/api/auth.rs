@@ -393,11 +393,12 @@ impl Auth {
         self.check(method, headers, ip, true)
     }
 
-    /// Whether the GET with `headers` that `ip` upgraded to a websocket still authenticates: its
-    /// session hasn't ended, or its token hasn't been revoked. Unlike a request, it doesn't count
-    /// as using the session, so a socket left open doesn't keep its session from idling out.
-    pub(super) fn recheck(&self, headers: &HeaderMap, ip: IpAddr) -> Result<(), Refusal> {
-        self.check(&Method::GET, headers, ip, false).map(drop).map_err(|Refused(refusal, _)| refusal)
+    /// The caller as it is now, if the GET with `headers` that `ip` upgraded to a websocket still
+    /// authenticates: its session hasn't ended, or its token hasn't been revoked. Its role and
+    /// clients are the user's now, which a reload may have changed. Unlike a request, it doesn't
+    /// count as using the session, so a socket left open doesn't keep its session from idling out.
+    pub(super) fn recheck(&self, headers: &HeaderMap, ip: IpAddr) -> Result<Caller, Refusal> {
+        self.check(&Method::GET, headers, ip, false).map_err(|Refused(refusal, _)| refusal)
     }
 
     /// [`authenticate`](Self::authenticate), counting the request as the session's use if `used`.
@@ -1032,9 +1033,9 @@ mod tests {
         let headers = HeaderMap::from_iter([(COOKIE, cookie.parse().unwrap())]);
         let ip = IpAddr::from([127, 0, 0, 1]);
         clock.pass(SESSION_IDLE - Duration::from_secs(1));
-        assert_eq!(auth.recheck(&headers, ip), Ok(()));
+        assert!(auth.recheck(&headers, ip).is_ok());
         clock.pass(Duration::from_secs(1));
-        assert_eq!(auth.recheck(&headers, ip), Err(Refusal::SessionEnded));
+        assert_eq!(auth.recheck(&headers, ip).err(), Some(Refusal::SessionEnded));
     }
 
     /// A user removed, or whose password changed, loses their sessions; a changed role applies at

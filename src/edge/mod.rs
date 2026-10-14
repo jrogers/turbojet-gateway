@@ -2420,7 +2420,7 @@ pub(crate) mod tests {
     }
 
     /// An order `cl_ord_id` for 100 AAPL at 10 from `comp_id`'s session.
-    fn new_order_from(comp_id: &str, cl_ord_id: &str) -> Input {
+    pub(crate) fn new_order_from(comp_id: &str, cl_ord_id: &str) -> Input {
         let request = crate::book::OrderRequest {
             cl_ord_id: cl_ord_id.into(),
             account: None,
