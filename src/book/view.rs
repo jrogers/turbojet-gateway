@@ -21,7 +21,8 @@ pub const MAX_ORDERS_PER_PAGE: usize = 1_000;
 /// Digits in the largest `u64`, so in any OrderId: what [`Book::order_named`] tries at most.
 const MAX_ORDER_ID_DIGITS: usize = 20;
 
-/// Which orders [`Book::orders`] returns: those matching every field set, by OrderId.
+/// Which orders [`Book::orders`] returns: those matching every field set, by OrderId, lowest first
+/// or with `desc` highest.
 #[derive(Debug, Clone, Default)]
 pub struct OrderFilter {
     /// A client session, or every session of a CompID.
@@ -33,15 +34,18 @@ pub struct OrderFilter {
     pub status: Option<Status>,
     /// Only orders not yet done.
     pub working: bool,
-    /// Only orders after this one: the last of the previous page.
+    /// Only orders after this one in the page's order (above it, or below it with `desc`): the
+    /// last of the previous page.
     pub after: Option<OrderId>,
+    /// Highest OrderId first: newest first.
+    pub desc: bool,
     /// At most this many, and never more than [`MAX_ORDERS_PER_PAGE`]; `None` is that many.
     pub limit: Option<usize>,
 }
 
 impl OrderFilter {
     fn matches(&self, order: &Order) -> bool {
-        self.after.is_none_or(|after| order.id.0 > after.0)
+        self.after.is_none_or(|after| if self.desc { order.id.0 < after.0 } else { order.id.0 > after.0 })
             && self.client.as_ref().is_none_or(|scope| scope.covers(&order.client))
             && self.comp_ids.as_ref().is_none_or(|comp_ids| is_one_of(order.client.comp_id(), comp_ids))
             && self.venue.as_ref().is_none_or(|venue| order.venue == *venue)
@@ -177,21 +181,24 @@ pub struct SessionRisk {
 }
 
 impl Book {
-    /// The orders matching `filter`, by OrderId. The walk is of the whole book, O(book) under the
-    /// gateway's lock; the page's limit bounds what it keeps and the views it makes.
+    /// The orders matching `filter`, by OrderId, lowest first or with `desc` highest. The walk is
+    /// of the whole book, O(book) under the gateway's lock; the page's limit bounds what it keeps
+    /// and the views it makes.
     // ponytail: a walk per page; an index of OrderIds in order (a BTreeMap) gives `range(after..)`
     // at O(page) if blotter calls show up in the gateway's latency.
     pub fn orders(&self, filter: &OrderFilter) -> Vec<OrderView> {
         let limit = filter.limit.unwrap_or(MAX_ORDERS_PER_PAGE).min(MAX_ORDERS_PER_PAGE);
-        // The lowest `limit` IDs so far, the highest on top to be pushed out.
-        let mut lowest = BinaryHeap::with_capacity(limit.saturating_add(1));
+        // Each ID as a key in the page's order, its own inverse: `desc` turns it around.
+        let key = |id: u64| if filter.desc { u64::MAX - id } else { id };
+        // The first `limit` keys so far, the last on top to be pushed out.
+        let mut first = BinaryHeap::with_capacity(limit.saturating_add(1));
         for order in self.orders.values().filter(|order| filter.matches(order)) {
-            lowest.push(order.id.0);
-            if lowest.len() > limit {
-                lowest.pop();
+            first.push(key(order.id.0));
+            if first.len() > limit {
+                first.pop();
             }
         }
-        lowest.into_sorted_vec().into_iter().map(|id| self.view(&self.orders[&OrderId(id)])).collect()
+        first.into_sorted_vec().into_iter().map(|k| self.view(&self.orders[&OrderId(key(k))])).collect()
     }
 
     /// The order and every request sent for it, if the book holds it.

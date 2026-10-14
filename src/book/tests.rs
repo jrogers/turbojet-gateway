@@ -3705,6 +3705,31 @@ fn orders_page_by_order_id_at_most_a_page_at_a_time() {
     assert_eq!((page[0].id, page[MAX_ORDERS_PER_PAGE - 1].id), (OrderId(1), OrderId(1_000)));
 }
 
+/// Pages of 2, each after the last of the one before, walk every order once, lowest first or with
+/// `desc` highest, a filter's too.
+#[test]
+fn orders_page_both_ways() {
+    let mut book = three_orders();
+    for cl_ord_id in ["C2", "C3"] {
+        run(&mut book, order_from(&desk("DESK1"), cl_ord_id));
+    }
+    let walk = |filter: OrderFilter| {
+        let mut filter = OrderFilter { limit: Some(2), ..filter };
+        let mut walked = Vec::new();
+        loop {
+            let page = book.orders(&filter);
+            assert!(page.len() <= 2);
+            let Some(last) = page.last() else { break walked };
+            filter.after = Some(last.id);
+            walked.extend(ids(&page));
+        }
+    };
+    assert_eq!(walk(OrderFilter::default()), [1, 2, 3, 4, 5]);
+    assert_eq!(walk(OrderFilter { desc: true, ..OrderFilter::default() }), [5, 4, 3, 2, 1]);
+    let working = OrderFilter { working: true, desc: true, ..OrderFilter::default() };
+    assert_eq!(walk(working), [5, 4, 3, 1]);
+}
+
 #[test]
 fn an_orders_view_shows_what_is_pending() {
     let mut book = book();

@@ -816,6 +816,7 @@ fn created_in(from: DateTime<Utc>, to: DateTime<Utc>) -> StoredOrders {
         status: None,
         working: false,
         after: None,
+        desc: false,
         limit: None,
     }
 }
@@ -899,14 +900,22 @@ async fn stored_orders_are_read_by_creation_and_filters() {
 }
 
 /// Pages of 2, each from the last of the one before, walk the range in (created, OrderId) order,
-/// each order once: 3 and 4, created at one time, on one page or split across two.
+/// or with `desc` the reverse, each order once: 3 and 4, created at one time, on one page or split
+/// across two.
 #[tokio::test]
 async fn stored_orders_page_by_creation_then_order_id() {
     let store = memory().await;
     history(&store).await;
-    for (from, expected) in [(on(0, 0), vec![1, 2, 3, 4, 5, 6]), (on(0, 10), vec![2, 3, 4, 5, 6])] {
+    let cases = [
+        (on(0, 0), false, vec![1, 2, 3, 4, 5, 6]),
+        (on(0, 10), false, vec![2, 3, 4, 5, 6]),
+        (on(0, 0), true, vec![6, 5, 4, 3, 2, 1]),
+        (on(0, 10), true, vec![6, 5, 4, 3, 2]),
+    ];
+    for (from, desc, expected) in cases {
         let mut query = created_in(from, on(3, 0));
         query.limit = Some(2);
+        query.desc = desc;
         let mut walked = Vec::new();
         loop {
             let page = store.orders(&query).await.unwrap();
@@ -1005,8 +1014,8 @@ fn a_read_only_url_replaces_its_mode() {
     assert_eq!(read_only("sqlite://j.db?cache=shared&mode=rw"), "sqlite://j.db?cache=shared&mode=ro");
 }
 
-/// Past orders are read along the `sent_new` range, in its order, every filter and the cursor
-/// set or none: the orders and the cancels each by key, nothing scanned and no sort.
+/// Past orders are read along the `sent_new` range, in its order or backwards, every filter and
+/// the cursor set or none: the orders and the cancels each by key, nothing scanned and no sort.
 #[tokio::test]
 async fn stored_orders_read_by_creation_without_sorting() {
     let store = memory().await;
@@ -1022,7 +1031,8 @@ async fn stored_orders_read_by_creation_without_sorting() {
         limit: Some(2),
         ..bare.clone()
     };
-    for query in [bare, full] {
+    let desc = |query: &StoredOrders| StoredOrders { desc: true, ..query.clone() };
+    for query in [desc(&bare), desc(&full), bare, full] {
         let (sql, _) = stored_orders_sql(&query);
         let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(&store.pool).await.unwrap();
         let plan: Vec<String> = plan.iter().map(|row| row.try_get("detail").unwrap()).collect();

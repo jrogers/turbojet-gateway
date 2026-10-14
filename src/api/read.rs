@@ -171,6 +171,9 @@ pub(super) struct OrdersQuery {
     to: Option<DateTime<Utc>>,
     /// The previous page's `next`: a number from the book, a cursor from the database.
     after: Option<String>,
+    /// Newest first: the highest `id` first from the book, the latest created from the database.
+    #[serde(default)]
+    desc: bool,
     limit: Option<usize>,
 }
 
@@ -190,12 +193,13 @@ enum Next {
     Cursor(String),
 }
 
-/// `GET /api/orders?client=&venue=&symbol=&status=&working=&from=&to=&after=&limit=`: the orders
-/// matching every filter given, `limit` at a time (by default [`ORDERS_PAGE_DEFAULT`], at most
-/// [`MAX_ORDERS_PER_PAGE`]).
+/// `GET /api/orders?client=&venue=&symbol=&status=&working=&from=&to=&after=&desc=&limit=`: the
+/// orders matching every filter given, `limit` at a time (by default [`ORDERS_PAGE_DEFAULT`], at
+/// most [`MAX_ORDERS_PER_PAGE`]), oldest first or with `desc=true` newest.
 ///
 /// Without `from`, they're the book's, by OrderId. `after` and `next` are then the numeric `id`,
-/// not the wire OrderID, so a cursor holds when its order leaves the book.
+/// not the wire OrderID, so a cursor holds when its order leaves the book; with `desc`, `after`
+/// reads those below it.
 ///
 /// With `from` (RFC 3339; `to` is now by default, and needs `from`), they're the database's
 /// created in `from..to`, a range of [`HISTORY_RANGE_MAX`] at most, by creation, then `id`: the
@@ -249,6 +253,7 @@ pub(super) async fn orders(
         status: query.status,
         working: query.working,
         after,
+        desc: query.desc,
         limit: Some(limit),
     };
     let orders = gateway.orders(&filter);
@@ -333,6 +338,7 @@ async fn stored_orders(
         status: query.status,
         working: query.working,
         after,
+        desc: query.desc,
         limit: Some(limit),
     };
     let orders = store.orders(&stored).await.map_err(database_failed)?;
@@ -661,9 +667,15 @@ pub(super) mod tests {
         assert_eq!(page["next"], id);
         let page = fixture.ok(&format!("/api/orders?limit=1&after={id}")).await;
         assert_eq!(page, serde_json::json!({ "orders": [], "next": null }));
+        // Newest first, `after` is below: none below the one order.
+        assert_eq!(fixture.ok("/api/orders?desc=true&limit=1").await["next"], id);
+        let page = fixture.ok(&format!("/api/orders?desc=true&limit=1&after={id}")).await;
+        assert_eq!(page, serde_json::json!({ "orders": [], "next": null }));
 
         let over = MAX_ORDERS_PER_PAGE + 1;
-        for bad in ["limit=0", &format!("limit={over}"), "status=bogus", "client=FUNDA", "after=JB1", "colour=red"] {
+        for bad in
+            ["limit=0", &format!("limit={over}"), "status=bogus", "client=FUNDA", "after=JB1", "desc=1", "colour=red"]
+        {
             assert_eq!(fixture.get(&format!("/api/orders?{bad}")).await.status, StatusCode::BAD_REQUEST, "{bad}");
         }
     }
@@ -758,6 +770,18 @@ pub(super) mod tests {
             after = format!("&after={next}");
         }
         assert_eq!(seen, ["A100", "A101", "A102"]);
+
+        // Newest first, the same way.
+        let mut seen = Vec::new();
+        let mut after = String::new();
+        loop {
+            let page = fixture.ok(&format!("/api/orders?{range}&desc=true{after}")).await;
+            let (page_names, next) = names(&page);
+            seen.extend(page_names.iter().map(ToString::to_string));
+            let Some(next) = next.as_str() else { break };
+            after = format!("&after={next}");
+        }
+        assert_eq!(seen, ["A102", "A101", "A100"]);
     }
 
     /// A range too long, empty or backwards, `to` alone, a time that isn't one, an `after` that

@@ -489,7 +489,7 @@ jetbridge user remove alice --users users.toml
 | `GET /api/health` | none | `{"version"}` |
 | `POST /api/login`, `POST /api/logout`, `GET /api/me` | none, any, any | see above |
 | `GET /api/sessions` | viewer | client sessions connected or paused, then every venue's: status, sequence numbers, activity, `paused` |
-| `GET /api/orders` | viewer | the book's orders, or with `from` past ones: `?client=&venue=&symbol=&status=&working=true&from=&to=&after=&limit=` |
+| `GET /api/orders` | viewer | the book's orders, or with `from` past ones: `?client=&venue=&symbol=&status=&working=true&from=&to=&after=&desc=true&limit=` |
 | `GET /api/orders/{order_id}` | viewer | one order by its OrderID(37), past ones too, with every request sent for it and the venue's OrderID |
 | `GET /api/orders/{order_id}/messages` | viewer | `?limit=&after=`: the order's messages, both sides'; see [Searching the message log](#searching-the-message-log) |
 | `GET /api/messages` | viewer | `?session=&direction=&msg_type=&tag=&since=&until=&limit=&after=`: the message log, searched |
@@ -525,11 +525,12 @@ jetbridge user remove alice --users users.toml
   for the following page (`null` after a short page; a full page may be followed by an empty one).
   `client` is a scope (a session the gateway hasn't seen gives an empty page); `status` is `new`,
   `partially_filled`, `filled`, `canceled` and so on. Without `from`, the orders are the book's:
-  working ones and each client's done orders of its current trading day.
+  working ones and each client's done orders of its current trading day. They come lowest `id`
+  first; with `desc=true`, highest first, newest, and `after` reads on below it.
 - **Past orders**, with a [database](#database): `GET /api/orders?from=&to=` reads the orders
   created from `from` up to `to`, both RFC 3339 times, `to` now by default. A range covers 31
   days at most, and may reach into the future. They're the database's orders, past days' and
-  today's, oldest first, filtered as above; `client` may name a session that isn't connected now.
+  today's, oldest first (newest with `desc=true`), filtered as above; `client` may name a session that isn't connected now.
   Each is as last written, and an order pruned is gone. Here `next` is a string, not a number:
   pass it back as `after` as it is, with the same query. Write a `+` in a time's offset as `%2B`
   (`from=2026-10-01T09:00:00%2B02:00`), or it reads as a space. Refused (400): `to` without

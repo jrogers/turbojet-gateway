@@ -429,7 +429,8 @@ impl Store {
 }
 
 /// Which orders [`Store::orders`] returns: those created in `from..to` matching every other field
-/// set, by creation time, then OrderId. As [`OrderFilter`](crate::book::OrderFilter), over history.
+/// set, by creation time, then OrderId, oldest first or with `desc` newest. As
+/// [`OrderFilter`](crate::book::OrderFilter), over history.
 #[derive(Debug, Clone)]
 pub struct StoredOrders {
     /// The earliest creation (when the order's original request was sent) included.
@@ -448,9 +449,12 @@ pub struct StoredOrders {
     pub status: Option<Status>,
     /// Only orders not yet done when last written.
     pub working: bool,
-    /// Only orders after this one, by creation time then OrderId: the last of the previous page,
-    /// its [`OrderView::created`] and [`OrderView::id`]. Creation times can tie.
+    /// Only orders after this one in the page's order, by creation time then OrderId (before it
+    /// with `desc`): the last of the previous page, its [`OrderView::created`] and
+    /// [`OrderView::id`]. Creation times can tie.
     pub after: Option<(DateTime<Utc>, OrderId)>,
+    /// Newest first.
+    pub desc: bool,
     /// At most this many, and never more than [`MAX_ORDERS_PER_PAGE`]; `None` is that many.
     pub limit: Option<usize>,
 }
@@ -466,8 +470,8 @@ enum Value {
 /// request, its one `sent` row without a cancel or replace's kind, and lets SQLite take the
 /// partial `sent_new`; `CROSS JOIN` keeps it going from that range to the orders, as `HELD`.
 /// Ordered by `s.order_id`, not the equal `o.id`, which the index doesn't have: SQLite would sort
-/// each run of one time. The cursor's time is a lower bound too, so a later page starts its range
-/// there, not at `from`.
+/// each run of one time. The cursor's time is a bound too, lower or with `desc` upper, so a later
+/// page starts its range there. `desc` walks the index backwards, no sort either.
 fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
     let mut sql = String::from(
         "SELECT o.*, s.sent_at AS created, c.answered AS cancel_answered \
@@ -478,7 +482,11 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
     if let Some((created, id)) = &query.after {
         // Past `i64::MAX`, no stored OrderId is after it.
         let id = i64::try_from(id.0).unwrap_or(i64::MAX);
-        sql.push_str(" AND s.sent_at >= $3 AND (s.sent_at > $3 OR s.order_id > $4)");
+        sql.push_str(if query.desc {
+            " AND s.sent_at <= $3 AND (s.sent_at < $3 OR s.order_id < $4)"
+        } else {
+            " AND s.sent_at >= $3 AND (s.sent_at > $3 OR s.order_id > $4)"
+        });
         values.extend([Value::Text(bound_text(*created)), Value::Integer(id)]);
     }
     // Appends `condition`, its `$` the placeholder of `value`, the next one.
@@ -517,7 +525,8 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
     }
     let limit = query.limit.unwrap_or(MAX_ORDERS_PER_PAGE).min(MAX_ORDERS_PER_PAGE);
     values.push(Value::Integer(i64::try_from(limit).expect("at most MAX_ORDERS_PER_PAGE")));
-    sql.push_str(&format!(" ORDER BY s.sent_at, s.order_id LIMIT ${}", values.len()));
+    let order = if query.desc { "s.sent_at DESC, s.order_id DESC" } else { "s.sent_at, s.order_id" };
+    sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", values.len()));
     (sql, values)
 }
 
