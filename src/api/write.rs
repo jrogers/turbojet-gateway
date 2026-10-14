@@ -1208,7 +1208,7 @@ mod tests {
         let credit = r#"{"reason":"testing","set":{"credit":5}}"#;
         let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, credit).await;
         assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
-        assert_eq!(answer.body, serde_json::json!({ "table": { "credit": 5 }, "reload": null }));
+        assert_eq!(answer.body, serde_json::json!({ "table": { "credit": "5" }, "reload": null }));
         // What's wrong with its own table names only that: it's said.
         let negative = r#"{"reason":"testing","set":{"credit":-5}}"#;
         let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, negative).await;
@@ -1277,7 +1277,7 @@ mod tests {
 
         let body =
             fixture.admin("PATCH", DEFAULTS, &set(r#"{"credit":1000,"symbols":["AAPL"]}"#), StatusCode::OK).await;
-        assert_eq!(body["table"], serde_json::json!({ "symbols": ["AAPL"], "credit": 1000 }));
+        assert_eq!(body["table"], serde_json::json!({ "symbols": ["AAPL"], "credit": "1000" }));
         assert_eq!(body["reload"]["config"]["routes"], 1);
         assert_eq!(fixture.config(), format!("{top}\n[risk.defaults]\ncredit = 1000\nsymbols = [\"AAPL\"]\n"));
         assert_eq!(funda().credit, Some(Decimal::from(1000)));

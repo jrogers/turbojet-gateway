@@ -95,7 +95,7 @@ Notable changes to Jetbridge.
 - More of the API: a routing dry run (`GET /api/routes/test`); setting and resetting a session's
   sequence numbers; asking a venue where an order stands (`POST /api/orders/{order_id}/status`),
   with an `unknown_at_venue` alarm when it doesn't know a live order; the risk limits as
-  configured (`GET /api/risk/limits`), and editing them, which rewrites `jetbridge.toml`'s table
+  configured (`GET /api/risk/limits`, amounts as decimal strings), and editing them, which rewrites `jetbridge.toml`'s table
   in place and reloads. The order detail has the venue's OrderID.
 - A venue's ExecutionReport saying it doesn't know an order (Status, Rejected, OrdRejReason 5) no
   longer rejects the order: it raises the `unknown_at_venue` alarm, and the order stays live.

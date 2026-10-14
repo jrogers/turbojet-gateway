@@ -384,7 +384,9 @@ pub struct RiskTable {
 }
 
 /// A decimal as TOML writes it: a float goes through its shortest exact form, so `0.1` is 0.1.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Written as a decimal string, as the API writes every decimal, so no digit is lost to a
+/// reader's floats.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum Amount {
     Integer(i64),
@@ -453,17 +455,28 @@ impl RiskTable {
 }
 
 impl Amount {
-    fn positive(&self) -> Result<Decimal, String> {
-        let text = match self {
+    /// The amount as text, as the loader parses it.
+    fn text(&self) -> String {
+        match self {
             Self::Integer(integer) => integer.to_string(),
             Self::Float(float) => float.to_string(),
             Self::Text(text) => text.clone(),
-        };
+        }
+    }
+
+    fn positive(&self) -> Result<Decimal, String> {
+        let text = self.text();
         let amount: Decimal = text.parse().map_err(|_| format!("{text:?} is not a decimal"))?;
         if amount <= Decimal::ZERO {
             return Err(format!("{text} is not positive"));
         }
         Ok(amount)
+    }
+}
+
+impl Serialize for Amount {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text())
     }
 }
 

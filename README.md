@@ -572,8 +572,9 @@ jetbridge user remove alice --users users.toml
 ### Editing the risk limits
 
 `GET /api/risk/limits` answers the limits as `jetbridge.toml` writes them, `{"defaults": {...},
-"clients": {"FUNDA": {...}}}`, each table with only the keys it sets; `GET /api/risk` has them as
-in force, merged. An admin changes them with a `PATCH` to `/api/risk/limits/defaults` or
+"clients": {"FUNDA": {...}}}`, each table with only the keys it sets, amounts as decimal strings
+(`"1000"`, `"5.5"`) however the file writes them; `GET /api/risk` has them as in force, merged.
+An admin changes them with a `PATCH` to `/api/risk/limits/defaults` or
 `/api/risk/limits/client/{comp_id}`:
 
 ```json

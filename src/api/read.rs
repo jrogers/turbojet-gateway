@@ -416,7 +416,7 @@ pub(super) async fn risk(axum::extract::State(state): AxumState, caller: Caller)
 }
 
 /// `GET /api/risk/limits`: the limits in force as the configuration writes them, `{defaults,
-/// clients: {COMPID: ...}}`, each table with only the keys it sets. A client's keys replace the
+/// clients: {COMPID: ...}}`, each table with only the keys it sets, amounts as decimal strings. A client's keys replace the
 /// defaults'; `GET /api/risk` shows the limits merged. A scoped caller's clients' only, and the
 /// defaults.
 pub(super) async fn risk_limits(
@@ -910,7 +910,7 @@ pub(super) mod tests {
         let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
         assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);
         let expected = serde_json::json!({
-            "defaults": { "max_order_qty": 1000, "price_band": 5.5, "symbols": ["AAPL"] },
+            "defaults": { "max_order_qty": "1000", "price_band": "5.5", "symbols": ["AAPL"] },
             "clients": { "FUNDA": { "max_notional": "250000.50", "self_trade": true } },
         });
         assert_eq!(fixture.ok("/api/risk/limits").await, expected);
@@ -1119,7 +1119,7 @@ pub(super) mod tests {
             assert!(risk["defaults"].is_object(), "{risk}");
             assert!(risk["references"].is_object(), "{risk}");
             let limits = read(bearer, "/api/risk/limits").await;
-            assert_eq!(limits["defaults"], serde_json::json!({ "max_order_qty": 1000 }));
+            assert_eq!(limits["defaults"], serde_json::json!({ "max_order_qty": "1000" }));
             assert_eq!(keys(&limits["clients"]), comp_ids);
         }
     }
