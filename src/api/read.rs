@@ -260,8 +260,9 @@ async fn stored_orders(
     range: Range<DateTime<Utc>>,
     limit: usize,
 ) -> Result<Json<OrdersPage>, ApiError> {
-    let after = query.after.as_deref().map(decode_after).transpose()?;
+    // The database first, so a range without one is refused for that whatever its `after`.
     let store = state.service()?.store().cloned().ok_or_else(|| bad("no [database]: only the current day is kept"))?;
+    let after = query.after.as_deref().map(decode_after).transpose()?;
     let stored = StoredOrders {
         from: range.start,
         to: range.end,
@@ -692,9 +693,12 @@ pub(super) mod tests {
         // 31 days exactly is taken.
         fixture.ok(&format!("/api/orders?{from}&to=2026-11-01T00:00:00Z")).await;
 
-        let answer = fixture_with("").await.get(&format!("/api/orders?{range}")).await;
-        assert_eq!(answer.status, StatusCode::BAD_REQUEST);
-        assert_eq!(answer.body["error"], "no [database]: only the current day is kept");
+        let without = fixture_with("").await;
+        for query in [range.to_string(), format!("{range}&after=JB1")] {
+            let answer = without.get(&format!("/api/orders?{query}")).await;
+            assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+            assert_eq!(answer.body["error"], "no [database]: only the current day is kept", "{query}");
+        }
     }
 
     /// `to` is now by default: a range from an hour ago is taken, and holds none of the past
