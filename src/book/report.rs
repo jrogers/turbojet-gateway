@@ -46,8 +46,12 @@ impl Book {
         }
         tracing::error!(%venue, %downstream, %exec_id, order = %order.name, "venue doesn't know a live order");
         let text = format!("venue {venue} doesn't know live order {} ({downstream}, ExecID {exec_id})", order.name);
-        self.unknown_at_venue.insert(order.id);
-        self.alarm(AlarmKind::UnknownAtVenue, Some(order.client.clone()), text);
+        let (id, client) = (order.id, order.client.clone());
+        // Touched for its `order` event, which carries the mark: a console shows it, and Resolve.
+        if self.unknown_at_venue.insert(id) {
+            self.touched.orders.insert(id);
+        }
+        self.alarm(AlarmKind::UnknownAtVenue, Some(client), text);
     }
 
     /// See [`Input::Resolve`](super::Input::Resolve). The order's requests the venue never
@@ -181,8 +185,11 @@ impl Book {
         let Some(why) = dropped(venue, order, answered, report) else {
             return false;
         };
-        if why != Dropped::Stale || (report.exec_type == ExecType::Status && report.downstream == order.downstream) {
-            self.unknown_at_venue.remove(&id);
+        let knows =
+            why != Dropped::Stale || (report.exec_type == ExecType::Status && report.downstream == order.downstream);
+        // Touched for its `order` event, as when marked.
+        if knows && self.unknown_at_venue.remove(&id) {
+            self.touched.orders.insert(id);
         }
         match why {
             Dropped::Repeat { changed: true } => {

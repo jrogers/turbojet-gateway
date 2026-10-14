@@ -766,7 +766,11 @@ fn a_status_answer_that_the_venue_doesnt_know_the_order_raises_an_alarm() {
     let mut out = Vec::new();
     book.handle(unknown("1"), &mut out);
     assert!(out.is_empty());
-    assert!(book.take_changes().is_empty());
+    // The order's row only, written as it was: touched for its `order` event.
+    let changes = book.take_changes();
+    let [row] = changes.orders.as_slice() else { panic!("{changes:?}") };
+    assert_eq!(row.order, *book.order(OrderId(1)).unwrap());
+    assert!(changes.sent.is_empty() && changes.cl_ord_ids.is_empty(), "{changes:?}");
     assert_eq!((book.snapshot(), book.risk_view()), (before, risk));
     let events: Vec<GatewayEvent> = book.take_events().collect();
     let [GatewayEvent::Alarm(alarm)] = events.as_slice() else { panic!("{events:?}") };
@@ -818,6 +822,34 @@ fn a_report_from_the_venue_unmarks_an_order_it_said_it_didnt_know() {
     run(&mut book, unknown("1"));
     run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));
     assert!(!book.is_unknown_at_venue(OrderId(1)));
+}
+
+/// `input` handled, and the views of the orders it touched: what the gateway sends as `order`
+/// events.
+fn touched_by(book: &mut Book, input: Input) -> Vec<OrderView> {
+    book.handle(input, &mut Vec::new());
+    let views = book.touched_views();
+    let changes = book.take_changes();
+    book.mirror.apply(changes);
+    views
+}
+
+/// Marking an order touches it, and so does a dropped repeat unmarking it, so each sends an
+/// `order` event carrying the mark: the console shows it, and Resolve, without a snapshot. The
+/// same answer again, the mark unchanged, touches nothing.
+#[test]
+fn the_mark_changing_sends_the_order() {
+    let mut book = book();
+    new_order(&mut book, "C1");
+    run(&mut book, venue_report("1", Status::New, 0, 0));
+    let views = touched_by(&mut book, unknown("1"));
+    let [view] = views.as_slice() else { panic!("{views:?}") };
+    assert!(view.unknown_at_venue, "{view:?}");
+    assert_eq!(touched_by(&mut book, unknown("1")), []);
+    let views = touched_by(&mut book, venue_report_as("1", ExecType::Status, Status::New, 0, 0));
+    let [view] = views.as_slice() else { panic!("{views:?}") };
+    assert!(!view.unknown_at_venue, "{view:?}");
+    assert_eq!(touched_by(&mut book, venue_report_as("1", ExecType::Status, Status::New, 0, 0)), []);
 }
 
 /// A stale resend that also repeats where the order stands leaves the mark: the order's own

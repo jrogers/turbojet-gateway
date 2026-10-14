@@ -1171,17 +1171,20 @@ async fn an_order_unknown_at_its_venue_is_resolved() {
     let mut unknown = report(&order, "E-unknown", (v44::ExecType::OrderStatus, v44::OrdStatus::Rejected), (0, 0));
     unknown.ord_rej_reason = Some(v44::OrdRejReason::UnknownOrder.into());
     setup.venue.send(unknown.to_message());
+    // The alarm, and an order event carrying the mark, for a console to show Resolve by.
     let alarm = timeout(WAIT, async {
-        loop {
+        let (mut alarmed, mut marked) = (false, false);
+        while !(alarmed && marked) {
             match gateway_events.recv().await {
-                Ok(GatewayEvent::Alarm(alarm)) if alarm.kind == AlarmKind::UnknownAtVenue => return,
+                Ok(GatewayEvent::Alarm(alarm)) if alarm.kind == AlarmKind::UnknownAtVenue => alarmed = true,
+                Ok(GatewayEvent::Order(view)) if view.unknown_at_venue => marked = true,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("the gateway's events closed"),
-                // Other events, and a lag: the alarm may be yet to come.
+                // Other events, and a lag: those looked for may be yet to come.
                 _ => {}
             }
         }
     });
-    alarm.await.expect("no unknown_at_venue alarm");
+    alarm.await.expect("no unknown_at_venue alarm and order event");
 
     let response = post(addr, &path("resolve"), &token, reason).await;
     assert!(response.starts_with("HTTP/1.1 204"), "{response}");
