@@ -231,18 +231,19 @@ impl Store {
         work: impl AsyncFnOnce(&mut AnyConnection) -> io::Result<T>,
     ) -> io::Result<T> {
         let mut held = self.writer.lock().await;
-        if held.is_none() {
-            *held = Some(self.pool.acquire().await.map_err(database(doing))?);
-        }
-        let connection = held.as_mut().expect("taken above");
+        let connection = match held.take() {
+            Some(connection) => connection,
+            None => self.pool.acquire().await.map_err(database(doing))?,
+        };
+        let connection = held.insert(connection);
         let result = work(connection).await;
         let broken = match &result {
             Ok(_) => false,
             Err(e) if e.kind() == io::ErrorKind::TimedOut => true,
             Err(_) => timed(doing, async { connection.ping().await.map_err(database(doing)) }).await.is_err(),
         };
-        if broken && let Some(connection) = held.take() {
-            drop(connection.detach());
+        if broken {
+            drop(held.take().map(PoolConnection::detach));
         }
         result
     }

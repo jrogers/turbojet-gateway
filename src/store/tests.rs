@@ -73,8 +73,8 @@ impl Relay {
         let (upstream, connections) = (upstream.to_string(), silent.clone());
         tokio::spawn(async move {
             loop {
-                let (client, _) = listener.accept().await.unwrap();
-                let server = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                let Ok((client, _)) = listener.accept().await else { continue };
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else { continue };
                 let flag = Arc::new(AtomicBool::new(false));
                 connections.lock().unwrap().push(flag.clone());
                 let (client_read, client_write) = client.into_split();
@@ -511,12 +511,15 @@ async fn a_connection_silent_in_a_write_fails_it_and_the_next_commits() {
         let (store, second) = (store.clone(), second.clone());
         async move { store.write(&[second]).await }
     });
-    while store.hooks.gate_in_transaction.receiver_count() == 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
+    let limit = DATABASE_TIMEOUT * 3;
+    let held = async {
+        while store.hooks.gate_in_transaction.receiver_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(limit, held).await.expect("the write held at the gate");
     relay.silence();
     store.hooks.gate_in_transaction.send_replace(true);
-    let limit = DATABASE_TIMEOUT * 3;
     let failed = tokio::time::timeout(limit, writing).await.expect("not held by the silent connection").unwrap();
     assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::TimedOut);
     let retried = tokio::time::timeout(limit, store.write(std::slice::from_ref(&second))).await;
