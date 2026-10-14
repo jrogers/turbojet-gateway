@@ -158,10 +158,10 @@ export default function Sessions({ me }: { me: Me }) {
                           {me.role === 'admin' && (
                             <>
                               <button type="button" onClick={() => choose('sequence', session)}>
-                                Set numbers
+                                Set numbers…
                               </button>
-                              <button type="button" onClick={() => choose('reset', session)}>
-                                Reset to 1
+                              <button type="button" className="danger" onClick={() => choose('reset', session)}>
+                                Reset to 1…
                               </button>
                             </>
                           )}
@@ -210,14 +210,18 @@ export default function Sessions({ me }: { me: Me }) {
           {action.kind === 'sequence' && (
             <>
               <p>Either or both: one left empty is kept.</p>
+              <p>Lowering next in while logged on can have messages accepted again; pause the session first to be safe.</p>
               <label>
                 Next in
-                <input type="number" min={1} value={nextIn} onChange={(e) => setNextIn(e.target.value)} />
+                <input type="text" inputMode="numeric" value={nextIn} onChange={(e) => setNextIn(e.target.value)} />
               </label>
               <label>
                 Next out
-                <input type="number" min={1} value={nextOut} onChange={(e) => setNextOut(e.target.value)} />
+                <input type="text" inputMode="numeric" value={nextOut} onChange={(e) => setNextOut(e.target.value)} />
               </label>
+              {[nextIn, nextOut].some((text) => Number.isNaN(seqNumber(text))) && (
+                <p className="muted">Each is a whole number, 1 or more.</p>
+              )}
             </>
           )}
           {action.kind === 'reset' && (

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
-import Routes from './Routes.tsx'
+import Routes, { CHANGED } from './Routes.tsx'
 import { initial, LiveContext } from './store.ts'
 import type { Me, RouteView } from './types.ts'
 
@@ -156,4 +156,24 @@ test('a refused read of the rules says why and shows none', async () => {
   expect((await screen.findByRole('alert')).textContent).toBe('nope')
   expect(screen.queryByRole('table')).toBeNull()
   expect(within(screen.getByRole('region', { name: 'Dry run' })).getByRole('button', { name: 'Test' })).toBeTruthy()
+})
+
+test("an answer whose rule isn't the table's says the rules changed, and reads them again", async () => {
+  const moved: RouteView = { client: null, ex_destination: null, symbol: 'AAPL', venue: 'NYSE', reject: null }
+  // The table as read first, then as another admin's reload has made it.
+  const tables = [RULES, [moved, ...RULES]]
+  const calls = serve({
+    '/api/routes': () => json(tables.shift()),
+    '/api/routes/test?client=FUNDA&symbol=AAPL': () => json({ rule: 0, route: moved, target: { venue: 'NYSE' } }),
+  })
+  render(show())
+  await screen.findByRole('table')
+  await dryRun('FUNDA', '', 'AAPL')
+  expect(screen.getByRole('alert').textContent).toBe(CHANGED)
+  expect(screen.getByRole('status').textContent).toBe('')
+  expect(screen.getByRole('table').querySelector('.matched')).toBeNull()
+  // Read again: the new rule's there.
+  await screen.findByText('NYSE')
+  expect(rows()).toHaveLength(4)
+  expect(calls).toEqual(['/api/routes', '/api/routes/test?client=FUNDA&symbol=AAPL', '/api/routes'])
 })
