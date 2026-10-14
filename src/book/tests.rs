@@ -771,6 +771,7 @@ fn a_status_answer_that_the_venue_doesnt_know_the_order_raises_an_alarm() {
     let events: Vec<GatewayEvent> = book.take_events().collect();
     let [GatewayEvent::Alarm(alarm)] = events.as_slice() else { panic!("{events:?}") };
     assert_eq!(alarm.kind, AlarmKind::UnknownAtVenue);
+    assert_eq!(alarm.client.as_ref(), Some(&book.order(OrderId(1)).unwrap().client));
 
     // Asked under 1, answered after a replace to 1-1 was accepted: the venue knows the order by
     // 1-1 now, so no alarm.
@@ -920,6 +921,7 @@ fn a_fill_on_a_resolved_order_raises_an_alarm() {
     let events: Vec<GatewayEvent> = book.take_events().collect();
     let [GatewayEvent::Alarm(alarm)] = events.as_slice() else { panic!("{events:?}") };
     assert_eq!(alarm.kind, AlarmKind::FillOnDoneOrder);
+    assert_eq!(alarm.client.as_ref(), Some(&book.order(OrderId(1)).unwrap().client));
     assert_eq!(alarm.text, "venue NASDAQ reported done order 1 filled 60 (ExecID V1); not applied");
     // A resend at or below the order's CumQty is no news.
     run(&mut book, venue_report("1", Status::PartiallyFilled, 40, 40));

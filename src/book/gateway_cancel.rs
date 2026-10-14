@@ -124,6 +124,7 @@ impl Book {
         else {
             self.alarm(
                 AlarmKind::Orphan,
+                None,
                 format!("venue {venue} holds request {downstream}, not a cancel's or replace's"),
             );
             return tracing::error!(%venue, %downstream, "orphaned request isn't a cancel's or replace's");
@@ -134,6 +135,7 @@ impl Book {
         // Each way on is logged at error, with what's done about it.
         self.alarm(
             AlarmKind::Orphan,
+            None,
             format!("venue {venue} holds request {downstream}, which the database never had"),
         );
         // ponytail: a walk of every order per orphan, at a start only; a map by name if many.
@@ -266,7 +268,8 @@ impl Book {
             gateway.stuck = true;
             let text = format!("gateway gave up cancelling order {} after {} tries", order.name, gateway.tries);
             tracing::error!(order = %order.name, tries = gateway.tries, "gateway gave up cancelling an order");
-            return self.alarm(AlarmKind::StuckCancel, text);
+            let client = Some(order.client.clone());
+            return self.alarm(AlarmKind::StuckCancel, client, text);
         }
         self.send_gateway_cancel(id, out);
     }
@@ -310,7 +313,8 @@ impl Book {
             gateway.stuck = true;
             let text = format!("gateway gave up cancelling order {}: the venue says it's done or unknown", order.name);
             tracing::error!(order = %order.name, "gateway gave up cancelling an order the venue says is done or unknown");
-            return self.alarm(AlarmKind::StuckCancel, text);
+            let client = Some(order.client.clone());
+            return self.alarm(AlarmKind::StuckCancel, client, text);
         }
         self.retry_gateway_cancel(id, out);
     }

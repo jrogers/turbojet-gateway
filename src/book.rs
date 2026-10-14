@@ -851,10 +851,10 @@ impl Book {
         self.unavailable = unavailable;
         if unavailable {
             tracing::error!("{BEHIND}");
-            self.alarm(AlarmKind::GatewayUnavailable, BEHIND.to_owned());
+            self.alarm(AlarmKind::GatewayUnavailable, None, BEHIND.to_owned());
         } else {
             tracing::info!("{CAUGHT_UP}");
-            self.alarm(AlarmKind::GatewayAvailable, CAUGHT_UP.to_owned());
+            self.alarm(AlarmKind::GatewayAvailable, None, CAUGHT_UP.to_owned());
         }
     }
 

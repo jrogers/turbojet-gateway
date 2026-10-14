@@ -327,7 +327,27 @@ pub enum GatewayEvent {
 pub struct Alarm {
     pub time: DateTime<Utc>,
     pub kind: AlarmKind,
+    /// The client of the order the alarm is about; `null` for one about no order.
+    pub client: Option<ClientId>,
     pub text: String,
+}
+
+impl Alarm {
+    /// Whether a viewer of the clients of `comp_ids` (`None`, every client's) is shown the alarm.
+    /// The gateway's availability and a venue's store reset concern every client, so every viewer;
+    /// an alarm about an order, its client's viewers. An orphan or an unknown order could be any
+    /// client's, and its text names it, so only an unscoped viewer sees one. The match is
+    /// exhaustive so that a new kind decides too.
+    pub fn visible_to(&self, comp_ids: Option<&[String]>) -> bool {
+        let Some(comp_ids) = comp_ids else { return true };
+        match self.kind {
+            AlarmKind::GatewayUnavailable | AlarmKind::GatewayAvailable | AlarmKind::VenueStoreReset => true,
+            AlarmKind::StuckCancel | AlarmKind::Overfill | AlarmKind::UnknownAtVenue | AlarmKind::FillOnDoneOrder => {
+                self.client.as_ref().is_some_and(|client| is_one_of(client.comp_id(), comp_ids))
+            }
+            AlarmKind::Orphan | AlarmKind::UnknownOrder => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -371,8 +391,9 @@ impl Book {
         self.events.drain(..)
     }
 
-    /// Records an alarm of `kind` at the inputs' time, for [`take_events`](Self::take_events).
-    pub(super) fn alarm(&mut self, kind: AlarmKind, text: String) {
-        self.events.push(GatewayEvent::Alarm(Alarm { time: self.now, kind, text }));
+    /// Records an alarm of `kind` about an order of `client`, if any, at the inputs' time, for
+    /// [`take_events`](Self::take_events).
+    pub(super) fn alarm(&mut self, kind: AlarmKind, client: Option<ClientId>, text: String) {
+        self.events.push(GatewayEvent::Alarm(Alarm { time: self.now, kind, client, text }));
     }
 }

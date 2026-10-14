@@ -262,7 +262,7 @@ impl Book {
         out: &mut Vec<Output>,
     ) {
         let Some(sent) = self.downstream.get(downstream).cloned() else {
-            self.alarm(AlarmKind::UnknownOrder, format!("venue {venue} refused unknown request {downstream}"));
+            self.alarm(AlarmKind::UnknownOrder, None, format!("venue {venue} refused unknown request {downstream}"));
             return tracing::warn!(%venue, %downstream, "cancel reject for an unknown request");
         };
         let id = sent.order;

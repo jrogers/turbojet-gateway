@@ -20,7 +20,7 @@ impl Book {
         let (downstream, exec_id) = (&report.downstream, &report.exec_id);
         tracing::warn!(%venue, %downstream, %exec_id, "execution report for an unknown order");
         let text = format!("venue {venue} reported on unknown order {downstream} (ExecID {exec_id})");
-        self.alarm(AlarmKind::UnknownOrder, text);
+        self.alarm(AlarmKind::UnknownOrder, None, text);
     }
 
     /// The venue's answer to [`Input::VenueStatusRequest`](super::Input::VenueStatusRequest) for an
@@ -47,7 +47,7 @@ impl Book {
         tracing::error!(%venue, %downstream, %exec_id, order = %order.name, "venue doesn't know a live order");
         let text = format!("venue {venue} doesn't know live order {} ({downstream}, ExecID {exec_id})", order.name);
         self.unknown_at_venue.insert(order.id);
-        self.alarm(AlarmKind::UnknownAtVenue, text);
+        self.alarm(AlarmKind::UnknownAtVenue, Some(order.client.clone()), text);
     }
 
     /// See [`Input::Resolve`](super::Input::Resolve). The order's requests the venue never
@@ -74,10 +74,11 @@ impl Book {
     fn overfill(&mut self, venue: &VenueId, report: &VenueReport, id: OrderId, qty: Decimal) {
         let (downstream, exec_id, cum_qty) = (&report.downstream, &report.exec_id, report.cum_qty);
         tracing::error!(%venue, %downstream, %exec_id, %cum_qty, "overfill");
-        let name = &self.orders[&id].name;
+        let order = &self.orders[&id];
+        let name = &order.name;
         let text =
             format!("venue {venue} reported order {name} filled {cum_qty} of {qty} (ExecID {exec_id}); not applied");
-        self.alarm(AlarmKind::Overfill, text);
+        self.alarm(AlarmKind::Overfill, Some(order.client.clone()), text);
     }
 
     pub(super) fn venue_report(&mut self, venue: &VenueId, mut report: VenueReport, out: &mut Vec<Output>) {
@@ -200,9 +201,10 @@ impl Book {
     fn fill_on_done_order(&mut self, venue: &VenueId, report: &VenueReport, id: OrderId) {
         let (downstream, exec_id, cum_qty) = (&report.downstream, &report.exec_id, report.cum_qty);
         tracing::error!(%venue, %downstream, %exec_id, %cum_qty, "fill on a done order");
-        let name = &self.orders[&id].name;
+        let order = &self.orders[&id];
+        let name = &order.name;
         let text = format!("venue {venue} reported done order {name} filled {cum_qty} (ExecID {exec_id}); not applied");
-        self.alarm(AlarmKind::FillOnDoneOrder, text);
+        self.alarm(AlarmKind::FillOnDoneOrder, Some(order.client.clone()), text);
     }
 }
 

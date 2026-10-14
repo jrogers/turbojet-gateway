@@ -586,11 +586,17 @@ impl Gateway {
         (orders, state.book.blocked().to_vec(), state.book.unavailable())
     }
 
-    /// Publishes an alarm the gateway raises outside the book, if anyone listens.
+    /// Publishes an alarm the gateway raises outside the book, if anyone listens: about no
+    /// client's order.
     fn alarm(&self, kind: AlarmKind, text: impl FnOnce() -> String) {
         if self.events.receiver_count() > 0 {
             // An error only once every listener has gone since the check.
-            let _ = self.events.send(GatewayEvent::Alarm(Alarm { time: self.clock.now(), kind, text: text() }));
+            let _ = self.events.send(GatewayEvent::Alarm(Alarm {
+                time: self.clock.now(),
+                kind,
+                client: None,
+                text: text(),
+            }));
         }
     }
 
@@ -2997,10 +3003,10 @@ pub(crate) mod tests {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
     }
 
-    /// The kinds of the alarms published so far.
-    fn alarms(events: &mut Events) -> Vec<AlarmKind> {
+    /// The kinds of the alarms published so far, and the CompIDs of their clients.
+    fn alarms(events: &mut Events) -> Vec<(AlarmKind, Option<String>)> {
         let alarms = published(events).into_iter().filter_map(|event| match event {
-            GatewayEvent::Alarm(alarm) => Some(alarm.kind),
+            GatewayEvent::Alarm(alarm) => Some((alarm.kind, alarm.client.map(|client| client.comp_id().to_string()))),
             _ => None,
         });
         alarms.collect()
@@ -3064,11 +3070,16 @@ pub(crate) mod tests {
         use crate::book::Alarm;
         let blocked = serde_json::to_value(GatewayEvent::Blocked { scope: Scope::All }).unwrap();
         assert_eq!(blocked, serde_json::json!({"type": "blocked", "scope": "all"}));
-        let alarm = Alarm { time: at("2026-10-11T12:00:00Z"), kind: AlarmKind::StuckCancel, text: "t".into() };
+        let time = at("2026-10-11T12:00:00Z");
+        let alarm = Alarm { time, kind: AlarmKind::StuckCancel, client: Some("FUNDA".into()), text: "t".into() };
         let alarm = serde_json::to_value(GatewayEvent::Alarm(alarm)).unwrap();
-        let want =
-            serde_json::json!({"type": "alarm", "time": "2026-10-11T12:00:00Z", "kind": "stuck_cancel", "text": "t"});
+        let client = "FIX.4.4:JETBRIDGE->FUNDA";
+        let want = serde_json::json!(
+            {"type": "alarm", "time": "2026-10-11T12:00:00Z", "kind": "stuck_cancel", "client": client, "text": "t"}
+        );
         assert_eq!(alarm, want);
+        let alarm = Alarm { time, kind: AlarmKind::Orphan, client: None, text: "t".into() };
+        assert_eq!(serde_json::to_value(GatewayEvent::Alarm(alarm)).unwrap()["client"], serde_json::Value::Null);
         let gateway = gateway();
         book_order(&gateway);
         let view = gateway.lock().book.touched_views().remove(0);
@@ -3092,7 +3103,7 @@ pub(crate) mod tests {
             venue_order_id: None,
         };
         gateway.handle(refused);
-        assert_eq!(alarms(&mut events), [AlarmKind::StuckCancel]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::StuckCancel, Some("FUNDA".into()))]);
     }
 
     #[tokio::test]
@@ -3101,7 +3112,7 @@ pub(crate) mod tests {
         let mut events = gateway.subscribe();
         let input = Version::Fix44.venue_input(&VENUE.into(), &venue_report("99", 0)).unwrap().unwrap();
         gateway.handle(input);
-        assert_eq!(alarms(&mut events), [AlarmKind::UnknownOrder]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::UnknownOrder, None)]);
     }
 
     #[tokio::test]
@@ -3111,7 +3122,7 @@ pub(crate) mod tests {
         let mut events = gateway.subscribe();
         let input = Version::Fix44.venue_input(&VENUE.into(), &venue_report("1", 150)).unwrap().unwrap();
         gateway.handle(input);
-        assert_eq!(alarms(&mut events), [AlarmKind::Overfill]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::Overfill, Some("FUNDA".into()))]);
         assert_eq!(gateway.lock().book.order(OrderId(1)).unwrap().cum_qty, Decimal::ZERO);
     }
 
@@ -3123,11 +3134,11 @@ pub(crate) mod tests {
         book_order(&gateway);
         let mut events = gateway.subscribe();
         gateway.handle(Input::Orphan { venue: VENUE.into(), downstream: "1-1".into(), replace: None });
-        assert_eq!(alarms(&mut events), [AlarmKind::Orphan]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::Orphan, None)]);
         gateway.lock().orphan_ids.insert("X1".into());
         let input = Version::Fix44.venue_input(&VENUE.into(), &venue_report("X1", 0)).unwrap().unwrap();
         assert!(gateway.orphan_answer(&VENUE.into(), &input));
-        assert_eq!(alarms(&mut events), [AlarmKind::Orphan]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::Orphan, None)]);
     }
 
     #[tokio::test]
@@ -3138,7 +3149,7 @@ pub(crate) mod tests {
         let unsent = orphans::Unsent { downstreams: vec!["1".into()], next_outgoing: u64::MAX };
         let inputs = gateway.unsent_inputs(&VENUE.into(), unsent, &sessions.venue.handle());
         assert!(matches!(inputs[..], [Input::SendFailed { .. }]));
-        assert_eq!(alarms(&mut events), [AlarmKind::VenueStoreReset]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::VenueStoreReset, None)]);
     }
 
     /// Raised once as the database falls behind, by a tick's step with no input, and once as it
@@ -3158,12 +3169,12 @@ pub(crate) mod tests {
         timeout(Duration::from_secs(5), waited).await.expect("never unavailable");
         gateway.handle_all([]);
         gateway.handle_all([]);
-        assert_eq!(alarms(&mut events), [AlarmKind::GatewayUnavailable]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::GatewayUnavailable, None)]);
         assert!(gateway.unavailable());
         store.hooks.gate.send_replace(true);
         timeout(Duration::from_secs(5), gateway.committed()).await.expect("not committed");
         gateway.handle_all([]);
-        assert_eq!(alarms(&mut events), [AlarmKind::GatewayAvailable]);
+        assert_eq!(alarms(&mut events), [(AlarmKind::GatewayAvailable, None)]);
         assert!(!gateway.unavailable());
     }
 
