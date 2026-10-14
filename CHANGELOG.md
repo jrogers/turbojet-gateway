@@ -125,7 +125,11 @@ Notable changes to Jetbridge.
 - A web console in `web/` (React and TypeScript, Node 24 or later to build), served at the API's
   address by a gateway built with `--features console`: the blotter live and past days', an
   order's page with cancel, status and resolve, the sessions with pause, resume and resend, and
-  the alarms, with a banner while the gateway is unavailable.
+  the alarms, with a banner while the gateway is unavailable. Also risk, with exposure, blocks,
+  the kill switch (confirmed by typing its scope) and, for admins, limit editing; message search;
+  setting and resetting sequence numbers, for admins; the routes with a dry run; and, for admins
+  without `--clients`, reload and the audit log. The nav shows each user what its role and
+  clients allow. A reason dialog returns the focus where it was when it closes.
 - Marking an order unknown at its venue, and clearing that mark, now sends an `order` event on the
   live socket: a console saw the change only at its next snapshot.
 - The first start of this version on a database indexes its requests sent by time, once, for

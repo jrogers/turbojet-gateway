@@ -6,14 +6,11 @@ knowing about is in [CAVEATS.md](CAVEATS.md).
 
 ## 1. Operator access
 
-The [API](README.md#api) covers sessions and their sequence numbers, the blotter and past days'
-orders, asking a venue for an order's status and resolving one it doesn't know, risk with the
-kill switch and limit editing, routes with a dry run, the message log with search, reload and the
-audit log. Still to do:
-
-- **Console** (L). The [console](README.md#console) shows the blotter, an order's page and the
-  sessions. Still to add: risk with the kill switch and limit editing, message search, setting
-  sequence numbers, and admin: routes with the dry run, reload and the audit log.
+The [API](README.md#api) and the [console](README.md#console) cover sessions and their sequence
+numbers, the blotter and past days' orders, asking a venue for an order's status and resolving one
+it doesn't know, risk with the kill switch and limit editing, routes with a dry run, the message
+log with search, reload and the audit log. Nothing is open here; where they fall short is in
+[CAVEATS.md](CAVEATS.md#operator-api).
 
 ## 2. Durability
 

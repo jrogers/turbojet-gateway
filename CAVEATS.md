@@ -416,6 +416,21 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   (`gateway_unavailable`, `gateway_available`, `venue_store_reset`), its new clients' too.
 - The sessions screen reads the sequence numbers every 5 seconds while it's open and the page
   shown: the live events don't carry them, so between reads they lag.
+- The risk screen reads the risk every 5 seconds while it's open and the page shown, and at each
+  snapshot and action: no live event carries notionals, so between reads they lag.
+- A limit edit from the risk screen rewrites `jetbridge.toml` and reloads: see
+  [Editing the limits over the API](#editing-the-limits-over-the-api).
+- The audit screen and Reload are for admins without `--clients` only, as the API allows: both
+  reach every client.
+- The audit screen can't page back: it shows the last `limit` entries from since, at most 1,000.
+  Older ones after since are read from the files in `audit_dir`.
+- The routes screen reads the rules again at each snapshot and at a reload from the console. A
+  SIGHUP, or another admin's reload, changes them unseen until a dry run's answer names a rule
+  that isn't the one shown: the console says so and reads them again.
+- The console reads the user's role again only at a live snapshot after the first. A reload that
+  changes a user's clients brings one within 10 seconds; one that changes only its role shows
+  after the socket reconnects or the page is reloaded. Until then the API refuses what the role no
+  longer allows (403).
 - With "working only" on, past the snapshot's 1,000 working orders the blotter pages upward from
   them: the snapshot holds the oldest, so "More" reads newer ones, which show at the top, not the
   bottom.

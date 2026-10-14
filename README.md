@@ -739,18 +739,47 @@ cargo build --release --features console
 Without the feature, the gateway serves the API only. The console's files are served with a
 Content-Security-Policy allowing only the gateway's own scripts, styles and connections.
 
-It has three screens, kept live by `GET /api/live`, with a banner while that socket is down:
+Its screens are kept live by `GET /api/live`, with a banner while that socket is down. Every user
+sees Orders, Sessions, Risk, Messages and Routes in the nav; an admin without `--clients` also sees
+Audit, and a Reload button in the header. A user with `--clients` sees and acts on only its clients,
+as the API narrows it. A reload that changes a user's clients shows at its live socket's next
+snapshot, when the console also reads the user's role again. Viewers read; operators and admins act,
+each action with a reason:
 
 - **Orders**, the blotter: the working orders, newest first, filtered by client, venue, symbol and
   status; with "working only" off, today's done orders too; with dates, past days' orders from the
   [database](#database), as they were read. Each links to its page.
 - **An order's page**: its fields, kept live; its requests to the venue; and its messages on both
   sides from the [message log](#message-log), a page at a time. An operator or admin can cancel it,
-  ask its venue for its status, and resolve it once the venue has said it doesn't know it, each
-  with a reason.
+  ask its venue for its status, and resolve it once the venue has said it doesn't know it.
 - **Sessions**: the client and venue sessions, their state and next sequence numbers, and whether
-  paused. An operator or admin can pause, resume, or ask for a resend from a sequence number, each
-  with a reason.
+  paused. An operator or admin can pause, resume, or ask for a resend from a sequence number. An
+  admin can also set the next sequence numbers, either or both, warned that lowering next in while
+  logged on can have messages accepted again, so pause the session first; or reset both to 1,
+  which works only while the session is disconnected and clears the messages kept for resends.
+  See [CAVEATS.md](CAVEATS.md#operator-api).
+- **Risk**: each session's open and filled notional beside its limits, the reference prices and the
+  blocks, read again every 5 seconds while the screen is open and the page shown. An operator or
+  admin can block a scope, lift a block, or pull the [kill switch](#kill-switch) for a scope, which
+  blocks it and cancels its working orders, confirmed by typing the scope. Below, the limits as
+  `jetbridge.toml` writes them, each client's table with only the keys it sets. An admin edits a
+  key, removes it, or adds or deletes a client's table, the defaults only without `--clients`; each
+  edit [rewrites the file and reloads](#editing-the-risk-limits), and shows the table as written and
+  what the reload took.
+- **Messages**: the [message log](#searching-the-message-log) searched by session, direction,
+  MsgTypes (`D,F`) and tag conditions, every one of which must hold, over a range from since to
+  until (UTC; a day after since if left empty) of 24 hours at most, with 100 sessions, MsgTypes
+  and tags at most together, and 1 to 1,000 a page (100 by default). "More" reads the next page,
+  and while the range's end is still to come, "Check for newer" reads what's been logged since.
+  Messages show as text, as on the wire.
+- **Routes**: the routing rules in the order they're tried, and a dry run: a client's CompID,
+  ExDestination and symbol, and the rule such an order would match, highlighted, with the venue it
+  would go to or the reject it would get. Routing only: blocks and risk aren't checked.
+- **Reload**, from the header: rereads the files, as SIGHUP does. What it took, or why it kept a
+  file, shows under the header on every screen until dismissed.
+- **Audit**: the [audit log](#audit-log), newest first, from a since (UTC; the start if empty), the
+  last 100 entries or up to 1,000 with a limit. It can't page back past those: a full read says
+  older ones are left out.
 
 Alarms show above every screen, newest first, the latest 100, each with its time, kind, client and
 text, until dismissed; the header counts those not dismissed. While the gateway is
