@@ -234,11 +234,11 @@ test('an action posts the reason with the CSRF token, reads the order again, and
 })
 
 test('cancel and status post to their own paths', async () => {
-  routes[`POST ${PATH}/cancel`] = () => new Response(null, { status: 204 })
+  routes[`POST ${PATH}/cancel`] = () => json({ committed: false }, 202)
   routes[`POST ${PATH}/status`] = () => new Response(null, { status: 202 })
   await show(who('admin'))
   for (const [button, status] of [
-    ['Cancel', 'Cancel sent to the venue.'],
+    ['Cancel', 'Cancel sent to the venue. Applied; not yet saved to the database.'],
     ['Ask status', 'Status asked of the venue; its answer comes as the order’s reports.'],
   ]) {
     fireEvent.click(screen.getByRole('button', { name: button }))

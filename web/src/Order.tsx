@@ -5,11 +5,11 @@ import MessageList from './MessageList.tsx'
 import Reason from './Reason.tsx'
 import { done, useLive } from './store.ts'
 import { utc } from './time.ts'
-import type { Me, OrderDetail } from './types.ts'
+import type { Committed, Me, OrderDetail } from './types.ts'
 
 type Action = 'cancel' | 'status' | 'resolve'
 
-const ACTIONS: Record<Action, { title: string; post: (orderId: string, reason: string) => Promise<void>; done: string }> = {
+const ACTIONS: Record<Action, { title: string; post: (orderId: string, reason: string) => Promise<Committed | void>; done: string }> = {
   cancel: { title: 'Cancel order', post: api.cancelOrder, done: 'Cancel sent to the venue.' },
   status: { title: 'Ask the venue for status', post: api.requestStatus, done: 'Status asked of the venue; its answer comes as the order’s reports.' },
   resolve: { title: 'Resolve order', post: api.resolve, done: 'Resolved: the order is canceled.' },
@@ -80,8 +80,8 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
 
   async function confirm(reason: string) {
     if (!action) return
-    await ACTIONS[action].post(orderId, reason)
-    setNotice(ACTIONS[action].done)
+    const answer = await ACTIONS[action].post(orderId, reason)
+    setNotice(api.outcome(ACTIONS[action].done, answer))
     refocus.current = true
     setReads((reads) => reads + 1)
   }

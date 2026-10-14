@@ -212,8 +212,16 @@ export interface RiskView {
   blocked: string[]
 }
 
+/**
+ * Whether an action has committed: `false` when the database didn't answer in time (202), the
+ * change in effect and committed when it does.
+ */
+export interface Committed {
+  committed: boolean
+}
+
 /** `api::write::Changed`: what a block or unblock answers. */
-export interface Changed {
+export interface Changed extends Committed {
   changed: boolean
 }
 

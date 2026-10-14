@@ -1,6 +1,7 @@
 import type {
   AuditEntry,
   Changed,
+  Committed,
   EditedView,
   LimitsSet,
   Me,
@@ -162,17 +163,20 @@ export const sequence = (id: string, reason: string, numbers: { next_incoming?: 
 export const reset = (id: string, reason: string) => request<Numbers>('POST', `/api/sessions/${segment(id)}/reset`, { reason })
 /** [unscoped admin] Rereads the files; 422, saying why, when one was kept. */
 export const reload = (reason: string) => request<ReloadView>('POST', '/api/reload', { reason })
+/** A 204, committed, as a 202's `{committed: false}` says it. */
+const committed = (answer: Committed | undefined): Committed => answer ?? { committed: true }
 export const cancelOrder = (orderId: string, reason: string) =>
-  request<void>('POST', `/api/orders/${segment(orderId)}/cancel`, { reason })
+  request<Committed | undefined>('POST', `/api/orders/${segment(orderId)}/cancel`, { reason }).then(committed)
 export const requestStatus = (orderId: string, reason: string) =>
   request<void>('POST', `/api/orders/${segment(orderId)}/status`, { reason })
 export const resolve = (orderId: string, reason: string) =>
-  request<void>('POST', `/api/orders/${segment(orderId)}/resolve`, { reason })
+  request<Committed | undefined>('POST', `/api/orders/${segment(orderId)}/resolve`, { reason }).then(committed)
 // A scope is `all`, `comp:COMPID` or `session:SESSION`, as written.
 export const block = (scope: string, reason: string) => request<Changed>('POST', '/api/risk/block', { reason, scope })
 export const unblock = (scope: string, reason: string) => request<Changed>('POST', '/api/risk/unblock', { reason, scope })
-/** The kill switch: blocks `scope` and cancels its orders; 204. */
-export const cancelAll = (scope: string, reason: string) => request<void>('POST', '/api/risk/cancel-all', { reason, scope })
+/** The kill switch: blocks `scope` and cancels its orders. */
+export const cancelAll = (scope: string, reason: string) =>
+  request<Committed | undefined>('POST', '/api/risk/cancel-all', { reason, scope }).then(committed)
 // The limit edits [admin]: each writes `jetbridge.toml` and reloads. An amount goes as a decimal
 // string, which keeps every digit.
 export const setDefaultLimits = (reason: string, set: LimitsSet) =>
@@ -182,6 +186,10 @@ export const setClientLimits = (compId: string, reason: string, set: LimitsSet) 
   request<EditedView>('PATCH', `/api/risk/limits/client/${segment(compId)}`, { reason, set })
 export const deleteClientLimits = (compId: string, reason: string) =>
   request<EditedView>('DELETE', `/api/risk/limits/client/${segment(compId)}`, { reason })
+
+/** An action's outcome, `done`, saying so if the answer says it isn't committed yet. */
+export const outcome = (done: string, answer: Committed | void) =>
+  answer?.committed === false ? `${done} Applied; not yet saved to the database.` : done
 
 /** What a failure says: an `Error`'s message, or anything else as text. */
 export const message = (e: unknown) => (e instanceof Error ? e.message : String(e))

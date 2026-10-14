@@ -87,14 +87,14 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
     if (!action) return
     const { kind, scope } = action
     if (kind === 'cancel-all') {
-      await api.cancelAll(scope, reason)
-      setDone(`Blocked ${scope} and sent cancels for its working orders; each Canceled shows as its venue confirms it.`)
+      const answer = await api.cancelAll(scope, reason)
+      setDone(api.outcome(`Blocked ${scope} and sent cancels for its working orders; each Canceled shows as its venue confirms it.`, answer))
     } else if (kind === 'block') {
-      const { changed } = await api.block(scope, reason)
-      setDone(changed ? `Blocked ${scope}.` : `${scope} was blocked already.`)
+      const answer = await api.block(scope, reason)
+      setDone(api.outcome(answer.changed ? `Blocked ${scope}.` : `${scope} was blocked already.`, answer))
     } else {
-      const { changed } = await api.unblock(scope, reason)
-      setDone(changed ? `Unblocked ${scope}.` : `${scope} wasn't blocked.`)
+      const answer = await api.unblock(scope, reason)
+      setDone(api.outcome(answer.changed ? `Unblocked ${scope}.` : `${scope} wasn't blocked.`, answer))
     }
     refocus.current = true
     reread()
