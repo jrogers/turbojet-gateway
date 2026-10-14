@@ -785,6 +785,8 @@ Alarms show above every screen, newest first, the latest 100, each with its time
 text, until dismissed; the header counts those not dismissed. While the gateway is
 [unavailable](#database), a banner says so.
 
+What to expect of it is in [CAVEATS.md](CAVEATS.md#console).
+
 To work on it, run the gateway with an `[api]`, then `npm run dev` in `web/`: Vite serves the
 console, reloading on changes, and passes `/api`, websockets included, to `JETBRIDGE_API`
 (`http://127.0.0.1:8080` by default). `npm test -- --run` runs its tests and `npm run lint` checks
