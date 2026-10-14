@@ -86,34 +86,9 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
   const [error, setError] = useState<string>()
   const [dismissed, setDismissed] = useState<Dismissed>(() => new Set())
   const [reloading, setReloading] = useState(false)
-  const [reloaded, setReloaded] = useState<Reload>()
   // Counts the reloads done, so the screens showing what one changes read again.
   const [reloads, countReload] = useReducer((n: number) => n + 1, 0)
-  // Set by a reload done: focus goes to the screen's heading once its dialog has closed.
-  const refocus = useRef(false)
   const admin = unscopedAdmin(me)
-
-  useEffect(() => {
-    if (!reloading && refocus.current) {
-      refocus.current = false
-      // Each screen has one h1; made focusable here, as not every screen needs it to be.
-      const heading = document.querySelector<HTMLElement>('main h1')
-      heading?.setAttribute('tabindex', '-1')
-      heading?.focus()
-    }
-  }, [reloading])
-
-  // A 422 is a reload that kept a file, and applied the other: an outcome to show, not a failure.
-  async function reload(reason: string) {
-    try {
-      setReloaded({ took: await api.reload(reason) })
-    } catch (e) {
-      if (!(e instanceof api.ApiError && e.status === 422)) throw e
-      setReloaded({ kept: e.message })
-    }
-    countReload()
-    refocus.current = true
-  }
 
   // Back to login once logged out, or on a 401: the session had ended already. Any other failure
   // keeps the session, and says so.
@@ -178,29 +153,9 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
       <main>
         <Banner />
         <Alarms dismissed={dismissed} onDismiss={setDismissed} />
-        {admin && (
-          // Always there for an admin who may reload, so a screen reader hears its text change.
-          <div className="reloaded" role="status">
-            {reloaded &&
-              ('took' in reloaded ? (
-                <Reloaded reload={reloaded.took} />
-              ) : (
-                <p className="error">The reload kept a file: {reloaded.kept}</p>
-              ))}
-            {reloaded && (
-              <button type="button" onClick={() => setReloaded(undefined)}>
-                Dismiss
-              </button>
-            )}
-          </div>
-        )}
+        {admin && <ReloadStatus asking={reloading} onClose={() => setReloading(false)} onReloaded={countReload} />}
         <Screen route={route} me={me} reloads={reloads} />
       </main>
-      {reloading && admin && (
-        <Reason title="Reload the configuration" confirmLabel="Reload" onConfirm={reload} onClose={() => setReloading(false)}>
-          <p>Rereads the configuration files, as SIGHUP does, and says what changed.</p>
-        </Reason>
-      )}
     </>
   )
 }
@@ -244,8 +199,62 @@ function Screen({ route, me, reloads }: { route: Route; me: Me; reloads: number 
 function Hidden({ title }: { title: string }) {
   return (
     <>
-      <h1>{title}</h1>
+      <h1 tabIndex={-1}>{title}</h1>
       <p className="muted">Not available to you.</p>
     </>
+  )
+}
+
+/**
+ * A reload's outcome, under the header on every screen, and while `asking`, its reason dialog.
+ * What it took and its warnings, or for a 422, why a file was kept: the other applied, so that's
+ * an outcome, not a failure to retry; any other failure stays in the dialog. Focus goes to the
+ * screen's heading once done.
+ */
+function ReloadStatus({ asking, onClose, onReloaded }: { asking: boolean; onClose: () => void; onReloaded: () => void }) {
+  const [reloaded, setReloaded] = useState<Reload>()
+  // Set by a reload done: focus goes to the heading once its dialog has closed.
+  const refocus = useRef(false)
+
+  useEffect(() => {
+    if (!asking && refocus.current) {
+      refocus.current = false
+      document.querySelector<HTMLElement>('main h1')?.focus()
+    }
+  }, [asking])
+
+  async function reload(reason: string) {
+    try {
+      setReloaded({ took: await api.reload(reason) })
+    } catch (e) {
+      if (!(e instanceof api.ApiError && e.status === 422)) throw e
+      setReloaded({ kept: e.message })
+    }
+    onReloaded()
+    refocus.current = true
+  }
+
+  return (
+    <div className="reloaded">
+      {/* Always there, so a screen reader hears its text change. */}
+      <div role="status">
+        {reloaded &&
+          ('took' in reloaded ? (
+            <Reloaded reload={reloaded.took} />
+          ) : (
+            <p className="error">The reload kept a file: {reloaded.kept}</p>
+          ))}
+      </div>
+      {reloaded && (
+        <button type="button" onClick={() => setReloaded(undefined)}>
+          Dismiss
+        </button>
+      )}
+      {asking && (
+        <Reason title="Reload the configuration" confirmLabel="Reload" onConfirm={reload} onClose={onClose}>
+          <p>Rereads the configuration files, as SIGHUP does, and says what changed.</p>
+        </Reason>
+      )}
+    </div>
   )
 }

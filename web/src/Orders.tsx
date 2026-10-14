@@ -189,7 +189,7 @@ export default function Orders() {
 
   return (
     <>
-      <h1>{past ? 'Past orders' : 'Orders'}</h1>
+      <h1 tabIndex={-1}>{past ? 'Past orders' : 'Orders'}</h1>
       <form className="filters" onSubmit={apply}>
         <label>
           Client

@@ -407,14 +407,13 @@ test('an admin reloads from the header, and sees what it took or why a file was 
     fireEvent.change(screen.getByLabelText('Reason'), { target: { value: reason } })
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Reload' })))
   }
-  const outcome = () => document.querySelector('.reloaded')!
-  expect(outcome().getAttribute('role')).toBe('status')
+  const outcome = () => document.querySelector('.reloaded [role=status]')!
   expect(outcome().textContent).toBe('')
 
   await reload('new client')
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(outcome().textContent).toBe(
-    'The reload took 3 routes, limits for 1 clients and day_end 17:00; sessions: added FUNDC.[database] url changed: restart to use itDismiss',
+    'The reload took 3 routes, limits for 1 clients and day_end 17:00; sessions: added FUNDC.[database] url changed: restart to use it',
   )
   expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Audit' }))
 
@@ -422,7 +421,7 @@ test('an admin reloads from the header, and sees what it took or why a file was 
   await reload('again')
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(outcome().textContent).toBe(
-    'The reload kept a file: jetbridge.toml is kept: bad route; the sessions file: nothing changedDismiss',
+    'The reload kept a file: jetbridge.toml is kept: bad route; the sessions file: nothing changed',
   )
 
   // Any other failure stays in the dialog, to try again.
@@ -431,7 +430,7 @@ test('an admin reloads from the header, and sees what it took or why a file was 
   expect(within(screen.getByRole('dialog')).getByRole('alert').textContent).toBe('the gateway is stopping')
   fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
 
-  fireEvent.click(within(outcome() as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
   expect(outcome().textContent).toBe('')
   expect(calls.filter((call) => call === 'POST /api/reload')).toHaveLength(3)
 })

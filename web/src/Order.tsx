@@ -91,7 +91,7 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
   if (detail === null) {
     return (
       <>
-        <h1>Order {orderId}</h1>
+        <h1 tabIndex={-1}>Order {orderId}</h1>
         <p className="error" role="alert">
           {missing}
         </p>

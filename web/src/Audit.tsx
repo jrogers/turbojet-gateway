@@ -59,7 +59,7 @@ export default function Audit() {
 
   return (
     <>
-      <h1>Audit</h1>
+      <h1 tabIndex={-1}>Audit</h1>
       <form className="filters" onSubmit={submit}>
         <label>
           Since (UTC; the start if empty)
@@ -120,10 +120,10 @@ function Entries({ entries, limit }: { entries: AuditEntry[]; limit: number }) {
                 <td>{entry.ip}</td>
                 <td>{entry.action}</td>
                 <td>{entry.target ?? ''}</td>
-                <td>
-                  <code>{entry.params === null ? '' : JSON.stringify(entry.params)}</code>
+                <td className="wrap">
+                  <code className="raw">{entry.params === null ? '' : JSON.stringify(entry.params)}</code>
                 </td>
-                <td>{entry.reason ?? ''}</td>
+                <td className="wrap">{entry.reason ?? ''}</td>
                 <td>{entry.result}</td>
               </tr>
             ))}

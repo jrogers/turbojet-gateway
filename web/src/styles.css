@@ -454,10 +454,16 @@ tr.matched {
 /* The reload's outcome, under the header on every screen. */
 
 .reloaded {
-  margin-bottom: 0.75rem;
   overflow-wrap: anywhere;
 }
 
-.reloaded:empty {
-  margin: 0;
+.reloaded:has(button) {
+  margin-bottom: 0.75rem;
+}
+
+/* Audit: the long cells wrap. */
+
+td.wrap {
+  white-space: normal;
+  max-width: 40ch;
 }

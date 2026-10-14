@@ -126,13 +126,13 @@ export async function logout() {
 
 export const sessions = () => request<SessionView[]>('GET', '/api/sessions')
 export const risk = () => request<RiskView>('GET', '/api/risk')
-/** The limits as `jetbridge.toml` writes them: edit from these, not `RiskView`'s, which are merged. */
 export const routes = () => request<RouteView[]>('GET', '/api/routes')
 /** Where an order of `client` (a CompID) would go: routing only, no risk or blocks. */
 export const routeTest = (client: string, exDestination: string, symbol: string) =>
   request<RouteTest>('GET', `/api/routes/test${query({ client, ex_destination: exDestination, symbol })}`)
 /** [unscoped admin] The last `limit` entries from `since` (RFC 3339), oldest first. */
 export const audit = (since: string, limit: number) => request<AuditEntry[]>('GET', `/api/audit${query({ since, limit })}`)
+/** The limits as `jetbridge.toml` writes them: edit from these, not `RiskView`'s, which are merged. */
 export const riskLimits = () => request<RiskTables>('GET', '/api/risk/limits')
 
 /**

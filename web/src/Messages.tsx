@@ -162,7 +162,7 @@ export default function Messages({ me }: { me: Me }) {
 
   return (
     <>
-      <h1>Messages</h1>
+      <h1 tabIndex={-1}>Messages</h1>
       <form className="filters" onSubmit={submit}>
         <label>
           Session
