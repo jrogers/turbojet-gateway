@@ -74,13 +74,7 @@ cargo run --release --features tls -- --config examples/jetbridge.toml
 
 Build with `--features gzip` to compress the [message log](#message-log)'s files.
 
-Build with `--features console` to serve the web console at the API's address. It builds the
-console into the binary, so build that first, with Node 25 or later:
-
-```sh
-(cd web && npm ci && npm run build)
-cargo build --release --features console
-```
+Build with `--features console` to serve the [web console](#console) at the API's address.
 
 Jetbridge builds against Turbojet by path, so it expects a Turbojet checkout next to it
 (`../turbojet`). It needs Rust 1.89 or later.
@@ -725,6 +719,44 @@ the directory aren't touched, and a delete that fails is logged as a warning. Le
 are kept for ever. `audit_dir` and `audit_retention` are read at start only. `GET /api/audit` reads
 it back, oldest first: the last `limit` entries (100 by default, at most 1,000) from `since` (RFC
 3339), reading only the days it needs, newest first.
+
+## Console
+
+A web console for operators, served by the gateway at the API's address, at `/`: with the
+example's `[api]`, <http://127.0.0.1:8080/>. Log in as one of the API's [users](#users-and-tokens);
+it shows and does what that user's role and clients allow, as the API does. It's built into the
+binary, so build it first, with Node 25 or later (`web/package.json`'s `engines`), then the gateway
+with `--features console`:
+
+```sh
+(cd web && npm ci && npm run build)
+cargo build --release --features console
+```
+
+Without the feature, the gateway serves the API only. The console's files are served with a
+Content-Security-Policy allowing only the gateway's own scripts, styles and connections.
+
+It has three screens, kept live by `GET /api/live`, with a banner while that socket is down:
+
+- **Orders**, the blotter: the working orders, newest first, filtered by client, venue, symbol and
+  status; with "working only" off, today's done orders too; with dates, past days' orders from the
+  [database](#database), as they were read. Each links to its page.
+- **An order's page**: its fields, kept live; its requests to the venue; and its messages on both
+  sides from the [message log](#message-log), a page at a time. An operator or admin can cancel it,
+  ask its venue for its status, and resolve it once the venue has said it doesn't know it, each
+  with a reason.
+- **Sessions**: the client and venue sessions, their state and next sequence numbers, and whether
+  paused. An operator or admin can pause, resume, or ask for a resend from a sequence number, each
+  with a reason.
+
+Alarms show above every screen, newest first, the latest 100, each with its time, kind, client and
+text, until dismissed; the header counts those not dismissed. While the gateway is
+[unavailable](#database), a banner says so.
+
+To work on it, run the gateway with an `[api]`, then `npm run dev` in `web/`: Vite serves the
+console, reloading on changes, and passes `/api`, websockets included, to `JETBRIDGE_API`
+(`http://127.0.0.1:8080` by default). `npm test -- --run` runs its tests and `npm run lint` checks
+its types. `cargo test --all-features` includes the console, so needs `web/dist` built first.
 
 ## Signals
 

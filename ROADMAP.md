@@ -11,8 +11,9 @@ orders, asking a venue for an order's status and resolving one it doesn't know, 
 kill switch and limit editing, routes with a dry run, the message log with search, reload and the
 audit log. Still to do:
 
-- **Console** (L). A React and TypeScript web console in `web/`, built into release builds:
-  sessions, blotter, risk with the kill switch, logs, and admin (routing, reload, audit).
+- **Console** (L). The [console](README.md#console) shows the blotter, an order's page and the
+  sessions. Still to add: risk with the kill switch and limit editing, message search, setting
+  sequence numbers, and admin: routes with the dry run, reload and the audit log.
 
 ## 2. Durability
 

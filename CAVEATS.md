@@ -405,6 +405,23 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 - A live socket's snapshot holds up to 1,000 working orders; the rest are read from
   `GET /api/orders`, and may change between the two.
 
+## Console
+
+- The console is served only by a gateway built with `--features console`, after `npm run build`
+  in `web/`; without the feature, `/` is a 404.
+- Alarms aren't stored: the console shows those raised while it's open, so reloading the page
+  loses them, and dismissing one dismisses it in that page only.
+- The sessions screen reads the sequence numbers every 5 seconds while it's open and the page
+  shown: the live events don't carry them, so between reads they lag.
+- With "working only" on, past the snapshot's 1,000 working orders the blotter pages upward from
+  them: the snapshot holds the oldest, so "More" reads newer ones, which show at the top, not the
+  bottom.
+- The live blotter keeps the last 1,000 orders done since the last snapshot to show their latest
+  state; a snapshot, after a reconnect or falling behind, clears them and reads the blotter again.
+- An order's messages are read when its page opens: newer ones need "Check for newer".
+- The live socket needs a browser whose `connect-src 'self'` covers websockets to the page's own
+  host, as CSP 3 says; Safari's has since 2022.
+
 ## Message log
 
 - Messages are written with no `fsync`: they survive the gateway's process crashing, not the
