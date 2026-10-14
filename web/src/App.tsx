@@ -62,11 +62,11 @@ export default function App() {
   }
   if (me === undefined) return null
   if (me === null) return <Login onLogin={enter} notice={notice} />
-  return <Shell me={me} onLogout={() => enter(null)} />
+  return <Shell me={me} onMe={setMe} onLogout={() => enter(null)} />
 }
 
 /** The live state, for the whole shell: its header shows the alarm count, and the clients. */
-function Shell(props: { me: Me; onLogout: () => void }) {
+function Shell(props: { me: Me; onMe: (me: Me) => void; onLogout: () => void }) {
   return (
     <LiveProvider>
       <Frame {...props} />
@@ -74,9 +74,23 @@ function Shell(props: { me: Me; onLogout: () => void }) {
   )
 }
 
-function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
+function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; onLogout: () => void }) {
   const live = useLive()
-  // The user's clients as the last snapshot said: a reload may have changed them since login.
+  // A snapshot after the first may follow a reload or a reconnection, either of which may come
+  // with a new role: ask again who the user is. A failure keeps what was known; a 401 logs out.
+  useEffect(() => {
+    if (live.snapshots < 2) return
+    let current = true
+    api.me().then(
+      (me) => current && onMe(me),
+      () => {},
+    )
+    return () => {
+      current = false
+    }
+  }, [live.snapshots, onMe])
+  // The user's clients as the last snapshot said, over `GET /api/me`'s: they come with the
+  // snapshot, so the screens rescope with what it shows, without waiting on that answer.
   const me = useMemo(
     () => (live.clients === undefined ? login : { ...login, clients: live.clients }),
     [login, live.clients],

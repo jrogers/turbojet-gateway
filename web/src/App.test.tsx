@@ -378,6 +378,29 @@ test('the nav shows Routes to all, and Audit and Reload to an admin without clie
   expect(screen.queryByRole('button', { name: 'Reload…' })).toBeNull()
 })
 
+test('a snapshot after the first reads the user again: a role taken away hides its controls', async () => {
+  let me = root
+  const calls = serve({ 'GET /api/me': () => json(me) })
+  render(<App />)
+  await screen.findByText('admin')
+  const socket = await opened()
+  const snapshot = { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients: null }
+  act(() => {
+    socket.open()
+    socket.send(snapshot)
+  })
+  // The first snapshot is what login said: not asked again.
+  expect(calls).toEqual(['GET /api/me'])
+  expect(screen.getByRole('button', { name: 'Reload…' })).toBeTruthy()
+
+  me = { ...root, role: 'operator' }
+  act(() => socket.send(snapshot))
+  await screen.findByText('operator')
+  expect(calls).toEqual(['GET /api/me', 'GET /api/me'])
+  expect(screen.queryByRole('button', { name: 'Reload…' })).toBeNull()
+  expect(links()).not.toContain('Audit')
+})
+
 test('the audit log by its hash is not available to a user it is hidden from, asking nothing', async () => {
   const calls = serve({ 'GET /api/me': () => json({ ...root, clients: ['FUNDA'] }) })
   window.location.hash = '#/audit'
