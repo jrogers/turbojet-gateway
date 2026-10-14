@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import Alarms, { AlarmCount, type Dismissed } from './Alarms.tsx'
 import * as api from './api.ts'
 import Login from './Login.tsx'
+import Messages from './Messages.tsx'
 import Order from './Order.tsx'
 import Orders from './Orders.tsx'
 import Risk from './Risk.tsx'
@@ -104,6 +105,9 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
           <a href="#/risk" aria-current={current(route, 'risk')}>
             Risk
           </a>
+          <a href="#/messages" aria-current={current(route, 'messages')}>
+            Messages
+          </a>
         </nav>
         <AlarmCount dismissed={dismissed} />
         <span className="who">
@@ -129,7 +133,7 @@ function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
 }
 
 /** A nav link's `aria-current`: an order's page is the blotter's. */
-const current = (route: Route, screen: 'orders' | 'sessions' | 'risk') =>
+const current = (route: Route, screen: Exclude<Route['screen'], 'order'>) =>
   (route.screen === 'order' ? 'orders' : route.screen) === screen ? 'page' : undefined
 
 /** Says so while the live socket is down: what the screens show is as it was. */
@@ -151,6 +155,8 @@ function Screen({ route, me }: { route: Route; me: Me }) {
       return <Sessions me={me} />
     case 'risk':
       return <Risk me={me} />
+    case 'messages':
+      return <Messages me={me} />
     case 'order':
       // Keyed: another order's page starts afresh.
       return <Order key={route.orderId} orderId={route.orderId} me={me} />

@@ -121,6 +121,10 @@ test('routes switch with the hash, orders by default', async () => {
   await screen.findByRole('heading', { level: 1, name: 'Risk' })
   expect(screen.getByRole('link', { name: 'Risk' }).getAttribute('aria-current')).toBe('page')
   expect(await screen.findByText('not now')).toBeTruthy()
+  // Nothing read until a search is asked.
+  go('#/messages')
+  await screen.findByRole('heading', { level: 1, name: 'Messages' })
+  expect(screen.getByRole('link', { name: 'Messages' }).getAttribute('aria-current')).toBe('page')
   go('#/orders/A%2F1')
   await screen.findByRole('heading', { level: 1, name: 'Order A/1' })
   expect(within(screen.getByRole('navigation')).getByRole('link', { name: 'Orders' }).getAttribute('aria-current')).toBe('page')

@@ -132,6 +132,11 @@ export const riskLimits = () => request<RiskTables>('GET', '/api/risk/limits')
 export const orders = (params: Record<string, string | number | boolean | null | undefined> = {}) =>
   request<OrdersPage>('GET', `/api/orders${query(params)}`)
 export const order = (orderId: string) => request<OrderDetail>('GET', `/api/orders/${segment(orderId)}`)
+/**
+ * `GET /api/messages` with `params` as given, in order: `session` and `tag` repeat, as `msg_type`
+ * may. Pairs, not a record, for the repeats.
+ */
+export const messages = (params: [string, string][]) => request<Page>('GET', `/api/messages?${new URLSearchParams(params)}`)
 export const orderMessages = (orderId: string, params: { limit?: number; after?: string | null } = {}) =>
   request<Page>('GET', `/api/orders/${segment(orderId)}/messages${query(params)}`)
 
