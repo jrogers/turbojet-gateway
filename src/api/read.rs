@@ -20,9 +20,7 @@ use turbojet::fields::CompactString;
 use turbojet::{SessionId, SessionStatus};
 
 use super::{ApiError, Caller, State, bad};
-use crate::book::{
-    MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status, is_one_of,
-};
+use crate::book::{MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter, OrderId, OrderView, RiskView, ScopeName, Status};
 use crate::config::RiskTables;
 use crate::edge::Gateway;
 use crate::router::{Rule, Target};
@@ -125,7 +123,7 @@ pub(super) async fn sessions(
 
 /// What [`sessions`] answers: the clients' of `comp_ids` alone, if given.
 pub(super) fn session_views(service: &Service, comp_ids: Option<&[String]>) -> Vec<SessionView> {
-    let shown = |id: &SessionId| comp_ids.is_none_or(|comp_ids| is_one_of(&id.target_comp_id, comp_ids));
+    let shown = |id: &SessionId| super::live::shows_client(comp_ids, id);
     let mut clients = service.client_statuses();
     clients.retain(|status| shown(&status.id));
     clients.sort_by_cached_key(|status| status.id.to_string());

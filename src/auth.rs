@@ -198,6 +198,8 @@ impl Users {
         if clients.iter().any(String::is_empty) {
             return Err("an empty client CompID".to_string());
         }
+        let mut clients = clients;
+        sort_clients(&mut clients);
         let clients = (!clients.is_empty()).then_some(clients);
         self.user
             .insert(name.to_string(), User { role, password: hash_password(password), clients, tokens: Vec::new() });
@@ -306,10 +308,21 @@ impl FromStr for Users {
     type Err = String;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let users: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut users: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         users.check()?;
+        for clients in users.user.values_mut().filter_map(|user| user.clients.as_mut()) {
+            sort_clients(clients);
+        }
         Ok(users)
     }
+}
+
+/// Sorts and deduplicates a user's clients, once, as they're read or added: the same clients
+/// listed in another order are then equal, so a reload that only reorders them doesn't make a
+/// live socket send a new snapshot, as a change of scope does.
+fn sort_clients(clients: &mut Vec<String>) {
+    clients.sort_unstable();
+    clients.dedup();
 }
 
 /// A user name is 1 to [`MAX_NAME_LEN`] letters, digits and `.`, `_`, `-` or `@`: an email
@@ -552,6 +565,18 @@ mod tests {
         assert!(users.revoke_token("a", "abcd").unwrap_err().contains("more than one"));
         assert_eq!(users.revoke_token("a", "jb_abcd2222rest-of-token"), Ok("abcd2222".to_string()));
         assert_eq!(users.revoke_token("a", "abc"), Ok("abcd1111".to_string()));
+    }
+
+    /// A user's clients read or added are sorted, once each: the same list reordered is equal.
+    #[test]
+    fn clients_are_sorted_and_deduplicated() {
+        let hash = hash_password("pw");
+        let text = format!("[user.a]\nrole = \"viewer\"\npassword = \"{hash}\"\nclients = [\"B\", \"A\", \"B\"]\n");
+        let sorted = Some(vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(text.parse::<Users>().unwrap().get("a").unwrap().clients, sorted);
+        let mut users = Users::default();
+        users.add("a", Role::Viewer, vec!["B".into(), "A".into(), "A".into()], "a long password").unwrap();
+        assert_eq!(users.get("a").unwrap().clients, sorted);
     }
 
     /// `clients = []` is refused: leaving it out is the only way to say all.

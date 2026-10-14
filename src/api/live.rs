@@ -39,14 +39,15 @@ use serde::Serialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::info;
-use turbojet::{SessionEvent, SessionEventKind};
+use turbojet::{SessionEvent, SessionEventKind, SessionId};
 
 use super::read::{SessionSide, SessionView, session_views};
 use super::{ApiError, Caller, State};
 use crate::book::{GatewayEvent, MAX_ORDERS_PER_PAGE, OrderView, Scope, is_one_of};
 
-/// How often an open socket checks that its session or token still holds. Checking is a map
-/// lookup; a removed user or a revoked token keeps watching this long at most.
+/// How often an open socket checks that its session or token still holds, and reads its user's
+/// clients again. Checking is a map lookup; a removed user or a revoked token keeps watching this
+/// long at most, and a user whose clients a reload narrowed keeps seeing its old clients' events.
 const RECHECK: Duration = Duration::from_secs(10);
 // Its pings keep an idle socket's connection open.
 const _: () = assert!(RECHECK.as_secs() < super::listener::IDLE.as_secs());
@@ -190,7 +191,8 @@ pub(super) async fn live(
         clients: service.client_events(),
         venues: service.venue_events(),
     };
-    let viewer = Viewer { user: caller.user, ip: caller.ip, clients: caller.clients, headers };
+    let clients = caller.view_scope().map(<[String]>::to_vec);
+    let viewer = Viewer { user: caller.user, ip: caller.ip, clients, headers };
     let upgrade = upgrade.max_message_size(MAX_RECEIVED_LEN).max_frame_size(MAX_RECEIVED_LEN);
     // A client that goes before the upgrade completes drops the closure, and with it the count.
     Ok(upgrade.on_upgrade(move |socket| run(socket, state, events, viewer, counted)))
@@ -229,7 +231,8 @@ enum Step {
     /// A channel lagged: skip to its end and send a snapshot.
     Snapshot,
     /// The viewer's clients changed: as [`Snapshot`](Self::Snapshot), under the new scope. It
-    /// comes once a [`RECHECK`] at most, so isn't held to [`MIN_SNAPSHOT_GAP`].
+    /// comes once a [`RECHECK`] at most, so isn't held to [`MIN_SNAPSHOT_GAP`], but counts as a
+    /// snapshot: a lag within [`MIN_SNAPSHOT_GAP`] after it closes the socket.
     Rescoped,
     Close(u16, &'static str),
     Nothing,
@@ -274,9 +277,7 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, mut viewer
         }
         step = tokio::select! {
             _ = stopping.wait_for(|stopping| *stopping) => Step::Close(close_code::AWAY, STOPPING),
-            _ = recheck.tick() => {
-                rechecked(&state, &mut viewer, last_received.elapsed() >= RECHECK * MAX_SILENT_TICKS)
-            }
+            _ = recheck.tick() => rechecked(&state, &mut viewer, last_received),
             event = events.gateway.recv() => match event {
                 Ok(event) if shows(viewer.clients.as_deref(), &event) => json(&event),
                 Ok(_) => Step::Nothing,
@@ -284,7 +285,7 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, mut viewer
                 Err(RecvError::Closed) => Step::Close(close_code::AWAY, STOPPING),
             },
             event = events.clients.recv() => match event {
-                Ok(event) if viewer.clients.as_deref().is_none_or(|ids| is_one_of(&event.id.target_comp_id, ids)) => {
+                Ok(event) if shows_client(viewer.clients.as_deref(), &event.id) => {
                     session_change(SessionSide::Client, &event).map_or(Step::Nothing, |change| json(&change))
                 }
                 Ok(_) => Step::Nothing,
@@ -309,13 +310,14 @@ async fn run(mut socket: WebSocket, state: State, mut events: Events, mut viewer
 }
 
 /// What a recheck does: closes the socket if the viewer's credentials no longer hold or its client
-/// is `silent`, sends a snapshot under the viewer's new scope if its clients changed, and pings.
-fn rechecked(state: &State, viewer: &mut Viewer, silent: bool) -> Step {
+/// has sent nothing since `last_received` for [`MAX_SILENT_TICKS`], sends a snapshot under the
+/// viewer's new scope if its clients changed, and pings.
+fn rechecked(state: &State, viewer: &mut Viewer, last_received: Instant) -> Step {
     match state.auth.recheck(&viewer.headers, viewer.ip) {
         Err(refusal) => Step::Close(close_code::POLICY, refusal.message()),
-        Ok(_) if silent => Step::Close(close_code::AWAY, SILENT),
-        Ok(caller) if caller.clients != viewer.clients => {
-            viewer.clients = caller.clients;
+        Ok(_) if last_received.elapsed() >= RECHECK * MAX_SILENT_TICKS => Step::Close(close_code::AWAY, SILENT),
+        Ok(caller) if caller.view_scope() != viewer.clients.as_deref() => {
+            viewer.clients = caller.view_scope().map(<[String]>::to_vec);
             Step::Rescoped
         }
         Ok(_) => Step::Send(Message::Ping(Default::default())),
@@ -346,6 +348,11 @@ fn shows(comp_ids: Option<&[String]>, event: &GatewayEvent) -> bool {
         GatewayEvent::Blocked { scope } | GatewayEvent::Unblocked { scope } => scope.concerns(comp_ids),
         GatewayEvent::Alarm(alarm) => alarm.visible_to(Some(comp_ids)),
     }
+}
+
+/// Whether a viewer of the clients of `comp_ids` (`None`, all) is shown client session `id`.
+pub(super) fn shows_client(comp_ids: Option<&[String]>, id: &SessionId) -> bool {
+    comp_ids.is_none_or(|comp_ids| is_one_of(&id.target_comp_id, comp_ids))
 }
 
 fn json(value: &impl Serialize) -> Step {
@@ -591,10 +598,15 @@ mod tests {
     #[tokio::test]
     async fn a_scoped_viewer_gets_its_clients_events() {
         let fixture = fixture().await;
-        let (gateway, events, _sessions) = channels(16);
+        let (gateway, events, sessions) = channels(16);
         let (mut client, _stop) =
             open_run(fixture.state.clone(), events, viewer("val", Some(&["FUNDA"]), HeaderMap::new())).await;
         assert_eq!(next_json(&mut client).await["type"], "snapshot");
+        let [clients, venues] = &sessions;
+        let events = Events { gateway: gateway.subscribe(), clients: clients.subscribe(), venues: venues.subscribe() };
+        let (mut unscoped, _stop_unscoped) =
+            open_run(fixture.state.clone(), events, viewer("vic", None, HeaderMap::new())).await;
+        assert_eq!(next_json(&mut unscoped).await["type"], "snapshot");
         let funda = fixture.service.gateway().working_view(None).0.remove(0);
         let fundb = OrderView { client: "FUNDB".into(), ..funda.clone() };
         let alarm = |kind, client: Option<&str>| {
@@ -617,10 +629,11 @@ mod tests {
             (alarm(UnknownOrder, None), alarm(GatewayUnavailable, None)),
         ];
         for (held, sent) in cases {
-            assert!(shows(None, &held), "{held:?}");
+            let json = (serde_json::to_value(&held).unwrap(), serde_json::to_value(&sent).unwrap());
             gateway.send(held).unwrap();
-            gateway.send(sent.clone()).unwrap();
-            assert_eq!(next_json(&mut client).await, serde_json::to_value(&sent).unwrap());
+            gateway.send(sent).unwrap();
+            assert_eq!(next_json(&mut client).await, json.1);
+            assert_eq!((next_json(&mut unscoped).await, next_json(&mut unscoped).await), json);
         }
     }
 
@@ -638,7 +651,7 @@ mod tests {
         assert_eq!(until(&mut funda, |message| message["type"] == "session").await["side"], "client");
         fixture.service.venue_session("NASDAQ").unwrap().pause(None);
         assert_eq!(until(&mut fundb, |message| message["type"] == "session").await["side"], "venue");
-        // FUNDA's pausing was sent to the socket first, and is held back: nothing more comes.
+        // FUNDA's pausing was published first, and is held back: nothing more comes.
         let more = tokio::time::timeout(Duration::from_millis(200), fundb.next()).await;
         assert!(more.is_err(), "{more:?}");
     }
@@ -648,6 +661,7 @@ mod tests {
     #[tokio::test]
     async fn a_scope_change_takes_effect_at_the_recheck() {
         let fixture = fixture().await;
+        crate::edge::tests::book_input(fixture.service.gateway(), crate::edge::tests::new_order_from("FUNDB", "B1"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.toml");
         let mut users = crate::auth::Users::default();
@@ -671,12 +685,30 @@ mod tests {
         tokio::time::advance(RECHECK).await;
         let snapshot = next_json(&mut client).await;
         assert_eq!(snapshot["type"], "snapshot");
-        assert_eq!(snapshot["orders"], serde_json::json!([]));
-        let funda = fixture.service.gateway().working_view(None).0.remove(0);
-        let fundb = OrderView { client: "FUNDB".into(), ..funda.clone() };
+        let [order] = snapshot["orders"].as_array().unwrap().as_slice() else { panic!("{snapshot}") };
+        assert_eq!(order["client"], "FIX.4.4:JETBRIDGE->FUNDB");
+        let (orders, _, _) = fixture.service.gateway().working_view(None);
+        let [funda, fundb] = <[OrderView; 2]>::try_from(orders).unwrap();
         gateway.send(GatewayEvent::Order(funda)).unwrap();
         gateway.send(GatewayEvent::Order(fundb.clone())).unwrap();
         assert_eq!(next_json(&mut client).await, serde_json::to_value(GatewayEvent::Order(fundb)).unwrap());
+    }
+
+    /// A recheck finding the viewer's clients changed takes them and answers a new snapshot; one
+    /// finding them as they were pings.
+    #[tokio::test]
+    async fn a_recheck_rescopes_on_a_change_alone() {
+        let mut users = crate::auth::Users::default();
+        users.add("val", crate::auth::Role::Viewer, vec!["FUNDA".into()], "a long password").unwrap();
+        let token = users.add_token("val").unwrap();
+        let auth = super::super::auth::Auth::new(std::path::PathBuf::new(), users, false, false);
+        let (state, _dir) = super::super::tests::state(Arc::new(auth));
+        let headers =
+            HeaderMap::from_iter([(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap())]);
+        let mut viewer = viewer("val", Some(&["FUNDB"]), headers);
+        assert!(matches!(rechecked(&state, &mut viewer, Instant::now()), Step::Rescoped));
+        assert_eq!(viewer.clients, Some(vec!["FUNDA".to_string()]));
+        assert!(matches!(rechecked(&state, &mut viewer, Instant::now()), Step::Send(Message::Ping(_))));
     }
 
     /// A user may have MAX_LIVE_SOCKETS_PER_USER sockets open, 429 past that; there may be
