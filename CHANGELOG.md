@@ -122,7 +122,7 @@ Notable changes to Jetbridge.
 - `GET /api/orders?desc=true` pages newest first, the book's orders and past ones alike.
 - The live socket's snapshot carries `clients`, the user's clients it was taken under (`null` for
   all), so a console can tell when a reload rescoped it.
-- A web console in `web/` (React and TypeScript, Node 25 or later to build), served at the API's
+- A web console in `web/` (React and TypeScript, Node 24 or later to build), served at the API's
   address by a gateway built with `--features console`: the blotter live and past days', an
   order's page with cancel, status and resolve, the sessions with pause, resume and resend, and
   the alarms, with a banner while the gateway is unavailable.

@@ -409,8 +409,11 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 
 - The console is served only by a gateway built with `--features console`, after `npm run build`
   in `web/`; without the feature, `/` is a 404.
-- Alarms aren't stored: the console shows those raised while it's open, so reloading the page
-  loses them, and dismissing one dismisses it in that page only.
+- Alarms aren't stored: the console shows those raised while it's open and connected, so reloading
+  the page loses them, and those raised while it's reconnecting never show. Dismissing one
+  dismisses it in that page only.
+- When a reload changes a user's clients, the console drops every alarm but the gateway-wide ones
+  (`gateway_unavailable`, `gateway_available`, `venue_store_reset`), its new clients' too.
 - The sessions screen reads the sequence numbers every 5 seconds while it's open and the page
   shown: the live events don't carry them, so between reads they lag.
 - With "working only" on, past the snapshot's 1,000 working orders the blotter pages upward from
