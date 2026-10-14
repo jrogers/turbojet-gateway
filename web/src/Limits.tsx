@@ -90,8 +90,8 @@ export default function Limits({
   const [reads, reread] = useReducer((n: number) => n + 1, 0)
 
   // On showing, on being seen again, on each snapshot (the scope may have changed) and console
-  // reload, and on each edit opened or done. An answer to a read since outdone, or after unmounting, is dropped. A
-  // 403 or 404 clears the tables, and any edit open on them.
+  // reload, and on each edit opened or done. An answer to a read since outdone, or after
+  // unmounting, is dropped. A 403 or 404 clears the tables, and any edit open on them.
   const asking = useRef<object>(undefined)
   useEffect(() => {
     const read = () => {
