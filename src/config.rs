@@ -414,6 +414,8 @@ impl RiskTables {
 /// The table has an unknown key, or a value the loader refuses: why, naming the key.
 pub fn check_risk_table(text: &str, under: &str) -> Result<(), String> {
     let Ok(file) = toml::from_str::<toml::Table>(text) else { return Ok(()) };
+    // A CompID with a `.` in it splits into keys that find no table, so it skips the check. That
+    // fails safe: the whole file's load still refuses it (and the API refuses such a CompID first).
     let mut item = Some(&file);
     for key in under.split('.') {
         item = item.and_then(|table| table.get(key)).and_then(toml::Value::as_table);
@@ -603,6 +605,22 @@ impl File {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table's own keys and values are checked, whatever the rest of the file: a bad value or an
+    /// unknown key is refused, naming it; a table that isn't there, or a good one, passes.
+    #[test]
+    fn a_risk_table_is_checked_on_its_own() {
+        let file = "[risk.defaults]\ncredit = 5\n[risk.client.FUNDB]\ncredit = -5\n\
+                    [risk.client.FUNDC]\ncolour = \"red\"\n";
+        assert_eq!(
+            check_risk_table(file, "risk.client.FUNDB"),
+            Err("risk.client.FUNDB.credit: -5 is not positive".to_string())
+        );
+        let unknown = check_risk_table(file, "risk.client.FUNDC").unwrap_err();
+        assert!(unknown.starts_with("risk.client.FUNDC: ") && unknown.contains("colour"), "{unknown}");
+        assert_eq!(check_risk_table(file, "risk.client.FUNDA"), Ok(()));
+        assert_eq!(check_risk_table(file, "risk.defaults"), Ok(()));
+    }
 
     fn load(path: &Path) -> Result<Loaded, Error> {
         super::load(path, Vec::new())

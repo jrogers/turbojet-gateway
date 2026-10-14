@@ -521,26 +521,29 @@ async fn set_limits(
 /// An admin with clients isn't shown the reload, nor why the file was refused or a reload kept a
 /// file: the sessions, warnings and errors can name other clients. The audit log has them whole.
 /// It is shown what's wrong with the table it edited ([`EditError::Invalid`]), which names only
-/// that table.
+/// that table. It fails closed: a 422 is shown only if it starts with that table's name.
 async fn edit_limits(
     state: &State,
     caller: &Caller,
     mutation: Mutation,
     edit: Result<Edit, ApiError>,
 ) -> Result<Json<EditedView>, ApiError> {
+    let target = mutation.target.clone().unwrap_or_default();
     let answer = edit_limits_whole(state, caller, mutation, edit).await;
     if caller.view_scope().is_none() {
         return answer;
     }
+    let own = |message: &str| {
+        message.strip_prefix(target.as_str()).is_some_and(|rest| rest.starts_with(['.', ':'])) && !target.is_empty()
+    };
     match answer {
         Ok(Json(view)) => Ok(Json(EditedView { reload: None, ..view })),
-        Err(mut e) if e.message.starts_with(WRITTEN) => {
-            e.message = format!("{WRITTEN} kept a file; an unscoped admin can see why (POST /api/reload)");
-            Err(e)
-        }
-        Err(mut e) if e.message.starts_with(REFUSED) => {
-            e.message =
-                format!("{REFUSED} the file wouldn't load with it; an unscoped admin can see why (POST /api/reload)");
+        Err(mut e) if e.status == StatusCode::UNPROCESSABLE_ENTITY && !own(&e.message) => {
+            e.message = if e.message.starts_with(WRITTEN) {
+                format!("{WRITTEN} kept a file; an unscoped admin can see why (POST /api/reload)")
+            } else {
+                format!("{REFUSED} the file wouldn't load with it; an unscoped admin can see why (POST /api/reload)")
+            };
             Err(e)
         }
         Err(e) => Err(e),
