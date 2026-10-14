@@ -664,6 +664,17 @@ fn a_urls_password_is_hidden() {
     assert_eq!(without_password("postgres://jet:s@cret@db/j"), "postgres://jet:***@db/j");
 }
 
+/// Opening suggests `?mode=rwc` for SQLite only, says when the build lacks the URL's backend, and
+/// never shows a password.
+#[test]
+fn an_open_error_fits_the_backend() {
+    let sqlite = open_error("sqlite://j.db", true, false, "no such file").to_string();
+    assert!(sqlite.contains("?mode=rwc"), "{sqlite}");
+    let postgres = open_error("postgres://jet:secret@db/j", false, true, "refused").to_string();
+    assert!(!postgres.contains("mode=rwc") && !postgres.contains("secret"), "{postgres}");
+    assert_eq!(postgres.contains("--features postgres"), !cfg!(feature = "postgres"), "{postgres}");
+}
+
 /// A URL's scheme is read in any case, as sqlx reads it: an in-memory SQLite database's reads
 /// share the writer's connection, so they find its tables.
 #[tokio::test]

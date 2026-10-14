@@ -137,12 +137,7 @@ impl Store {
             })
             .connect(url)
             .await
-            .map_err(|e| {
-                let url = without_password(url);
-                io::Error::other(format!(
-                    "cannot open the database at {url}: {e} (a sqlite URL ending `?mode=rwc` creates a new database)"
-                ))
-            })?;
+            .map_err(|e| open_error(url, sqlite, postgres, e))?;
         if create(&pool).await? {
             warn!("created a new, empty database at {}", without_password(url));
         }
@@ -541,6 +536,19 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
     let order = if query.desc { "s.sent_at DESC, s.order_id DESC" } else { "s.sent_at, s.order_id" };
     sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", values.len()));
     (sql, values)
+}
+
+/// Why [`Store::open`] couldn't connect to `url`, of SQLite or PostgreSQL as `open` read its
+/// scheme, with a hint for what's likely wrong.
+fn open_error(url: &str, sqlite: bool, postgres: bool, e: impl Display) -> io::Error {
+    let hint = if sqlite {
+        " (a sqlite URL ending `?mode=rwc` creates a new database)"
+    } else if postgres && !cfg!(feature = "postgres") {
+        " (this build has no PostgreSQL: build with `--features postgres`)"
+    } else {
+        ""
+    };
+    io::Error::other(format!("cannot open the database at {}: {e}{hint}", without_password(url)))
 }
 
 /// The pool [`Store::orders`] and [`Store::order`] read with: two connections of their own, so a
