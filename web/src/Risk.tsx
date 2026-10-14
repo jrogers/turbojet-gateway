@@ -1,8 +1,8 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import * as api from './api.ts'
 import RiskLimits from './Limits.tsx'
-import { namesTarget } from './Orders.tsx'
 import Reason from './Reason.tsx'
+import { namesTarget, targetCompId } from './sessions.ts'
 import { useLive } from './store.ts'
 import type { Limits, Me, RiskView } from './types.ts'
 
@@ -12,9 +12,6 @@ export const RISK_EVERY = 5_000
 type Action = { kind: 'block' | 'unblock' | 'cancel-all'; scope: string }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
-
-/** A session's TargetCompID, the client's: `BEGIN:SENDER->TARGET`, maybe `/SUB`, `:QUAL`. */
-const targetCompId = (session: string) => session.slice(session.indexOf('->') + 2).split(/[/:]/)[0]
 
 /**
  * Risk: each session's open and filled notional beside its limits, the reference prices, and the

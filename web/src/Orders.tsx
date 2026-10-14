@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import * as api from './api.ts'
 import { orderHref } from './router.ts'
+import { namesTarget } from './sessions.ts'
 import { done, useLive } from './store.ts'
 import { utc } from './time.ts'
 import type { OrderView, Status } from './types.ts'
@@ -65,19 +66,6 @@ function params(query: Query): Record<string, string | boolean | undefined> | st
   if (to <= from) return 'To is before from.'
   if (to - from > MAX_DAYS * DAY) return `A range covers ${MAX_DAYS} days at most.`
   return { ...filters, desc: true, from: new Date(from).toISOString(), to: new Date(to).toISOString() }
-}
-
-/**
- * `api::read::names_target`: whether `session` (`BEGIN:SENDER->TARGET`, maybe `/SUB`, `:QUAL`)
- * has `compId` as its TargetCompID, the client's.
- */
-export function namesTarget(session: string, compId: string): boolean {
-  const at = session.indexOf('->')
-  if (at < 0) return false
-  const target = session.slice(at + 2)
-  if (!target.startsWith(compId)) return false
-  const rest = target.slice(compId.length)
-  return rest === '' || rest[0] === '/' || rest[0] === ':'
 }
 
 /** `book::OrderFilter::matches`, for the store's orders, which no request filtered. */
