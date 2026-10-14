@@ -110,7 +110,11 @@ test("a lag's snapshot replaces all but the alarms", () => {
   expect(state.blocked).toEqual(['comp:FUNDB'])
   expect(state.unavailable).toBe(true)
   expect(state.alarms.map((a) => a.text)).toEqual(['kept'])
-  expect(apply(state, { type: 'order', ...order(9, 'filled') }, snapshot()).finished.get(9)?.status).toBe('filled')
+  expect(state.snapshots).toBe(2)
+  // A snapshot empties the finished: they may be out of its scope.
+  const done = apply(state, { type: 'order', ...order(9, 'filled') })
+  expect([...done.finished.keys()]).toEqual([9])
+  expect(apply(done, snapshot()).finished.size).toBe(0)
 })
 
 test('alarms are kept newest first, so many at most; the gateway coming back is available', () => {

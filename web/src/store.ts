@@ -13,10 +13,13 @@ export interface LiveState {
   /** The working orders, by `id`. */
   orders: Map<number, OrderView>
   /**
-   * The orders done since the console opened, by `id`, as their last event said: so a screen
-   * showing done orders read over HTTP can show their latest. A snapshot keeps them.
+   * The orders done since the last snapshot, by `id`, as their last event said: so a screen
+   * showing done orders read over HTTP can show their latest. A snapshot clears them: its scope
+   * may have changed, and events may have been missed, so screens read again (`snapshots`).
    */
   finished: Map<number, OrderView>
+  /** The snapshots had: one more means what was read over HTTP may be stale, or out of scope. */
+  snapshots: number
   /** The snapshot's: with a full page, the `after` for `GET /api/orders?working=true`. */
   ordersNext: number | null
   /** Scopes as written: `all`, `comp:COMPID`, `session:SESSION`. */
@@ -31,6 +34,7 @@ export const initial: LiveState = {
   sessions: [],
   orders: new Map(),
   finished: new Map(),
+  snapshots: 0,
   ordersNext: null,
   blocked: [],
   unavailable: false,
@@ -53,6 +57,8 @@ export function reduce(state: LiveState, message: LiveMessage): LiveState {
         ready: true,
         sessions: message.sessions,
         orders: new Map(message.orders.map((order) => [order.id, order])),
+        finished: new Map(),
+        snapshots: state.snapshots + 1,
         ordersNext: message.orders_next,
         blocked: message.blocked,
         unavailable: message.unavailable,

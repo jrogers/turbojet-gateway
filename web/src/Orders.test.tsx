@@ -186,3 +186,18 @@ test('flags show as badges, and decimals as the API wrote them', () => {
   const cells = [...row('O1').querySelectorAll('td.num')].map((cell) => cell.textContent)
   expect(cells).toEqual(['100', '10.250000000000000001', '100.000', '10.10'])
 })
+
+test('a new snapshot reads again, dropping the pages read before', async () => {
+  const { rerender } = render(view(snapshot([])))
+  pages = [{ orders: [order(1)], next: 1 }, { orders: [order(5, { status: 'filled' })], next: null }]
+  await filter({ 'Working only': false })
+  await act(async () => fireEvent.click(screen.getByRole('button', { name: 'More' })))
+  expect(shown()).toEqual(['O5', 'O1'])
+
+  // Say the scope changed: the snapshot's orders, and a page read again.
+  pages = [{ orders: [order(2, { status: 'filled' })], next: null }]
+  const again = reduce(snapshot([]), { type: 'snapshot', sessions: [], orders: [order(3)], orders_next: null, blocked: [], unavailable: false })
+  await act(async () => rerender(view(again)))
+  expect(calls).toEqual(['/api/orders', '/api/orders?after=1', '/api/orders'])
+  expect(shown()).toEqual(['O3', 'O2'])
+})

@@ -109,28 +109,30 @@ export default function Orders() {
   const past = query.from !== ''
   const asked = params(query)
 
-  // The query a page read is for: one read for an earlier query is dropped.
-  const asking = useRef(query)
+  // A token for the current query and snapshot, new with each: a read for earlier ones is dropped.
+  const asking = useRef<object>(undefined)
 
-  // `asked` is `query`'s, so `query` alone is the dependency.
+  // `asked` is `query`'s, so `query` is the dependency, with the snapshots: a new one may follow
+  // missed events or a new scope, so what was read is read again.
   useEffect(() => {
-    asking.current = query
+    const at = {}
+    asking.current = at
     setLoaded(undefined)
     setError(typeof asked === 'string' ? asked : undefined)
     const reads = typeof asked !== 'string' && (past || !query.working)
     setBusy(reads)
     if (!reads) return
     api.orders(asked).then(
-      (page) => asking.current === query && setLoaded(page),
-      (e: unknown) => asking.current === query && setError(e instanceof Error ? e.message : String(e)),
-    ).finally(() => asking.current === query && setBusy(false))
-  }, [query])
+      (page) => asking.current === at && setLoaded(page),
+      (e: unknown) => asking.current === at && setError(e instanceof Error ? e.message : String(e)),
+    ).finally(() => asking.current === at && setBusy(false))
+  }, [query, live.snapshots])
 
   const next = loaded ? loaded.next : !past && query.working && live.ready ? live.ordersNext : null
 
   async function more() {
     if (typeof asked === 'string' || next === null) return
-    const at = query
+    const at = asking.current
     setBusy(true)
     setError(undefined)
     try {
