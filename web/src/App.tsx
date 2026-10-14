@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import Alarms, { AlarmCount, type Dismissed } from './Alarms.tsx'
 import * as api from './api.ts'
 import Login from './Login.tsx'
@@ -53,7 +53,22 @@ export default function App() {
   return <Shell me={me} onLogout={() => enter(null)} />
 }
 
-function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
+/** The live state, for the whole shell: its header shows the alarm count, and the clients. */
+function Shell(props: { me: Me; onLogout: () => void }) {
+  return (
+    <LiveProvider>
+      <Frame {...props} />
+    </LiveProvider>
+  )
+}
+
+function Frame({ me: login, onLogout }: { me: Me; onLogout: () => void }) {
+  const live = useLive()
+  // The user's clients as the last snapshot said: a reload may have changed them since login.
+  const me = useMemo(
+    () => (live.clients === undefined ? login : { ...login, clients: live.clients }),
+    [login, live.clients],
+  )
   const route = useRoute()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
@@ -74,9 +89,8 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
     }
   }
 
-  // The live state above the header too: its alarm count.
   return (
-    <LiveProvider>
+    <>
       <header className="shell">
         <span className="brand">Jetbridge</span>
         <nav>
@@ -106,7 +120,7 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
         <Alarms dismissed={dismissed} onDismiss={setDismissed} />
         <Screen route={route} me={me} />
       </main>
-    </LiveProvider>
+    </>
   )
 }
 

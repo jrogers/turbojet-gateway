@@ -189,6 +189,8 @@ export interface Snapshot {
   /** Scopes as written: `all`, `comp:COMPID`, `session:SESSION` (`book::Scope`). */
   blocked: string[]
   unavailable: boolean
+  /** The user's clients the snapshot was taken under: a reload may change them. `null`, all. */
+  clients: string[] | null
 }
 
 /** `api::live::SessionChange`'s `event`. */

@@ -27,6 +27,7 @@ const live = reduce(initial, {
   orders_next: null,
   blocked: [],
   unavailable: false,
+  clients: null,
 })
 
 const who = (role: Me['role'], clients: string[] | null = null): Me => ({ user: 'u', role, clients })

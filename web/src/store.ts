@@ -1,6 +1,6 @@
 import { createContext, createElement, useContext, useEffect, useReducer, useState, type ReactNode } from 'react'
 import { connect, type Opener, type Status as LinkStatus } from './live.ts'
-import type { Alarm, LiveMessage, OrderView, SessionChange, SessionView, Status } from './types.ts'
+import type { Alarm, AlarmKind, LiveMessage, OrderView, SessionChange, SessionView, Status } from './types.ts'
 
 /** The finished orders kept: the oldest go first. */
 export const MAX_FINISHED = 1_000
@@ -29,7 +29,15 @@ export interface LiveState {
   /** Scopes as written: `all`, `comp:COMPID`, `session:SESSION`. */
   blocked: string[]
   unavailable: boolean
-  /** Newest first, [`MAX_ALARMS`] at most. Not in a snapshot: those kept since the console opened. */
+  /**
+   * The user's clients as the last snapshot said (`null`, all), over what login said: a reload may
+   * change them. `undefined` until a snapshot.
+   */
+  clients?: string[] | null
+  /**
+   * Newest first, [`MAX_ALARMS`] at most. Not in a snapshot: those kept since the console opened,
+   * but only the gateway-wide ones once a snapshot comes under other clients.
+   */
   alarms: Alarm[]
 }
 
@@ -45,17 +53,23 @@ export const initial: LiveState = {
   alarms: [],
 }
 
+/** `book::Alarm::visible_to`'s alarms every user is sent, whatever its clients. */
+const GATEWAY_WIDE: readonly AlarmKind[] = ['gateway_unavailable', 'gateway_available', 'venue_store_reset']
+
 /** `book::Status::is_done`: no longer working. */
 export const done = (status: Status) => status === 'filled' || status === 'canceled' || status === 'expired' || status === 'rejected'
 
 /**
  * `message` applied to `state`, as `api::live` says a console does: a snapshot replaces all but
- * the alarms, an order event replaces its order (or adds it, or moves it to `finished` once done), and the rest
+ * the alarms (of which it keeps only the gateway-wide if its clients changed), an order event replaces its order (or adds it, or moves it to `finished` once done), and the rest
  * change what they name. Pure: `state` isn't changed.
  */
 export function reduce(state: LiveState, message: LiveMessage): LiveState {
   switch (message.type) {
-    case 'snapshot':
+    case 'snapshot': {
+      // Rescoped: the alarms about clients no longer the user's go, as no snapshot repeats them.
+      // Those about clients still its own go too: an alarm's `client` is a session, not a CompID.
+      const rescoped = state.snapshots > 0 && JSON.stringify(state.clients) !== JSON.stringify(message.clients)
       return {
         ...state,
         ready: true,
@@ -66,7 +80,10 @@ export function reduce(state: LiveState, message: LiveMessage): LiveState {
         ordersNext: message.orders_next,
         blocked: message.blocked,
         unavailable: message.unavailable,
+        clients: message.clients,
+        alarms: rescoped ? state.alarms.filter((alarm) => GATEWAY_WIDE.includes(alarm.kind)) : state.alarms,
       }
+    }
     case 'order': {
       const { type: _, ...order } = message
       // ponytail: a copy of the working orders per event, O(page) each, and of the finished ones

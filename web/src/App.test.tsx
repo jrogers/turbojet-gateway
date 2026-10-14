@@ -176,7 +176,7 @@ test('the shell keeps the live socket while logged in, and says when it is down'
   const socket = await opened()
   act(() => {
     socket.open()
-    socket.send({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false })
+    socket.send({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients: null })
   })
   expect(screen.getByRole('heading', { name: 'Clients' })).toBeTruthy()
   expect(screen.queryByText('Disconnected, reconnecting…')).toBeNull()
@@ -231,7 +231,7 @@ test('alarms show newest first, counted in the header, until dismissed; a snapsh
   render(<App />)
   await screen.findByText('operator')
   const socket = await opened()
-  const snapshot = { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false }
+  const snapshot = { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients: null }
   act(() => {
     socket.open()
     socket.send(snapshot)
@@ -277,7 +277,7 @@ test('the gateway unavailable shows a banner until it is available, from an alar
   render(<App />)
   await screen.findByText('operator')
   const socket = await opened()
-  const snapshot = (unavailable: boolean) => ({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable })
+  const snapshot = (unavailable: boolean) => ({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable, clients: null })
   act(() => {
     socket.open()
     socket.send(snapshot(false))
@@ -297,4 +297,33 @@ test('the gateway unavailable shows a banner until it is available, from an alar
   expect(screen.getByRole('alert')).toBeTruthy()
   act(() => socket.send(snapshot(false)))
   expect(screen.queryByRole('alert')).toBeNull()
+})
+
+test('a snapshot under other clients shows them in the header, and scopes the actions', async () => {
+  serve({ 'GET /api/me': () => json(alice), 'GET /api/sessions': () => json([]) })
+  window.location.hash = '#/sessions'
+  render(<App />)
+  await screen.findByText('FUNDA, FUNDB')
+  const socket = await opened()
+  const venue = {
+    side: 'venue',
+    id: 'FIX.4.4:JETBRIDGE->NASDAQ',
+    venue: 'NASDAQ',
+    status: 'logged_on',
+    next_incoming: null,
+    next_outgoing: null,
+    activity: null,
+    paused: false,
+  }
+  const snapshot = (clients: string[] | null) => ({ type: 'snapshot', sessions: [venue], orders: [], orders_next: null, blocked: [], unavailable: false, clients })
+  act(() => {
+    socket.open()
+    socket.send(snapshot(['FUNDA']))
+  })
+  expect(screen.getByText('FUNDA')).toBeTruthy()
+  // Scoped: a venue isn't its to act on.
+  expect(screen.queryByRole('button', { name: 'Pause' })).toBeNull()
+  act(() => socket.send(snapshot(null)))
+  expect(screen.getByText('all clients')).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Pause' })).toBeTruthy()
 })

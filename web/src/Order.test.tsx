@@ -55,7 +55,7 @@ const hit = (raw: string, over: Partial<Hit> = {}): Hit => ({
 const PATH = '/api/orders/O%2F7'
 
 const snapshot = (orders: OrderView[] = []): LiveState =>
-  reduce(initial, { type: 'snapshot', sessions: [], orders, orders_next: null, blocked: [], unavailable: false })
+  reduce(initial, { type: 'snapshot', sessions: [], orders, orders_next: null, blocked: [], unavailable: false, clients: null })
 
 const who = (role: Me['role']): Me => ({ user: 'u', role, clients: null })
 
@@ -116,7 +116,7 @@ test('shows the order’s fields and requests, and follows its live events', asy
 
   // A new snapshot reads it again.
   routes[`GET ${PATH}`] = () => json(detail({ status: 'filled', cum_qty: '100' }))
-  await act(async () => rerender(page('O/7', who('viewer'), reduce(state, { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false }))))
+  await act(async () => rerender(page('O/7', who('viewer'), reduce(state, { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients: null }))))
   expect(keys()).toEqual([`GET ${PATH}`, `GET ${PATH}`, `GET ${PATH}/messages`])
   expect(field('Status')).toBe('filled')
 })
@@ -252,7 +252,7 @@ test('an older read answering after a newer one is dropped', async () => {
   )
   const state = snapshot()
   const { rerender } = render(page('O/7', who('viewer'), state))
-  const again = reduce(state, { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false })
+  const again = reduce(state, { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false, clients: null })
   rerender(page('O/7', who('viewer'), again))
   expect(answers).toHaveLength(2)
   await act(async () => answers[1](detail({ status: 'filled' })))

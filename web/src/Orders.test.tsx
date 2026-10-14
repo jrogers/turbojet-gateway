@@ -30,7 +30,7 @@ const order = (id: number, over: Partial<OrderView> = {}): OrderView => ({
 })
 
 const snapshot = (orders: OrderView[], orders_next: number | null = null): LiveState =>
-  reduce(initial, { type: 'snapshot', sessions: [], orders, orders_next, blocked: [], unavailable: false })
+  reduce(initial, { type: 'snapshot', sessions: [], orders, orders_next, blocked: [], unavailable: false, clients: null })
 
 const view = (state: LiveState) => (
   <LiveContext.Provider value={{ ...state, link: 'open' }}>
@@ -233,7 +233,7 @@ test('a new snapshot reads again, dropping the pages read before', async () => {
 
   // Say the scope changed: the snapshot's orders, and a page read again.
   pages = [{ orders: [order(2, { status: 'filled' })], next: null }]
-  const again = reduce(snapshot([]), { type: 'snapshot', sessions: [], orders: [order(3)], orders_next: null, blocked: [], unavailable: false })
+  const again = reduce(snapshot([]), { type: 'snapshot', sessions: [], orders: [order(3)], orders_next: null, blocked: [], unavailable: false, clients: null })
   await act(async () => rerender(view(again)))
   expect(calls).toEqual(['/api/orders?desc=true', '/api/orders?desc=true&after=5', '/api/orders?desc=true'])
   expect(shown()).toEqual(['O3', 'O2'])

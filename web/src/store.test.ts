@@ -44,6 +44,7 @@ const snapshot = (over: Partial<Snapshot> = {}): Snapshot => ({
   orders_next: null,
   blocked: [],
   unavailable: false,
+  clients: null,
   ...over,
 })
 
@@ -115,6 +116,22 @@ test("a lag's snapshot replaces all but the alarms", () => {
   const done = apply(state, { type: 'order', ...order(9, 'filled') })
   expect([...done.finished.keys()]).toEqual([9])
   expect(apply(done, snapshot()).finished.size).toBe(0)
+})
+
+test("a snapshot under other clients keeps only the gateway-wide alarms; the first keeps them all", () => {
+  const kinds = (state: LiveState) => state.alarms.map((a) => a.kind)
+  // Alarms can come before the first snapshot, from a socket's first events.
+  const first = apply(initial, alarm('stuck_cancel'), snapshot({ clients: ['FUNDA'] }))
+  expect(kinds(first)).toEqual(['stuck_cancel'])
+  expect(first.clients).toEqual(['FUNDA'])
+  const held = apply(first, alarm('gateway_unavailable'), alarm('overfill'), alarm('venue_store_reset'), alarm('gateway_available'))
+  const same = apply(held, snapshot({ clients: ['FUNDA'] }))
+  expect(kinds(same)).toEqual(kinds(held))
+  const rescoped = apply(held, snapshot({ clients: ['FUNDB'] }))
+  expect(kinds(rescoped)).toEqual(['gateway_available', 'venue_store_reset', 'gateway_unavailable'])
+  expect(rescoped.clients).toEqual(['FUNDB'])
+  // Unscoped is a change too.
+  expect(kinds(apply(held, snapshot({ clients: null })))).toEqual(kinds(rescoped))
 })
 
 test('alarms are kept newest first, so many at most; the gateway coming back is available', () => {
