@@ -1,8 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import * as api from './api.ts'
 import Reason from './Reason.tsx'
 import { useLive } from './store.ts'
 import type { Me, SessionView } from './types.ts'
+
+/** How often the sequence numbers are read again, in ms: the live events don't carry them. */
+export const NUMBERS_EVERY = 5_000
+
+type Numbers = Pick<SessionView, 'next_incoming' | 'next_outgoing'>
+
+const key = (session: Pick<SessionView, 'side' | 'id'>) => `${session.side} ${session.id}`
 
 type Action = { kind: 'pause' | 'resume' | 'resend'; session: SessionView }
 
@@ -16,6 +23,21 @@ export default function Sessions({ me }: { me: Me }) {
   const [action, setAction] = useState<Action>()
   const [from, setFrom] = useState('')
   const [done, setDone] = useState<string>()
+  // The latest sequence numbers read, by `key`, over the store's: those change with every message,
+  // and only a snapshot says them.
+  const [numbers, setNumbers] = useState<Map<string, Numbers>>(new Map())
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      api.sessions().then(
+        (sessions) =>
+          setNumbers(new Map(sessions.map((s) => [key(s), { next_incoming: s.next_incoming, next_outgoing: s.next_outgoing }]))),
+        // A 401 has ended the session already; anything else, the next read may do better.
+        () => {},
+      )
+    }, NUMBERS_EVERY)
+    return () => clearInterval(timer)
+  }, [])
 
   const acts = (session: SessionView) =>
     me.role !== 'viewer' && (session.side === 'client' || me.clients === null)
@@ -33,8 +55,9 @@ export default function Sessions({ me }: { me: Me }) {
     if (kind === 'resend') {
       const seq = Number(from)
       if (!Number.isInteger(seq) || seq < 1) throw new Error('From must be a sequence number, 1 or more.')
-      const numbers = await api.resend(session.id, reason, seq)
-      setDone(`Asked ${name} to resend from ${seq}; next incoming ${numbers.next_incoming}.`)
+      const answer = await api.resend(session.id, reason, seq)
+      setNumbers((numbers) => new Map(numbers).set(key(session), answer))
+      setDone(`Asked ${name} to resend from ${seq}; next incoming ${answer.next_incoming}.`)
     } else {
       await api[kind](session.id, reason)
       setDone(`${kind === 'pause' ? 'Paused' : 'Resumed'} ${name}.`)
@@ -62,7 +85,7 @@ export default function Sessions({ me }: { me: Me }) {
                 </tr>
               </thead>
               <tbody>
-                {sessions.map((session) => (
+                {sessions.map((row) => ({ ...row, ...numbers.get(key(row)) })).map((session) => (
                   <tr key={session.id}>
                     <td title={session.id}>{session.venue ?? session.id}</td>
                     <td>

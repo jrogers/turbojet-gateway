@@ -1,10 +1,11 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 
 /**
  * A modal asking the reason for an action, which the API requires and audits. `children` are the
  * action's other fields. On submit it calls `onConfirm` with the reason, and closes once that
  * succeeds; a failure stays open, showing its message, to try again or cancel. Escape or Cancel
- * closes it. Focus starts on the reason, and goes back where it was on closing.
+ * closes it, but not while the action is under way. A native modal `<dialog>`: the page behind is
+ * inert. Focus starts on the reason, and goes back where it was on closing.
  */
 export default function Reason({
   title,
@@ -20,10 +21,16 @@ export default function Reason({
   const [reason, setReason] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  const dialog = useRef<HTMLDialogElement>(null)
 
   useEffect(() => {
     const before = document.activeElement
-    return () => (before instanceof HTMLElement ? before.focus() : undefined)
+    const shown = dialog.current!
+    shown.showModal()
+    return () => {
+      shown.close()
+      if (before instanceof HTMLElement) before.focus()
+    }
   }, [])
 
   async function submit(event: FormEvent) {
@@ -41,15 +48,17 @@ export default function Reason({
   }
 
   return (
-    <div className="backdrop">
-      <form
-        className="dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="reason-title"
-        onSubmit={submit}
-        onKeyDown={(e) => e.key === 'Escape' && !busy && onClose()}
-      >
+    <dialog
+      ref={dialog}
+      className="dialog"
+      aria-labelledby="reason-title"
+      onCancel={(e) => {
+        // Escape: closing is the parent's to do, by unmounting.
+        e.preventDefault()
+        if (!busy) onClose()
+      }}
+    >
+      <form onSubmit={submit}>
         <h2 id="reason-title">{title}</h2>
         {children}
         <label>
@@ -70,6 +79,6 @@ export default function Reason({
           </button>
         </div>
       </form>
-    </div>
+    </dialog>
   )
 }

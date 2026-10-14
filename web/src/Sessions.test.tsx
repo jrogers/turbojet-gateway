@@ -1,8 +1,8 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import * as api from './api.ts'
 import Reason from './Reason.tsx'
-import Sessions from './Sessions.tsx'
+import Sessions, { NUMBERS_EVERY } from './Sessions.tsx'
 import { initial, LiveContext, reduce } from './store.ts'
 import type { Me, SessionView } from './types.ts'
 
@@ -89,7 +89,8 @@ test('a resend posts the reason and from, with the CSRF token, and says how it w
   calls = serve(() => json({ error: 'a resend is under way' }, 409))
   fireEvent.click(within(row(FUNDA)).getByRole('button', { name: 'Resend' }))
   const dialog = screen.getByRole('dialog')
-  expect(dialog.getAttribute('aria-modal')).toBe('true')
+  // Shown as a modal (the setup's stand-in for showModal opens it).
+  expect((dialog as HTMLDialogElement).open).toBe(true)
   const reason = within(dialog).getByLabelText('Reason')
   expect(document.activeElement).toBe(reason)
   const confirm = within(dialog).getByRole('button', { name: 'Confirm' }) as HTMLButtonElement
@@ -102,7 +103,8 @@ test('a resend posts the reason and from, with the CSRF token, and says how it w
 
   calls = serve(() => json({ next_incoming: 12, next_outgoing: 34 }))
   fireEvent.click(confirm)
-  expect((await screen.findByRole('status')).textContent).toBe('Asked FIX.4.4:JETBRIDGE->FUNDA to resend from 7; next incoming 12.')
+  const status = await screen.findByRole('status')
+  expect(status.textContent).toBe('Asked FIX.4.4:JETBRIDGE->FUNDA to resend from 7; next incoming 12.')
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(calls).toHaveLength(1)
   expect(calls[0].url).toBe('/api/sessions/FIX.4.4%3AJETBRIDGE-%3EFUNDA/resend')
@@ -134,6 +136,37 @@ test('the reason dialog needs a reason, and Escape cancels it', () => {
   fireEvent.change(screen.getByLabelText('Reason'), { target: { value: '   ' } })
   fireEvent.submit(screen.getByRole('dialog'))
   expect(confirm).not.toHaveBeenCalled()
-  fireEvent.keyDown(screen.getByLabelText('Reason'), { key: 'Escape' })
+  // Escape is the dialog's cancel: kept from closing it natively, as the parent unmounts it.
+  const cancel = new Event('cancel', { cancelable: true })
+  fireEvent(screen.getByRole('dialog'), cancel)
+  expect(cancel.defaultPrevented).toBe(true)
   expect(close).toHaveBeenCalledOnce()
+})
+
+test('the sequence numbers are read again while shown, and a resend gives its own', async () => {
+  vi.useFakeTimers()
+  try {
+    const answers = [
+      json([{ ...session('client', FUNDA), next_incoming: 20, next_outgoing: 40 }, session('venue', VENUE)]),
+      json({ next_incoming: 21, next_outgoing: 41 }),
+    ]
+    const calls = serve(() => answers.shift()!)
+    const { unmount } = show(who('operator'))
+    expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on1234PauseResend`)
+    await act(() => vi.advanceTimersByTimeAsync(NUMBERS_EVERY))
+    expect(calls.map((c) => c.url)).toEqual(['/api/sessions'])
+    expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on2040PauseResend`)
+
+    fireEvent.click(within(row(FUNDA)).getByRole('button', { name: 'Resend' }))
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'gap' } })
+    fireEvent.change(screen.getByLabelText('From MsgSeqNum'), { target: { value: '3' } })
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm' })))
+    expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on2141PauseResend`)
+
+    unmount()
+    await vi.advanceTimersByTimeAsync(NUMBERS_EVERY * 3)
+    expect(calls).toHaveLength(2)
+  } finally {
+    vi.useRealTimers()
+  }
 })
