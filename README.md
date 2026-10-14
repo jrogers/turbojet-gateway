@@ -79,8 +79,7 @@ TLS to it.
 
 Build with `--features console` to serve the [web console](#console) at the API's address.
 
-Jetbridge builds against Turbojet by path, so it expects a Turbojet checkout next to it
-(`../turbojet`). It needs Rust 1.89 or later.
+It needs Rust 1.89 or later.
 
 ## Configuration
 

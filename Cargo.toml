@@ -33,12 +33,12 @@ sha2 = "0.10"
 subtle = "2"
 # The users file's atomic rewrite: a temporary file beside it, renamed over it.
 tempfile = "3"
-# By path while the engine API Jetbridge needs is still changing; crates.io once released.
-turbojet = { path = "../turbojet/crates/turbojet" }
+# From crates.io; engine work patches in a local Turbojet checkout (see CLAUDE.md).
+turbojet = "0.3"
 # `tz`: named time zones in session schedules and `day_end`.
-turbojet-config = { path = "../turbojet/crates/turbojet-config", features = ["tz"] }
-turbojet-fix42 = { path = "../turbojet/crates/turbojet-fix42" }
-turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
+turbojet-config = { version = "0.3", features = ["tz"] }
+turbojet-fix42 = "0.3"
+turbojet-fix44 = "0.3"
 # The operator API's HTTP server. HTTP/1.1 only: the Origin check on a cookie's websocket upgrade
 # (`api::auth`) keys on the Upgrade header, which HTTP/2's extended CONNECT doesn't send.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
