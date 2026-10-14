@@ -439,11 +439,12 @@ async fn a_database_reopens_and_another_schema_version_is_refused() {
     let changes = Changes { orders: vec![row], ..Changes::default() };
     let store = Store::open(&url).await.unwrap();
     store.write(std::slice::from_ref(&changes)).await.unwrap();
-    store.pool.close().await;
+    store.close().await;
     let store = Store::open(&url).await.unwrap();
     assert_eq!(store.load().await.unwrap(), applied(std::slice::from_ref(&changes)));
+    store.put_back_writer().await;
     sqlx::query("UPDATE schema_version SET version = 2").execute(&store.pool).await.unwrap();
-    store.pool.close().await;
+    store.close().await;
     let error = Store::open(&url).await.unwrap_err().to_string();
     assert!(error.contains("schema is version 2; this Jetbridge reads version 1"), "{error}");
     let pool = AnyPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
@@ -623,6 +624,7 @@ async fn a_cl_ord_id_with_no_day_is_one_row() {
     ];
     let first = Changes { orders, cl_ord_ids: vec![row(1)], ..Changes::default() };
     store.write(&[first, Changes { cl_ord_ids: vec![row(2)], ..Changes::default() }]).await.unwrap();
+    store.put_back_writer().await;
     let rows: Vec<(String, i64)> =
         sqlx::query_as("SELECT day, order_id FROM cl_ord_ids").fetch_all(&store.pool).await.unwrap();
     assert_eq!(rows, [(NO_DAY.to_string(), 2)]);
@@ -691,8 +693,9 @@ async fn a_schemes_case_does_not_matter() {
 async fn a_snapshot_is_repeatable_read_on_postgres() {
     let Some(url) = postgres().await else { return };
     let store = Store::open(&url).await.unwrap();
-    for (pool, read_only) in [(&store.pool, "off"), (&store.reads, "on")] {
-        let mut transaction = store.begin_snapshot(pool).await.unwrap();
+    for (pool, read_only) in [(&store.pool, "off"), (store.reads.as_ref().unwrap(), "on")] {
+        let mut connection = pool.acquire().await.unwrap();
+        let mut transaction = store.begin_snapshot(&mut connection).await.unwrap();
         let level: String =
             sqlx::query_scalar("SHOW transaction_isolation").fetch_one(&mut *transaction).await.unwrap();
         assert_eq!(level, "repeatable read");
@@ -758,6 +761,7 @@ pub(crate) fn current(client: &ClientId, day: Day) -> Changes {
 }
 
 async fn ids(store: &Store, sql: &str) -> Vec<i64> {
+    store.put_back_writer().await;
     sqlx::query_scalar(sql).fetch_all(&store.pool).await.unwrap()
 }
 
@@ -846,7 +850,7 @@ async fn opening_an_older_database_adds_the_pruned_table() {
     let (url, _dir) = reopenable().await;
     let store = Store::open(&url).await.unwrap();
     sqlx::query("DROP TABLE pruned").execute(&store.pool).await.unwrap();
-    store.pool.close().await;
+    store.close().await;
     let store = Store::open(&url).await.unwrap();
     assert_eq!(store.pruned_through().await.unwrap(), None);
     assert_eq!(store.prune(time(2, 0), 1).await.unwrap(), Pruned { orders: 0 });
@@ -1080,6 +1084,7 @@ async fn reads_of_history_dont_wait_for_the_writer() {
     let store = Store::open(&url).await.unwrap();
     let funda = ClientId::from("FUNDA");
     store.write(&[dated(1, &funda, None, true, on(0, 9))]).await.unwrap();
+    store.put_back_writer().await;
     let mut writing = store.pool.begin().await.unwrap();
     write_changes(&mut writing, &dated(2, &funda, None, true, on(0, 10))).await.unwrap();
     let wait = std::time::Duration::from_secs(5);
@@ -1089,7 +1094,7 @@ async fn reads_of_history_dont_wait_for_the_writer() {
     assert!(read.expect("not waiting for the writer").unwrap().is_some());
     writing.commit().await.unwrap();
     assert_eq!(ids_of(&store, created_in(on(0, 0), on(1, 0))).await, [1, 2]);
-    assert!(sqlx::query("DELETE FROM orders").execute(&store.reads).await.is_err(), "read-only");
+    assert!(sqlx::query("DELETE FROM orders").execute(store.reads.as_ref().unwrap()).await.is_err(), "read-only");
 }
 
 #[test]

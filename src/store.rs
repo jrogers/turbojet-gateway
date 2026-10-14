@@ -16,13 +16,12 @@
 use std::fmt::Display;
 use std::io;
 use std::str::FromStr;
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use sqlx::any::{AnyPoolOptions, AnyRow};
-use sqlx::{AnyConnection, AnyPool, Executor, Row};
+use sqlx::pool::PoolConnection;
+use sqlx::{AnyConnection, AnyPool, Connection, Executor, Row};
 use tracing::warn;
 use turbojet::fields::{CompactString, Decimal};
 
@@ -38,10 +37,17 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// The book's database: see the [module documentation](self).
 #[derive(Debug, Clone)]
 pub struct Store {
+    /// The writer's pool, of one connection, which [`writer`](Store::writer) holds.
     pool: AnyPool,
+    /// The writer's connection, held rather than returned to its pool between uses: sqlx pings a
+    /// connection it takes back, with no timeout, and one lost without a reset would then hold
+    /// the pool's one place until TCP gives up. Taken anew from the pool after one is dropped.
+    /// Writes, loads and prunes take turns on it.
+    writer: Arc<tokio::sync::Mutex<Option<PoolConnection<sqlx::Any>>>>,
     /// What [`orders`](Store::orders) and [`order`](Store::order) read with, so a page of history
-    /// doesn't hold the writer's one connection: see [`open`](Store::open).
-    reads: AnyPool,
+    /// doesn't hold the writer's one connection: see [`open`](Store::open). None for an in-memory
+    /// SQLite database, whose reads use the writer's.
+    reads: Option<AnyPool>,
     /// The database is PostgreSQL, not SQLite: see [`begin_snapshot`](Store::begin_snapshot) and
     /// `open_reads`.
     postgres: bool,
@@ -142,9 +148,10 @@ impl Store {
         if create(&pool).await? {
             warn!("created a new, empty database at {}", without_password(url));
         }
-        let reads = open_reads(url, sqlite, postgres, &pool).await?;
+        let reads = open_reads(url, sqlite, postgres).await?;
         Ok(Self {
             pool,
+            writer: Arc::default(),
             reads,
             postgres,
             #[cfg(test)]
@@ -161,7 +168,12 @@ impl Store {
     pub async fn write(&self, changes: &[Changes]) -> io::Result<()> {
         #[cfg(test)]
         self.hooks.before_write().await?;
-        let mut transaction = self.pool.begin().await.map_err(database("starting a write"))?;
+        self.on_writer("starting a write", async |connection| self.write_on(connection, changes).await).await
+    }
+
+    /// [`write`](Self::write)'s transaction, on `connection`.
+    async fn write_on(&self, connection: &mut AnyConnection, changes: &[Changes]) -> io::Result<()> {
+        let mut transaction = connection.begin().await.map_err(database("starting a write"))?;
         for changes in changes {
             write_changes(&mut transaction, changes).await?;
         }
@@ -171,10 +183,48 @@ impl Store {
         transaction.commit().await.map_err(database("committing a write"))
     }
 
-    /// Begins a transaction on `pool` that reads one snapshot throughout: SQLite's always does;
-    /// PostgreSQL's default, READ COMMITTED, takes one per statement.
-    async fn begin_snapshot(&self, pool: &AnyPool) -> Result<sqlx::Transaction<'static, sqlx::Any>, sqlx::Error> {
-        if self.postgres { pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ").await } else { pool.begin().await }
+    /// Runs `work` on the writer's connection, taking one from the pool if none is held. After an
+    /// error, one that doesn't answer a ping is dropped, so the next use takes a new one; one that
+    /// does is kept, as an in-memory database lives only as long as its connection.
+    async fn on_writer<T>(
+        &self,
+        doing: &'static str,
+        work: impl AsyncFnOnce(&mut AnyConnection) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut held = self.writer.lock().await;
+        if held.is_none() {
+            *held = Some(self.pool.acquire().await.map_err(database(doing))?);
+        }
+        let connection = held.as_mut().expect("taken above");
+        let result = work(connection).await;
+        if result.is_err() && connection.ping().await.is_err() {
+            held.take();
+        }
+        result
+    }
+
+    /// Runs `work` on a connection of the reads' pool, or the writer's if there is none.
+    async fn on_reads<T>(
+        &self,
+        doing: &'static str,
+        work: impl AsyncFnOnce(&mut AnyConnection) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let Some(reads) = &self.reads else { return self.on_writer(doing, work).await };
+        let mut connection = reads.acquire().await.map_err(database(doing))?;
+        work(&mut connection).await
+    }
+
+    /// Begins a transaction on `connection` that reads one snapshot throughout: SQLite's always
+    /// does; PostgreSQL's default, READ COMMITTED, takes one per statement.
+    async fn begin_snapshot<'c>(
+        &self,
+        connection: &'c mut AnyConnection,
+    ) -> Result<sqlx::Transaction<'c, sqlx::Any>, sqlx::Error> {
+        if self.postgres {
+            connection.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ").await
+        } else {
+            connection.begin().await
+        }
     }
 
     /// What [`Book::restore`](crate::book::Book::restore) keeps of the store: orders live or of
@@ -184,9 +234,14 @@ impl Store {
     ///
     /// The database refuses a query, or holds a value this build can't read.
     pub async fn load(&self) -> io::Result<Snapshot> {
+        self.on_writer("starting a load", async |connection| self.load_on(connection).await).await
+    }
+
+    /// [`load`](Self::load), on `connection`.
+    async fn load_on(&self, connection: &mut AnyConnection) -> io::Result<Snapshot> {
         // One transaction of one snapshot (see `begin_snapshot`), so the orders and what names
         // them are of the same commit.
-        let mut transaction = self.begin_snapshot(&self.pool).await.map_err(database("starting a load"))?;
+        let mut transaction = self.begin_snapshot(connection).await.map_err(database("starting a load"))?;
         let connection = &mut *transaction;
         let mut snapshot = Snapshot::default();
         // The held IDs found once, by index; dropped with the transaction should a read fail.
@@ -254,8 +309,21 @@ impl Store {
     ///
     /// The database refuses a query.
     pub async fn unknown_downstreams(&self, downstreams: &[CompactString]) -> io::Result<Vec<CompactString>> {
+        let known = self.on_writer("looking up requests sent", async |connection| {
+            Self::known_downstreams(connection, downstreams).await
+        });
+        let known = known.await?;
+        let mut seen = std::collections::HashSet::new();
+        Ok(downstreams.iter().filter(|d| !known.contains(*d) && seen.insert(*d)).cloned().collect())
+    }
+
+    /// Those of `downstreams` the store has a request sent under or an orphan handled, on
+    /// `connection`.
+    async fn known_downstreams(
+        connection: &mut AnyConnection,
+        downstreams: &[CompactString],
+    ) -> io::Result<std::collections::HashSet<CompactString>> {
         let mut known = std::collections::HashSet::new();
-        let mut connection = self.pool.acquire().await.map_err(database("looking up requests sent"))?;
         for chunk in downstreams.chunks(LOOKUP_CHUNK) {
             let placeholders: Vec<String> = (1..=chunk.len()).map(|n| format!("${n}")).collect();
             let placeholders = placeholders.join(", ");
@@ -268,8 +336,7 @@ impl Store {
                 known.insert(Columns(&row).compact("downstream")?);
             }
         }
-        let mut seen = std::collections::HashSet::new();
-        Ok(downstreams.iter().filter(|d| !known.contains(*d) && seen.insert(*d)).cloned().collect())
+        Ok(known)
     }
 
     /// Deletes the done orders of trading days that ended before `before`, with their requests
@@ -303,7 +370,13 @@ impl Store {
     /// One transaction of [`prune`](Self::prune): up to `batch` orders, found once into a
     /// temporary table, as `load`'s `held`. How many it deleted.
     async fn prune_batch(&self, before: &str, batch: u64) -> io::Result<u64> {
-        let mut transaction = self.pool.begin().await.map_err(database("starting a prune"))?;
+        self.on_writer("starting a prune", async |connection| Self::prune_batch_on(connection, before, batch).await)
+            .await
+    }
+
+    /// [`prune_batch`](Self::prune_batch), on `connection`.
+    async fn prune_batch_on(connection: &mut AnyConnection, before: &str, batch: u64) -> io::Result<u64> {
+        let mut transaction = connection.begin().await.map_err(database("starting a prune"))?;
         let connection = &mut *transaction;
         connection
             .execute("CREATE TEMPORARY TABLE pruning (id BIGINT PRIMARY KEY)")
@@ -353,10 +426,13 @@ impl Store {
     ///
     /// The database refuses the query, or holds a time this build can't read.
     pub async fn pruned_through(&self) -> io::Result<Option<DateTime<Utc>>> {
-        let through: Option<String> = sqlx::query_scalar("SELECT sent_through FROM pruned")
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(database("reading what was pruned"))?;
+        let through = self.on_writer("reading what was pruned", async |connection| {
+            sqlx::query_scalar("SELECT sent_through FROM pruned")
+                .fetch_optional(connection)
+                .await
+                .map_err(database("reading what was pruned"))
+        });
+        let through: Option<String> = through.await?;
         through.map(|through| parse_time("sent_through", &through)).transpose()
     }
 
@@ -375,7 +451,10 @@ impl Store {
             Value::Text(text) => query.bind(text.as_str()),
             Value::Integer(integer) => query.bind(*integer),
         });
-        let rows = query.fetch_all(&self.reads).await.map_err(database("reading past orders"))?;
+        let rows = self.on_reads("reading past orders", async |c| {
+            query.fetch_all(c).await.map_err(database("reading past orders"))
+        });
+        let rows = rows.await?;
         rows.iter()
             .map(|row| {
                 let row = Columns(row);
@@ -392,8 +471,13 @@ impl Store {
     /// The database refuses a query, or holds a value this build can't read or an order without
     /// its original request.
     pub async fn order(&self, name: &str) -> io::Result<Option<OrderDetail>> {
+        self.on_reads("starting to read an order", async |connection| self.order_on(connection, name).await).await
+    }
+
+    /// [`order`](Self::order), on `connection`.
+    async fn order_on(&self, connection: &mut AnyConnection, name: &str) -> io::Result<Option<OrderDetail>> {
         // One transaction, so the order and its requests are of the same commit, as in `load`.
-        let mut transaction = self.begin_snapshot(&self.reads).await.map_err(database("starting to read an order"))?;
+        let mut transaction = self.begin_snapshot(connection).await.map_err(database("starting to read an order"))?;
         let row = sqlx::query(
             "SELECT o.*, c.answered AS cancel_answered FROM orders o \
              LEFT JOIN sent c ON c.downstream = o.cancel WHERE o.name = $1",
@@ -429,11 +513,27 @@ impl Store {
         Ok(Some(OrderDetail { order: view, venue_order_id: order.venue_order_id, requests }))
     }
 
-    /// Closes the reads' pool (an in-memory database's is the writer's too): how the API's tests
-    /// make a read fail.
+    /// Closes the reads' pool (an in-memory database's is the writer's): how the API's tests make
+    /// a read fail.
     #[cfg(test)]
     pub(crate) async fn close_reads(&self) {
-        self.reads.close().await;
+        match &self.reads {
+            Some(reads) => reads.close().await,
+            None => self.close().await,
+        }
+    }
+
+    /// Puts the writer's connection back in its pool, for a test to use the pool itself.
+    #[cfg(test)]
+    pub(crate) async fn put_back_writer(&self) {
+        self.writer.lock().await.take();
+    }
+
+    /// Closes the writer's pool, its connection put back first: as a process's end does.
+    #[cfg(test)]
+    pub(crate) async fn close(&self) {
+        self.put_back_writer().await;
+        self.pool.close().await;
     }
 }
 
@@ -557,9 +657,9 @@ fn open_error(url: &str, sqlite: bool, postgres: bool, e: impl Display) -> io::E
 /// read-only: SQLite's by `mode=ro`, PostgreSQL's by each session's default. WAL (which the
 /// writer turns on) lets SQLite's read while it writes. An in-memory SQLite database is its one
 /// connection's, so it can't have another pool: its reads share the writer's, which is for tests.
-async fn open_reads(url: &str, sqlite: bool, postgres: bool, pool: &AnyPool) -> io::Result<AnyPool> {
+async fn open_reads(url: &str, sqlite: bool, postgres: bool) -> io::Result<Option<AnyPool>> {
     if sqlite && (url.contains(":memory:") || url.contains("mode=memory")) {
-        return Ok(pool.clone());
+        return Ok(None);
     }
     let url = if sqlite { read_only(url) } else { url.to_string() };
     AnyPoolOptions::new()
@@ -577,6 +677,7 @@ async fn open_reads(url: &str, sqlite: bool, postgres: bool, pool: &AnyPool) -> 
         })
         .connect(&url)
         .await
+        .map(Some)
         .map_err(|e| io::Error::other(format!("cannot open reads of the database at {}: {e}", without_password(&url))))
 }
 
