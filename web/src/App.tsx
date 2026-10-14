@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import Alarms, { AlarmCount, type Dismissed } from './Alarms.tsx'
 import * as api from './api.ts'
 import Login from './Login.tsx'
 import Order from './Order.tsx'
@@ -56,6 +57,7 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
   const route = useRoute()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  const [dismissed, setDismissed] = useState<Dismissed>(new Set())
 
   // Back to login once logged out, or on a 401: the session had ended already. Any other failure
   // keeps the session, and says so.
@@ -72,8 +74,9 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
     }
   }
 
+  // The live state above the header too: its alarm count.
   return (
-    <>
+    <LiveProvider>
       <header className="shell">
         <span className="brand">Jetbridge</span>
         <nav>
@@ -84,6 +87,7 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
             Sessions
           </a>
         </nav>
+        <AlarmCount dismissed={dismissed} />
         <span className="who">
           <span className="user">{me.user}</span> <span className="role">{me.role}</span>{' '}
           <span className="clients">{me.clients === null ? 'all clients' : me.clients.join(', ')}</span>
@@ -97,13 +101,12 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
           Log out
         </button>
       </header>
-      <LiveProvider>
-        <main>
-          <Banner />
-          <Screen route={route} me={me} />
-        </main>
-      </LiveProvider>
-    </>
+      <main>
+        <Banner />
+        <Alarms dismissed={dismissed} onDismiss={setDismissed} />
+        <Screen route={route} me={me} />
+      </main>
+    </LiveProvider>
   )
 }
 

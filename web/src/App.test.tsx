@@ -179,7 +179,7 @@ test('the shell keeps the live socket while logged in, and says when it is down'
     socket.send({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false })
   })
   expect(screen.getByRole('heading', { name: 'Clients' })).toBeTruthy()
-  expect(screen.queryByRole('status')).toBeNull()
+  expect(screen.queryByText('Disconnected, reconnecting…')).toBeNull()
 
   fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
   await screen.findByLabelText('User')
@@ -224,4 +224,77 @@ test('under StrictMode the shell leaves one live socket open', async () => {
   // Mounted, unmounted and mounted again: two opened, the first closed.
   await waitFor(() => expect(FakeSocket.opened).toHaveLength(2))
   expect(FakeSocket.opened.filter((socket) => !socket.closed)).toHaveLength(1)
+})
+
+test('alarms show newest first, counted in the header, until dismissed; a snapshot keeps them', async () => {
+  serve({ 'GET /api/me': () => json(alice) })
+  render(<App />)
+  await screen.findByText('operator')
+  const socket = await opened()
+  const snapshot = { type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false }
+  act(() => {
+    socket.open()
+    socket.send(snapshot)
+  })
+  expect(screen.queryByRole('region', { name: 'Alarms' })).toBeNull()
+  expect(screen.queryByText(/alarms?$/)).toBeNull()
+
+  const focused = document.activeElement
+  act(() => {
+    socket.send({ type: 'alarm', time: '2026-10-14T09:30:01.123Z', kind: 'stuck_cancel', client: 'FUNDA', text: 'gave up cancelling 7' })
+    socket.send({ type: 'alarm', time: '2026-10-14T09:31:02Z', kind: 'venue_store_reset', client: null, text: 'XNYS reset its store' })
+  })
+  // A new alarm doesn't take the focus.
+  expect(document.activeElement).toBe(focused)
+  expect(screen.getByText('2 alarms')).toBeTruthy()
+  const items = () =>
+    Array.from(screen.getByRole('region', { name: 'Alarms' }).querySelectorAll('li')).map((li) => li.textContent)
+  expect(items()).toEqual([
+    '2026-10-14 09:31:02 venue store reset XNYS reset its store Dismiss',
+    '2026-10-14 09:30:01 stuck cancel FUNDA gave up cancelling 7 Dismiss',
+  ])
+
+  act(() => socket.send(snapshot))
+  expect(items()).toHaveLength(2)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss the venue store reset alarm of 2026-10-14 09:31:02' }))
+  expect(items()).toEqual(['2026-10-14 09:30:01 stuck cancel FUNDA gave up cancelling 7 Dismiss'])
+  expect(screen.getByText('1 alarm')).toBeTruthy()
+
+  // Dismissed stays dismissed as more come.
+  act(() => socket.send({ type: 'alarm', time: '2026-10-14T09:32:00Z', kind: 'orphan', client: 'FUNDB', text: 'no order for 9' }))
+  expect(items()).toHaveLength(2)
+  expect(screen.getByText('2 alarms')).toBeTruthy()
+
+  fireEvent.click(screen.getByRole('button', { name: /^Dismiss the orphan/ }))
+  fireEvent.click(screen.getByRole('button', { name: /^Dismiss the stuck cancel/ }))
+  expect(screen.queryByRole('region', { name: 'Alarms' })).toBeNull()
+  expect(screen.queryByText(/alarms?$/)).toBeNull()
+})
+
+test('the gateway unavailable shows a banner until it is available, from an alarm or a snapshot', async () => {
+  serve({ 'GET /api/me': () => json(alice) })
+  render(<App />)
+  await screen.findByText('operator')
+  const socket = await opened()
+  const snapshot = (unavailable: boolean) => ({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable })
+  act(() => {
+    socket.open()
+    socket.send(snapshot(false))
+  })
+  expect(screen.queryByRole('alert')).toBeNull()
+
+  act(() => socket.send({ type: 'alarm', time: '2026-10-14T09:30:00Z', kind: 'gateway_unavailable', client: null, text: 'database behind' }))
+  expect(screen.getByRole('alert').textContent).toMatch(/^The gateway is unavailable/)
+  // Dismissing the alarm leaves the banner: it says how things stand, not what happened.
+  fireEvent.click(screen.getByRole('button', { name: /^Dismiss the gateway unavailable/ }))
+  expect(screen.getByRole('alert')).toBeTruthy()
+
+  act(() => socket.send({ type: 'alarm', time: '2026-10-14T09:30:05Z', kind: 'gateway_available', client: null, text: 'caught up' }))
+  expect(screen.queryByRole('alert')).toBeNull()
+
+  act(() => socket.send(snapshot(true)))
+  expect(screen.getByRole('alert')).toBeTruthy()
+  act(() => socket.send(snapshot(false)))
+  expect(screen.queryByRole('alert')).toBeNull()
 })

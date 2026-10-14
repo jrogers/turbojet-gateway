@@ -205,6 +205,53 @@ tbody tr:hover {
   color: var(--warn);
 }
 
+/* The gateway's unavailable banner, and the alarms not dismissed: a short list, scrolling. */
+
+.banner.error {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.alarms {
+  margin: 0 0 1rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+}
+
+.alarms h2 {
+  margin: 0 0 0.25rem;
+  font-size: 1em;
+  color: var(--warn);
+}
+
+.alarms ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 10rem;
+  overflow-y: auto;
+}
+
+.alarms li {
+  padding: 0.15rem 0;
+  overflow-wrap: anywhere;
+}
+
+.alarms time,
+.alarms .client {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.alarms .kind {
+  font-weight: 600;
+}
+
+.alarms button {
+  margin-left: 0.4rem;
+}
+
 /* Sessions. */
 
 h2 {

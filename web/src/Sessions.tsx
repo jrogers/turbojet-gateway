@@ -130,7 +130,8 @@ export default function Sessions({ me }: { me: Me }) {
   return (
     <>
       <h1>Sessions</h1>
-      {done && <p role="status">{done}</p>}
+      {/* Always there, so a screen reader hears its text change. */}
+      <p role="status">{done}</p>
       {live.ready ? (
         <>
           {table('client', 'Clients')}
