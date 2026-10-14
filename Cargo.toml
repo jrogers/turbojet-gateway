@@ -7,8 +7,9 @@ license = "Apache-2.0"
 publish = false
 
 [features]
-# TLS for the acceptor and initiators, from the sessions file, and for the API.
-tls = ["turbojet/tls", "turbojet-config/tls", "dep:tokio-rustls"]
+# TLS for the acceptor and initiators, from the sessions file, for the API, and for PostgreSQL
+# connections (`sslmode` in the URL; rustls, the operating system's roots), as turbojet-sql's.
+tls = ["turbojet/tls", "turbojet-config/tls", "dep:tokio-rustls", "sqlx/tls-rustls-ring-native-roots"]
 # `[message_log] compress`: gzip the message log's finished files.
 gzip = ["turbojet/gzip"]
 # PostgreSQL for the `[database] url`, as well as SQLite.
