@@ -1,0 +1,137 @@
+import { createContext, createElement, useContext, useEffect, useReducer, useState, type ReactNode } from 'react'
+import { connect, type Opener, type Status as LinkStatus } from './live.ts'
+import type { Alarm, LiveMessage, OrderView, SessionChange, SessionView, Status } from './types.ts'
+
+/** The alarms kept, newest first. */
+export const MAX_ALARMS = 100
+
+/** What `/api/live` has said: its last snapshot with the events since applied. */
+export interface LiveState {
+  /** Whether a snapshot has come: until then the rest is empty, not known to be. */
+  ready: boolean
+  sessions: SessionView[]
+  /** The working orders, by `id`. */
+  orders: Map<number, OrderView>
+  /** The snapshot's: with a full page, the `after` for `GET /api/orders?working=true`. */
+  ordersNext: number | null
+  /** Scopes as written: `all`, `comp:COMPID`, `session:SESSION`. */
+  blocked: string[]
+  unavailable: boolean
+  /** Newest first, [`MAX_ALARMS`] at most. Not in a snapshot: those kept since the console opened. */
+  alarms: Alarm[]
+}
+
+export const initial: LiveState = {
+  ready: false,
+  sessions: [],
+  orders: new Map(),
+  ordersNext: null,
+  blocked: [],
+  unavailable: false,
+  alarms: [],
+}
+
+/** `book::Status::is_done`: no longer working. */
+const done = (status: Status) => status === 'filled' || status === 'canceled' || status === 'expired' || status === 'rejected'
+
+/**
+ * `message` applied to `state`, as `api::live` says a console does: a snapshot replaces all but
+ * the alarms, an order event replaces its order (or adds it, or drops it once done), and the rest
+ * change what they name. Pure: `state` isn't changed.
+ */
+export function reduce(state: LiveState, message: LiveMessage): LiveState {
+  switch (message.type) {
+    case 'snapshot':
+      return {
+        ...state,
+        ready: true,
+        sessions: message.sessions,
+        orders: new Map(message.orders.map((order) => [order.id, order])),
+        ordersNext: message.orders_next,
+        blocked: message.blocked,
+        unavailable: message.unavailable,
+      }
+    case 'order': {
+      const { type: _, ...order } = message
+      const orders = new Map(state.orders)
+      if (done(order.status)) orders.delete(order.id)
+      else orders.set(order.id, order)
+      return { ...state, orders }
+    }
+    case 'blocked':
+      return state.blocked.includes(message.scope) ? state : { ...state, blocked: [...state.blocked, message.scope] }
+    case 'unblocked':
+      return { ...state, blocked: state.blocked.filter((scope) => scope !== message.scope) }
+    case 'alarm': {
+      const { type: _, ...alarm } = message
+      const unavailable =
+        alarm.kind === 'gateway_unavailable' ? true : alarm.kind === 'gateway_available' ? false : state.unavailable
+      return { ...state, unavailable, alarms: [alarm, ...state.alarms].slice(0, MAX_ALARMS) }
+    }
+    case 'session': {
+      const sessions = changed(state.sessions, message)
+      return sessions === state.sessions ? state : { ...state, sessions }
+    }
+    default:
+      // A type newer than this console: nothing it knows to change.
+      return state
+  }
+}
+
+/** `sessions` with `change` applied to the one it names, added if new: a client's first connection. */
+function changed(sessions: SessionView[], change: SessionChange): SessionView[] {
+  const at = sessions.findIndex((session) => session.side === change.side && session.id === change.id)
+  const session: SessionView = sessions[at] ?? {
+    side: change.side,
+    id: change.id,
+    venue: null,
+    status: 'disconnected',
+    next_incoming: null,
+    next_outgoing: null,
+    activity: null,
+    paused: false,
+  }
+  const next = { ...session }
+  switch (change.event) {
+    case 'connected':
+    case 'logged_on':
+    case 'logging_out':
+      next.status = change.event
+      break
+    case 'disconnected':
+      next.status = 'disconnected'
+      next.activity = null
+      break
+    case 'paused':
+    case 'resumed':
+      next.paused = change.event === 'paused'
+      break
+    case 'resend_started':
+    case 'resend_finished':
+      if (next.activity) next.activity = { ...next.activity, resending: change.event === 'resend_started' }
+      break
+    default:
+      // `refused` (its disconnection follows), or a newer event: nothing shown changes.
+      return sessions
+  }
+  return at < 0 ? [...sessions, next] : sessions.with(at, next)
+}
+
+/** The live state, and how its socket stands. */
+export type Live = LiveState & { link: LinkStatus }
+
+export const LiveContext = createContext<Live>({ ...initial, link: 'connecting' })
+
+/** The live state, from the nearest [`LiveProvider`]. */
+export const useLive = () => useContext(LiveContext)
+
+/**
+ * Opens `/api/live` while mounted, and gives its state to those below. `open` makes the socket:
+ * a fake one in tests.
+ */
+export function LiveProvider({ children, open }: { children: ReactNode; open?: Opener }) {
+  const [state, dispatch] = useReducer(reduce, initial)
+  const [link, setLink] = useState<LinkStatus>('connecting')
+  useEffect(() => connect({ onMessage: dispatch, onStatus: setLink, open }), [open])
+  return createElement(LiveContext.Provider, { value: { ...state, link } }, children)
+}

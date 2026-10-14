@@ -1,7 +1,8 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
 import * as api from './api.ts'
+import { FakeSocket } from './fake-socket.ts'
 import type { Me } from './types.ts'
 
 const alice: Me = { user: 'alice', role: 'operator', clients: ['FUNDA', 'FUNDB'], csrf: 'tok' }
@@ -30,6 +31,9 @@ function serve(routes: Record<string, () => Response>) {
 
 beforeEach(() => {
   window.location.hash = ''
+  FakeSocket.opened = []
+  // The shell opens the live socket: a fake, which nothing answers unless a test says.
+  vi.stubGlobal('WebSocket', FakeSocket)
 })
 
 afterEach(() => {
@@ -141,4 +145,49 @@ test('says so when the gateway cannot be reached at start', async () => {
   })
   render(<App />)
   expect((await screen.findByRole('alert')).textContent).toBe('cannot reach the gateway')
+})
+
+test('the shell keeps the live socket while logged in, and says when it is down', async () => {
+  serve({ 'GET /api/me': () => json(alice), 'POST /api/logout': () => new Response(null, { status: 204 }) })
+  window.location.hash = '#/sessions'
+  render(<App />)
+  await screen.findByText('operator')
+  const socket = FakeSocket.opened[FakeSocket.opened.length - 1]
+  act(() => {
+    socket.open()
+    socket.send({ type: 'snapshot', sessions: [], orders: [], orders_next: null, blocked: [], unavailable: false })
+  })
+  expect(screen.getByRole('heading', { name: 'Clients' })).toBeTruthy()
+  expect(screen.queryByRole('status')).toBeNull()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
+  await screen.findByLabelText('User')
+  expect(socket.closed).toBe(true)
+})
+
+test('a live socket lost shows a banner until it opens again', async () => {
+  serve({ 'GET /api/me': () => json(alice) })
+  render(<App />)
+  await screen.findByText('operator')
+  const socket = FakeSocket.opened[FakeSocket.opened.length - 1]
+  act(() => socket.open())
+  act(() => socket.end(1001, 'the gateway is stopping'))
+  expect(screen.getByRole('status').textContent).toBe('Disconnected, reconnecting…')
+  // The reconnect, a second or so later.
+  await waitFor(() => expect(FakeSocket.opened.length).toBeGreaterThan(1), { timeout: 2_000 })
+  act(() => FakeSocket.opened[FakeSocket.opened.length - 1].open())
+  expect(screen.queryByRole('status')).toBeNull()
+})
+
+test('a live socket refused by policy returns to login, saying why', async () => {
+  serve({ 'GET /api/me': () => json(alice) })
+  render(<App />)
+  await screen.findByText('operator')
+  const socket = FakeSocket.opened[FakeSocket.opened.length - 1]
+  act(() => {
+    socket.open()
+    socket.end(1008, 'the session has ended: log in again')
+  })
+  expect(screen.getByRole('alert').textContent).toBe('the session has ended: log in again')
+  expect(screen.getByLabelText('User')).toBeTruthy()
 })

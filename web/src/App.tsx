@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import * as api from './api.ts'
 import Login from './Login.tsx'
+import Sessions from './Sessions.tsx'
+import { LiveProvider, useLive } from './store.ts'
 import { useRoute, type Route } from './router.ts'
 import type { Me } from './types.ts'
 
@@ -93,20 +95,34 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
           Log out
         </button>
       </header>
-      <main>
-        <Screen route={route} />
-      </main>
+      <LiveProvider>
+        <main>
+          <Banner />
+          <Screen route={route} me={me} />
+        </main>
+      </LiveProvider>
     </>
   )
 }
 
-// Placeholders until the screens are written (tasks 3 to 5).
-function Screen({ route }: { route: Route }) {
+/** Says so while the live socket is down: what the screens show is as it was. */
+function Banner() {
+  const { link } = useLive()
+  if (link !== 'reconnecting') return null
+  return (
+    <p className="banner" role="status">
+      Disconnected, reconnecting…
+    </p>
+  )
+}
+
+// Orders' placeholders until their screens are written (tasks 4 and 5).
+function Screen({ route, me }: { route: Route; me: Me }) {
   switch (route.screen) {
     case 'orders':
       return <h1>Orders</h1>
     case 'sessions':
-      return <h1>Sessions</h1>
+      return <Sessions me={me} />
     case 'order':
       return <h1>Order {route.orderId}</h1>
   }
