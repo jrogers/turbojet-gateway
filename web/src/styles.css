@@ -1,0 +1,194 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1b1f24;
+  --muted: #5d6670;
+  --line: #d6dae0;
+  --panel: #f4f6f8;
+  --accent: #1f5fbf;
+  --accent-fg: #ffffff;
+  --error: #b42318;
+  --warn: #9a6700;
+  --ok: #1a7f37;
+  color-scheme: light dark;
+  font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216;
+    --fg: #e3e7ec;
+    --muted: #9aa4af;
+    --line: #2c333b;
+    --panel: #171b21;
+    --accent: #5b9bf0;
+    --accent-fg: #0f1216;
+    --error: #f97066;
+    --warn: #e3b341;
+    --ok: #4ac26b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+a {
+  color: var(--accent);
+}
+
+h1 {
+  font-size: 1.25rem;
+  margin: 0 0 0.75rem;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+input,
+select {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.3rem 0.5rem;
+}
+
+button {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+button.primary,
+.login button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.error {
+  color: var(--error);
+}
+
+/* The shell. */
+
+header.shell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+  padding: 0.5rem 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+header.shell .brand {
+  font-weight: 600;
+}
+
+header.shell nav {
+  display: flex;
+  gap: 1rem;
+}
+
+header.shell nav a {
+  text-decoration: none;
+  color: var(--muted);
+}
+
+header.shell nav a[aria-current='page'] {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+header.shell .who {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+header.shell .user {
+  color: var(--fg);
+}
+
+header.shell .role {
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 0.3rem;
+  font-size: 0.85em;
+}
+
+main {
+  padding: 1rem;
+}
+
+/* Login. */
+
+main.login {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+}
+
+.login form {
+  display: grid;
+  gap: 0.75rem;
+  width: min(20rem, 100%);
+}
+
+.login label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+/* Tables: dense, and scrolling sideways in a narrow window rather than squeezing. */
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  padding: 0.25rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+}
+
+td.num,
+th.num {
+  text-align: right;
+}
+
+tbody tr:hover {
+  background: var(--panel);
+}
