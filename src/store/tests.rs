@@ -1027,9 +1027,9 @@ async fn a_replaced_order_shows_once_with_every_request() {
     assert!(!store.order("A7").await.unwrap().unwrap().order.pending_cancel);
 }
 
-/// On a file database, history is read on a pool of its own: a read runs while the writer's one
-/// connection holds a transaction open, not waiting for it, and sees only what's committed. The
-/// read pool is read-only.
+/// On a database not in memory, history is read on a pool of its own: a read runs while the
+/// writer's one connection holds a transaction open, not waiting for it, and sees only what's
+/// committed. The read pool is read-only.
 #[tokio::test]
 async fn reads_of_history_dont_wait_for_the_writer() {
     let (url, _dir) = reopenable().await;

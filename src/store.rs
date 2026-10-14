@@ -114,6 +114,7 @@ impl Store {
     pub async fn open(url: &str) -> io::Result<Self> {
         sqlx::any::install_default_drivers();
         let sqlite = url.starts_with("sqlite:");
+        let postgres = url.starts_with("postgres:") || url.starts_with("postgresql:");
         // One connection to write, as one writer task writes and `load` runs once at start; reads
         // of history have their own pool (`reads`). No idle timeout or lifetime, so a
         // `sqlite::memory:` database, which is its connection's, lives as long as the store.
@@ -140,7 +141,7 @@ impl Store {
         if create(&pool).await? {
             warn!("created a new, empty database at {}", without_password(url));
         }
-        let reads = open_reads(url, sqlite, &pool).await?;
+        let reads = open_reads(url, sqlite, postgres, &pool).await?;
         Ok(Self {
             pool,
             reads,
@@ -531,11 +532,11 @@ fn stored_orders_sql(query: &StoredOrders) -> (String, Vec<Value>) {
 }
 
 /// The pool [`Store::orders`] and [`Store::order`] read with: two connections of their own, so a
-/// page of history, which may walk every order in its range, never holds the writer's. SQLite's
-/// are read-only, and WAL (which the writer turns on) lets them read while it writes. An
-/// in-memory SQLite database is its one connection's, so it can't have another pool: its reads
-/// share the writer's, which is for tests.
-async fn open_reads(url: &str, sqlite: bool, pool: &AnyPool) -> io::Result<AnyPool> {
+/// page of history, which may walk every order in its range, never holds the writer's. They're
+/// read-only: SQLite's by `mode=ro`, PostgreSQL's by each session's default. WAL (which the
+/// writer turns on) lets SQLite's read while it writes. An in-memory SQLite database is its one
+/// connection's, so it can't have another pool: its reads share the writer's, which is for tests.
+async fn open_reads(url: &str, sqlite: bool, postgres: bool, pool: &AnyPool) -> io::Result<AnyPool> {
     if sqlite && (url.contains(":memory:") || url.contains("mode=memory")) {
         return Ok(pool.clone());
     }
@@ -546,6 +547,9 @@ async fn open_reads(url: &str, sqlite: bool, pool: &AnyPool) -> io::Result<AnyPo
             Box::pin(async move {
                 if sqlite {
                     connection.execute("PRAGMA busy_timeout = 5000").await?;
+                }
+                if postgres {
+                    connection.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await?;
                 }
                 Ok(())
             })
