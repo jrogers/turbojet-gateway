@@ -418,12 +418,15 @@ pub(super) struct LimitsBody {
 }
 
 /// What a limit edit answers: the table edited as the file now has it (`null` once deleted), and
-/// what the reload took.
+/// what the reload took (`null` for an admin with clients: it can name other clients).
 #[derive(Debug, Serialize)]
 pub(super) struct EditedView {
     table: Option<RiskTable>,
-    reload: ReloadView,
+    reload: Option<ReloadView>,
 }
+
+/// The start of a limit edit's 422 once the file is written, its reload having kept a file.
+const WRITTEN: &str = "the edit is written, but the reload";
 
 /// `PATCH /api/risk/limits/defaults {reason, set: {key: value | null}}` [unscoped admin]: sets
 /// the defaults' keys, removing those set to `null`, in `jetbridge.toml`, and reloads; see
@@ -511,7 +514,37 @@ async fn set_limits(
 }
 
 /// Runs `edit`, audited as `mutation`, if it parsed; see [`Service::edit_limits`].
+///
+/// An admin with clients isn't shown the reload, nor why the file was refused or a reload kept a
+/// file: the sessions, warnings and errors can name other clients. The audit log has them whole.
 async fn edit_limits(
+    state: &State,
+    caller: &Caller,
+    mutation: Mutation,
+    edit: Result<Edit, ApiError>,
+) -> Result<Json<EditedView>, ApiError> {
+    let answer = edit_limits_whole(state, caller, mutation, edit).await;
+    if caller.view_scope().is_none() {
+        return answer;
+    }
+    match answer {
+        Ok(Json(view)) => Ok(Json(EditedView { reload: None, ..view })),
+        Err(mut e) if e.status == StatusCode::UNPROCESSABLE_ENTITY => {
+            e.message = if e.message.starts_with(WRITTEN) {
+                format!("{WRITTEN} kept a file; an unscoped admin can see why (POST /api/reload)")
+            } else {
+                "the edit is refused: the file wouldn't load with it; an unscoped admin can see why \
+                 (POST /api/reload)"
+                    .to_string()
+            };
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// [`edit_limits`], answered whole.
+async fn edit_limits_whole(
     state: &State,
     caller: &Caller,
     mutation: Mutation,
@@ -532,10 +565,10 @@ async fn edit_limits(
             ApiError::new(status, e.to_string())
         })?;
         let (Json(reload), note) = answer(reloaded).map_err(|mut e| {
-            e.message = format!("the edit is written, but the reload {}", e.message);
+            e.message = format!("{WRITTEN} {}", e.message);
             e
         })?;
-        Ok((Json(EditedView { table, reload }), note))
+        Ok((Json(EditedView { table, reload: Some(reload) }), note))
     })
     .await
 }
@@ -1149,6 +1182,42 @@ mod tests {
         assert_eq!(fixture.last_result(), "refused: abe may see only clients FUNDB, not the audit log");
         assert_eq!(fixture.config(), config);
         assert_eq!(as_scoped("DELETE", fundb, REASON).await, StatusCode::OK);
+    }
+
+    /// A scoped admin's edit answers its table but not the reload, which would name FUNDC, a
+    /// counterparty added meanwhile; and a reload keeping the sessions file, or a file refusing
+    /// the edit, answers 422 without saying why, as both could name other clients. The audit log
+    /// says why.
+    #[tokio::test]
+    async fn a_scoped_admins_edit_names_no_other_client() {
+        let fixture = fixture().await;
+        let dir = fixture.dirs.0.path();
+        let sessions = std::fs::read_to_string(dir.join("sessions.toml")).unwrap();
+        std::fs::write(dir.join("sessions.toml"), format!("{sessions}[counterparty.FUNDC]\n")).unwrap();
+        let fundb = "/api/risk/limits/client/FUNDB";
+        let credit = r#"{"reason":"testing","set":{"credit":5}}"#;
+        let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, credit).await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+        assert_eq!(answer.body, serde_json::json!({ "table": { "credit": 5 }, "reload": null }));
+
+        std::fs::write(dir.join("sessions.toml"), format!("{sessions}[counterparty.FUNDC]\nbogus = \n")).unwrap();
+        let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, credit).await;
+        assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", answer.body);
+        let written = "the edit is written, but the reload kept a file; an unscoped admin can see why \
+                       (POST /api/reload)";
+        assert_eq!(answer.body["error"], written);
+        assert!(fixture.last_result().contains("kept the sessions file: "), "{}", fixture.last_result());
+
+        std::fs::write(dir.join("sessions.toml"), &sessions).unwrap();
+        let config = fixture.config().replace("venue = \"NASDAQ\"", "venue = \"FUNDC\"");
+        std::fs::write(dir.join("jetbridge.toml"), config).unwrap();
+        let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, credit).await;
+        assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", answer.body);
+        assert!(!answer.body.to_string().contains("FUNDC"), "{}", answer.body);
+        assert!(fixture.last_result().contains("FUNDC"), "{}", fixture.last_result());
+        // Unscoped, it's said.
+        let answer = fixture.send("PATCH", &fixture.admin, fundb, credit).await;
+        assert!(answer.body.to_string().contains("FUNDC"), "{}", answer.body);
     }
 
     /// A reload answers what changed; one whose configuration is refused answers 422 with why,
