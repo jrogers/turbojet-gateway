@@ -745,6 +745,11 @@ async fn open_reads(url: &str, sqlite: bool, postgres: bool) -> io::Result<Optio
                 }
                 if postgres {
                     connection.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await?;
+                    // As the writer's (see `Store::open`): an `order` read lost without a reset
+                    // would hold its snapshot, and VACUUM back, until the server's TCP keepalive
+                    // gave up. No healthy read idles in a transaction that long.
+                    let timeout = DATABASE_TIMEOUT.as_millis();
+                    connection.execute(format!("SET idle_in_transaction_session_timeout = {timeout}").as_str()).await?;
                 }
                 Ok(())
             })

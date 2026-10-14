@@ -1295,7 +1295,8 @@ async fn stored_orders_read_by_creation_without_sorting() {
 /// store's timeout rather than holding one of the reads' two connections, which is dropped, and
 /// a read after answers on a new one. A lock on `orders`, taken outside the relay, holds the read
 /// in its statement to be silenced there. (A reads connection silent while idle is pinged when
-/// taken, under the pool's acquire timeout, and dropped if it doesn't answer.)
+/// taken, under the pool's acquire timeout, and dropped if it doesn't answer.) The server ends
+/// the silent `order` read's session, left idle in its transaction, within the timeout too.
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn a_connection_silent_in_a_history_read_fails_it_and_a_read_after_answers() {
@@ -1308,7 +1309,9 @@ async fn a_connection_silent_in_a_history_read_fails_it_and_a_read_after_answers
         }
     }
     let Some(url) = postgres().await else { return };
-    let relay = Relay::new(&url).await;
+    // The store's sessions named, to be found in `pg_stat_activity`.
+    let name = format!("jetbridge_test_{:016x}", getrandom::u64().unwrap());
+    let relay = Relay::new(&format!("{url}&application_name={name}")).await;
     let store = Store::open(&relay.url).await.unwrap();
     store.write(&[dated(1, &ClientId::from("FUNDA"), None, true, on(0, 9))]).await.unwrap();
     let mut locker = AnyConnection::connect(&url).await.unwrap();
@@ -1331,6 +1334,16 @@ async fn a_connection_silent_in_a_history_read_fails_it_and_a_read_after_answers
         lock.rollback().await.unwrap();
         let failed = tokio::time::timeout(limit, reading).await.expect("not held by the silent connection").unwrap();
         assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        if by_name {
+            let idle = "SELECT COUNT(*) FROM pg_stat_activity \
+                        WHERE application_name = $1 AND state = 'idle in transaction'";
+            let ended = async {
+                while sqlx::query_scalar::<_, i64>(idle).bind(&name).fetch_one(&mut locker).await.unwrap() > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(limit, ended).await.expect("the server ends the session idle in its transaction");
+        }
         let mut answered = false;
         for _ in 0..2 {
             match tokio::time::timeout(limit, found(&store, by_name)).await {
