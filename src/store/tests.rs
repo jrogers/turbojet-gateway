@@ -1290,3 +1290,59 @@ async fn stored_orders_read_by_creation_without_sorting() {
         assert!(!plan.iter().any(|step| step.starts_with("SCAN") || step.contains("TEMP B-TREE")), "{plan:?}");
     }
 }
+
+/// A history read whose connection goes silent in its statement, with no reset, fails within the
+/// store's timeout rather than holding one of the reads' two connections, which is dropped, and
+/// a read after answers on a new one. A lock on `orders`, taken outside the relay, holds the read
+/// in its statement to be silenced there. (A reads connection silent while idle is pinged when
+/// taken, under the pool's acquire timeout, and dropped if it doesn't answer.)
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_connection_silent_in_a_history_read_fails_it_and_a_read_after_answers() {
+    /// How many orders a read finds: by `orders`, or by `order` if `by_name`.
+    async fn found(store: &Store, by_name: bool) -> io::Result<usize> {
+        if by_name {
+            store.order("A1").await.map(|order| usize::from(order.is_some()))
+        } else {
+            store.orders(&created_in(on(0, 0), on(1, 0))).await.map(|orders| orders.len())
+        }
+    }
+    let Some(url) = postgres().await else { return };
+    let relay = Relay::new(&url).await;
+    let store = Store::open(&relay.url).await.unwrap();
+    store.write(&[dated(1, &ClientId::from("FUNDA"), None, true, on(0, 9))]).await.unwrap();
+    let mut locker = AnyConnection::connect(&url).await.unwrap();
+    let limit = DATABASE_TIMEOUT * 3;
+    for by_name in [false, true] {
+        let mut lock = locker.begin().await.unwrap();
+        lock.execute("LOCK TABLE orders IN ACCESS EXCLUSIVE MODE").await.unwrap();
+        let reading = tokio::spawn({
+            let store = store.clone();
+            async move { found(&store, by_name).await }
+        });
+        let waiting = "SELECT COUNT(*) FROM pg_locks WHERE relation = 'orders'::regclass AND NOT granted";
+        let held = async {
+            while sqlx::query_scalar::<_, i64>(waiting).fetch_one(&mut *lock).await.unwrap() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(limit, held).await.expect("the read waits on the lock");
+        relay.silence();
+        lock.rollback().await.unwrap();
+        let failed = tokio::time::timeout(limit, reading).await.expect("not held by the silent connection").unwrap();
+        assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let mut answered = false;
+        for _ in 0..2 {
+            match tokio::time::timeout(limit, found(&store, by_name)).await {
+                Ok(Ok(found)) => {
+                    assert_eq!(found, 1);
+                    answered = true;
+                    break;
+                }
+                Ok(Err(_)) => {}
+                Err(_) => panic!("held by a silent connection"),
+            }
+        }
+        assert!(answered, "a read on a new connection answers");
+    }
+}

@@ -36,7 +36,7 @@ use crate::book::{
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// How long the store waits on the database for one statement, a write's begin or commit, a
-/// prune batch, or a connection from its pool, before giving up. A statement is a row or a
+/// prune batch, an order's read, or a connection from its pool, before giving up. A statement is a row or a
 /// bounded batch, so this is far past any healthy one; it's there for a connection lost
 /// without a reset, which would otherwise wait on the operating system's TCP timeouts.
 #[cfg(not(test))]
@@ -281,6 +281,8 @@ impl Store {
     ///
     /// The database refuses a query, or holds a value this build can't read.
     pub async fn load(&self) -> io::Result<Snapshot> {
+        // ponytail: run at start, untimed, so a database that stops answering during a start
+        // holds the start until TCP gives up (about 15 minutes); time it if starts must fail fast.
         self.on_writer("starting a load", async |connection| self.load_on(connection).await).await
     }
 
@@ -363,6 +365,7 @@ impl Store {
     ///
     /// The database refuses a query.
     pub async fn unknown_downstreams(&self, downstreams: &[CompactString]) -> io::Result<Vec<CompactString>> {
+        // ponytail: run at start, untimed, as `load` is.
         let known = self.on_writer("looking up requests sent", async |connection| {
             Self::known_downstreams(connection, downstreams).await
         });
@@ -486,6 +489,7 @@ impl Store {
     ///
     /// The database refuses the query, or holds a time this build can't read.
     pub async fn pruned_through(&self) -> io::Result<Option<DateTime<Utc>>> {
+        // ponytail: run at start, untimed, as `load` is.
         let through = self.on_writer("reading what was pruned", async |connection| {
             sqlx::query_scalar("SELECT sent_through FROM pruned")
                 .fetch_optional(connection)
@@ -504,7 +508,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// The database refuses the query, or holds a value this build can't read.
+    /// The database refuses the query, or holds a value this build can't read. A query with no
+    /// answer in [`DATABASE_TIMEOUT`] fails the read, and its connection is dropped.
     pub async fn orders(&self, query: &StoredOrders) -> io::Result<Vec<OrderView>> {
         let (sql, values) = stored_orders_sql(query);
         let query = values.iter().fold(sqlx::query(&sql), |query, value| match value {
@@ -512,7 +517,8 @@ impl Store {
             Value::Integer(integer) => query.bind(*integer),
         });
         let rows = self.on_reads("reading past orders", async |c| {
-            query.fetch_all(c).await.map_err(database("reading past orders"))
+            timed("reading past orders", async { query.fetch_all(c).await.map_err(database("reading past orders")) })
+                .await
         });
         let rows = rows.await?;
         rows.iter()
@@ -529,9 +535,13 @@ impl Store {
     /// # Errors
     ///
     /// The database refuses a query, or holds a value this build can't read or an order without
-    /// its original request.
+    /// its original request. A read not done in [`DATABASE_TIMEOUT`] fails, and its connection is
+    /// dropped.
     pub async fn order(&self, name: &str) -> io::Result<Option<OrderDetail>> {
-        self.on_reads("starting to read an order", async |connection| self.order_on(connection, name).await).await
+        self.on_reads("starting to read an order", async |connection| {
+            timed("reading an order", self.order_on(connection, name)).await
+        })
+        .await
     }
 
     /// [`order`](Self::order), on `connection`.
@@ -957,6 +967,7 @@ const TABLES: &[&str] = &[
 /// database of another version is left as it is.
 /// Whether the database is new: it had no schema version.
 async fn create(pool: &AnyPool) -> io::Result<bool> {
+    // ponytail: run at start, untimed, as `Store::load` is.
     let mut transaction = pool.begin().await.map_err(database("starting to create the tables"))?;
     let connection = &mut *transaction;
     let version_table = "CREATE TABLE IF NOT EXISTS schema_version (
