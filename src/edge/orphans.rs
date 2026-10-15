@@ -487,10 +487,11 @@ impl Gateway {
     /// documentation](self)). Every request of ours its session stores below it was handed to
     /// the session before now, so its change was queued before the checkpoint's and commits first;
     /// and none of them is unanswered, since the checkpoint is at most each unanswered request's
-    /// bound (see `State::in_flight`), and an answered request stays answered. Takes none
-    /// without a database, or while orphan work is pending: until handled, an orphan isn't
-    /// recorded, and a checkpoint past it would lose it. Returns what it queued. A `next_seq` may
-    /// be 0, from a session whose store hasn't opened yet: a scan begins at 1 whatever it says.
+    /// bound (see `State::in_flight`), and what ends a request's being unanswered is final: its
+    /// answer, its order done, an original order past PendingNew. Takes none without a
+    /// database, or while orphan work is pending: until handled, an orphan isn't recorded, and a
+    /// checkpoint past it would lose it, nor for a venue whose logon isn't done. Returns what it
+    /// queued.
     pub fn checkpoint_once(&self) -> Vec<(VenueId, Checkpoint)> {
         let Some(writer) = &self.writer else { return Vec::new() };
         let mut state = self.lock();
@@ -503,6 +504,10 @@ impl Gateway {
         let state = &mut *state;
         let mut checkpoints = Vec::new();
         for (venue, to) in &state.venues {
+            // Until its logon is done, a session may publish the numbers of a store it's resetting.
+            if !state.logged_on.contains(to.session.id()) {
+                continue;
+            }
             let Some(activity) = to.session.status().and_then(|status| status.activity) else { continue };
             // ponytail: a request its venue never answers holds the checkpoint back for good, so
             // the scan grows back towards a whole one, as before checkpoints; a bound on the

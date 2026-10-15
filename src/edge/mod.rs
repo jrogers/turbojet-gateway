@@ -213,9 +213,10 @@ struct State {
     /// downstream ClOrdID, kept until the book counts it answered: what holds back
     /// [`Gateway::checkpoint_once`]. Kept with a database only.
     in_flight: HashMap<VenueId, HashMap<CompactString, u64>>,
-    /// Venues whose sessions are logged on, from the venue app's `on_logon` to its `on_logout`:
-    /// by then a reset at logon has happened, so the numbers a session publishes are its own.
-    logged_on: HashSet<VenueId>,
+    /// Venue sessions logged on, from the venue app's `on_logon` to its `on_logout`: by then a
+    /// reset at logon has happened, so the numbers a session publishes are its own. By session,
+    /// not venue: a reload that drops or renames a venue while it's up still sees it logged out.
+    logged_on: HashSet<SessionId>,
 }
 
 #[derive(Debug)]
@@ -897,7 +898,7 @@ impl Gateway {
                 // ponytail: a counterparty's ResetSeqNumFlag mid-session can still leave a bound
                 // read before the reset, too high; the request's own MsgSeqNum, from its
                 // `Receipt`, if that shows.
-                let logged_on = state.logged_on.contains(venue);
+                let logged_on = state.logged_on.contains(to.session.id());
                 let bound = self.writer.is_some().then(|| {
                     let status = logged_on.then(|| to.session.status()).flatten();
                     status.and_then(|s| s.activity).map_or(1, |a| a.next_outgoing)
@@ -905,12 +906,8 @@ impl Gateway {
                 match to.session.send(msg) {
                     Ok(receipt) => {
                         if let Some(bound) = bound {
-                            state
-                                .in_flight
-                                .entry(venue.clone())
-                                .or_default()
-                                .entry(downstream.clone())
-                                .or_insert(bound);
+                            let bounds = state.in_flight.entry(venue.clone()).or_default();
+                            bounds.entry(downstream.clone()).and_modify(|b| *b = (*b).min(bound)).or_insert(bound);
                         }
                         self.settle(receipt, venue.clone(), downstream.clone(), ctx.map(Context::hold));
                         None
@@ -1115,7 +1112,7 @@ impl Application for VenueApp {
         let unsent = {
             let mut state = self.0.lock();
             // Before the unsent requests go, so they get their bounds.
-            state.logged_on.insert(venue.clone());
+            state.logged_on.insert(session.id().clone());
             state.unsent.remove(&venue)
         };
         let unsent = unsent.map(|unsent| self.0.unsent_inputs(&venue, unsent, session)).unwrap_or_default();
@@ -1125,10 +1122,7 @@ impl Application for VenueApp {
     }
 
     fn on_logout(&self, session: &SessionHandle, _ended: Disconnect) {
-        let mut state = self.0.lock();
-        if let Some((venue, _)) = state.venue_names.get(session.id()).cloned() {
-            state.logged_on.remove(&venue);
-        }
+        self.0.lock().logged_on.remove(session.id());
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
@@ -2967,6 +2961,7 @@ pub(crate) mod tests {
     async fn a_checkpoint_stops_at_the_first_unanswered_request() {
         let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let mut sessions = connected(&gateway, false).await;
+        venue_logged_on(&gateway, true).await;
         sessions.client.handle().send(order("C1")).unwrap();
         let sent = next_message(&mut sessions.venue_events).await;
         let stored: u64 = sent.field(tags::MSG_SEQ_NUM).unwrap();
@@ -2990,8 +2985,12 @@ pub(crate) mod tests {
         assert!(taken[0].1.next_seq <= stored, "{taken:?}, the order stored as {stored}");
 
         acknowledge(&gateway, "1", "V1");
+        // A heartbeat may go between the reads.
+        let before = next_outgoing();
         let taken = gateway.checkpoint_once();
-        assert_eq!(taken.iter().map(|(_, c)| c.next_seq).collect::<Vec<_>>(), [next_outgoing()]);
+        let after = next_outgoing();
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert!((before..=after).contains(&taken[0].1.next_seq), "{taken:?}, between {before} and {after}");
         gateway.committed().await;
         assert_eq!(store.checkpoints().await.unwrap()[&VenueId::from(VENUE)], taken[0].1);
     }
@@ -3002,12 +3001,7 @@ pub(crate) mod tests {
     async fn a_request_sent_before_its_venue_logs_on_is_bound_at_1() {
         let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let mut sessions = connected(&gateway, false).await;
-        let logged_on = async {
-            while !gateway.lock().logged_on.contains(VENUE) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        };
-        timeout(Duration::from_secs(5), logged_on).await.expect("the venue app never saw the logon");
+        venue_logged_on(&gateway, true).await;
         gateway.lock().logged_on.clear();
         sessions.client.handle().send(order("C1")).unwrap();
         next_message(&mut sessions.venue_events).await;
@@ -3015,11 +3009,34 @@ pub(crate) mod tests {
         assert_eq!(bound, 1);
     }
 
+    /// Waits until the venue app has seen the venue's session log on, or off.
+    async fn venue_logged_on(gateway: &Gateway, logged_on: bool) {
+        let reached = async {
+            while gateway.lock().logged_on.contains(&id()) != logged_on {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(Duration::from_secs(5), reached).await.expect("the venue app never saw it");
+    }
+
+    /// The venue app counts the venue's session logged on from its logon to its logout, and no
+    /// checkpoint is taken for it while it isn't.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_venue_is_logged_on_from_its_logon_to_its_logout() {
+        let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
+        let sessions = connected(&gateway, false).await;
+        venue_logged_on(&gateway, true).await;
+        sessions.venue.shutdown(None).await;
+        venue_logged_on(&gateway, false).await;
+        assert!(gateway.checkpoint_once().is_empty());
+    }
+
     /// No checkpoint is taken while orphan work is pending, nor without a database.
     #[tokio::test(flavor = "multi_thread")]
     async fn no_checkpoint_while_orphan_work_is_pending_or_without_a_database() {
         let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let _sessions = connected(&gateway, false).await;
+        venue_logged_on(&gateway, true).await;
         assert_eq!(gateway.checkpoint_once().len(), 1);
         let unsent = orphans::Unsent { downstreams: vec!["1".into()], next_outgoing: 1 };
         gateway.lock().unsent.insert(VENUE.into(), unsent);
