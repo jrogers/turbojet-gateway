@@ -214,8 +214,8 @@ impl Book {
         }
     }
 
-    /// Records orphaned replace `pending` as the gateway's, or as the client's if its redelivered
-    /// replace `adopted` it (naming that OrigClOrdID), pending on its order unless that's done
+    /// Records orphaned replace `pending` as the gateway's, or as the client's if its replace, sent
+    /// again, `adopted` it (naming that OrigClOrdID), pending on its order unless that's done
     /// (then only its answers map to the order).
     fn make_orphan_pending(&mut self, id: OrderId, mut pending: Pending, adopted: Option<CompactString>) {
         let downstream = pending.downstream.clone();

@@ -139,9 +139,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   - a replace the client never sends again (one its session gap-filled, say) is answered only by
     the venue's acceptance, as Restated, with the new terms;
   - a replace on other terms is refused as "replace pending" while the orphan is;
-  - one taken while the orphan waits for an earlier replace to be answered is held in memory until
-    then, and stored after: a second restart before the earlier one is answered finds the orphan
-    again, and the client hears Restated, not Replaced;
+  - one taken while the orphan waits for an earlier replace to be answered has its ClOrdID stored
+    at once, but is stored as the orphan only once that's answered: a second restart before then
+    finds the orphan again, and the client hears Restated, not Replaced;
   - one taken after the order has ended is answered Replaced, with the order's final status
     (Canceled, say).
 
