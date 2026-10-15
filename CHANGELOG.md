@@ -50,8 +50,9 @@ Notable changes to Jetbridge.
   `[database]` everything stays in memory, as before.
 - PostgreSQL for `[database] url`, with `--features postgres`, and TLS to it with `tls`.
 - Recovery at start: before the venues log on, each venue's session store is read and compared
-  with the database. An order the venue's session stored but the database never recorded is
-  cancelled at the venue's logon, logged as an error; an unrecorded cancel cancels its order,
+  with the database, from a checkpoint taken every minute rather than whole. An order the
+  venue's session stored but the database never recorded is cancelled at the venue's logon,
+  logged as an error; an unrecorded cancel cancels its order,
   and an unrecorded replace stays pending on its order, Replaced to the client if it sends its
   replace again with those terms, marked as a resend or not, Restated if not. Requests the
   database has that the venue's session never stored are sent at the venue's logon, marked

@@ -112,9 +112,14 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   as received. The book takes them as repeats.
 - Each time a venue's session reconnects it asks the venue to resend from its oldest message
   not yet committed; the reports it has already handled are dropped as stale.
-- Each start reads every message in every venue's session store, to compare its requests with
-  the database: about 3.9 s per million stored messages, measured from an in-memory store; a
-  disk store adds its read time. A large store makes for a slow start.
+- Each start reads each venue's session store from its checkpoint, taken every minute, to compare
+  its requests with the database. A store read whole takes about 3.9 s per million stored
+  messages, measured from an in-memory store; a disk store adds its read time. A store is read
+  whole if it was reset or created after its checkpoint, doesn't say when it was created, or is
+  numbered short of it.
+- No checkpoint is taken while work a start found for the venues is pending, or of a venue not
+  logged on. A request a venue never answers holds its checkpoint back for good, so each start
+  reads more of that venue's store, up to the whole of it.
 - A reload that keeps a client's or venue's session in memory is applied all the same, with an
   error logged; the next start refuses the file.
 - A client that logs on with ResetSeqNumFlag(141)=Y after a restart doesn't redeliver the

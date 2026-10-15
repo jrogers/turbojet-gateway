@@ -255,8 +255,10 @@ that finds a venue's store has no record of its session while the database has l
 orders of a client's current day, for that venue.
 
 **What a restart does.** Before any session starts, the gateway restores the book as last
-committed, then reads every request each venue's session stored and compares them with the
-database:
+committed, then reads the requests each venue's session stored and compares them with the
+database. It reads each store from a checkpoint, taken every minute, below which every request
+has committed and been answered; see [CAVEATS.md](CAVEATS.md#database-and-recovery) for when it
+reads one whole:
 
 - an order the venue's session stored but the database never recorded (the gateway stopped
   within a commit of sending it) is cancelled at the venue's next logon, logged as an error. The
