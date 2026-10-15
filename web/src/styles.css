@@ -132,8 +132,7 @@ button:disabled {
   cursor: default;
 }
 
-button.primary,
-.login button {
+button.primary {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-fg);
@@ -414,7 +413,7 @@ main {
   padding: 1rem;
 }
 
-/* Login. */
+/* Login: a panel centred on the ground, the brand above the form. */
 
 main.login {
   display: grid;
@@ -422,14 +421,19 @@ main.login {
   min-height: 100vh;
 }
 
+.login .panel {
+  width: min(20rem, 100%);
+  padding: 1.25rem;
+}
+
+.login .brand {
+  font-size: 15px;
+  font-weight: 600;
+}
+
 .login form {
   display: grid;
   gap: 0.75rem;
-  width: min(20rem, 100%);
-  padding: 1.25rem;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 6px;
 }
 
 .login label {
@@ -607,6 +611,21 @@ td.actions button + button {
 .filters label select {
   color: var(--fg);
   font-size: 13px;
+}
+
+/* Messages' tag conditions: a box of rows, among the filters. */
+
+.filters fieldset {
+  margin: 0;
+  padding: 0.25rem 0.75rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.filters legend {
+  padding: 0 0.25rem;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .filters label.check {

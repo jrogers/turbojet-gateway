@@ -9,6 +9,9 @@ export const AUDIT_MAX = 1_000
 /** `api::AUDIT_READ_DEFAULT`. */
 const AUDIT_DEFAULT = 100
 
+/** A result's tone by its first word, as `audit` writes it: `allowed`, `refused: …`, `failed: …`. */
+const RESULT_TONES: Record<string, string> = { allowed: 'ok', refused: 'error', failed: 'error' }
+
 /**
  * The audit log [unscoped admin], newest first: the last `limit` entries from `since`, as
  * `GET /api/audit` reads it. It can't page further back, so a full read says older ones are left
@@ -112,17 +115,23 @@ function Entries({ entries, limit }: { entries: AuditEntry[]; limit: number }) {
           <tbody>
             {entries.map((entry, i) => (
               <tr key={i}>
-                <td>{utc(entry.time, 3)}</td>
+                <td>
+                  <time dateTime={entry.time}>{utc(entry.time, 3)}</time>
+                </td>
                 <td>{entry.user ?? ''}</td>
                 <td>{entry.role ?? ''}</td>
-                <td>{entry.ip}</td>
+                <td>
+                  <code>{entry.ip}</code>
+                </td>
                 <td>{entry.action}</td>
                 <td>{entry.target ?? ''}</td>
                 <td className="wrap">
                   <code className="raw">{entry.params === null ? '' : JSON.stringify(entry.params)}</code>
                 </td>
                 <td className="wrap">{entry.reason ?? ''}</td>
-                <td>{entry.result}</td>
+                <td>
+                  <span className={`pill ${RESULT_TONES[entry.result.split(':')[0]] ?? 'muted'}`}>{entry.result}</span>
+                </td>
               </tr>
             ))}
           </tbody>

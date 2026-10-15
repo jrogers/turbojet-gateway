@@ -73,8 +73,12 @@ export default function MessageList({ fetchPage }: { fetchPage: (after: string |
             <tbody>
               {hits.map((hit, at) => (
                 <tr key={at}>
-                  <td>{utc(hit.time, 3)}</td>
-                  <td>{hit.direction}</td>
+                  <td>
+                    <time dateTime={hit.time}>{utc(hit.time, 3)}</time>
+                  </td>
+                  <td>
+                    <span className={hit.direction === 'in' ? 'pill info' : 'pill muted'}>{hit.direction}</span>
+                  </td>
                   <td>{hit.session ?? ''}</td>
                   <td>{hit.msg_type ?? ''}</td>
                   <td>

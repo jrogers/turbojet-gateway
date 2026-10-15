@@ -121,7 +121,7 @@ export default function Routes({ me, reloads }: { me: Me; reloads: number }) {
         routes !== null && <Rules routes={routes} matched={tested?.rule ?? null} />
       )}
 
-      <section aria-labelledby="dry-run-title">
+      <section className="panel" aria-labelledby="dry-run-title">
         <h2 id="dry-run-title">Dry run</h2>
         <form className="filters" onSubmit={submit}>
           <label>

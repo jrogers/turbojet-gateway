@@ -26,32 +26,34 @@ export default function Login({ onLogin, notice }: { onLogin: (me: Me) => void; 
 
   return (
     <main className="login">
-      <form onSubmit={submit}>
-        <h1>Jetbridge</h1>
-        <label>
-          User
-          <input name="user" autoFocus autoComplete="username" required value={user} onChange={(e) => setUser(e.target.value)} />
-        </label>
-        <label>
-          Password
-          <input
-            name="password"
-            type="password"
-            autoComplete="current-password"
-            required
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </label>
-        {(error ?? notice) && (
-          <p className="error" role="alert">
-            {error ?? notice}
-          </p>
-        )}
-        <button type="submit" disabled={busy}>
-          Log in
-        </button>
-      </form>
+      <div className="panel">
+        <h1 className="brand">Jetbridge</h1>
+        <form onSubmit={submit}>
+          <label>
+            User
+            <input name="user" autoFocus autoComplete="username" required value={user} onChange={(e) => setUser(e.target.value)} />
+          </label>
+          <label>
+            Password
+            <input
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </label>
+          {(error ?? notice) && (
+            <p className="error" role="alert">
+              {error ?? notice}
+            </p>
+          )}
+          <button type="submit" className="primary" disabled={busy}>
+            Log in
+          </button>
+        </form>
+      </div>
     </main>
   )
 }
