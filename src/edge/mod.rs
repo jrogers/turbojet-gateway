@@ -209,6 +209,10 @@ struct State {
     /// Requests the store has as sent that each venue's session never stored, to send at its next
     /// logon: see [`orphans`].
     unsent: HashMap<VenueId, orphans::Unsent>,
+    /// Each venue request's lower bound on the number its session stores it under, by venue and
+    /// downstream ClOrdID, kept until the book counts it answered: what holds back
+    /// [`Gateway::checkpoint_once`]. Kept with a database only.
+    in_flight: HashMap<VenueId, HashMap<CompactString, u64>>,
 }
 
 #[derive(Debug)]
@@ -231,6 +235,7 @@ impl Gateway {
             orphan_cancels_sending: 0,
             orphan_ids: HashSet::new(),
             unsent: HashMap::new(),
+            in_flight: HashMap::new(),
         };
         Self {
             state: Mutex::new(state),
@@ -838,10 +843,11 @@ impl Gateway {
     /// [`commit`](Self::commit). `Some` for a venue request its session refused. A venue request
     /// queued holds `ctx`'s message in flight until the venue's session has stored it, so a stop
     /// before then has the client resend it rather than losing it. A venue request `resent`
-    /// (see [`Input::Unsent`]) is marked PossResend(97).
+    /// (see [`Input::Unsent`]) is marked PossResend(97). One queued, with a database, gets its
+    /// bound in `state.in_flight`.
     fn send(
         self: &Arc<Self>,
-        state: &State,
+        state: &mut State,
         output: &Output,
         (now, resent): (UtcTimestamp, bool),
         ctx: Option<&mut Context<'_>>,
@@ -879,8 +885,24 @@ impl Gateway {
                 if resent {
                     msg.set(tags::POSS_RESEND, true);
                 }
+                // Read before the send: the session publishes its next number once it has stored
+                // a message, and sends in order, so the request's own number can't be lower. A
+                // session still logging on takes sends, queued, before it publishes its numbers:
+                // then 1, and the venue's whole store is scanned until the request is answered.
+                let bound = self
+                    .writer
+                    .is_some()
+                    .then(|| to.session.status().and_then(|s| s.activity).map_or(1, |a| a.next_outgoing));
                 match to.session.send(msg) {
                     Ok(receipt) => {
+                        if let Some(bound) = bound {
+                            state
+                                .in_flight
+                                .entry(venue.clone())
+                                .or_default()
+                                .entry(downstream.clone())
+                                .or_insert(bound);
+                        }
                         self.settle(receipt, venue.clone(), downstream.clone(), ctx.map(Context::hold));
                         None
                     }
@@ -2915,6 +2937,57 @@ pub(crate) mod tests {
         assert!(!gateway.orphans_pending());
         assert_eq!(gateway.prune_once(&store, Some(day)).await, Some(1));
         assert_eq!(store.pruned_through().await.unwrap(), Some(at(5)));
+    }
+
+    /// A checkpoint is held back to the bound of an order the venue hasn't answered, at most the
+    /// number its session stored it under, then moves to the session's next number once the
+    /// venue answers, and commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_checkpoint_stops_at_the_first_unanswered_request() {
+        let (gateway, store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
+        let mut sessions = connected(&gateway, false).await;
+        sessions.client.handle().send(order("C1")).unwrap();
+        let sent = next_message(&mut sessions.venue_events).await;
+        let stored: u64 = sent.field(tags::MSG_SEQ_NUM).unwrap();
+        let next_outgoing = || {
+            let status = sessions.venue.handle().status().unwrap();
+            status.activity.unwrap().next_outgoing
+        };
+        // Until the session has published the order's number: else the checkpoint would be at
+        // the order with or without its bound.
+        timeout(Duration::from_secs(5), async {
+            while next_outgoing() <= stored {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the venue's session never published the order's number");
+
+        let taken = gateway.checkpoint_once();
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert_eq!(taken[0].0, VenueId::from(VENUE));
+        assert!(taken[0].1.next_seq <= stored, "{taken:?}, the order stored as {stored}");
+
+        acknowledge(&gateway, "1", "V1");
+        let taken = gateway.checkpoint_once();
+        assert_eq!(taken.iter().map(|(_, c)| c.next_seq).collect::<Vec<_>>(), [next_outgoing()]);
+        gateway.committed().await;
+        assert_eq!(store.checkpoints().await.unwrap()[&VenueId::from(VENUE)], taken[0].1);
+    }
+
+    /// No checkpoint is taken while orphan work is pending, nor without a database.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_checkpoint_while_orphan_work_is_pending_or_without_a_database() {
+        let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
+        let _sessions = connected(&gateway, false).await;
+        assert_eq!(gateway.checkpoint_once().len(), 1);
+        let unsent = orphans::Unsent { downstreams: vec!["1".into()], next_outgoing: 1 };
+        gateway.lock().unsent.insert(VENUE.into(), unsent);
+        assert!(gateway.checkpoint_once().is_empty());
+
+        let gateway = super::tests::gateway();
+        let _sessions = connected(&gateway, false).await;
+        assert!(gateway.checkpoint_once().is_empty());
     }
 
     /// Our session with the venue, as the gateway's initiator has it.

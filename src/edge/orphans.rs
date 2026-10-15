@@ -45,15 +45,15 @@ use chrono::{DateTime, Utc};
 use std::io;
 use std::sync::Arc;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use turbojet::codec::{self, Decoded};
 use turbojet::fields::{CompactString, UtcTimestamp, format_compact};
 use turbojet::message::tags;
 use turbojet::store::{Fetched, Opened, SentMessages, SessionLog};
 use turbojet::{Message, MsgType, Receipt, SessionHandle, SessionId, SessionStorage};
 
-use super::Gateway;
-use crate::book::{AlarmKind, Changes, ClientId, Input, OrdType, OrphanedReplace, VenueId};
+use super::{Gateway, State};
+use crate::book::{AlarmKind, Changes, Checkpoint, ClientId, Input, OrdType, OrphanedReplace, VenueId};
 use crate::fix::Version;
 use crate::store::Store;
 
@@ -450,21 +450,7 @@ impl Gateway {
     /// What [`orphans_pending`](Self::orphans_pending) finds, said, if anything: the venues with
     /// cancels or unsent requests waiting, the cancels being sent, and whether replaces wait.
     fn orphan_work(&self) -> Option<String> {
-        let state = self.lock();
-        let replaces = state.book.orphaned_replaces_waiting();
-        if state.orphan_cancels.is_empty() && state.orphan_cancels_sending == 0 && state.unsent.is_empty() && !replaces
-        {
-            return None;
-        }
-        let mut cancels: Vec<&VenueId> = state.orphan_cancels.keys().collect();
-        let mut unsent: Vec<&VenueId> = state.unsent.keys().collect();
-        cancels.sort();
-        unsent.sort();
-        Some(format!(
-            "cancels waiting for venues {cancels:?}, {} being sent, unsent requests waiting for venues {unsent:?}, \
-             replaces waiting: {replaces}",
-            state.orphan_cancels_sending
-        ))
+        orphan_work(&self.lock())
     }
 
     /// Deletes from `store` the done orders of trading days that ended `retention` before now, by
@@ -495,6 +481,58 @@ impl Gateway {
             }
         }
     }
+
+    /// Takes a checkpoint of each logged-on venue's session store, and queues it for the
+    /// database: a start's scan for orphans may begin there (see the [module
+    /// documentation](self)). Every request of ours its session stores below it was handed to
+    /// the session before now, so its change was queued before the checkpoint's and commits first;
+    /// and none of them is unanswered, since the checkpoint is at most each unanswered request's
+    /// bound (see `State::in_flight`), and an answered request stays answered. Takes none
+    /// without a database, or while orphan work is pending: until handled, an orphan isn't
+    /// recorded, and a checkpoint past it would lose it. Returns what it queued.
+    pub fn checkpoint_once(&self) -> Vec<(VenueId, Checkpoint)> {
+        let Some(writer) = &self.writer else { return Vec::new() };
+        let mut state = self.lock();
+        if let Some(work) = orphan_work(&state) {
+            debug!("no checkpoint of the venues' stores while orphaned venue requests are handled: {work}");
+            return Vec::new();
+        }
+        // Before any number is read: a store reset after it numbers from 1 again.
+        let taken_at = self.clock.now();
+        let state = &mut *state;
+        let mut checkpoints = Vec::new();
+        for (venue, to) in &state.venues {
+            let Some(activity) = to.session.status().and_then(|status| status.activity) else { continue };
+            // ponytail: a request its venue never answers holds the checkpoint back for good, so
+            // the scan grows back towards a whole one, as before checkpoints; a bound on the
+            // wait if a venue shows it.
+            let bounds = state.in_flight.entry(venue.clone()).or_default();
+            bounds.retain(|downstream, _| state.book.is_unanswered(downstream));
+            let next_seq = bounds.values().copied().fold(activity.next_outgoing, u64::min);
+            checkpoints.push((venue.clone(), Checkpoint { next_seq, taken_at }));
+        }
+        if !checkpoints.is_empty() {
+            writer.queue(Changes { checkpoints: checkpoints.clone(), ..Changes::default() }, None);
+        }
+        checkpoints
+    }
+}
+
+/// What [`Gateway::orphan_work`] finds, under the lock held as `state`.
+fn orphan_work(state: &State) -> Option<String> {
+    let replaces = state.book.orphaned_replaces_waiting();
+    if state.orphan_cancels.is_empty() && state.orphan_cancels_sending == 0 && state.unsent.is_empty() && !replaces {
+        return None;
+    }
+    let mut cancels: Vec<&VenueId> = state.orphan_cancels.keys().collect();
+    let mut unsent: Vec<&VenueId> = state.unsent.keys().collect();
+    cancels.sort();
+    unsent.sort();
+    Some(format!(
+        "cancels waiting for venues {cancels:?}, {} being sent, unsent requests waiting for venues {unsent:?}, \
+         replaces waiting: {replaces}",
+        state.orphan_cancels_sending
+    ))
 }
 
 /// Orders [`Gateway::prune_once`] deletes to a transaction: the store's one connection is the

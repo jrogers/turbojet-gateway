@@ -916,18 +916,22 @@ impl Book {
         let mut unanswered: Vec<(OrderId, &CompactString, DateTime<Utc>)> = self
             .downstream
             .iter()
-            .filter(|(_, sent)| !sent.answered)
-            .filter(|(_, sent)| {
-                let order = &self.orders[&sent.order];
-                order.venue == *venue
-                    && !order.status.is_done()
-                    && (sent.kind.is_some() || order.status == Status::PendingNew)
-            })
+            .filter(|(downstream, sent)| self.orders[&sent.order].venue == *venue && self.is_unanswered(downstream))
             .map(|(downstream, sent)| (sent.order, downstream, sent.sent_at))
             .collect();
         // `<name>` before `<name>-1`, and `<name>-9` before `<name>-10`.
         unanswered.sort_unstable_by_key(|&(order, downstream, _)| (order.0, downstream.len(), downstream));
         unanswered.into_iter().map(|(_, downstream, sent_at)| (downstream.clone(), sent_at)).collect()
+    }
+
+    /// Whether the request sent as `downstream` is one [`unanswered`](Self::unanswered) lists:
+    /// its venue hasn't answered it, and its order is live (an original order, while it's
+    /// PendingNew).
+    pub fn is_unanswered(&self, downstream: &str) -> bool {
+        self.downstream.get(downstream).is_some_and(|sent| {
+            let order = &self.orders[&sent.order];
+            !sent.answered && !order.status.is_done() && (sent.kind.is_some() || order.status == Status::PendingNew)
+        })
     }
 
     pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
