@@ -147,7 +147,7 @@ export default function Sessions({ me }: { me: Me }) {
                     <td title={session.id}>{session.venue ?? session.id}</td>
                     <td>
                       <span className={`pill ${tone(session)}`}>
-                        <span className="dot" />
+                        <span className="dot" aria-hidden="true" />
                         {session.status.replaceAll('_', ' ')}
                       </span>
                       {session.activity?.resending && ', resending'}

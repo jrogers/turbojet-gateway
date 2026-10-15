@@ -128,7 +128,7 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
 
   return (
     <div className="app">
-      <div className="sidebar">
+      <header className="sidebar">
         <span className="brand">Jetbridge</span>
         <nav className="links" aria-label="Main">
           <a href="#/orders" aria-current={current(route, 'orders')}>
@@ -180,7 +180,7 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
             </button>
           </div>
         </div>
-      </div>
+      </header>
       <main>
         <header className="page">
           <LinkState />
@@ -220,7 +220,7 @@ function LinkState() {
     <span role="status">
       {link === 'open' ? (
         <span className="pill ok">
-          <span className="dot" />
+          <span className="dot" aria-hidden="true" />
           Live
         </span>
       ) : link === 'connecting' ? (

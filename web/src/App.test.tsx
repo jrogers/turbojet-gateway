@@ -74,7 +74,10 @@ test('shows login without a session, and the app once logged in', async () => {
   password = 'right'
   fireEvent.change(screen.getByLabelText('Password'), { target: { value: password } })
   fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
-  expect(await screen.findByRole('button', { name: 'Log out' })).toBeTruthy()
+  // In the top-level header, a banner, with the nav: not outside every landmark. (jsdom also
+  // takes main's header for a banner, so this looks for the header rather than the role.)
+  const logout = await screen.findByRole('button', { name: 'Log out' })
+  expect(logout.closest('header')?.parentElement?.className).toBe('app')
 })
 
 test('the shell shows the role and clients, or all clients, and logs out', async () => {
