@@ -1007,16 +1007,18 @@ async fn a_connection_silent_before_a_prune_fails_it_and_the_next_write_commits(
     assert_eq!(ids(&store, "SELECT id FROM orders ORDER BY id").await, [1, 2, 3, 4]);
 }
 
-/// A database from before the `pruned` table gains it when opened.
+/// A database from before the `pruned` and `checkpoints` tables gains them when opened.
 #[tokio::test]
-async fn opening_an_older_database_adds_the_pruned_table() {
+async fn opening_an_older_database_adds_the_pruned_and_checkpoints_tables() {
     let (url, _dir) = reopenable().await;
     let store = Store::open(&url).await.unwrap();
     sqlx::query("DROP TABLE pruned").execute(&store.pool).await.unwrap();
+    sqlx::query("DROP TABLE checkpoints").execute(&store.pool).await.unwrap();
     store.close().await;
     let store = Store::open(&url).await.unwrap();
     assert_eq!(store.pruned_through().await.unwrap(), None);
     assert_eq!(store.prune(time(2, 0), 1).await.unwrap(), Pruned { orders: 0 });
+    assert_eq!(store.checkpoints().await.unwrap(), HashMap::new());
 }
 
 /// Each venue keeps its latest checkpoint: a later write replaces one venue's, not the other's.
