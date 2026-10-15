@@ -565,13 +565,12 @@ impl Gateway {
             bounds.retain(|downstream, _| state.book.holds_checkpoint(downstream));
             !bounds.is_empty()
         });
-        if let Some(work) = orphan_work(state) {
-            debug!("no checkpoint of the venues' stores while orphaned venue requests are handled: {work}");
-            return Vec::new();
-        }
         // Before any number is read: a store reset after it numbers from 1 again.
         let taken_at = self.clock.now();
-        let mut checkpoints = Vec::new();
+        // Each logged-on venue's next number, unless its store was reset since the last run. Read
+        // every run, before the check for orphan work, like the prune: a reset while it's pending
+        // must still be caught, and the longer between reads the likelier one is missed.
+        let mut read = Vec::new();
         for (venue, to) in &state.venues {
             // Until its logon is done, a session may publish the numbers of a store it's resetting.
             let Some(last_read) = state.logged_on.get_mut(to.session.id()) else { continue };
@@ -596,11 +595,19 @@ impl Gateway {
                 }
                 continue;
             }
+            read.push((venue, next_outgoing));
+        }
+        if let Some(work) = orphan_work(state) {
+            debug!("no checkpoint of the venues' stores while orphaned venue requests are handled: {work}");
+            return Vec::new();
+        }
+        let mut checkpoints = Vec::new();
+        for (venue, next_outgoing) in read {
             // ponytail: a request its venue never answers holds the checkpoint back for good, so
             // the scan grows back towards a whole one, as before checkpoints; a bound on the
             // wait if a venue shows it.
             let bounds = state.in_flight.get(venue).into_iter().flat_map(|bounds| bounds.values());
-            let next_seq = bounds.copied().fold(activity.next_outgoing, u64::min);
+            let next_seq = bounds.copied().fold(next_outgoing, u64::min);
             checkpoints.push((venue.clone(), Checkpoint { next_seq, taken_at }));
         }
         if !checkpoints.is_empty() {

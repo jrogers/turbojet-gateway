@@ -3094,7 +3094,7 @@ pub(crate) mod tests {
     /// A store reset mid-session, as a counterparty's ResetSeqNumFlag does with no logout, shows
     /// as the session's next number below the one last read (faked here by raising that): no
     /// checkpoint of the venue that run, its requests bounded at 1, and the next run's checkpoint
-    /// at most 1.
+    /// at most 1. Caught while orphan work is pending as well.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_store_reset_mid_session_bounds_its_requests_at_1() {
         let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
@@ -3104,11 +3104,24 @@ pub(crate) mod tests {
         next_message(&mut sessions.venue_events).await;
         gateway.lock().logged_on.insert(id(), u64::MAX);
         assert!(gateway.checkpoint_once().is_empty());
-        assert_eq!(gateway.lock().in_flight[VENUE]["1"], 1);
-        assert!(gateway.lock().logged_on[&id()] < u64::MAX);
+        let bound = gateway.lock().in_flight[VENUE]["1"];
+        let last_read = gateway.lock().logged_on[&id()];
+        assert_eq!(bound, 1);
+        assert!(last_read < u64::MAX);
         let taken = gateway.checkpoint_once();
         assert_eq!(taken.len(), 1, "{taken:?}");
         assert!(taken[0].1.next_seq <= 1, "{taken:?}");
+
+        // Caught while orphan work is pending, too, though no checkpoint is taken then.
+        let unsent = orphans::Unsent { downstreams: vec!["X".into()], next_outgoing: 1 };
+        gateway.lock().unsent.insert(VENUE.into(), unsent);
+        gateway.lock().in_flight.entry(VENUE.into()).or_default().insert("1".into(), 5);
+        gateway.lock().logged_on.insert(id(), u64::MAX);
+        assert!(gateway.checkpoint_once().is_empty());
+        let bound = gateway.lock().in_flight[VENUE]["1"];
+        let last_read = gateway.lock().logged_on[&id()];
+        assert_eq!(bound, 1);
+        assert!(last_read < u64::MAX);
     }
 
     /// A venue's answer drops its request's bound as it's handled, not at the next checkpoint's
