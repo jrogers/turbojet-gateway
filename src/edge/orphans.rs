@@ -489,7 +489,8 @@ impl Gateway {
     /// and none of them is unanswered, since the checkpoint is at most each unanswered request's
     /// bound (see `State::in_flight`), and an answered request stays answered. Takes none
     /// without a database, or while orphan work is pending: until handled, an orphan isn't
-    /// recorded, and a checkpoint past it would lose it. Returns what it queued.
+    /// recorded, and a checkpoint past it would lose it. Returns what it queued. A `next_seq` may
+    /// be 0, from a session whose store hasn't opened yet: a scan begins at 1 whatever it says.
     pub fn checkpoint_once(&self) -> Vec<(VenueId, Checkpoint)> {
         let Some(writer) = &self.writer else { return Vec::new() };
         let mut state = self.lock();
