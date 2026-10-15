@@ -133,13 +133,15 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   and sent afresh, so the venue sees the order twice, the first cancelled. A cancel the venue's
   session drops goes again at the next logon.
 - An orphaned cancel has its order cancelled by the gateway. An orphaned replace stays pending on
-  its order, which keeps working; the client's redelivered replace with the same terms is taken
-  as it, and the venue's acceptance reaches the client as Replaced:
-  - a replace that isn't marked as a possible resend (PossDupFlag or PossResend) isn't taken as
-    the orphan: the venue's acceptance reaches the client as Restated, with the new terms;
-  - a redelivered replace on other terms is refused as "replace pending" while the orphan is;
-  - one taken while the orphan waits for an earlier replace to be answered isn't stored: a
-    restart before the earlier one is answered ends in Restated, not Replaced;
+  its order, which keeps working. The client's replace, sent again with the same terms, is taken
+  as it, marked as a possible resend (PossDupFlag or PossResend) or not, and the venue's
+  acceptance reaches the client as Replaced:
+  - a replace the client never sends again (one its session gap-filled, say) is answered only by
+    the venue's acceptance, as Restated, with the new terms;
+  - a replace on other terms is refused as "replace pending" while the orphan is;
+  - one taken while the orphan waits for an earlier replace to be answered is held in memory until
+    then, and stored after: a second restart before the earlier one is answered finds the orphan
+    again, and the client hears Restated, not Replaced;
   - one taken after the order has ended is answered Replaced, with the order's final status
     (Canceled, say).
 

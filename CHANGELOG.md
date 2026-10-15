@@ -52,11 +52,11 @@ Notable changes to Jetbridge.
 - Recovery at start: before the venues log on, each venue's session store is read and compared
   with the database. An order the venue's session stored but the database never recorded is
   cancelled at the venue's logon, logged as an error; an unrecorded cancel cancels its order,
-  and an unrecorded replace stays pending on its order, Replaced to the client if its
-  redelivered replace matches it, Restated if not. Requests the database has that the venue's
-  session never stored are sent at the venue's logon, marked PossResend, unless the session
-  resets its sequence numbers at that logon, when they fail. Undelivered reports go to their
-  clients again, marked PossResend.
+  and an unrecorded replace stays pending on its order, Replaced to the client if it sends its
+  replace again with those terms, marked as a resend or not, Restated if not. Requests the
+  database has that the venue's session never stored are sent at the venue's logon, marked
+  PossResend, unless the session resets its sequence numbers at that logon, when they fail.
+  Undelivered reports go to their clients again, marked PossResend.
 - New orders are rejected as "gateway unavailable" while the oldest change not yet committed has
   waited over a second; cancels, replaces and venue reports keep flowing.
 - With a database, client and venue sessions must be kept in a durable store: a start with a

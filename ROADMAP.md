@@ -8,8 +8,6 @@ knowing about is in [CAVEATS.md](CAVEATS.md).
 
 - **Orphan scan checkpoint** (M). Each start reads every venue store whole, about 3.9 s per
   million stored messages; a checkpoint would read only what's past the last commit.
-- **Orphaned replace edge cases** (S). The cases listed in CAVEATS where a client hears Restated
-  or a refusal for a replace the venue accepted.
 
 ## 2. Risk and routing
 
