@@ -13,6 +13,7 @@
 //! session as it shows (which the gateway keeps unambiguous) and its CompID, all a
 //! [`ClientId`] holds.
 
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::io;
 use std::str::FromStr;
@@ -27,9 +28,9 @@ use tracing::warn;
 use turbojet::fields::{CompactString, Decimal};
 
 use crate::book::{
-    CancelKind, Changes, ClOrdIdRow, ClientId, Day, GatewayCancel, MAX_ORDERS_PER_PAGE, OrdType, Order, OrderDetail,
-    OrderId, OrderRequest, OrderRow, OrderView, Origin, Pending, Scope, ScopeName, Sent, Side, Snapshot, Status,
-    TimeInForce, Today, Undelivered, VenueId, order_view, request_view,
+    CancelKind, Changes, Checkpoint, ClOrdIdRow, ClientId, Day, GatewayCancel, MAX_ORDERS_PER_PAGE, OrdType, Order,
+    OrderDetail, OrderId, OrderRequest, OrderRow, OrderView, Origin, Pending, Scope, ScopeName, Sent, Side, Snapshot,
+    Status, TimeInForce, Today, Undelivered, VenueId, order_view, request_view,
 };
 
 /// The schema this build reads and writes. A database of another is refused, not migrated.
@@ -501,6 +502,28 @@ impl Store {
         through.map(|through| parse_time("sent_through", &through)).transpose()
     }
 
+    /// Each venue's latest [`Checkpoint`], of those written.
+    ///
+    /// # Errors
+    ///
+    /// The database refuses the query, or holds a value this build can't read.
+    pub async fn checkpoints(&self) -> io::Result<HashMap<VenueId, Checkpoint>> {
+        // ponytail: run at start, untimed, as `load` is.
+        let rows = self.on_writer("reading the checkpoints", async |connection| {
+            fetch(connection, "SELECT venue, next_seq, taken_at FROM checkpoints", "checkpoints").await
+        });
+        let mut checkpoints = HashMap::new();
+        for row in rows.await? {
+            let row = Columns(&row);
+            let checkpoint = Checkpoint {
+                next_seq: unsigned("next_seq", row.integer("next_seq")?)?,
+                taken_at: row.time("taken_at")?,
+            };
+            checkpoints.insert(row.compact("venue")?, checkpoint);
+        }
+        Ok(checkpoints)
+    }
+
     /// The orders created (their original request sent) in `query.from..query.to` and matching
     /// its other fields, by creation time, then OrderId, as the database has them: done orders the
     /// book has dropped, until [`prune`](Self::prune) deletes them, and those it holds, as last
@@ -970,6 +993,13 @@ const TABLES: &[&str] = &[
         id BIGINT PRIMARY KEY CHECK (id = 1),
         sent_through TEXT NOT NULL
     )",
+    // Each venue's checkpoint of the orphan scan: see `Checkpoint`. `IF NOT EXISTS` adds it to a
+    // database made before it, so the schema version stays.
+    "CREATE TABLE IF NOT EXISTS checkpoints (
+        venue TEXT PRIMARY KEY,
+        next_seq BIGINT NOT NULL,
+        taken_at TEXT NOT NULL
+    )",
 ];
 
 /// Creates the tables a new database lacks, after checking the version of one that has them: a
@@ -1084,9 +1114,21 @@ fn upsert(table: &str, key: &[&str], columns: &[&str]) -> String {
 type Query<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>>;
 
 async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io::Result<()> {
-    let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered, orphans } =
-        changes;
+    let Changes {
+        orders,
+        sent,
+        cl_ord_ids,
+        days,
+        blocked,
+        references,
+        filled,
+        undelivered,
+        delivered,
+        orphans,
+        checkpoints,
+    } = changes;
     write_orphans(connection, orphans).await?;
+    write_checkpoints(connection, checkpoints).await?;
     for row in orders {
         run(connection, bind_order(sqlx::query(&UPSERT_ORDER), row)?, "writing an order").await?;
     }
@@ -1116,22 +1158,7 @@ async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io:
         run(connection, query, "writing a day").await?;
     }
     if let Some(blocked) = blocked {
-        run(connection, sqlx::query("DELETE FROM blocks"), "clearing the blocks").await?;
-        for (position, scope) in blocked.iter().enumerate() {
-            let position = i64::try_from(position).expect("blocks are a handful");
-            let (kind, client, comp_id) = match scope {
-                Scope::Session(client) => ("session", Some(client.to_string()), Some(client.comp_id())),
-                Scope::CompId(comp_id) => ("comp_id", None, Some(comp_id.as_str())),
-                Scope::All => ("all", None, None),
-            };
-            let query =
-                sqlx::query("INSERT INTO blocks (position, kind, client, client_comp_id) VALUES ($1, $2, $3, $4)")
-                    .bind(position)
-                    .bind(kind)
-                    .bind(client)
-                    .bind(comp_id);
-            run(connection, query, "writing a block").await?;
-        }
+        write_blocks(connection, blocked).await?;
     }
     for (symbol, price) in references {
         let query = sqlx::query(&UPSERT_REFERENCE).bind(symbol.as_str()).bind(price.to_string());
@@ -1152,11 +1179,45 @@ async fn write_changes(connection: &mut AnyConnection, changes: &Changes) -> io:
     Ok(())
 }
 
+/// `blocked` in place of every block.
+async fn write_blocks(connection: &mut AnyConnection, blocked: &[Scope]) -> io::Result<()> {
+    run(connection, sqlx::query("DELETE FROM blocks"), "clearing the blocks").await?;
+    for (position, scope) in blocked.iter().enumerate() {
+        let position = i64::try_from(position).expect("blocks are a handful");
+        let (kind, client, comp_id) = match scope {
+            Scope::Session(client) => ("session", Some(client.to_string()), Some(client.comp_id())),
+            Scope::CompId(comp_id) => ("comp_id", None, Some(comp_id.as_str())),
+            Scope::All => ("all", None, None),
+        };
+        let query = sqlx::query("INSERT INTO blocks (position, kind, client, client_comp_id) VALUES ($1, $2, $3, $4)")
+            .bind(position)
+            .bind(kind)
+            .bind(client)
+            .bind(comp_id);
+        run(connection, query, "writing a block").await?;
+    }
+    Ok(())
+}
+
 async fn write_orphans(connection: &mut AnyConnection, orphans: &[CompactString]) -> io::Result<()> {
     for downstream in orphans {
         let query = sqlx::query("INSERT INTO orphans (downstream) VALUES ($1) ON CONFLICT DO NOTHING")
             .bind(downstream.as_str());
         run(connection, query, "writing an orphan").await?;
+    }
+    Ok(())
+}
+
+async fn write_checkpoints(connection: &mut AnyConnection, checkpoints: &[(VenueId, Checkpoint)]) -> io::Result<()> {
+    for (venue, checkpoint) in checkpoints {
+        let query = sqlx::query(
+            "INSERT INTO checkpoints (venue, next_seq, taken_at) VALUES ($1, $2, $3) ON CONFLICT (venue) \
+             DO UPDATE SET next_seq = excluded.next_seq, taken_at = excluded.taken_at",
+        )
+        .bind(venue.as_str())
+        .bind(signed(checkpoint.next_seq)?)
+        .bind(time_text(checkpoint.taken_at));
+        run(connection, query, "writing a checkpoint").await?;
     }
     Ok(())
 }

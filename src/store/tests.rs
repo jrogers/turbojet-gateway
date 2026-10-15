@@ -293,8 +293,10 @@ async fn every_row_reads_back_as_written() {
         ],
         delivered: Vec::new(),
         orphans: vec!["Z1".into()],
+        checkpoints: vec![("LSE".into(), Checkpoint { next_seq: 7, taken_at: time(2, 123_456_789) })],
     };
     store.write(std::slice::from_ref(&changes)).await.unwrap();
+    assert_eq!(store.checkpoints().await.unwrap(), changes.checkpoints.iter().cloned().collect());
     let loaded = store.load().await.unwrap();
     assert_eq!(loaded, applied(&[changes]));
     // Decimals of other scales compare equal: check the text too.
@@ -391,6 +393,7 @@ async fn merged_changes_write_what_the_changes_do() {
     };
     let report = |n: u8| Undelivered { client: funda.clone(), message: vec![n] };
     let cl_ord_id = |order| ClOrdIdRow { client: funda.clone(), day: None, cl_ord_id: "C1".into(), order };
+    let checkpoint = |next_seq| Checkpoint { next_seq, taken_at: time(1, 0) };
     let written = [
         Changes {
             orders: vec![row(Status::New), order_row(2)],
@@ -398,6 +401,7 @@ async fn merged_changes_write_what_the_changes_do() {
             blocked: Some(vec![Scope::All]),
             references: vec![("AAPL".into(), decimal("10"))],
             undelivered: vec![(1, report(1)), (2, report(2))],
+            checkpoints: vec![("LSE".into(), checkpoint(5))],
             ..Changes::default()
         },
         Changes {
@@ -406,6 +410,7 @@ async fn merged_changes_write_what_the_changes_do() {
             references: vec![("AAPL".into(), decimal("11"))],
             undelivered: vec![(3, report(3))],
             delivered: vec![1, 9],
+            checkpoints: vec![("LSE".into(), checkpoint(8))],
             ..Changes::default()
         },
         Changes { delivered: vec![3, 4], ..Changes::default() },
@@ -419,12 +424,14 @@ async fn merged_changes_write_what_the_changes_do() {
     assert_eq!(merged.blocked, Some(vec![Scope::All]));
     assert_eq!(merged.undelivered, [(2, report(2)), (4, report(4))]);
     assert_eq!(merged.delivered, [1, 3, 9]);
+    assert_eq!(merged.checkpoints, [("LSE".into(), checkpoint(8))]);
     assert_eq!(applied(std::slice::from_ref(&merged)), applied(&written));
 
     let (one, each) = (store().await, store().await);
     one.write(std::slice::from_ref(&merged)).await.unwrap();
     each.write(&written).await.unwrap();
     assert_eq!(one.load().await.unwrap(), each.load().await.unwrap());
+    assert_eq!(one.checkpoints().await.unwrap(), each.checkpoints().await.unwrap());
 }
 
 /// Random sequences of batches inserting and deleting a few undelivered rows, some already in the
@@ -1010,6 +1017,20 @@ async fn opening_an_older_database_adds_the_pruned_table() {
     let store = Store::open(&url).await.unwrap();
     assert_eq!(store.pruned_through().await.unwrap(), None);
     assert_eq!(store.prune(time(2, 0), 1).await.unwrap(), Pruned { orders: 0 });
+}
+
+/// Each venue keeps its latest checkpoint: a later write replaces one venue's, not the other's.
+#[tokio::test]
+async fn checkpoints_keep_each_venues_latest() {
+    let store = store().await;
+    assert_eq!(store.checkpoints().await.unwrap(), HashMap::new());
+    let checkpoint = |next_seq, nanos| Checkpoint { next_seq, taken_at: time(1, nanos) };
+    let first = vec![("LSE".into(), checkpoint(10, 1)), ("XETRA".into(), checkpoint(20, 1))];
+    store.write(&[Changes { checkpoints: first, ..Changes::default() }]).await.unwrap();
+    let second = vec![("LSE".into(), checkpoint(15, 2))];
+    store.write(&[Changes { checkpoints: second, ..Changes::default() }]).await.unwrap();
+    let expected = HashMap::from([("LSE".into(), checkpoint(15, 2)), ("XETRA".into(), checkpoint(20, 1))]);
+    assert_eq!(store.checkpoints().await.unwrap(), expected);
 }
 
 // ponytail: SQLite's plans only; PostgreSQL's aren't asserted. Add EXPLAIN checks if a large

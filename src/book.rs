@@ -23,7 +23,7 @@ mod view;
 
 use amend::{Amend, Refused, Terms};
 use persist::Touched;
-pub use persist::{Changes, ClOrdIdRow, OrderRow, Snapshot, Undelivered};
+pub use persist::{Changes, Checkpoint, ClOrdIdRow, OrderRow, Snapshot, Undelivered};
 pub use view::{
     Alarm, AlarmKind, CancelState, GatewayCancelView, GatewayEvent, MAX_ORDERS_PER_PAGE, OrderDetail, OrderFilter,
     OrderView, RequestKind, RequestView, RiskView, SessionRisk,

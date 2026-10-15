@@ -6,9 +6,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use turbojet::fields::{CompactString, Decimal};
 
-use super::{Book, ClientId, Day, Order, OrderId, Scope, Sent, Today};
+use super::{Book, ClientId, Day, Order, OrderId, Scope, Sent, Today, VenueId};
 
 /// The records the book's inputs touched since [`Book::take_changes`] last took them, as they
 /// are now: whole rows, each to replace what the store has under its key. None is a delete: what
@@ -36,6 +37,9 @@ pub struct Changes {
     /// does. Not loaded: [`Store::unknown_downstreams`](crate::store::Store::unknown_downstreams)
     /// reads them.
     pub orphans: Vec<CompactString>,
+    /// Venues' checkpoints of the orphan scan: the gateway adds these; the book never does. Not
+    /// loaded: [`Store::checkpoints`](crate::store::Store::checkpoints) reads them.
+    pub checkpoints: Vec<(VenueId, Checkpoint)>,
 }
 
 impl Changes {
@@ -57,8 +61,10 @@ impl Changes {
         let mut undelivered = BTreeMap::new();
         let mut delivered = BTreeSet::new();
         let mut orphans = BTreeSet::new();
+        let mut checkpoints = HashMap::new();
         for changes in changes {
             orphans.extend(changes.orphans);
+            checkpoints.extend(changes.checkpoints);
             orders.extend(changes.orders.into_iter().map(|row| (row.order.id, row)));
             sent.extend(changes.sent);
             let key = |row: &ClOrdIdRow| (row.client.clone(), row.day, row.cl_ord_id.clone());
@@ -90,8 +96,19 @@ impl Changes {
             undelivered: undelivered.into_iter().collect(),
             delivered: delivered.into_iter().collect(),
             orphans: orphans.into_iter().collect(),
+            checkpoints: checkpoints.into_iter().collect(),
         }
     }
+}
+
+/// Where a start's scan of a venue's session store for orphans may begin (see
+/// [`edge::orphans`](crate::edge::orphans)): every request of ours the store holds below `next_seq`
+/// has its change committed, and its answer too. Taken at `taken_at`, stamped before `next_seq`
+/// was read, so it is ignored if the venue's store was reset since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub next_seq: u64,
+    pub taken_at: DateTime<Utc>,
 }
 
 /// A report queued for `client`, as the FIX message its session is sent, framed with the
@@ -150,9 +167,20 @@ impl Snapshot {
 
     /// Writes `changes` over the records, as the store does.
     pub fn apply(&mut self, changes: Changes) {
-        // Orphans aren't loaded, so not in a snapshot.
-        let Changes { orders, sent, cl_ord_ids, days, blocked, references, filled, undelivered, delivered, orphans: _ } =
-            changes;
+        // Orphans and checkpoints aren't loaded, so not in a snapshot.
+        let Changes {
+            orders,
+            sent,
+            cl_ord_ids,
+            days,
+            blocked,
+            references,
+            filled,
+            undelivered,
+            delivered,
+            orphans: _,
+            checkpoints: _,
+        } = changes;
         for row in orders {
             self.next_order_id = self.next_order_id.max(row.order.id.0 + 1);
             self.orders.insert(row.order.id, row);
