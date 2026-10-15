@@ -323,17 +323,19 @@ function Exposure({ risk, limitsOf }: { risk: RiskView; limitsOf: (session: stri
 
 /**
  * What a session has used of its credit, open and filled, as `risk::State::within_credit` counts
- * it: a bar, warn from 75% and error from 90%, and the decimals exact beside it.
+ * it: a bar of its share of `limit`, warn from 75% and error from 90%, and the decimal exact beside
+ * it. The limit is the Credit column's.
  */
 function Usage({ used, limit }: { used: Decimal; limit: Decimal }) {
-  // For display only, the share is a float; the text beside it is the decimals.
-  const share = Number(used) / Number(limit)
+  // For display only, the share is a float; the text beside it is the decimal. A credit of 0, which
+  // the config refuses, is all used by anything.
+  const share = Number(limit) > 0 ? Number(used) / Number(limit) : Number(used) > 0 ? 1 : 0
   return (
     <>
       <span className={share >= 0.9 ? 'bar error' : share >= 0.75 ? 'bar warn' : 'bar'} aria-hidden>
         <span style={{ width: `${Math.min(1, share) * 100}%` }} />
       </span>
-      {used} / {limit}
+      {used}
     </>
   )
 }
@@ -341,7 +343,7 @@ function Usage({ used, limit }: { used: Decimal; limit: Decimal }) {
 const scale = (d: Decimal) => d.split('.')[1]?.length ?? 0
 
 /** `a + b` exactly, at the larger of their scales. Both not negative, as notionals are. */
-function add(a: Decimal, b: Decimal): Decimal {
+export function add(a: Decimal, b: Decimal): Decimal {
   const at = Math.max(scale(a), scale(b))
   const whole = (d: Decimal) => BigInt(d.replace('.', '') + '0'.repeat(at - scale(d)))
   const digits = (whole(a) + whole(b)).toString().padStart(at + 1, '0')

@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import * as api from './api.ts'
-import Risk, { RISK_EVERY } from './Risk.tsx'
+import Risk, { add, RISK_EVERY } from './Risk.tsx'
 import { initial, LiveContext, reduce, type LiveState } from './store.ts'
 import type { Limits, LiveMessage, Me, RiskView, SessionView } from './types.ts'
 
@@ -81,16 +81,18 @@ test('shows each session against its limits as merged, and the reference prices,
 test('a session with a credit limit shows its open and filled against it, exactly, toned by the share', async () => {
   const FUNDC = 'FIX.4.4:JETBRIDGE->FUNDC'
   const FUNDD = 'FIX.4.4:JETBRIDGE->FUNDD'
+  const FUNDE = 'FIX.4.4:JETBRIDGE->FUNDE'
   const credit = (credit: string) => ({ ...none, credit })
   serve({
     'GET /api/risk': () =>
       json({
         ...fixture,
-        by_comp_id: { FUNDA: credit('1281.25'), FUNDB: credit('1000'), FUNDC: credit('1000') },
+        by_comp_id: { FUNDA: credit('1281.25'), FUNDB: credit('1000'), FUNDC: credit('1000'), FUNDE: credit('0') },
         sessions: [
           ...fixture.sessions,
           { client: FUNDC, open: '900', filled: '50.25' },
           { client: FUNDD, open: '1', filled: '0' },
+          { client: FUNDE, open: '0', filled: '0' },
         ],
       }),
   })
@@ -99,18 +101,28 @@ test('a session with a credit limit shows its open and filled against it, exactl
   const usage = (name: string) => row(name).querySelector('td.usage')!
   const bar = (name: string) => usage(name).querySelector('.bar')
   // 80%: warn.
-  expect(usage(FUNDA).textContent).toBe('1025.0000 / 1281.25')
+  expect(usage(FUNDA).textContent).toBe('1025.0000')
   expect(bar(FUNDA)!.className).toBe('bar warn')
   expect((bar(FUNDA)!.firstChild as HTMLElement).style.width).toBe('80%')
   // 95.025%: error.
-  expect(usage(FUNDC).textContent).toBe('950.25 / 1000')
+  expect(usage(FUNDC).textContent).toBe('950.25')
   expect(bar(FUNDC)!.className).toBe('bar error')
   // Under 75%, the sum exact at the larger scale.
-  expect(usage(FUNDB).textContent).toBe('12.500000000000000001 / 1000')
+  expect(usage(FUNDB).textContent).toBe('12.500000000000000001')
   expect(bar(FUNDB)!.className).toBe('bar')
   // No limit, no bar.
   expect(usage(FUNDD).textContent).toBe('')
   expect(bar(FUNDD)).toBeNull()
+  // 0 of 0: an empty bar, not NaN.
+  expect(usage(FUNDE).textContent).toBe('0')
+  expect([bar(FUNDE)!.className, (bar(FUNDE)!.firstChild as HTMLElement).style.width]).toEqual(['bar', '0%'])
+})
+
+test('adds decimals exactly, at the larger scale', () => {
+  expect(add('0.05', '0.02')).toBe('0.07')
+  expect(add('0.7', '0.5')).toBe('1.2')
+  expect(add('3', '4')).toBe('7')
+  expect(add('1.5', '0.25')).toBe('1.75')
 })
 
 test('a 404 clears what was shown, says why, and stops the reads until a snapshot', async () => {
