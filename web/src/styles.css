@@ -1,30 +1,65 @@
+/* Tokens: dark first, with a light variant from the same names. */
+
 :root {
-  --bg: #ffffff;
-  --fg: #1b1f24;
-  --muted: #5d6670;
-  --line: #d6dae0;
-  --panel: #f4f6f8;
-  --accent: #1f5fbf;
-  --accent-fg: #ffffff;
-  --error: #b42318;
-  --warn: #9a6700;
-  --ok: #1a7f37;
+  --bg: #0d1117;
+  --panel: #11161d;
+  --line: #1f2731;
+  --fg: #e6eaf0;
+  --muted: #8b96a3;
+  --accent: #6cb6ff;
+  --accent-fg: #0d1117;
+  --warn: #f0a35b;
+  --ok: #5fd3a9;
+  --error: #ff8a8a;
+  --danger: #b3261e;
+  --danger-fg: #ffffff;
+  --buy: var(--accent);
+  --sell: var(--warn);
+  --flash: rgb(108 182 255 / 0.25);
+
+  --tone-info-bg: #132a45;
+  --tone-info-fg: #6cb6ff;
+  --tone-warn-bg: #2d2212;
+  --tone-warn-fg: #f0a35b;
+  --tone-ok-bg: #10302a;
+  --tone-ok-fg: #5fd3a9;
+  --tone-error-bg: #3a1518;
+  --tone-error-fg: #ff8a8a;
+  --tone-muted-bg: #1d2633;
+  --tone-muted-fg: #a3adb9;
+
+  --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
   color-scheme: light dark;
-  font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font: 13px/1.4 var(--font-sans);
 }
 
-@media (prefers-color-scheme: dark) {
+@media (prefers-color-scheme: light) {
   :root {
-    --bg: #0f1216;
-    --fg: #e3e7ec;
-    --muted: #9aa4af;
-    --line: #2c333b;
-    --panel: #171b21;
-    --accent: #5b9bf0;
-    --accent-fg: #0f1216;
-    --error: #f97066;
-    --warn: #e3b341;
-    --ok: #4ac26b;
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --line: #d0d7de;
+    --fg: #1f2328;
+    --muted: #59636e;
+    --accent: #0969da;
+    --accent-fg: #ffffff;
+    --warn: #9a6700;
+    --ok: #1a7f37;
+    --error: #cf222e;
+    --danger: #b3261e;
+    --flash: rgb(9 105 218 / 0.15);
+
+    --tone-info-bg: #ddf4ff;
+    --tone-info-fg: #0550ae;
+    --tone-warn-bg: #fff8c5;
+    --tone-warn-fg: #7d4e00;
+    --tone-ok-bg: #dafbe1;
+    --tone-ok-fg: #116329;
+    --tone-error-bg: #ffebe9;
+    --tone-error-fg: #a40e26;
+    --tone-muted-bg: #eaeef2;
+    --tone-muted-fg: #57606a;
   }
 }
 
@@ -36,6 +71,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
+  font: 13px/1.4 var(--font-sans);
 }
 
 a {
@@ -47,6 +83,19 @@ h1 {
   margin: 0 0 0.75rem;
 }
 
+/* Numbers, times, IDs and wire text: monospace, the digits in columns. */
+
+.num,
+td.num,
+th.num,
+time,
+code,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
 button,
 input,
 select {
@@ -54,20 +103,28 @@ select {
   color: inherit;
 }
 
+input:not([type='checkbox'], [type='radio']),
+select,
+button {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
 input,
 select {
   background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 4px;
   padding: 0.3rem 0.5rem;
 }
 
 button {
   background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 4px;
   padding: 0.3rem 0.75rem;
   cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--muted);
 }
 
 button:disabled {
@@ -82,8 +139,146 @@ button.primary,
   color: var(--accent-fg);
 }
 
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--danger-fg);
+  font-weight: 600;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .error {
   color: var(--error);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.buy,
+td.buy {
+  color: var(--buy);
+}
+
+.sell,
+td.sell {
+  color: var(--sell);
+}
+
+/* Shared pieces: pills, dots, bars, cards and panels. */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  background: var(--tone-muted-bg);
+  color: var(--tone-muted-fg);
+}
+
+.pill.info {
+  background: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+}
+
+.pill.warn {
+  background: var(--tone-warn-bg);
+  color: var(--tone-warn-fg);
+}
+
+.pill.ok {
+  background: var(--tone-ok-bg);
+  color: var(--tone-ok-fg);
+}
+
+.pill.error {
+  background: var(--tone-error-bg);
+  color: var(--tone-error-fg);
+}
+
+.pill.muted {
+  background: var(--tone-muted-bg);
+  color: var(--tone-muted-fg);
+}
+
+.dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.bar {
+  display: block;
+  height: 4px;
+  background: var(--line);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.bar.warn > span {
+  background: var(--warn);
+}
+
+.bar.error > span {
+  background: var(--error);
+}
+
+.panel,
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.panel {
+  padding: 0.75rem 1rem;
+}
+
+.card {
+  padding: 0.6rem 0.75rem;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.75rem;
+  margin: 0 0 1rem;
+}
+
+@keyframes flash {
+  from {
+    background-color: var(--flash);
+  }
+
+  to {
+    background-color: transparent;
+  }
+}
+
+.flash {
+  animation: flash 1s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash {
+    animation: none;
+  }
 }
 
 /* The shell. */
@@ -104,6 +299,7 @@ header.shell .brand {
 
 header.shell nav {
   display: flex;
+  flex-wrap: wrap;
   gap: 1rem;
 }
 
@@ -112,9 +308,14 @@ header.shell nav a {
   color: var(--muted);
 }
 
+header.shell nav a:hover {
+  color: var(--fg);
+}
+
 header.shell nav a[aria-current='page'] {
   color: var(--fg);
   font-weight: 600;
+  box-shadow: inset 0 -2px var(--accent);
 }
 
 header.shell .who {
@@ -128,9 +329,9 @@ header.shell .user {
 
 header.shell .role {
   border: 1px solid var(--line);
-  border-radius: 3px;
-  padding: 0 0.3rem;
-  font-size: 0.85em;
+  border-radius: 10px;
+  padding: 0 0.4rem;
+  font-size: 11px;
 }
 
 main {
@@ -149,6 +350,10 @@ main.login {
   display: grid;
   gap: 0.75rem;
   width: min(20rem, 100%);
+  padding: 1.25rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
 }
 
 .login label {
@@ -156,10 +361,12 @@ main.login {
   gap: 0.25rem;
 }
 
-/* Tables: dense, and scrolling sideways in a narrow window rather than squeezing. */
+/* Tables: dense, in a rounded box that scrolls sideways in a narrow window rather than squeezing. */
 
 .table-wrap {
   overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
 }
 
 table {
@@ -170,15 +377,22 @@ table {
 
 th,
 td {
-  padding: 0.25rem 0.6rem;
+  padding: 0.3rem 0.6rem;
   border-bottom: 1px solid var(--line);
   text-align: left;
   white-space: nowrap;
 }
 
+tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
 th {
   color: var(--muted);
+  font-size: 11px;
   font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
   background: var(--panel);
 }
 
@@ -191,32 +405,31 @@ tbody tr:hover {
   background: var(--panel);
 }
 
-.muted {
-  color: var(--muted);
-}
-
 /* The live socket's banner, while it's down. */
 
 .banner {
   margin: 0 0 1rem;
   padding: 0.4rem 0.75rem;
   border: 1px solid var(--warn);
-  border-radius: 4px;
-  color: var(--warn);
+  border-radius: 6px;
+  background: var(--tone-warn-bg);
+  color: var(--tone-warn-fg);
 }
 
 /* The gateway's unavailable banner, and the alarms not dismissed: a short list, scrolling. */
 
 .banner.error {
   border-color: var(--error);
-  color: var(--error);
+  background: var(--tone-error-bg);
+  color: var(--tone-error-fg);
 }
 
 .alarms {
   margin: 0 0 1rem;
   padding: 0.4rem 0.75rem;
   border: 1px solid var(--warn);
-  border-radius: 4px;
+  border-radius: 6px;
+  background: var(--panel);
 }
 
 .alarms h2 {
@@ -240,6 +453,7 @@ tbody tr:hover {
 
 .alarms time,
 .alarms .client {
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
@@ -268,14 +482,14 @@ td.actions button + button {
 .dialog {
   width: min(24rem, calc(100% - 2rem));
   padding: 1rem;
-  background: var(--bg);
+  background: var(--panel);
   color: var(--fg);
   border: 1px solid var(--line);
   border-radius: 6px;
 }
 
 .dialog::backdrop {
-  background: rgb(0 0 0 / 0.4);
+  background: rgb(0 0 0 / 0.55);
 }
 
 .dialog form {
@@ -311,32 +525,42 @@ td.actions button + button {
 .filters label {
   display: grid;
   gap: 0.25rem;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.filters label input,
+.filters label select {
+  color: var(--fg);
+  font-size: 13px;
 }
 
 .filters label.check {
   display: flex;
   align-items: center;
   gap: 0.35rem;
-  padding-bottom: 0.35rem;
+  padding-bottom: 0.5rem;
+  font-size: 13px;
 }
 
 .badge {
   margin-left: 0.4rem;
-  padding: 0 0.3rem;
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  font-size: 0.85em;
-  color: var(--muted);
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--tone-muted-bg);
+  color: var(--tone-muted-fg);
 }
 
 .badge.warn {
-  border-color: var(--warn);
-  color: var(--warn);
+  background: var(--tone-warn-bg);
+  color: var(--tone-warn-fg);
 }
 
 .badge.error {
-  border-color: var(--error);
-  color: var(--error);
+  background: var(--tone-error-bg);
+  color: var(--tone-error-fg);
 }
 
 /* An order: its fields as a grid of name over value, and its messages as on the wire. */
@@ -346,11 +570,17 @@ td.actions button + button {
   grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
   gap: 0.5rem 1rem;
   margin: 0 0 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
 }
 
 .fields dt {
   color: var(--muted);
-  font-size: 0.85em;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .fields dd {
@@ -383,7 +613,11 @@ table.messages td:last-child {
 table.tags td {
   border: 0;
   padding: 0 0.6rem 0 0;
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
+}
+
+table.tags tr:hover {
+  background: none;
 }
 
 /* For screen readers only: a table's header row the layout doesn't show. */
@@ -397,7 +631,7 @@ table.tags td {
   white-space: nowrap;
 }
 
-/* Risk: the blocks, each with its Unblock, and the kill switch, red. */
+/* Risk: the blocks, each with its Unblock. */
 
 ul.blocks {
   list-style: none;
@@ -412,20 +646,16 @@ ul.blocks li {
   padding: 0.2rem 0;
 }
 
-button.danger {
-  background: var(--error);
-  border-color: var(--error);
-  color: var(--bg);
-  font-weight: 600;
-}
-
 /* Limits: each row named by its first cell, a checkbox beside its text in the dialog, and an
    edit's answer. */
 
 tbody th[scope='row'] {
   background: none;
   color: inherit;
+  font-size: inherit;
   font-weight: inherit;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 .dialog label.check {
@@ -446,7 +676,7 @@ ul.warnings {
 /* Routes: the rule a dry run matched. */
 
 tr.matched {
-  background: var(--panel);
+  background: var(--tone-info-bg);
   box-shadow: inset 3px 0 var(--accent);
   font-weight: 600;
 }
