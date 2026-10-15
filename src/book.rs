@@ -934,6 +934,14 @@ impl Book {
         })
     }
 
+    /// Whether the request sent as `downstream` holds back a checkpoint of its venue's store (see
+    /// [`edge::orphans`](crate::edge::orphans)): it's unanswered, or an orphaned replace waiting
+    /// for the one pending before it, which the book doesn't count sent until it's made pending,
+    /// and unanswered then.
+    pub fn holds_checkpoint(&self, downstream: &str) -> bool {
+        self.is_unanswered(downstream) || self.orphan_waiting(downstream)
+    }
+
     pub fn handle(&mut self, input: Input, out: &mut Vec<Output>) {
         match input {
             Input::NewOrder { client, request, redelivered, sent } => {

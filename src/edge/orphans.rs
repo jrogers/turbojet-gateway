@@ -231,9 +231,9 @@ impl Gateway {
     }
 
     /// Bounds each of `stored` (ClOrdIDs, with the numbers `venue`'s session stored them under)
-    /// the book counts unanswered, so no checkpoint passes it: those restored from the database,
-    /// and orphaned amendments now pending, or waiting to be (no checkpoint is taken while one
-    /// waits, and it's pending after). Requests sent again at the logon get theirs as sent.
+    /// that holds a checkpoint back ([`Book::holds_checkpoint`](crate::book::Book::holds_checkpoint)),
+    /// so none passes it: those restored from the database, and orphaned amendments now pending,
+    /// or waiting to be. Requests sent again at the logon get theirs as sent.
     fn seed_in_flight<'a>(&self, venue: &VenueId, stored: impl Iterator<Item = (&'a CompactString, u64)>) {
         if self.writer.is_none() {
             return;
@@ -241,9 +241,8 @@ impl Gateway {
         let mut state = self.lock();
         let state = &mut *state;
         let book = &state.book;
-        let unanswered = |downstream: &CompactString| book.is_unanswered(downstream) || book.orphan_waiting(downstream);
         let bounds = state.in_flight.entry(venue.clone()).or_default();
-        for (downstream, seq) in stored.filter(|(downstream, _)| unanswered(downstream)) {
+        for (downstream, seq) in stored.filter(|(downstream, _)| book.holds_checkpoint(downstream)) {
             bounds.entry(downstream.clone()).and_modify(|bound| *bound = (*bound).min(seq)).or_insert(seq);
         }
     }
@@ -548,7 +547,7 @@ impl Gateway {
         // pending, and every other venue's bounds would pile up meanwhile. Also drops the bounds
         // of a venue a reload took out, once answered.
         state.in_flight.retain(|_, bounds| {
-            bounds.retain(|downstream, _| state.book.is_unanswered(downstream));
+            bounds.retain(|downstream, _| state.book.holds_checkpoint(downstream));
             !bounds.is_empty()
         });
         if let Some(work) = orphan_work(state) {

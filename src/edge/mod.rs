@@ -210,8 +210,8 @@ struct State {
     /// logon: see [`orphans`].
     unsent: HashMap<VenueId, orphans::Unsent>,
     /// Each venue request's lower bound on the number its session stores it under, by venue and
-    /// downstream ClOrdID, kept until the book counts it answered: what holds back
-    /// [`Gateway::checkpoint_once`]. Kept with a database only.
+    /// downstream ClOrdID, kept while it holds a checkpoint back ([`Book::holds_checkpoint`]):
+    /// what holds back [`Gateway::checkpoint_once`]. Kept with a database only.
     in_flight: HashMap<VenueId, HashMap<CompactString, u64>>,
     /// Venue sessions logged on, from the venue app's `on_logon` to its `on_logout`: by then a
     /// reset at logon has happened, so the numbers a session publishes are its own. By session,
@@ -3058,6 +3058,31 @@ pub(crate) mod tests {
         let gateway = super::tests::gateway();
         let _sessions = connected(&gateway, false).await;
         assert!(gateway.checkpoint_once().is_empty());
+    }
+
+    /// An orphaned replace waiting for the one pending before it keeps its bound through a
+    /// checkpoint's run, though the book doesn't count it sent until it's made pending: else a
+    /// later checkpoint could pass it while it's unanswered.
+    #[tokio::test]
+    async fn a_waiting_orphaned_replace_keeps_its_bound() {
+        let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
+        book_order(&gateway);
+        acknowledge(&gateway, "1", "V1");
+        let orphan = |downstream: &str| {
+            let replace = crate::book::OrphanedReplace {
+                qty: 200.into(),
+                price: Some(10.into()),
+                ord_type: crate::book::OrdType::Limit,
+                time_in_force: None,
+            };
+            Input::Orphan { venue: VENUE.into(), downstream: downstream.into(), replace: Some(replace) }
+        };
+        // The first is pending, so the second waits for its answer.
+        gateway.handle_all([orphan("1-1"), orphan("1-2")]);
+        assert!(gateway.lock().book.orphan_waiting("1-2"));
+        gateway.lock().in_flight.entry(VENUE.into()).or_default().insert("1-2".into(), 7);
+        gateway.checkpoint_once();
+        assert_eq!(gateway.lock().in_flight.get(VENUE).and_then(|bounds| bounds.get("1-2")), Some(&7));
     }
 
     /// Our session with the venue, as the gateway's initiator has it.
