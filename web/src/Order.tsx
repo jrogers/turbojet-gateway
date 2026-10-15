@@ -166,7 +166,7 @@ function Fields({ order }: { order: OrderDetail }) {
     ['Venue', order.venue],
     ['Venue’s OrderID', order.venue_order_id ?? ''],
     ['Symbol', order.symbol],
-    ['Side', order.side.replace('_', ' ')],
+    ['Side', <span className={order.side === 'buy' ? 'buy' : 'sell'}>{order.side.replace('_', ' ')}</span>],
     ['Type', order.ord_type],
     ['Qty', order.qty],
     ['Price', order.price ?? ''],

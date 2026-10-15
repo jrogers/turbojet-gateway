@@ -330,20 +330,20 @@ const Row = memo(function Row({ order }: { order: OrderView }) {
   )
 })
 
-/** An order's status, and its flags as badges after it, those it repeats left out: the blotter's and the order page's. */
+/** An order's status, and its flags as pills after it, those it repeats left out: the blotter's and the order page's. */
 export function StatusText({ order }: { order: OrderView }) {
   return (
     <>
       <StatusPill status={order.status} />
       {/* Not when the status says it already. */}
-      {order.pending_cancel && order.status !== 'pending_cancel' && <span className="badge">cancel pending</span>}
-      {order.pending_replace && order.status !== 'pending_replace' && <span className="badge">replace pending</span>}
+      {order.pending_cancel && order.status !== 'pending_cancel' && <span className="pill muted">cancel pending</span>}
+      {order.pending_replace && order.status !== 'pending_replace' && <span className="pill muted">replace pending</span>}
       {order.gateway_cancel && (
-        <span className={order.gateway_cancel.state === 'stuck' ? 'badge warn' : 'badge'}>
+        <span className={order.gateway_cancel.state === 'stuck' ? 'pill warn' : 'pill muted'}>
           gateway cancel {order.gateway_cancel.state.replace('_', ' ')}
         </span>
       )}
-      {order.unknown_at_venue && <span className="badge error">unknown at venue</span>}
+      {order.unknown_at_venue && <span className="pill error">unknown at venue</span>}
     </>
   )
 }

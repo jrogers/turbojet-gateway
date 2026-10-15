@@ -31,7 +31,7 @@
   --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
-  color-scheme: light dark;
+  color-scheme: dark light;
   font: 13px/1.4 var(--font-sans);
 }
 
@@ -86,8 +86,6 @@ h1 {
 /* Numbers, times, IDs and wire text: monospace, the digits in columns. */
 
 .num,
-td.num,
-th.num,
 time,
 code,
 kbd,
@@ -171,13 +169,11 @@ button.risky {
   color: var(--muted);
 }
 
-.buy,
-td.buy {
+.buy {
   color: var(--buy);
 }
 
-.sell,
-td.sell {
+.sell {
   color: var(--sell);
 }
 
@@ -428,7 +424,9 @@ header.page {
 }
 
 header.page button.pill {
-  min-height: 0;
+  min-height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
   border-color: var(--warn);
 }
 
@@ -513,14 +511,8 @@ tbody tr:hover {
 .banner {
   margin: 0 0 1rem;
   padding: 0.4rem 0.75rem;
-  border: 1px solid var(--warn);
+  border: 1px solid var(--error);
   border-radius: 6px;
-  background: var(--tone-warn-bg);
-  color: var(--tone-warn-fg);
-}
-
-.banner.error {
-  border-color: var(--error);
   background: var(--tone-error-bg);
   color: var(--tone-error-fg);
 }
@@ -613,7 +605,7 @@ td.actions button + button {
   gap: 0.5rem;
 }
 
-/* Orders: the filters, and an order's flags as badges after its status. */
+/* Orders: the filters, and an order's flags as pills after its status. */
 
 .filters {
   display: flex;
@@ -659,24 +651,8 @@ td.actions button + button {
   font-size: 13px;
 }
 
-.badge {
+.pill + .pill {
   margin-left: 0.4rem;
-  padding: 1px 6px;
-  border-radius: 10px;
-  font-size: 11px;
-  font-weight: 500;
-  background: var(--tone-muted-bg);
-  color: var(--tone-muted-fg);
-}
-
-.badge.warn {
-  background: var(--tone-warn-bg);
-  color: var(--tone-warn-fg);
-}
-
-.badge.error {
-  background: var(--tone-error-bg);
-  color: var(--tone-error-fg);
 }
 
 /* A blotter's Filled cell: the fill as a bar, before its quantity. */

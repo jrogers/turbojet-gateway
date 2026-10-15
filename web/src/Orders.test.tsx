@@ -106,7 +106,7 @@ test('live rows are the store’s working orders, newest first, and follow its e
   // A row done stays in this view, and a done one read over HTTP follows its events.
   expect(shown()).toEqual(['O5', 'O4', 'O3', 'O2'])
   expect(row('O4').textContent).toContain('rejected')
-  expect(within(row('O3')).getByText('unknown at venue').className).toBe('badge error')
+  expect(within(row('O3')).getByText('unknown at venue').className).toBe('pill error')
 
   pages = [{ orders: [order(1)], next: null }]
   await more()
@@ -205,7 +205,7 @@ test('a read for an earlier query is dropped, whenever it comes', async () => {
   expect(screen.queryByRole('button', { name: 'More' })).toBeNull()
 })
 
-test('flags show as badges, and decimals as the API wrote them', () => {
+test('flags show as pills after the status, and decimals as the API wrote them', () => {
   render(
     view(
       snapshot([
@@ -215,16 +215,16 @@ test('flags show as badges, and decimals as the API wrote them', () => {
       ]),
     ),
   )
-  const badges = (orderId: string) =>
-    [...row(orderId).querySelectorAll('.badge')].map((badge) => `${badge.className}: ${badge.textContent}`)
-  expect(badges('O1')).toEqual(['badge: cancel pending', 'badge: replace pending'])
-  expect(badges('O2')).toEqual(['badge warn: gateway cancel stuck'])
-  expect(badges('O3')).toEqual(['badge: gateway cancel in flight', 'badge error: unknown at venue'])
+  const flags = (orderId: string) =>
+    [...row(orderId).querySelectorAll('.pill ~ .pill')].map((flag) => `${flag.className}: ${flag.textContent}`)
+  expect(flags('O1')).toEqual(['pill muted: cancel pending', 'pill muted: replace pending'])
+  expect(flags('O2')).toEqual(['pill warn: gateway cancel stuck'])
+  expect(flags('O3')).toEqual(['pill muted: gateway cancel in flight', 'pill error: unknown at venue'])
   const cells = [...row('O1').querySelectorAll('td.num')].map((cell) => cell.textContent)
   expect(cells).toEqual(['100', '10.250000000000000001', '100.000', '10.10'])
 })
 
-test('a pending flag its status already says shows no badge; under another status it does', () => {
+test('a pending flag its status already says shows no pill; under another status it does', () => {
   render(
     view(
       snapshot([
@@ -235,11 +235,11 @@ test('a pending flag its status already says shows no badge; under another statu
       ]),
     ),
   )
-  const badges = (orderId: string) => [...row(orderId).querySelectorAll('.badge')].map((badge) => badge.textContent)
-  expect(badges('O1')).toEqual([])
-  expect(badges('O2')).toEqual([])
-  expect(badges('O3')).toEqual(['replace pending'])
-  expect(badges('O4')).toEqual(['cancel pending'])
+  const flags = (orderId: string) => [...row(orderId).querySelectorAll('.pill ~ .pill')].map((flag) => flag.textContent)
+  expect(flags('O1')).toEqual([])
+  expect(flags('O2')).toEqual([])
+  expect(flags('O3')).toEqual(['replace pending'])
+  expect(flags('O4')).toEqual(['cancel pending'])
 })
 
 test('a new snapshot reads again, dropping the pages read before', async () => {
