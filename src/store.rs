@@ -1094,6 +1094,8 @@ static UPSERT_UNDELIVERED: LazyLock<String> =
     LazyLock::new(|| upsert("undelivered", &["id"], &["id", "client", "client_comp_id", "message"]));
 static UPSERT_FILLED: LazyLock<String> =
     LazyLock::new(|| upsert("risk_filled", &["client", "client_comp_id"], &["client", "client_comp_id", "notional"]));
+static UPSERT_CHECKPOINT: LazyLock<String> =
+    LazyLock::new(|| upsert("checkpoints", &["venue"], &["venue", "next_seq", "taken_at"]));
 
 /// `INSERT ... ON CONFLICT (key) DO UPDATE` of `columns`, bound in order as `$1`, `$2`...: the
 /// upsert SQLite and PostgreSQL both take.
@@ -1210,13 +1212,10 @@ async fn write_orphans(connection: &mut AnyConnection, orphans: &[CompactString]
 
 async fn write_checkpoints(connection: &mut AnyConnection, checkpoints: &[(VenueId, Checkpoint)]) -> io::Result<()> {
     for (venue, checkpoint) in checkpoints {
-        let query = sqlx::query(
-            "INSERT INTO checkpoints (venue, next_seq, taken_at) VALUES ($1, $2, $3) ON CONFLICT (venue) \
-             DO UPDATE SET next_seq = excluded.next_seq, taken_at = excluded.taken_at",
-        )
-        .bind(venue.as_str())
-        .bind(signed(checkpoint.next_seq)?)
-        .bind(time_text(checkpoint.taken_at));
+        let query = sqlx::query(&UPSERT_CHECKPOINT)
+            .bind(venue.as_str())
+            .bind(signed(checkpoint.next_seq)?)
+            .bind(time_text(checkpoint.taken_at));
         run(connection, query, "writing a checkpoint").await?;
     }
     Ok(())
