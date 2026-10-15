@@ -220,8 +220,9 @@ struct State {
     /// reset at logon has happened, so the numbers a session publishes are its own. By session,
     /// not venue: a reload that renames a venue while it's up keeps it logged on, as its session is.
     /// With each, its next outgoing number as last read, at the logon and at each
-    /// [`Gateway::checkpoint_once`]: numbers only rise within a connection, so a request sent
-    /// since is stored at or above it.
+    /// [`Gateway::checkpoint_once`]: numbers only rise within a connection, but for a
+    /// counterparty's reset mid-session, which `checkpoint_once` catches, so a request sent since
+    /// is stored at or above it.
     logged_on: HashMap<SessionId, u64>,
     /// What this start's [`Gateway::cancel_orphans`] found: `Orphans::default()` if it didn't run.
     orphans_found: orphans::Orphans,
@@ -921,9 +922,11 @@ impl Gateway {
                 // on yet takes sends, queued, and may still reset its store or publish the old
                 // one's numbers: then 1, and the venue's whole store is scanned until the request
                 // is answered.
-                // ponytail: a counterparty's ResetSeqNumFlag mid-session can still leave a bound
-                // read before the reset, too high; the request's own MsgSeqNum, from its
-                // `Receipt`, if that shows.
+                // ponytail: a counterparty's ResetSeqNumFlag mid-session resets the store with no
+                // logout, so bounds read before it are too high; the next checkpoint's run catches
+                // it (the number fell) and bounds the venue's requests at 1, unless the session
+                // sent more after the reset than before it within that interval. Exact would be a
+                // reset count, or the store's created time, in Turbojet's `Activity`.
                 let bound = state.logged_on.get(to.session.id()).copied().unwrap_or(1);
                 match to.session.send(msg) {
                     Ok(receipt) => {
@@ -3086,6 +3089,26 @@ pub(crate) mod tests {
         let gateway = super::tests::gateway();
         let _sessions = connected(&gateway, false).await;
         assert!(gateway.checkpoint_once().is_empty());
+    }
+
+    /// A store reset mid-session, as a counterparty's ResetSeqNumFlag does with no logout, shows
+    /// as the session's next number below the one last read (faked here by raising that): no
+    /// checkpoint of the venue that run, its requests bounded at 1, and the next run's checkpoint
+    /// at most 1.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_reset_mid_session_bounds_its_requests_at_1() {
+        let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
+        let mut sessions = connected(&gateway, false).await;
+        venue_logged_on(&gateway, true).await;
+        sessions.client.handle().send(order("C1")).unwrap();
+        next_message(&mut sessions.venue_events).await;
+        gateway.lock().logged_on.insert(id(), u64::MAX);
+        assert!(gateway.checkpoint_once().is_empty());
+        assert_eq!(gateway.lock().in_flight[VENUE]["1"], 1);
+        assert!(gateway.lock().logged_on[&id()] < u64::MAX);
+        let taken = gateway.checkpoint_once();
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert!(taken[0].1.next_seq <= 1, "{taken:?}");
     }
 
     /// A venue's answer drops its request's bound as it's handled, not at the next checkpoint's

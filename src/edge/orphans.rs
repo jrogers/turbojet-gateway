@@ -51,11 +51,15 @@
 //! every venue's checkpoint, not just its own, so until it clears each start reads more of every
 //! store, back towards the whole, as before checkpoints; `Gateway::check_prefix`, the backstop for
 //! a clock that went back, sees only the scanned tail; a counterparty's ResetSeqNumFlag mid-session
-//! can leave a bound read before the reset, too high, so a checkpoint past a request; a clock
-//! stepped back across a reset, with no checkpoint taken after the reset before a stop, can make
-//! the stale checkpoint look newer than the store; and checkpoints are keyed by venue name, so a
-//! venue pointed at another session's store, older and numbered further, passes both checks (the
-//! rest of the orphan logic, too, takes a venue and its session as one).
+//! resets the store with no logout, leaving bounds read before it too high: the next checkpoint's
+//! run catches it (the session's number fell), bounds the venue's requests at 1 and takes no
+//! checkpoint of it, unless the session sent more after the reset than before it within that
+//! interval, when a checkpoint can pass a request (exact would be a reset count, or the store's
+//! created time, in Turbojet's `Activity`: an engine change); a clock stepped back across a reset,
+//! with no checkpoint taken after the reset before a stop, can make the stale checkpoint look newer
+//! than the store; and checkpoints are keyed by venue name, so a venue pointed at another session's
+//! store, older and numbered further, passes both checks (the rest of the orphan logic, too, takes
+//! a venue and its session as one).
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -543,8 +547,9 @@ impl Gateway {
     /// bound (see `State::in_flight`), and what ends a request's being unanswered is final: its
     /// answer, its order done, an original order past PendingNew. Takes none without a
     /// database, or while orphan work is pending: until handled, an orphan isn't recorded, and a
-    /// checkpoint past it would lose it, nor for a venue whose logon isn't done. Drops answered
-    /// requests' bounds whether it takes one or not. Returns what it queued.
+    /// checkpoint past it would lose it, nor for a venue whose logon isn't done or whose store was
+    /// reset mid-session since the last run. Drops answered requests' bounds whether it takes one
+    /// or not. Returns what it queued.
     pub fn checkpoint_once(&self) -> Vec<(VenueId, Checkpoint)> {
         let Some(writer) = &self.writer else { return Vec::new() };
         let mut state = self.lock();
@@ -571,7 +576,25 @@ impl Gateway {
             let Some(last_read) = state.logged_on.get_mut(to.session.id()) else { continue };
             let Some(activity) = to.session.status().and_then(|status| status.activity) else { continue };
             // What later requests to it are bounded by.
-            *last_read = activity.next_outgoing;
+            let before = std::mem::replace(last_read, activity.next_outgoing);
+            let next_outgoing = activity.next_outgoing;
+            // Numbers only rise, but for a counterparty's ResetSeqNumFlag mid-session, which
+            // resets the store with no logout: requests sent since were bounded by the old
+            // store's number, too high, so they're bounded at 1; and no checkpoint this run, as
+            // one stamped after the reset, which a start accepts, could pass them.
+            if next_outgoing < before {
+                warn!(
+                    %venue,
+                    before,
+                    next_outgoing,
+                    "the venue's session store was reset mid-session: its requests are bounded at 1, and no \
+                     checkpoint of it is taken this run"
+                );
+                if let Some(bounds) = state.in_flight.get_mut(venue) {
+                    bounds.values_mut().for_each(|bound| *bound = 1);
+                }
+                continue;
+            }
             // ponytail: a request its venue never answers holds the checkpoint back for good, so
             // the scan grows back towards a whole one, as before checkpoints; a bound on the
             // wait if a venue shows it.
