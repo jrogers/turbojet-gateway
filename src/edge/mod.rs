@@ -213,6 +213,9 @@ struct State {
     /// downstream ClOrdID, kept until the book counts it answered: what holds back
     /// [`Gateway::checkpoint_once`]. Kept with a database only.
     in_flight: HashMap<VenueId, HashMap<CompactString, u64>>,
+    /// Venues whose sessions are logged on, from the venue app's `on_logon` to its `on_logout`:
+    /// by then a reset at logon has happened, so the numbers a session publishes are its own.
+    logged_on: HashSet<VenueId>,
 }
 
 #[derive(Debug)]
@@ -236,6 +239,7 @@ impl Gateway {
             orphan_ids: HashSet::new(),
             unsent: HashMap::new(),
             in_flight: HashMap::new(),
+            logged_on: HashSet::new(),
         };
         Self {
             state: Mutex::new(state),
@@ -887,12 +891,17 @@ impl Gateway {
                 }
                 // Read before the send: the session publishes its next number once it has stored
                 // a message, and sends in order, so the request's own number can't be lower. A
-                // session still logging on takes sends, queued, before it publishes its numbers:
-                // then 1, and the venue's whole store is scanned until the request is answered.
-                let bound = self
-                    .writer
-                    .is_some()
-                    .then(|| to.session.status().and_then(|s| s.activity).map_or(1, |a| a.next_outgoing));
+                // session not logged on yet takes sends, queued, and may still reset its store or
+                // publish the old one's numbers: then 1, and the venue's whole store is scanned
+                // until the request is answered.
+                // ponytail: a counterparty's ResetSeqNumFlag mid-session can still leave a bound
+                // read before the reset, too high; the request's own MsgSeqNum, from its
+                // `Receipt`, if that shows.
+                let logged_on = state.logged_on.contains(venue);
+                let bound = self.writer.is_some().then(|| {
+                    let status = logged_on.then(|| to.session.status()).flatten();
+                    status.and_then(|s| s.activity).map_or(1, |a| a.next_outgoing)
+                });
                 match to.session.send(msg) {
                     Ok(receipt) => {
                         if let Some(bound) = bound {
@@ -1103,11 +1112,23 @@ impl Application for VenueApp {
     fn on_logon(&self, session: &SessionHandle) {
         let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
         let Some(venue) = venue else { return };
-        let unsent = self.0.lock().unsent.remove(&venue);
+        let unsent = {
+            let mut state = self.0.lock();
+            // Before the unsent requests go, so they get their bounds.
+            state.logged_on.insert(venue.clone());
+            state.unsent.remove(&venue)
+        };
         let unsent = unsent.map(|unsent| self.0.unsent_inputs(&venue, unsent, session)).unwrap_or_default();
         // Sent before anything the book sends now, as they would have been.
         self.0.handle_all(unsent.into_iter().chain([Input::VenueUp { venue: venue.clone() }]));
         self.0.send_orphan_cancels(&venue);
+    }
+
+    fn on_logout(&self, session: &SessionHandle, _ended: Disconnect) {
+        let mut state = self.0.lock();
+        if let Some((venue, _)) = state.venue_names.get(session.id()).cloned() {
+            state.logged_on.remove(&venue);
+        }
     }
 
     fn on_message(&self, ctx: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
@@ -2973,6 +2994,25 @@ pub(crate) mod tests {
         assert_eq!(taken.iter().map(|(_, c)| c.next_seq).collect::<Vec<_>>(), [next_outgoing()]);
         gateway.committed().await;
         assert_eq!(store.checkpoints().await.unwrap()[&VenueId::from(VENUE)], taken[0].1);
+    }
+
+    /// A request sent while its venue's session isn't logged on, as the gateway's venue app has
+    /// it, gets bound 1: the session may yet reset its store at the logon.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_sent_before_its_venue_logs_on_is_bound_at_1() {
+        let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
+        let mut sessions = connected(&gateway, false).await;
+        let logged_on = async {
+            while !gateway.lock().logged_on.contains(VENUE) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(Duration::from_secs(5), logged_on).await.expect("the venue app never saw the logon");
+        gateway.lock().logged_on.clear();
+        sessions.client.handle().send(order("C1")).unwrap();
+        next_message(&mut sessions.venue_events).await;
+        let bound = gateway.lock().in_flight[VENUE]["1"];
+        assert_eq!(bound, 1);
     }
 
     /// No checkpoint is taken while orphan work is pending, nor without a database.
