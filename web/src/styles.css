@@ -120,6 +120,7 @@ select {
 button {
   background: var(--panel);
   padding: 0.3rem 0.75rem;
+  white-space: nowrap;
   cursor: pointer;
 }
 
