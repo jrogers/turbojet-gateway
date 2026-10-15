@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use turbojet::{Acceptor, SessionEvent, SessionHandle, SessionId, SessionSchedule, SessionStatus};
 use turbojet_config::{Changes, Initiators, SessionsFile};
 
@@ -42,6 +42,12 @@ const CANCELS_WAIT: Duration = Duration::from_secs(5);
 /// [`Gateway::orphans_pending`]). Orders become prunable a trading day at a time, so an hour late
 /// keeps them an hour longer, no more.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// How often a checkpoint of the venues' stores is taken, with a database, the first time this
+/// long after the start (see [`Gateway::checkpoint_once`]). It bounds what a crash leaves the next
+/// start's orphan scan to read to about this long of each venue's messages, past any request still
+/// unanswered; a whole scan reads about 250k messages a second, so a minute's is quick.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What [`Service::reload`] did with each file: what changed, or why the file was kept as it
 /// was; and what it took but warns about.
@@ -93,6 +99,8 @@ pub struct Service {
     writing: Option<JoinHandle<()>>,
     /// [`prune_hourly`], with a database: aborted at shutdown, or when the service is dropped.
     pruning: Option<JoinHandle<()>>,
+    /// [`checkpoint_every_minute`], with a database: aborted with `pruning`.
+    checkpointing: Option<JoinHandle<()>>,
     /// The `[database] retention` in force: set at start and by each reload, read by `pruning`.
     retention: Arc<Mutex<Option<Duration>>>,
     /// The database, if there is one.
@@ -112,7 +120,7 @@ pub struct Service {
 impl Drop for Service {
     fn drop(&mut self) {
         self.retrying.abort();
-        for task in [&self.writing, &self.pruning].into_iter().flatten() {
+        for task in [&self.writing, &self.pruning, &self.checkpointing].into_iter().flatten() {
             task.abort();
         }
         if let Ok(Some(api)) = self.api.get_mut() {
@@ -167,6 +175,8 @@ impl Service {
         let retrying = tokio::spawn(gateway.clone().run_ticks(TICK_INTERVAL));
         let retention = Arc::new(Mutex::new(loaded.retention));
         let pruning = store.clone().map(|store| tokio::spawn(prune_hourly(gateway.clone(), store, retention.clone())));
+        // After start_gateway's cancel_orphans: a checkpoint is no use to the scan already done.
+        let checkpointing = store.is_some().then(|| tokio::spawn(checkpoint_every_minute(gateway.clone())));
         let service = Self {
             path: path.to_path_buf(),
             gateway,
@@ -179,6 +189,7 @@ impl Service {
             retrying,
             writing,
             pruning,
+            checkpointing,
             retention,
             store,
             api: Mutex::new(None),
@@ -434,18 +445,18 @@ impl Service {
         warnings
     }
 
-    /// Waits for a reload under way and refuses later ones, stops pruning, stops the operator API
-    /// (its requests under way finish first, briefly), logs the clients' sessions out, cancels the
-    /// working orders of those with cancel on disconnect (pending countdowns fire as the clients
-    /// go; the shutdown's own Logouts start none), waits for the venues to answer the gateway's
-    /// cancels, logs the venues' sessions out, returning once all have closed, then logs what the
-    /// stop loses. The message log writes what it holds and finishes its last file once the service is
-    /// dropped (with the sessions, which hold it too).
+    /// Waits for a reload under way and refuses later ones, stops pruning and checkpoints, stops the
+    /// operator API (its requests under way finish first, briefly), logs the clients' sessions
+    /// out, cancels the working orders of those with cancel on disconnect (pending countdowns fire
+    /// as the clients go; the shutdown's own Logouts start none), waits for the venues to answer
+    /// the gateway's cancels, logs the venues' sessions out, returning once all have closed, then
+    /// logs what the stop loses. The message log writes what it holds and finishes its last file
+    /// once the service is dropped (with the sessions, which hold it too).
     pub async fn shutdown(&self) {
         // A reload under way finishes first; any later one finds the flag and does nothing.
         self.stopping.store(true, Ordering::SeqCst);
-        if let Some(pruning) = &self.pruning {
-            pruning.abort();
+        for task in [&self.pruning, &self.checkpointing].into_iter().flatten() {
+            task.abort();
         }
         // ponytail: polled, as the cancels below are; reloads are rare and quick.
         while matches!(self.reloading.try_lock(), Err(TryLockError::WouldBlock)) {
@@ -577,6 +588,22 @@ async fn prune_hourly(gateway: Arc<Gateway>, store: Store, retention: Arc<Mutex<
         interval.tick().await;
         let retention = *retention.lock().unwrap_or_else(PoisonError::into_inner);
         gateway.prune_once(&store, retention).await;
+    }
+}
+
+/// Every [`CHECKPOINT_INTERVAL`] from an interval after the start, takes a checkpoint of the
+/// venues' stores: see [`Gateway::checkpoint_once`].
+async fn checkpoint_every_minute(gateway: Arc<Gateway>) {
+    let mut interval = tokio::time::interval(CHECKPOINT_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick is at once.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let taken = gateway.checkpoint_once();
+        if !taken.is_empty() {
+            debug!(?taken, "took a checkpoint of the venues' stores");
+        }
     }
 }
 
@@ -1287,6 +1314,7 @@ mod tests {
         let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
         let retention = || *service.retention.lock().unwrap();
         assert!(service.pruning.is_some());
+        assert!(service.checkpointing.is_some());
         assert_eq!(retention(), Some(Duration::from_secs(400 * 86_400)));
         write(&dir, "jetbridge.toml", &config("retention = \"2d\"\n"));
         assert!(service.reload().unwrap().warnings.is_empty());
@@ -1328,6 +1356,35 @@ mod tests {
         assert_eq!(runs_after(PRUNE_INTERVAL - Duration::from_millis(1)).await, 0);
         assert_eq!(runs_after(Duration::from_millis(2)).await, 1);
         pruning.abort();
+    }
+
+    /// The first checkpoint is a minute after the start, not at it: each run with a writer and no
+    /// orphan work reads the gateway's clock, here counting.
+    #[tokio::test]
+    async fn the_first_checkpoint_is_a_minute_after_the_start() {
+        use std::sync::atomic::AtomicUsize;
+        let (_store, _snapshot, writer, writing) = start_writer("sqlite::memory:", None).await.unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let clock = {
+            let runs = runs.clone();
+            turbojet::Clock::from_fn(move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                chrono::DateTime::UNIX_EPOCH
+            })
+        };
+        let gateway = Gateway::new(Router::new(Vec::new()), Version::Fix44).with_clock(clock).with_writer(writer);
+        tokio::time::pause();
+        let checkpointing = tokio::spawn(checkpoint_every_minute(Arc::new(gateway)));
+        let runs_after = async |wait: Duration| {
+            tokio::time::sleep(wait).await;
+            runs.load(Ordering::SeqCst)
+        };
+        assert_eq!(runs_after(Duration::ZERO).await, 0);
+        assert_eq!(runs_after(CHECKPOINT_INTERVAL - Duration::from_millis(1)).await, 0);
+        assert_eq!(runs_after(Duration::from_millis(2)).await, 1);
+        assert_eq!(runs_after(CHECKPOINT_INTERVAL).await, 2);
+        checkpointing.abort();
+        writing.abort();
     }
 
     /// A database with rows in it is restored from at the next start: here a block.
