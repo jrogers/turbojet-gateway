@@ -26,7 +26,7 @@ export function AlarmCount({ dismissed }: { dismissed: Dismissed }) {
   return (
     <span aria-live="polite">
       {count > 0 && (
-        <button type="button" className="pill warn" onClick={() => document.getElementById('alarms')?.focus()}>
+        <button type="button" className="pill warn" aria-controls="alarms" onClick={() => document.getElementById('alarms')?.focus()}>
           {count} {count === 1 ? 'alarm' : 'alarms'}
         </button>
       )}

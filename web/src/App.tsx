@@ -125,9 +125,9 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
 
   return (
     <div className="app">
-      <nav className="sidebar" aria-label="Main">
+      <div className="sidebar">
         <span className="brand">Jetbridge</span>
-        <div className="links">
+        <nav className="links" aria-label="Main">
           <a href="#/orders" aria-current={current(route, 'orders')}>
             Orders
             {working > 0 && <Count shown={working} said={`${working} working`} />}
@@ -150,7 +150,7 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
               Audit
             </a>
           )}
-        </div>
+        </nav>
         <div className="who">
           <span>
             <span className="user">{me.user}</span> <span className="role">{me.role}</span>
@@ -170,7 +170,7 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
             Log out
           </button>
         </div>
-      </nav>
+      </div>
       <main>
         <header className="page">
           <LinkState />
@@ -201,27 +201,25 @@ const current = (route: Route, screen: Exclude<Route['screen'], 'order'>) =>
   (route.screen === 'order' ? 'orders' : route.screen) === screen ? 'page' : undefined
 
 /**
- * How the live socket stands: live, or still connecting, or, said as a status, down, so what the
- * screens show is as it was.
+ * How the live socket stands: live, still connecting, or down, so what the screens show is as it
+ * was. Always there, so a screen reader hears it go down, and come back.
  */
 function LinkState() {
   const { link } = useLive()
-  switch (link) {
-    case 'open':
-      return (
+  return (
+    <span role="status">
+      {link === 'open' ? (
         <span className="pill ok">
-          <span className="dot" /> Live
+          <span className="dot" />
+          Live
         </span>
-      )
-    case 'connecting':
-      return <span className="pill muted">Connecting…</span>
-    case 'reconnecting':
-      return (
-        <p className="pill warn" role="status">
-          Disconnected, reconnecting…
-        </p>
-      )
-  }
+      ) : link === 'connecting' ? (
+        <span className="pill muted">Connecting…</span>
+      ) : (
+        <span className="pill warn">Disconnected, reconnecting…</span>
+      )}
+    </span>
+  )
 }
 
 /** The screen the route names; one the user may not see says so, asking nothing of the API. */

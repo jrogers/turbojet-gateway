@@ -205,18 +205,20 @@ test('the shell keeps the live socket while logged in, and says when it is down'
   expect(socket.closed).toBe(true)
 })
 
-test('a live socket lost shows a banner until it opens again', async () => {
+test('the header says the live socket is connecting, then live, and down until it opens again', async () => {
   serve({ 'GET /api/me': () => json(alice) })
   render(<App />)
   await screen.findByText('operator')
   const socket = await opened()
+  expect(screen.getByRole('status').textContent).toBe('Connecting…')
   act(() => socket.open())
+  expect(screen.getByRole('status').textContent).toBe('Live')
   act(() => socket.end(1001, 'the gateway is stopping'))
   expect(screen.getByRole('status').textContent).toBe('Disconnected, reconnecting…')
   // The reconnect, a second or so later.
   await waitFor(() => expect(FakeSocket.opened.length).toBeGreaterThan(1), { timeout: 2_000 })
   act(() => FakeSocket.opened[FakeSocket.opened.length - 1].open())
-  expect(screen.queryByRole('status')).toBeNull()
+  expect(screen.getByRole('status').textContent).toBe('Live')
 })
 
 test('a live socket refused by policy returns to login, saying why', async () => {
@@ -385,7 +387,12 @@ test('the nav counts the working orders, and the venues down', async () => {
 })
 
 const root: Me = { user: 'root', role: 'admin', clients: null, csrf: 'tok' }
-const links = () => within(screen.getByRole('navigation')).getAllByRole('link').map((link) => link.textContent)
+/** The nav's links, by their accessible names: a name matcher sees each, in order. */
+function links() {
+  const names: string[] = []
+  within(screen.getByRole('navigation')).getAllByRole('link', { name: (name) => (names.push(name), true) })
+  return names
+}
 
 test('the nav shows Routes to all, and Audit and Reload to an admin without clients only', async () => {
   serve({ 'GET /api/me': () => json(alice) })

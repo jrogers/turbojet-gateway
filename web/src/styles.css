@@ -369,6 +369,10 @@ td.sell {
 /* A phone: the sidebar takes its own row, and its links and user flow in rows. */
 
 @media (max-width: 760px) {
+  .app {
+    align-content: flex-start;
+  }
+
   .sidebar {
     flex-basis: 100%;
     max-width: none;
@@ -385,7 +389,7 @@ td.sell {
 }
 
 .app > main {
-  flex: 999 1 560px;
+  flex: 999 1 520px;
   min-width: 0;
 }
 
@@ -398,10 +402,6 @@ header.page {
   align-items: center;
   gap: 0.5rem;
   margin: 0 0 0.75rem;
-}
-
-header.page p {
-  margin: 0;
 }
 
 header.page button.pill {
