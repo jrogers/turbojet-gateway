@@ -32,7 +32,7 @@ impl Book {
     /// cancel is in flight; for a blocked client, if it raises the quantity; and if its new terms
     /// break a risk limit (see [`risk::check`]).
     pub(super) fn replace(&mut self, amend: Amend, named: (Side, CompactString), terms: Terms, out: &mut Vec<Output>) {
-        if amend.redelivered && self.adopt_orphaned_replace(&amend, &named, &terms, out) {
+        if self.adopt_orphaned_replace(&amend, &named, &terms, out) {
             return;
         }
         let Terms { qty, price, ord_type, time_in_force } = terms;
@@ -71,10 +71,12 @@ impl Book {
         self.risk.track(id, order.exposure());
     }
 
-    /// Takes a client's redelivered replace as the orphaned replace (see `Input::Orphan`) it was
-    /// sent as before a restart, if the order's pending replace, or the one it last accepted, is
-    /// an orphan with the same terms: the request becomes the client's, so the venue's answers
-    /// answer it. Accepted already, it's answered as Replaced now. `false` if there's none.
+    /// Takes a client's replace, sent again and marked as resent or not, as the orphaned replace
+    /// (see `Input::Orphan`) it was sent as before a restart, if the order's pending replace, or
+    /// the one it last accepted, is an orphan with the same terms: the request becomes the
+    /// client's, so the venue's answers answer it. Accepted already, it's answered as Replaced
+    /// now. `false` if there's none. Unmarked is safe: the venue holds, or is deciding on, just
+    /// what the client asks, so Replaced is true either way.
     fn adopt_orphaned_replace(
         &mut self,
         amend: &Amend,
@@ -104,7 +106,7 @@ impl Book {
             .get(&id)
             .is_some_and(|(p, adopted)| adopted.is_none() && (p.qty, p.price, p.ord_type, p.time_in_force) == wanted);
         if waiting {
-            tracing::info!(order = %order.name, cl_ord_id = %amend.cl_ord_id, "a redelivered replace is the waiting orphaned one");
+            tracing::info!(order = %order.name, cl_ord_id = %amend.cl_ord_id, "a replace is the waiting orphaned one");
             self.remember(&amend.client, amend.cl_ord_id.clone(), id);
             let (pending, adopted) = self.orphaned_replaces.get_mut(&id).expect("looked up above");
             pending.cl_ord_id = amend.cl_ord_id.clone();
@@ -132,7 +134,7 @@ impl Book {
         } else {
             order.pending.as_ref().expect("matched above").downstream.clone()
         };
-        tracing::info!(order = %order.name, %downstream, cl_ord_id = %amend.cl_ord_id, accepted, "a redelivered replace is the orphaned one");
+        tracing::info!(order = %order.name, %downstream, cl_ord_id = %amend.cl_ord_id, accepted, "a replace is the orphaned one");
         self.remember(&amend.client, amend.cl_ord_id.clone(), id);
         let sent = self.downstream.get_mut(&downstream).expect("matched above");
         (sent.origin, sent.cl_ord_id, sent.orig_cl_ord_id) =

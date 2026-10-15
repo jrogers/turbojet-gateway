@@ -560,8 +560,8 @@ pub enum Input {
     /// sending it); `replace` holds a replace's terms. Recorded as the gateway's own request, so
     /// the venue's answers apply to the order. A cancel is a cancel: the order also gets the
     /// gateway's own, waiting for `VenueUp`. A replace is pending, its terms applied if the venue
-    /// accepts it, and the order keeps working: the client hears Replaced if its redelivered
-    /// replace with those terms is taken as it, else Restated. A replace waits for the one pending
+    /// accepts it, and the order keeps working: the client hears Replaced if its replace with
+    /// those terms, sent again, is taken as it, else Restated. A replace waits for the one pending
     /// to be answered. One for an order the book doesn't hold (done, and dropped at a roll) is
     /// logged.
     Orphan {
@@ -766,8 +766,8 @@ pub struct Book {
     /// or not anyone listens.
     events: Vec<GatewayEvent>,
     /// Orphaned replaces (see [`Input::Orphan`]) of orders with a replace pending, by order, to be
-    /// made pending once that one is answered, with the client's OrigClOrdID once its redelivered
-    /// replace is taken as it (the pending's `cl_ord_id` then the client's): see
+    /// made pending once that one is answered, with the client's OrigClOrdID once its replace,
+    /// sent again, is taken as it (the pending's `cl_ord_id` then the client's): see
     /// `adopt_orphaned_replace`. Not stored: a restart before then finds the orphan again in the
     /// venue's store.
     orphaned_replaces: HashMap<OrderId, (Pending, Option<CompactString>)>,
