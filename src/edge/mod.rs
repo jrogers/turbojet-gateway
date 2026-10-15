@@ -3041,7 +3041,8 @@ pub(crate) mod tests {
         assert!(gateway.checkpoint_once().is_empty());
     }
 
-    /// No checkpoint is taken while orphan work is pending, nor without a database.
+    /// No checkpoint is taken while orphan work is pending, nor without a database; but an
+    /// answered request's bound, here one the book doesn't have, is dropped all the same.
     #[tokio::test(flavor = "multi_thread")]
     async fn no_checkpoint_while_orphan_work_is_pending_or_without_a_database() {
         let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
@@ -3050,7 +3051,9 @@ pub(crate) mod tests {
         assert_eq!(gateway.checkpoint_once().len(), 1);
         let unsent = orphans::Unsent { downstreams: vec!["1".into()], next_outgoing: 1 };
         gateway.lock().unsent.insert(VENUE.into(), unsent);
+        gateway.lock().in_flight.entry(VENUE.into()).or_default().insert("1".into(), 1);
         assert!(gateway.checkpoint_once().is_empty());
+        assert!(gateway.lock().in_flight.is_empty());
 
         let gateway = super::tests::gateway();
         let _sessions = connected(&gateway, false).await;

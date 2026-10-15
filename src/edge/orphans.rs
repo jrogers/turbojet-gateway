@@ -538,18 +538,25 @@ impl Gateway {
     /// bound (see `State::in_flight`), and what ends a request's being unanswered is final: its
     /// answer, its order done, an original order past PendingNew. Takes none without a
     /// database, or while orphan work is pending: until handled, an orphan isn't recorded, and a
-    /// checkpoint past it would lose it, nor for a venue whose logon isn't done. Returns what it
-    /// queued.
+    /// checkpoint past it would lose it, nor for a venue whose logon isn't done. Drops answered
+    /// requests' bounds whether it takes one or not. Returns what it queued.
     pub fn checkpoint_once(&self) -> Vec<(VenueId, Checkpoint)> {
         let Some(writer) = &self.writer else { return Vec::new() };
         let mut state = self.lock();
-        if let Some(work) = orphan_work(&state) {
+        let state = &mut *state;
+        // Every run, before the checks below: a venue that never logs on again keeps orphan work
+        // pending, and every other venue's bounds would pile up meanwhile. Also drops the bounds
+        // of a venue a reload took out, once answered.
+        state.in_flight.retain(|_, bounds| {
+            bounds.retain(|downstream, _| state.book.is_unanswered(downstream));
+            !bounds.is_empty()
+        });
+        if let Some(work) = orphan_work(state) {
             debug!("no checkpoint of the venues' stores while orphaned venue requests are handled: {work}");
             return Vec::new();
         }
         // Before any number is read: a store reset after it numbers from 1 again.
         let taken_at = self.clock.now();
-        let state = &mut *state;
         let mut checkpoints = Vec::new();
         for (venue, to) in &state.venues {
             // Until its logon is done, a session may publish the numbers of a store it's resetting.
@@ -560,9 +567,8 @@ impl Gateway {
             // ponytail: a request its venue never answers holds the checkpoint back for good, so
             // the scan grows back towards a whole one, as before checkpoints; a bound on the
             // wait if a venue shows it.
-            let bounds = state.in_flight.entry(venue.clone()).or_default();
-            bounds.retain(|downstream, _| state.book.is_unanswered(downstream));
-            let next_seq = bounds.values().copied().fold(activity.next_outgoing, u64::min);
+            let bounds = state.in_flight.get(venue).into_iter().flat_map(|bounds| bounds.values());
+            let next_seq = bounds.copied().fold(activity.next_outgoing, u64::min);
             checkpoints.push((venue.clone(), Checkpoint { next_seq, taken_at }));
         }
         if !checkpoints.is_empty() {
