@@ -238,3 +238,26 @@ test('a new snapshot reads again, dropping the pages read before', async () => {
   expect(calls).toEqual(['/api/orders?desc=true', '/api/orders?desc=true&after=5', '/api/orders?desc=true'])
   expect(shown()).toEqual(['O3', 'O2'])
 })
+
+test('a row the feed changes flashes, its status a pill and its fill a bar', () => {
+  const before = snapshot([order(1), order(2)])
+  const { rerender } = render(view(before))
+  expect(row('O1').className).toBe('')
+  expect(row('O1').querySelector('.pill')!.className).toBe('pill info')
+  expect(row('O1').querySelector('td.buy')!.textContent).toBe('buy')
+
+  rerender(view(event(before, { id: 1, status: 'partially_filled', cum_qty: '40', side: 'sell_short' })))
+  expect(row('O1').className).toBe('flash')
+  expect(row('O2').className).toBe('')
+  expect(within(row('O1')).getByText('partially filled').className).toBe('pill warn')
+  expect(row('O1').querySelector('td.sell')!.textContent).toBe('sell short')
+  const bar = row('O1').querySelector<HTMLElement>('.bar')!
+  expect(bar.getAttribute('aria-hidden')).toBe('true')
+  expect((bar.firstChild as HTMLElement).style.width).toBe('40%')
+
+  // A snapshot's objects are new, but unchanged ones don't flash.
+  fireEvent.animationEnd(row('O1'))
+  expect(row('O1').className).toBe('')
+  rerender(view(snapshot([order(1, { status: 'partially_filled', cum_qty: '40', side: 'sell_short' }), order(2)])))
+  expect(row('O1').className).toBe('')
+})

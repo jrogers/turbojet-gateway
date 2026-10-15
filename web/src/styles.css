@@ -239,6 +239,10 @@ td.sell {
   background: var(--error);
 }
 
+.bar.ok > span {
+  background: var(--ok);
+}
+
 .panel,
 .card {
   background: var(--panel);
@@ -630,6 +634,15 @@ td.actions button + button {
 .badge.error {
   background: var(--tone-error-bg);
   color: var(--tone-error-fg);
+}
+
+/* A blotter's Filled cell: the fill as a bar, before its quantity. */
+
+td .bar {
+  display: inline-block;
+  width: 3rem;
+  margin-right: 0.5rem;
+  vertical-align: middle;
 }
 
 /* An order: its fields as a grid of name over value, and its messages as on the wire. */

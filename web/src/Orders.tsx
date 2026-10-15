@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from 'reac
 import * as api from './api.ts'
 import { orderHref } from './router.ts'
 import { namesTarget } from './sessions.ts'
+import { StatusPill } from './Status.tsx'
 import { done, useLive } from './store.ts'
 import { utc } from './time.ts'
 import type { OrderView, Status } from './types.ts'
@@ -274,11 +275,29 @@ export default function Orders() {
 
 /**
  * An order's row. Amounts as the API wrote them: decimals, never floats. Memoised: an event
- * changes one order, and the rest keep their objects.
+ * changes one order, and the rest keep their objects. Flashes when the feed changes it: a new
+ * object with new content, as a snapshot's are new objects too.
  */
 const Row = memo(function Row({ order }: { order: OrderView }) {
+  const tr = useRef<HTMLTableRowElement>(null)
+  const last = useRef(order)
+  useEffect(() => {
+    if (last.current === order) return
+    const changed = JSON.stringify(last.current) !== JSON.stringify(order)
+    last.current = order
+    const row = tr.current
+    if (!changed || !row) return
+    // Removed and added again, reflowing between, to restart a flash still running.
+    row.classList.remove('flash')
+    void row.offsetWidth
+    row.classList.add('flash')
+    // Not React's onAnimationEnd: without AnimationEvent, as in jsdom, it listens for a prefixed one.
+    row.addEventListener('animationend', () => row.classList.remove('flash'), { once: true })
+  }, [order])
+  // For display only, the bar's width is a float; the text beside it is the decimal.
+  const filled = Math.min(1, Number(order.cum_qty) / Number(order.qty)) || 0
   return (
-    <tr>
+    <tr ref={tr}>
       <td>{utc(order.created)}</td>
       <td>
         <a href={orderHref(order.order_id)}>{order.order_id}</a>
@@ -287,11 +306,16 @@ const Row = memo(function Row({ order }: { order: OrderView }) {
       <td>{order.cl_ord_id}</td>
       <td>{order.venue}</td>
       <td>{order.symbol}</td>
-      <td>{order.side.replace('_', ' ')}</td>
+      <td className={order.side === 'buy' ? 'buy' : 'sell'}>{order.side.replace('_', ' ')}</td>
       <td>{order.ord_type}</td>
       <td className="num">{order.qty}</td>
       <td className="num">{order.price ?? ''}</td>
-      <td className="num">{order.cum_qty}</td>
+      <td className="num">
+        <span className={order.status === 'filled' ? 'bar ok' : 'bar'} aria-hidden>
+          <span style={{ width: `${filled * 100}%` }} />
+        </span>
+        {order.cum_qty}
+      </td>
       <td className="num">{order.avg_px}</td>
       <td>
         <StatusText order={order} />
@@ -304,7 +328,7 @@ const Row = memo(function Row({ order }: { order: OrderView }) {
 export function StatusText({ order }: { order: OrderView }) {
   return (
     <>
-      {order.status.replaceAll('_', ' ')}
+      <StatusPill status={order.status} />
       {order.pending_cancel && <span className="badge">cancel pending</span>}
       {order.pending_replace && <span className="badge">replace pending</span>}
       {order.gateway_cancel && (
