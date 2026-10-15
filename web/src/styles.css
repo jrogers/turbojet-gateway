@@ -138,11 +138,23 @@ button.primary {
   color: var(--accent-fg);
 }
 
-button.danger {
+/* Solid for the kill switch; outlined for a row's destructive action, filled on hover. */
+
+button.danger,
+button.risky:hover:not(:disabled) {
   background: var(--danger);
   border-color: var(--danger);
   color: var(--danger-fg);
+}
+
+button.danger {
   font-weight: 600;
+}
+
+button.risky {
+  background: transparent;
+  border-color: var(--error);
+  color: var(--error);
 }
 
 :focus-visible {
@@ -353,6 +365,16 @@ td.sell {
   border-top: 1px solid var(--line);
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+.sidebar .who .buttons {
+  display: flex;
+  gap: 0.4rem;
+  align-self: stretch;
+}
+
+.sidebar .who .buttons button {
+  flex: 1;
 }
 
 .sidebar .user {
@@ -663,6 +685,12 @@ td .bar {
   width: 3rem;
   margin-right: 0.5rem;
   vertical-align: middle;
+}
+
+/* Risk's credit used: wider, so a quarter shows. */
+
+td.usage .bar {
+  width: 5rem;
 }
 
 /* An order: its fields as a grid of name over value, and its messages as on the wire. */

@@ -169,14 +169,16 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
               {error}
             </span>
           )}
-          {admin && (
-            <button type="button" onClick={() => setReloading(true)}>
-              Reload…
+          <div className="buttons">
+            {admin && (
+              <button type="button" onClick={() => setReloading(true)}>
+                Reload…
+              </button>
+            )}
+            <button type="button" onClick={logout} disabled={busy}>
+              Log out
             </button>
-          )}
-          <button type="button" onClick={logout} disabled={busy}>
-            Log out
-          </button>
+          </div>
         </div>
       </div>
       <main>

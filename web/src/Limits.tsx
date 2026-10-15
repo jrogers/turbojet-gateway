@@ -227,7 +227,12 @@ export default function Limits({
                       </button>
                     )}
                     {table !== null && mayEdit(table) && (
-                      <button type="button" aria-label={`Delete ${table}'s limits`} onClick={() => open({ kind: 'delete', table })}>
+                      <button
+                        type="button"
+                        className="risky"
+                        aria-label={`Delete ${table}'s limits`}
+                        onClick={() => open({ kind: 'delete', table })}
+                      >
                         Delete table…
                       </button>
                     )}

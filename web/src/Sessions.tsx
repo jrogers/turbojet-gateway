@@ -175,7 +175,7 @@ export default function Sessions({ me }: { me: Me }) {
                               <button type="button" onClick={() => choose('sequence', session)}>
                                 Set numbers…
                               </button>
-                              <button type="button" className="danger" onClick={() => choose('reset', session)}>
+                              <button type="button" className="risky" onClick={() => choose('reset', session)}>
                                 Reset to 1…
                               </button>
                             </>

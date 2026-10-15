@@ -330,13 +330,14 @@ const Row = memo(function Row({ order }: { order: OrderView }) {
   )
 })
 
-/** An order's status, and its flags as badges after it: the blotter's and the order page's. */
+/** An order's status, and its flags as badges after it, those it repeats left out: the blotter's and the order page's. */
 export function StatusText({ order }: { order: OrderView }) {
   return (
     <>
       <StatusPill status={order.status} />
-      {order.pending_cancel && <span className="badge">cancel pending</span>}
-      {order.pending_replace && <span className="badge">replace pending</span>}
+      {/* Not when the status says it already. */}
+      {order.pending_cancel && order.status !== 'pending_cancel' && <span className="badge">cancel pending</span>}
+      {order.pending_replace && order.status !== 'pending_replace' && <span className="badge">replace pending</span>}
       {order.gateway_cancel && (
         <span className={order.gateway_cancel.state === 'stuck' ? 'badge warn' : 'badge'}>
           gateway cancel {order.gateway_cancel.state.replace('_', ' ')}

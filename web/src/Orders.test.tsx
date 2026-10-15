@@ -224,6 +224,24 @@ test('flags show as badges, and decimals as the API wrote them', () => {
   expect(cells).toEqual(['100', '10.250000000000000001', '100.000', '10.10'])
 })
 
+test('a pending flag its status already says shows no badge; under another status it does', () => {
+  render(
+    view(
+      snapshot([
+        order(1, { status: 'pending_cancel', pending_cancel: true }),
+        order(2, { status: 'pending_replace', pending_replace: true }),
+        order(3, { status: 'pending_cancel', pending_replace: true }),
+        order(4, { status: 'pending_replace', pending_cancel: true }),
+      ]),
+    ),
+  )
+  const badges = (orderId: string) => [...row(orderId).querySelectorAll('.badge')].map((badge) => badge.textContent)
+  expect(badges('O1')).toEqual([])
+  expect(badges('O2')).toEqual([])
+  expect(badges('O3')).toEqual(['replace pending'])
+  expect(badges('O4')).toEqual(['cancel pending'])
+})
+
 test('a new snapshot reads again, dropping the pages read before', async () => {
   const { rerender } = render(view(snapshot([])))
   pages = [{ orders: [order(5, { status: 'filled' })], next: 5 }, { orders: [order(1)], next: null }]

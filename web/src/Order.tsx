@@ -130,14 +130,14 @@ export default function Order({ orderId, me }: { orderId: string; me: Me }) {
         <>
           {acts && (
             <p className="actions">
-              <button type="button" className="danger" onClick={() => choose('cancel')}>
+              <button type="button" className="risky" onClick={() => choose('cancel')}>
                 Cancel
               </button>
               <button type="button" onClick={() => choose('status')}>
                 Ask status
               </button>
               {shown.unknown_at_venue && (
-                <button type="button" className="danger" onClick={() => choose('resolve')}>
+                <button type="button" className="risky" onClick={() => choose('resolve')}>
                   Resolve
                 </button>
               )}
