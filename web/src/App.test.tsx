@@ -274,6 +274,10 @@ test('alarms show newest first, counted in the header, until dismissed; a snapsh
     '2026-10-14 09:30:01 stuck cancel FUNDA gave up cancelling 7 Dismiss',
   ])
 
+  // The count goes to the list.
+  fireEvent.click(screen.getByRole('button', { name: '2 alarms' }))
+  expect(document.activeElement).toBe(screen.getByRole('region', { name: 'Alarms' }))
+
   act(() => socket.send(snapshot))
   expect(items()).toHaveLength(2)
 
@@ -346,6 +350,38 @@ test('a snapshot under other clients shows them in the header, and scopes the ac
   act(() => socket.send(snapshot(null)))
   expect(screen.getByText('all clients')).toBeTruthy()
   expect(screen.getByRole('button', { name: 'Pause' })).toBeTruthy()
+})
+
+test('the nav counts the working orders, and the venues down', async () => {
+  serve({ 'GET /api/me': () => json(alice) })
+  // A screen that reads nothing until asked: the orders are only what the nav counts.
+  window.location.hash = '#/messages'
+  render(<App />)
+  await screen.findByText('operator')
+  const socket = await opened()
+  const venue = (id: string, status: string) => ({
+    side: 'venue',
+    id,
+    venue: id,
+    status,
+    next_incoming: null,
+    next_outgoing: null,
+    activity: null,
+    paused: false,
+  })
+  const snapshot = (sessions: unknown[], orders: unknown[]) => ({ type: 'snapshot', sessions, orders, orders_next: null, blocked: [], unavailable: false, clients: null })
+  act(() => {
+    socket.open()
+    socket.send(snapshot([venue('NASDAQ', 'logged_on'), venue('XNYS', 'disconnected')], [{ id: 1, status: 'new' }, { id: 2, status: 'new' }]))
+  })
+  const nav = within(screen.getByRole('navigation'))
+  expect(within(nav.getByRole('link', { name: 'Orders, 2 working' })).getByText('2')).toBeTruthy()
+  expect(within(nav.getByRole('link', { name: 'Sessions, 1 down' })).getByText('1 down').className).toBe('count pill warn')
+
+  // None working and none down: no counts.
+  act(() => socket.send(snapshot([venue('NASDAQ', 'logged_on')], [])))
+  expect(nav.getByRole('link', { name: 'Orders' })).toBeTruthy()
+  expect(nav.getByRole('link', { name: 'Sessions' })).toBeTruthy()
 })
 
 const root: Me = { user: 'root', role: 'admin', clients: null, csrf: 'tok' }

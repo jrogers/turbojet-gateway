@@ -281,57 +281,128 @@ td.sell {
   }
 }
 
-/* The shell. */
+/* The shell: the sidebar, stacked above the screen on a phone, and the page header. */
 
-header.shell {
+.app {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem 1.25rem;
-  padding: 0.5rem 1rem;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
+  min-height: 100vh;
 }
 
-header.shell .brand {
-  font-weight: 600;
-}
-
-header.shell nav {
+.sidebar {
+  flex: 1 1 200px;
+  max-width: 220px;
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 1rem;
+  padding: 1rem 0.75rem;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
 }
 
-header.shell nav a {
-  text-decoration: none;
+.sidebar .brand {
+  padding: 0 0.6rem;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.sidebar .links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar .links a {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 36px;
+  padding: 0 0.6rem;
+  border-radius: 6px;
   color: var(--muted);
+  text-decoration: none;
 }
 
-header.shell nav a:hover {
+.sidebar .links a:hover {
   color: var(--fg);
 }
 
-header.shell nav a[aria-current='page'] {
+.sidebar .links a[aria-current='page'] {
+  background: var(--tone-muted-bg);
   color: var(--fg);
   font-weight: 600;
-  box-shadow: inset 0 -2px var(--accent);
 }
 
-header.shell .who {
+.sidebar .count {
   margin-left: auto;
-  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 
-header.shell .user {
+.sidebar .who {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
+  padding: 0.75rem 0.6rem 0;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.sidebar .user {
   color: var(--fg);
 }
 
-header.shell .role {
+.sidebar .role {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 0 0.4rem;
   font-size: 11px;
+}
+
+/* A phone: the sidebar takes its own row, and its links and user flow in rows. */
+
+@media (max-width: 760px) {
+  .sidebar {
+    flex-basis: 100%;
+    max-width: none;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .sidebar .links,
+  .sidebar .who {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+}
+
+.app > main {
+  flex: 999 1 560px;
+  min-width: 0;
+}
+
+/* The page header: the live socket's state and the alarm count, above the screen's heading. */
+
+header.page {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.75rem;
+}
+
+header.page p {
+  margin: 0;
+}
+
+header.page button.pill {
+  min-height: 0;
+  border-color: var(--warn);
 }
 
 main {
@@ -405,7 +476,7 @@ tbody tr:hover {
   background: var(--panel);
 }
 
-/* The live socket's banner, while it's down. */
+/* The gateway's unavailable banner, and the alarms not dismissed: a short list, scrolling. */
 
 .banner {
   margin: 0 0 1rem;
@@ -415,8 +486,6 @@ tbody tr:hover {
   background: var(--tone-warn-bg);
   color: var(--tone-warn-fg);
 }
-
-/* The gateway's unavailable banner, and the alarms not dismissed: a short list, scrolling. */
 
 .banner.error {
   border-color: var(--error);

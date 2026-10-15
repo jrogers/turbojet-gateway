@@ -65,7 +65,7 @@ export default function App() {
   return <Shell me={me} onMe={setMe} onLogout={() => enter(null)} />
 }
 
-/** The live state, for the whole shell: its header shows the alarm count, and the clients. */
+/** The live state, for the whole shell: its nav shows counts and the clients, its header the alarms. */
 function Shell(props: { me: Me; onMe: (me: Me) => void; onLogout: () => void }) {
   return (
     <LiveProvider>
@@ -119,16 +119,22 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
     }
   }
 
+  // The nav's counts: the working orders, and the venues not logged on.
+  const working = live.orders.size
+  const down = live.sessions.filter((session) => session.side === 'venue' && session.status !== 'logged_on').length
+
   return (
-    <>
-      <header className="shell">
+    <div className="app">
+      <nav className="sidebar" aria-label="Main">
         <span className="brand">Jetbridge</span>
-        <nav>
+        <div className="links">
           <a href="#/orders" aria-current={current(route, 'orders')}>
             Orders
+            {working > 0 && <Count shown={working} said={`${working} working`} />}
           </a>
           <a href="#/sessions" aria-current={current(route, 'sessions')}>
             Sessions
+            {down > 0 && <Count shown={`${down} down`} said={`${down} down`} warn />}
           </a>
           <a href="#/risk" aria-current={current(route, 'risk')}>
             Risk
@@ -144,32 +150,48 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
               Audit
             </a>
           )}
-        </nav>
-        <AlarmCount dismissed={dismissed} />
-        <span className="who">
-          <span className="user">{me.user}</span> <span className="role">{me.role}</span>{' '}
-          <span className="clients">{me.clients === null ? 'all clients' : me.clients.join(', ')}</span>
-        </span>
-        {error && (
-          <span className="error" role="alert">
-            {error}
+        </div>
+        <div className="who">
+          <span>
+            <span className="user">{me.user}</span> <span className="role">{me.role}</span>
           </span>
-        )}
-        {admin && (
-          <button type="button" onClick={() => setReloading(true)}>
-            Reload…
+          <span className="clients">{me.clients === null ? 'all clients' : me.clients.join(', ')}</span>
+          {error && (
+            <span className="error" role="alert">
+              {error}
+            </span>
+          )}
+          {admin && (
+            <button type="button" onClick={() => setReloading(true)}>
+              Reload…
+            </button>
+          )}
+          <button type="button" onClick={logout} disabled={busy}>
+            Log out
           </button>
-        )}
-        <button type="button" onClick={logout} disabled={busy}>
-          Log out
-        </button>
-      </header>
+        </div>
+      </nav>
       <main>
-        <Banner />
+        <header className="page">
+          <LinkState />
+          <AlarmCount dismissed={dismissed} />
+        </header>
         <Alarms dismissed={dismissed} onDismiss={setDismissed} />
         {admin && <ReloadStatus asking={reloading} onClose={() => setReloading(false)} onReloaded={countReload} />}
         <Screen route={route} me={me} reloads={reloads} />
       </main>
+    </div>
+  )
+}
+
+/** A nav link's count: `shown` beside its text, `said` to a screen reader, as "Orders, 2 working". */
+function Count({ shown, said, warn }: { shown: number | string; said: string; warn?: boolean }) {
+  return (
+    <>
+      <span className={warn ? 'count pill warn' : 'count'} aria-hidden="true">
+        {shown}
+      </span>
+      <span className="visually-hidden">, {said}</span>
     </>
   )
 }
@@ -178,15 +200,28 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
 const current = (route: Route, screen: Exclude<Route['screen'], 'order'>) =>
   (route.screen === 'order' ? 'orders' : route.screen) === screen ? 'page' : undefined
 
-/** Says so while the live socket is down: what the screens show is as it was. */
-function Banner() {
+/**
+ * How the live socket stands: live, or still connecting, or, said as a status, down, so what the
+ * screens show is as it was.
+ */
+function LinkState() {
   const { link } = useLive()
-  if (link !== 'reconnecting') return null
-  return (
-    <p className="banner" role="status">
-      Disconnected, reconnecting…
-    </p>
-  )
+  switch (link) {
+    case 'open':
+      return (
+        <span className="pill ok">
+          <span className="dot" /> Live
+        </span>
+      )
+    case 'connecting':
+      return <span className="pill muted">Connecting…</span>
+    case 'reconnecting':
+      return (
+        <p className="pill warn" role="status">
+          Disconnected, reconnecting…
+        </p>
+      )
+  }
 }
 
 /** The screen the route names; one the user may not see says so, asking nothing of the API. */

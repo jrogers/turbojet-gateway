@@ -14,7 +14,10 @@ let lastId = 0
 const id = (alarm: Alarm) => ids.get(alarm) ?? (ids.set(alarm, ++lastId), lastId)
 
 
-/** The header's count of the alarms not dismissed; nothing shown when there are none. */
+/**
+ * The header's count of the alarms not dismissed, a button to their list; nothing shown when
+ * there are none.
+ */
 export function AlarmCount({ dismissed }: { dismissed: Dismissed }) {
   const { alarms } = useLive()
   const count = alarms.filter((alarm) => !dismissed.has(alarm)).length
@@ -23,9 +26,9 @@ export function AlarmCount({ dismissed }: { dismissed: Dismissed }) {
   return (
     <span aria-live="polite">
       {count > 0 && (
-        <span className="badge warn">
+        <button type="button" className="pill warn" onClick={() => document.getElementById('alarms')?.focus()}>
           {count} {count === 1 ? 'alarm' : 'alarms'}
-        </span>
+        </button>
       )}
     </span>
   )
@@ -48,7 +51,7 @@ export default function Alarms({ dismissed, onDismiss }: { dismissed: Dismissed;
         </p>
       )}
       {shown.length > 0 && (
-        <section className="alarms" aria-labelledby="alarms-heading">
+        <section className="alarms" id="alarms" tabIndex={-1} aria-labelledby="alarms-heading">
           <h2 id="alarms-heading">Alarms</h2>
           <ul>
             {shown.map((alarm) => (
