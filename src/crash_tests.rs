@@ -35,6 +35,7 @@ use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 use turbojet::fields::{Code, Decimal, UtcTimestamp};
 use turbojet::message::tags;
+use turbojet::store::Fetched;
 use turbojet::{
     Acceptor, Application, Context, Disconnect, DiskStorage, FixMessage, Initiator, InitiatorConfig, MemoryStorage,
     Message, MessageReject, MsgType, ReconnectPolicy, SessionConfig, SessionHandle, SessionStorage,
@@ -392,11 +393,21 @@ impl Setup {
         self.venue.session(GATEWAY).reset_sequence_numbers().await.unwrap();
     }
 
-    /// How many messages the venue's session at the gateway has stored, while the gateway is down.
-    fn venue_store_holds(&self) -> u64 {
+    /// While the gateway is down: how many messages the venue's session at the gateway has
+    /// numbered, and how many of them from `begin` a fetch returns, as a scan from there reads
+    /// (a fetch skips what the store keeps no copy of, a Logon or a heartbeat).
+    fn venue_store_read(&self, begin: u64) -> (u64, usize) {
         let disk = DiskStorage::new(self.dir.path().join("venue-store"), true).unwrap();
-        let log = disk.open(&turbojet::SessionId::new("FIX.4.4", GATEWAY, VENUE)).unwrap();
-        log.next_outgoing() - 1
+        let mut log = disk.open(&turbojet::SessionId::new("FIX.4.4", GATEWAY, VENUE)).unwrap();
+        let holds = log.next_outgoing() - 1;
+        if begin > holds {
+            return (holds, 0);
+        }
+        let fetched = match log.fetch(begin, holds).unwrap() {
+            Fetched::Ready(fetched) => fetched,
+            Fetched::Pending(job) => job.run().unwrap(),
+        };
+        (holds, fetched.len())
     }
 
     /// Takes a checkpoint of the venue's store once what the book changed has committed, and the
@@ -1275,13 +1286,12 @@ async fn a_restart_scans_from_the_checkpoint_and_still_cancels_an_orphan_after_i
 
     setup.gateway.take().expect("the gateway is running").crash();
     setup.gone().await;
-    let holds = setup.venue_store_holds();
-    assert!(checkpoint.next_seq > 1, "{checkpoint:?}");
+    let ((_, whole), (holds, from_checkpoint)) =
+        (setup.venue_store_read(1), setup.venue_store_read(checkpoint.next_seq));
+    assert!(from_checkpoint < whole, "{checkpoint:?}, {holds} stored");
     setup.start_again().await;
     let found = setup.gateway().service.gateway().orphans_found();
-    // At most: a fetch skips what the store keeps no copy of, a Logon or a heartbeat.
-    let from_checkpoint = holds + 1 - checkpoint.next_seq;
-    assert!(u64::try_from(found.scanned).unwrap() <= from_checkpoint, "{found:?}, {checkpoint:?}, {holds} stored");
+    assert_eq!(found.scanned, from_checkpoint, "{found:?}, {checkpoint:?}, {holds} stored");
     assert_eq!(found.orders, 1, "{found:?}");
     let (mut cancel, mut again) = (None, None);
     for _ in 0..2 {
@@ -1369,11 +1379,35 @@ async fn a_checkpoint_from_before_the_venues_store_was_reset_is_ignored() {
 
     setup.gateway.take().expect("the gateway is running").crash();
     setup.gone().await;
-    let holds = setup.venue_store_holds();
+    let ((holds, whole), (_, from_checkpoint)) =
+        (setup.venue_store_read(1), setup.venue_store_read(checkpoint.next_seq));
     assert!(checkpoint.next_seq <= holds + 1, "{checkpoint:?}, {holds} stored: the reset isn't seen by number");
+    assert!(from_checkpoint < whole, "{checkpoint:?}, {holds} stored");
     setup.start_again().await;
+    // Whole: a checkpoint taken since the reset would be honoured, and read less.
     let found = setup.gateway().service.gateway().orphans_found();
-    let from_checkpoint = holds + 1 - checkpoint.next_seq;
-    assert!(u64::try_from(found.scanned).unwrap() > from_checkpoint, "{found:?}, {checkpoint:?}, {holds} stored");
+    assert_eq!(found.scanned, whole, "{found:?}, {checkpoint:?}, {holds} stored");
     setup.assert_quiet().await;
+}
+
+/// An orphaned replace, found at the restart and made pending on its order, holds back the
+/// checkpoints after: its bound is the number the venue's session stored it under.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_orphaned_replace_holds_the_checkpoint_back() {
+    let mut setup = Setup::new().await;
+    partly_filled(&mut setup).await;
+    setup.gateway().store().hooks.gate.send_replace(false);
+    setup.send(replace("C2", "C1", 150));
+    let msg = setup.venue_events.message().await;
+    let seq: u64 = msg.field(tags::MSG_SEQ_NUM).unwrap();
+    let sent: v44::OrderCancelReplaceRequest = msg.parse().unwrap();
+
+    setup.crash_and_restart().await;
+    let found = setup.gateway().service.gateway().orphans_found();
+    assert_eq!(found.amendments, 1, "{found:?}");
+    let downstream = sent.cl_ord_id.to_string();
+    let adopted = |database: &Snapshot| database.sent.get(&*downstream).is_some_and(|sent| sent.cl_ord_id == "C2");
+    setup.until_stored(adopted).await;
+    let checkpoint = setup.checkpoint().await;
+    assert!(checkpoint.next_seq <= seq, "{checkpoint:?}, the replace stored as {seq}");
 }
