@@ -217,6 +217,8 @@ struct State {
     /// reset at logon has happened, so the numbers a session publishes are its own. By session,
     /// not venue: a reload that drops or renames a venue while it's up still sees it logged out.
     logged_on: HashSet<SessionId>,
+    /// What this start's [`Gateway::cancel_orphans`] found.
+    orphans_found: orphans::Orphans,
 }
 
 #[derive(Debug)]
@@ -241,6 +243,7 @@ impl Gateway {
             unsent: HashMap::new(),
             in_flight: HashMap::new(),
             logged_on: HashSet::new(),
+            orphans_found: orphans::Orphans::default(),
         };
         Self {
             state: Mutex::new(state),
@@ -395,6 +398,11 @@ impl Gateway {
     /// The router new orders are routed by.
     pub fn router(&self) -> Router {
         self.lock().book.router().clone()
+    }
+
+    /// What this start's [`cancel_orphans`](Self::cancel_orphans) found, if it ran.
+    pub fn orphans_found(&self) -> orphans::Orphans {
+        self.lock().orphans_found
     }
 
     /// What a stop leaves unfinished: open orders, undelivered reports and the gateway's own

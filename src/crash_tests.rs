@@ -392,6 +392,34 @@ impl Setup {
         self.venue.session(GATEWAY).reset_sequence_numbers().await.unwrap();
     }
 
+    /// How many messages the venue's session at the gateway has stored, while the gateway is down.
+    fn venue_store_holds(&self) -> u64 {
+        let disk = DiskStorage::new(self.dir.path().join("venue-store"), true).unwrap();
+        let log = disk.open(&turbojet::SessionId::new("FIX.4.4", GATEWAY, VENUE)).unwrap();
+        log.next_outgoing() - 1
+    }
+
+    /// Takes a checkpoint of the venue's store once what the book changed has committed, and the
+    /// gateway has seen the venue's logon (which may trail the venue's), and waits for it to
+    /// commit too.
+    async fn checkpoint(&self) -> book::Checkpoint {
+        self.gateway().committed().await;
+        let gateway = self.gateway().service.gateway().clone();
+        let taken = async {
+            loop {
+                let taken = gateway.checkpoint_once();
+                if !taken.is_empty() {
+                    return taken;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let taken = timeout(WAIT, taken).await.expect("no checkpoint taken");
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        self.gateway().committed().await;
+        taken[0].1
+    }
+
     /// Drops the client's connection, without a Logout, and waits for the gateway to see it go.
     async fn disconnect_client(&mut self) {
         let running = self.running.take().expect("the client is running");
@@ -1227,4 +1255,125 @@ async fn an_unsent_order_from_before_a_session_reset_is_rejected_not_sent() {
     setup.assert_quiet().await;
     let database = setup.database().await;
     assert_eq!(stored(&database, "C1"), [(Status::Rejected, Decimal::ZERO)]);
+}
+
+/// A venue's three answered orders, a checkpoint, then a fourth order orphaned by a crash: the
+/// restart's scan begins at the checkpoint, reading only what the store holds from there, and
+/// still finds the orphan and cancels it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_scans_from_the_checkpoint_and_still_cancels_an_orphan_after_it() {
+    let mut setup = Setup::new().await;
+    for n in 1..=3 {
+        setup.working_order(&format!("C{n}"), n).await;
+    }
+    let checkpoint = setup.checkpoint().await;
+    setup.gateway().store().hooks.gate.send_replace(false);
+    setup.send(order("C4"));
+    let sent: v44::NewOrderSingle = setup.venue_events.parse().await;
+    let orphan = setup.id(0, "4");
+    assert_eq!(sent.cl_ord_id.as_str(), orphan);
+
+    setup.gateway.take().expect("the gateway is running").crash();
+    setup.gone().await;
+    let holds = setup.venue_store_holds();
+    assert!(checkpoint.next_seq > 1, "{checkpoint:?}");
+    setup.start_again().await;
+    let found = setup.gateway().service.gateway().orphans_found();
+    // At most: a fetch skips what the store keeps no copy of, a Logon or a heartbeat.
+    let from_checkpoint = holds + 1 - checkpoint.next_seq;
+    assert!(u64::try_from(found.scanned).unwrap() <= from_checkpoint, "{found:?}, {checkpoint:?}, {holds} stored");
+    assert_eq!(found.orders, 1, "{found:?}");
+    let (mut cancel, mut again) = (None, None);
+    for _ in 0..2 {
+        let msg = setup.venue_events.message().await;
+        match msg.msg_type() {
+            MsgType::OrderCancelRequest => cancel = Some(msg.parse::<v44::OrderCancelRequest>().unwrap()),
+            MsgType::NewOrderSingle => again = Some(msg.parse::<v44::NewOrderSingle>().unwrap()),
+            other => panic!("unexpected {other:?}: {msg:?}"),
+        }
+    }
+    let (cancel, again) = (cancel.expect("the orphan's cancel"), again.expect("the order again"));
+    assert_eq!(cancel.orig_cl_ord_id.as_str(), orphan);
+    setup.venue_send(canceled(&cancel.cl_ord_id, &orphan, 0));
+    setup.venue_send(acked(&again.cl_ord_id, 100));
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C4"), Code::Known(v44::ExecType::New)));
+    setup.assert_quiet().await;
+}
+
+/// Order C1 sent, unanswered, and its MsgSeqNum: its change committed.
+async fn unanswered_order(setup: &mut Setup) -> (v44::NewOrderSingle, u64) {
+    setup.send(order("C1"));
+    let msg = setup.venue_events.message().await;
+    let seq: u64 = msg.field(tags::MSG_SEQ_NUM).unwrap();
+    setup.until_stored(|database| !stored(database, "C1").is_empty()).await;
+    (msg.parse().unwrap(), seq)
+}
+
+/// After a restart, C1 wasn't sent again (nor anything else), and the venue's late ack of it
+/// reaches the client.
+async fn late_ack_applies(setup: &mut Setup, sent: &v44::NewOrderSingle) {
+    let found = setup.gateway().service.gateway().orphans_found();
+    assert_eq!(found.unsent, 0, "{found:?}");
+    setup.assert_quiet().await;
+    setup.venue_send(acked(&sent.cl_ord_id, 100));
+    let new = setup.events.execution_report().await;
+    assert_eq!((new.cl_ord_id.as_deref(), new.exec_type), (Some("C1"), Code::Known(v44::ExecType::New)));
+    let database = setup.database().await;
+    assert_eq!(stored(&database, "C1"), [(Status::New, Decimal::ZERO)]);
+}
+
+/// An order the venue hasn't answered holds the checkpoint back, though a later one is answered:
+/// the restart's scan from the checkpoint still finds it stored, so it isn't sent again, and
+/// stays pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_order_holds_the_checkpoint_back_across_a_restart() {
+    let mut setup = Setup::new().await;
+    let (sent, seq) = unanswered_order(&mut setup).await;
+    setup.working_order("C2", 2).await;
+    let checkpoint = setup.checkpoint().await;
+    assert!(checkpoint.next_seq <= seq, "{checkpoint:?}, the order stored as {seq}");
+
+    setup.crash_and_restart().await;
+    late_ack_applies(&mut setup, &sent).await;
+}
+
+/// An order unanswered across a restart, restored from the database, holds back the next start's
+/// checkpoints: a restart after one still finds it stored, so it isn't sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_order_unanswered_across_a_restart_holds_the_next_checkpoint_back() {
+    let mut setup = Setup::new().await;
+    let (sent, seq) = unanswered_order(&mut setup).await;
+    setup.crash_and_restart().await;
+    let checkpoint = setup.checkpoint().await;
+    assert!(checkpoint.next_seq <= seq, "{checkpoint:?}, the order stored as {seq}");
+
+    setup.crash_and_restart().await;
+    late_ack_applies(&mut setup, &sent).await;
+}
+
+/// A venue whose session resets at each logon: a checkpoint taken before the reset is ignored
+/// at the next start, though the new store is numbered past it, and the whole store is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkpoint_from_before_the_venues_store_was_reset_is_ignored() {
+    let mut setup = Setup::with(Options { reset_on_logon: true, ..Options::default() }).await;
+    for n in 1..=3 {
+        setup.working_order(&format!("C{n}"), n).await;
+    }
+    let checkpoint = setup.checkpoint().await;
+    setup.crash_and_restart().await;
+    for n in 1..=4 {
+        setup.working_order(&format!("D{n}"), 3 + n).await;
+    }
+    setup.database().await;
+
+    setup.gateway.take().expect("the gateway is running").crash();
+    setup.gone().await;
+    let holds = setup.venue_store_holds();
+    assert!(checkpoint.next_seq <= holds + 1, "{checkpoint:?}, {holds} stored: the reset isn't seen by number");
+    setup.start_again().await;
+    let found = setup.gateway().service.gateway().orphans_found();
+    let from_checkpoint = holds + 1 - checkpoint.next_seq;
+    assert!(u64::try_from(found.scanned).unwrap() > from_checkpoint, "{found:?}, {checkpoint:?}, {holds} stored");
+    setup.assert_quiet().await;
 }

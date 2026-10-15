@@ -2,9 +2,9 @@
 //! recorded, because the gateway stopped within a commit of sending them. Everything else the
 //! database lacks is redelivered by the sessions, but the venue may be working an orphan with no
 //! order in the book to report it to. At a start, before the venues' initiators open their
-//! sessions, [`Gateway::cancel_orphans`] reads every request each venue's session stored, groups
-//! them by order (the root of their ClOrdIDs), and cancels the orders of those the database has
-//! never had, logging each at error:
+//! sessions, [`Gateway::cancel_orphans`] reads the requests each venue's session stored (from its
+//! checkpoint: see below), groups them by order (the root of their ClOrdIDs), and cancels the
+//! orders of those the database has never had, logging each at error:
 //!
 //! - an order the database never had (its NewOrderSingle orphaned, and perhaps replaces of it
 //!   too) has no order in the book: an OrderCancelRequest naming the newest order or replace of
@@ -32,11 +32,19 @@
 //! evicted from a store past its size budget since its last reset looks unsent, and goes again:
 //! the venue may refuse it as a duplicate.
 //!
-//! ponytail: the whole of each venue's store is read and decoded, every start, in windows of
-//! [`SCAN_WINDOW`], and its requests looked up: a million stored NewOrderSingles, all ours, took
-//! 3.9 s (2.2 s reading and decoding, 1.7 s looking up), a release build on an M3 from a
-//! `MemoryStorage` and an in-memory SQLite, the machine not idle. A checkpoint past what the
-//! database has seen, if starts show it.
+//! The scan reads each venue's store from its checkpoint (see [`Gateway::checkpoint_once`]): every
+//! request of ours stored below it has its change committed, and its answer too, so it can be
+//! neither an orphan nor unsent. A checkpoint is ignored, and the whole store read, if the store
+//! was reset after it was taken, or doesn't say when it was created. Unanswered requests the scan
+//! finds are bounded again (`State::in_flight`), so a later checkpoint doesn't pass them.
+//!
+//! ponytail: a whole scan, in windows of [`SCAN_WINDOW`], costs about 3.9 s per million stored
+//! NewOrderSingles, all ours (2.2 s reading and decoding, 1.7 s looking up), a release build on
+//! an M3 from a `MemoryStorage` and an in-memory SQLite, the machine not idle. Accepted
+//! ceilings: a request its venue never answers holds the checkpoint back, so the scan grows
+//! back towards a whole one; `Gateway::check_prefix`, the backstop for a clock that went back,
+//! sees only the scanned tail; and a counterparty's ResetSeqNumFlag mid-session can leave a
+//! bound read before the reset, too high, so a checkpoint past a request.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -132,8 +140,9 @@ enum Kind {
 }
 
 impl Gateway {
-    /// Reads every message each of `venues` (name, session and the store its initiator keeps it
-    /// in) stored, and cancels the orders of the requests `store` has never recorded: see the
+    /// Reads the messages each of `venues` (name, session and the store its initiator keeps it
+    /// in) stored from its checkpoint in `store`, or from the first if it has none or it doesn't
+    /// hold, and cancels the orders of the requests `store` has never recorded: see the
     /// [module documentation](self). Call it after [`restore`](Self::restore) and before the
     /// initiators start: it opens each session's log and closes it, which a `disk` store locks
     /// while open. Nothing is sent: the cancels go at each venue's logon.
@@ -150,6 +159,7 @@ impl Gateway {
     ) -> io::Result<Orphans> {
         let mut found = Orphans::default();
         let pruned_through = store.pruned_through().await?.map(|through| through + PRUNED_SLACK);
+        let checkpoints = store.checkpoints().await?;
         for (venue, id, storage) in venues {
             let venue: VenueId = venue.as_str().into();
             let in_store = |e: io::Error| io::Error::other(format!("venue {venue}'s store: {e}"));
@@ -164,10 +174,22 @@ impl Gateway {
                      its files kept",
                 )));
             }
-            let requests = scan(log.as_mut(), &venue, &mut found.scanned).await.map_err(in_store)?;
+            let created = log.created_at().map(DateTime::<Utc>::from);
+            let begin = match scan_from(checkpoints.get(&venue), created, log.next_outgoing()) {
+                Ok(begin) => {
+                    info!(%venue, begin, "scanning the venue's store from its checkpoint");
+                    begin
+                }
+                Err(why) => {
+                    info!(%venue, "scanning the venue's whole store: {why}");
+                    1
+                }
+            };
+            let requests = scan(log.as_mut(), &venue, begin, &mut found.scanned).await.map_err(in_store)?;
             self.check_prefix(&venue, &requests)?;
             let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
-            let created = log.created_at().map(DateTime::<Utc>::from);
+            let seqs: Vec<(CompactString, u64)> =
+                requests.iter().map(|request| (request.cl_ord_id.clone(), request.seq)).collect();
             found.unsent += self.find_unsent(&venue, &ids, created, log.next_outgoing());
             let chains = chains(requests);
             ids.extend(chains.keys().cloned());
@@ -188,6 +210,7 @@ impl Gateway {
                     found.amendments += usize::from(self.orphaned_amendment(log.as_mut(), &venue, request).await?);
                 }
             }
+            self.seed_in_flight(&venue, seqs);
         }
         info!(
             scanned = found.scanned,
@@ -197,7 +220,26 @@ impl Gateway {
             pruned = found.pruned,
             "looked for venue requests the database lacks, and the converse"
         );
+        self.lock().orphans_found = found;
         Ok(found)
+    }
+
+    /// Bounds each of `stored` (ClOrdIDs, with the numbers `venue`'s session stored them under)
+    /// the book counts unanswered, so no checkpoint passes it: those restored from the database,
+    /// and orphaned amendments now pending, or waiting to be (no checkpoint is taken while one
+    /// waits, and it's pending after). Requests sent again at the logon get theirs as sent.
+    fn seed_in_flight(&self, venue: &VenueId, stored: Vec<(CompactString, u64)>) {
+        if self.writer.is_none() {
+            return;
+        }
+        let mut state = self.lock();
+        let state = &mut *state;
+        let book = &state.book;
+        let unanswered = |downstream: &CompactString| book.is_unanswered(downstream) || book.orphan_waiting(downstream);
+        let bounds = state.in_flight.entry(venue.clone()).or_default();
+        for (downstream, seq) in stored.into_iter().filter(|(downstream, _)| unanswered(downstream)) {
+            bounds.entry(downstream).and_modify(|bound| *bound = (*bound).min(seq)).or_insert(seq);
+        }
     }
 
     /// Keeps for `venue`'s next logon the requests the book has as sent to it, unanswered, that
@@ -560,12 +602,31 @@ async fn fetch(log: &mut dyn SessionLog, begin: u64, end: u64) -> io::Result<Sen
     }
 }
 
-/// The requests of ours among every message the log stored, read [`SCAN_WINDOW`] at a time,
-/// counting them into `scanned`.
-async fn scan(log: &mut dyn SessionLog, venue: &VenueId, scanned: &mut usize) -> io::Result<Vec<Request>> {
+/// Where a venue's scan begins: at its `checkpoint` if the store wasn't reset since it was taken,
+/// so was created at least a millisecond before it (a store may keep the time in milliseconds,
+/// as [`Gateway::find_unsent`] allows) and numbers up to it; else at 1, the error saying why.
+fn scan_from(
+    checkpoint: Option<&Checkpoint>,
+    created: Option<DateTime<Utc>>,
+    next_outgoing: u64,
+) -> Result<u64, &'static str> {
+    let checkpoint = checkpoint.ok_or("no checkpoint")?;
+    let created = created.ok_or("the store doesn't say when it was created, so a reset can't be ruled out")?;
+    if created + Duration::from_millis(1) > checkpoint.taken_at {
+        return Err("the store was created or reset after the checkpoint was taken");
+    }
+    if checkpoint.next_seq > next_outgoing {
+        return Err("the checkpoint is past the store's next number: the store was reset since");
+    }
+    Ok(checkpoint.next_seq.max(1))
+}
+
+/// The requests of ours among the messages the log stored from `begin`, read [`SCAN_WINDOW`] at
+/// a time, counting them into `scanned`.
+async fn scan(log: &mut dyn SessionLog, venue: &VenueId, begin: u64, scanned: &mut usize) -> io::Result<Vec<Request>> {
     let last = log.next_outgoing().saturating_sub(1);
     let mut requests = Vec::new();
-    let mut begin = 1;
+    let mut begin = begin;
     while begin <= last {
         let end = last.min(begin + SCAN_WINDOW - 1);
         for (seq, bytes) in fetch(log, begin, end).await? {
@@ -678,6 +739,24 @@ fn cancel(newest: &Message, cl_ord_id: CompactString) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkpoint holds only for a store created a millisecond or more before it was taken,
+    /// and numbered at least up to it; a checkpoint of 0 begins at 1.
+    #[test]
+    fn a_scan_begins_at_the_checkpoint_only_if_the_store_wasnt_reset_since() {
+        let at = |millis| DateTime::<Utc>::from_timestamp_millis(millis).expect("in range");
+        let checkpoint = |next_seq| Checkpoint { next_seq, taken_at: at(1_000) };
+        assert_eq!(scan_from(Some(&checkpoint(5)), Some(at(999)), 5), Ok(5));
+        assert_eq!(scan_from(Some(&checkpoint(5)), Some(at(0)), 9), Ok(5));
+        assert_eq!(scan_from(Some(&checkpoint(0)), Some(at(0)), 9), Ok(1));
+        assert!(scan_from(None, Some(at(0)), 9).is_err());
+        assert!(scan_from(Some(&checkpoint(5)), None, 9).is_err());
+        // Created within the millisecond of the checkpoint, or after: reset since, perhaps.
+        assert!(scan_from(Some(&checkpoint(5)), Some(at(1_000) - Duration::from_micros(999)), 9).is_err());
+        assert!(scan_from(Some(&checkpoint(5)), Some(at(2_000)), 9).is_err());
+        // Past the store's next number.
+        assert!(scan_from(Some(&checkpoint(5)), Some(at(0)), 4).is_err());
+    }
 
     #[test]
     fn only_ids_of_the_gateways_shapes_are_its_own() {
