@@ -62,26 +62,35 @@ enum Event {
     Message(Message),
 }
 
-struct Recorder(UnboundedSender<Event>);
+/// Records what it sees; asked for messages again, it resends them only if `resends`, else
+/// gap-fills them.
+struct Recorder {
+    events: UnboundedSender<Event>,
+    resends: bool,
+}
 
 impl Application for Recorder {
     fn on_logon(&self, _: &SessionHandle) {
-        let _ = self.0.send(Event::LoggedOn);
+        let _ = self.events.send(Event::LoggedOn);
     }
 
     fn on_logout(&self, _: &SessionHandle, _: Disconnect) {
-        let _ = self.0.send(Event::LoggedOut);
+        let _ = self.events.send(Event::LoggedOut);
     }
 
     fn on_message(&self, _: &mut Context<'_>, msg: &Message) -> Result<(), MessageReject> {
-        let _ = self.0.send(Event::Message(msg.clone()));
+        let _ = self.events.send(Event::Message(msg.clone()));
         Ok(())
+    }
+
+    fn should_resend(&self, _: &SessionHandle, _: &Message) -> bool {
+        self.resends
     }
 }
 
-fn recorder() -> (Arc<Recorder>, Events) {
+fn recorder(resends: bool) -> (Arc<Recorder>, Events) {
     let (events, rx) = unbounded_channel();
-    (Arc::new(Recorder(events)), Events(rx))
+    (Arc::new(Recorder { events, resends }), Events(rx))
 }
 
 struct Events(UnboundedReceiver<Event>);
@@ -260,7 +269,7 @@ impl Setup {
         let dir = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let venue_port = listener.local_addr().unwrap().port();
-        let (app, mut venue_events) = recorder();
+        let (app, mut venue_events) = recorder(true);
         let venue = Acceptor::new(SessionConfig::new("FIX.4.4", VENUE), Arc::new(MemoryStorage::new()), app).unwrap();
         tokio::spawn(venue.clone().serve(listener));
         // Kept open across starts, so the port stays the gateway's while it's down: a client
@@ -273,7 +282,7 @@ impl Setup {
         let gateway = Gateway::start(dir.path(), listener.try_clone().unwrap(), venue_open, client_open);
         venue_events.logged_on().await;
 
-        let (app, mut events) = recorder();
+        let (app, mut events) = recorder(options.client_resends);
         let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", CLIENT), GATEWAY);
         config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(20));
         let client = Initiator::new(format!("127.0.0.1:{port}"), config, Arc::new(MemoryStorage::new()), app).unwrap();
@@ -437,18 +446,20 @@ struct Options {
     database: bool,
     /// The venue's session resets at each logon.
     reset_on_logon: bool,
+    /// Asked for messages again, the client resends them; else it gap-fills them.
+    client_resends: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { cancel_on_disconnect: None, database: true, reset_on_logon: false }
+        Self { cancel_on_disconnect: None, database: true, reset_on_logon: false, client_resends: true }
     }
 }
 
 /// Jetbridge's files: clients on `port`, the venue at `venue_port`, both sessions on disk, as
 /// `options` say.
 fn write_config(dir: &Path, port: u16, venue_port: u16, options: &Options) {
-    let Options { cancel_on_disconnect, database, reset_on_logon } = options;
+    let Options { cancel_on_disconnect, database, reset_on_logon, .. } = options;
     let cancel = cancel_on_disconnect
         .map(|grace| format!("cancel_on_disconnect = \"disconnect\"\ncancel_grace = \"{}ms\"\n", grace.as_millis()))
         .unwrap_or_default();
@@ -774,7 +785,21 @@ fn terms(report: &v44::ExecutionReport) -> Terms {
 /// fill after reaches the client.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_keeps_working() {
-    let mut setup = Setup::new().await;
+    replace_in_flight_at_a_crash(true).await;
+}
+
+/// As [`a_replace_in_flight_at_a_crash_is_answered_and_its_order_keeps_working`], but the
+/// client's session gap-fills the replace the gateway asks for again, and the client sends it
+/// afresh, unmarked: it's still taken as the orphan and answered Replaced.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unmarked_resent_replace_is_answered_after_a_crash() {
+    replace_in_flight_at_a_crash(false).await;
+}
+
+/// A replace in flight at a crash, the client's session resending it (`resends`) or the client
+/// sending it again unmarked.
+async fn replace_in_flight_at_a_crash(resends: bool) {
+    let mut setup = Setup::with(Options { client_resends: resends, ..Options::default() }).await;
     let order = partly_filled(&mut setup).await;
     setup.gateway().store().hooks.gate.send_replace(false);
     setup.send(replace("C2", "C1", 150));
@@ -782,6 +807,9 @@ async fn a_replace_in_flight_at_a_crash_is_answered_and_its_order_keeps_working(
     assert_eq!((sent.orig_cl_ord_id.as_str(), sent.order_qty), (&*order, Some(150.into())));
 
     setup.crash_and_restart().await;
+    if !resends {
+        setup.send(replace("C2", "C1", 150));
+    }
     let downstream = sent.cl_ord_id.to_string();
     let adopted = |database: &Snapshot| database.sent.get(&*downstream).is_some_and(|sent| sent.cl_ord_id == "C2");
     setup.until_stored(adopted).await;
