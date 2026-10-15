@@ -549,6 +549,9 @@ impl Gateway {
         // Every run, before the checks below: a venue that never logs on again keeps orphan work
         // pending, and every other venue's bounds would pile up meanwhile. Also drops the bounds
         // of a venue a reload took out, once answered.
+        // ponytail: a walk of every bound under the lock, but a venue's answer drops its own as
+        // it's handled (`handle_locked`), so this finds only the few that misses (a request whose
+        // order ended through another's answer, say); a sweep per order ending if it shows.
         state.in_flight.retain(|_, bounds| {
             bounds.retain(|downstream, _| state.book.holds_checkpoint(downstream));
             !bounds.is_empty()

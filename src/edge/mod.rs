@@ -781,7 +781,15 @@ impl Gateway {
         while let Some(input) = inputs.pop_front() {
             let send_failed = matches!(input, Input::SendFailed { .. });
             let resent = matches!(input, Input::Unsent { .. });
+            let answer = answer(&input);
             state.book.handle(input, &mut outputs);
+            // As it's answered, not at the next checkpoint's run, so the bounds don't pile up.
+            if let Some((venue, downstream)) = answer
+                && let Some(bounds) = state.in_flight.get_mut(&venue)
+                && !state.book.holds_checkpoint(&downstream)
+            {
+                bounds.remove(&downstream);
+            }
             for output in outputs.drain(..) {
                 if let Some(failed) = self.send(state, &output, (now, resent), ctx.as_deref_mut(), &mut reports) {
                     debug_assert!(!send_failed, "SendFailed made venue-bound output");
@@ -1015,6 +1023,18 @@ impl Gateway {
             error!("the book panicked while handling a message; stopping");
             std::process::abort()
         })
+    }
+}
+
+/// The venue and downstream ClOrdID of a venue's answer to a request, or of a send that failed:
+/// once handled, the request's bound in `State::in_flight` may go.
+fn answer(input: &Input) -> Option<(VenueId, CompactString)> {
+    match input {
+        Input::VenueReport { venue, report } => Some((venue.clone(), report.downstream.clone())),
+        Input::VenueCancelReject { venue, downstream, .. } | Input::SendFailed { venue, downstream, .. } => {
+            Some((venue.clone(), downstream.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -3066,6 +3086,18 @@ pub(crate) mod tests {
         let gateway = super::tests::gateway();
         let _sessions = connected(&gateway, false).await;
         assert!(gateway.checkpoint_once().is_empty());
+    }
+
+    /// A venue's answer drops its request's bound as it's handled, not at the next checkpoint's
+    /// run.
+    #[tokio::test]
+    async fn a_venue_answer_drops_its_requests_bound() {
+        let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
+        book_order(&gateway);
+        gateway.lock().in_flight.entry(VENUE.into()).or_default().insert("1".into(), 7);
+        let input = Version::Fix44.venue_input(&VENUE.into(), &venue_report("1", 0)).unwrap().unwrap();
+        gateway.handle(input);
+        assert_eq!(gateway.lock().in_flight[VENUE].get("1"), None);
     }
 
     /// An orphaned replace waiting for the one pending before it keeps its bound through a
