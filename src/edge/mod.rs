@@ -217,7 +217,7 @@ struct State {
     /// reset at logon has happened, so the numbers a session publishes are its own. By session,
     /// not venue: a reload that drops or renames a venue while it's up still sees it logged out.
     logged_on: HashSet<SessionId>,
-    /// What this start's [`Gateway::cancel_orphans`] found.
+    /// What this start's [`Gateway::cancel_orphans`] found: `Orphans::default()` if it didn't run.
     orphans_found: orphans::Orphans,
 }
 
@@ -400,8 +400,10 @@ impl Gateway {
         self.lock().book.router().clone()
     }
 
-    /// What this start's [`cancel_orphans`](Self::cancel_orphans) found, if it ran.
-    pub fn orphans_found(&self) -> orphans::Orphans {
+    /// What this start's [`cancel_orphans`](Self::cancel_orphans) found: `Orphans::default()` if
+    /// it didn't run (without a database, say).
+    #[cfg_attr(not(test), expect(dead_code, reason = "only the crash tests read it"))]
+    pub(crate) fn orphans_found(&self) -> orphans::Orphans {
         self.lock().orphans_found
     }
 

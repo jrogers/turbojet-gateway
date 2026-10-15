@@ -35,16 +35,21 @@
 //! The scan reads each venue's store from its checkpoint (see [`Gateway::checkpoint_once`]): every
 //! request of ours stored below it has its change committed, and its answer too, so it can be
 //! neither an orphan nor unsent. A checkpoint is ignored, and the whole store read, if the store
-//! was reset after it was taken, or doesn't say when it was created. Unanswered requests the scan
-//! finds are bounded again (`State::in_flight`), so a later checkpoint doesn't pass them.
+//! was created or reset after it was taken, doesn't say when it was created, or is numbered short
+//! of it. Unanswered requests the scan finds are bounded again (`State::in_flight`), so a later
+//! checkpoint doesn't pass them.
 //!
 //! ponytail: a whole scan, in windows of [`SCAN_WINDOW`], costs about 3.9 s per million stored
 //! NewOrderSingles, all ours (2.2 s reading and decoding, 1.7 s looking up), a release build on
 //! an M3 from a `MemoryStorage` and an in-memory SQLite, the machine not idle. Accepted
 //! ceilings: a request its venue never answers holds the checkpoint back, so the scan grows
 //! back towards a whole one; `Gateway::check_prefix`, the backstop for a clock that went back,
-//! sees only the scanned tail; and a counterparty's ResetSeqNumFlag mid-session can leave a
-//! bound read before the reset, too high, so a checkpoint past a request.
+//! sees only the scanned tail; a counterparty's ResetSeqNumFlag mid-session can leave a bound
+//! read before the reset, too high, so a checkpoint past a request; a clock stepped back across a
+//! reset, with no checkpoint taken after the reset before a stop, can make the stale checkpoint
+//! look newer than the store; and checkpoints are keyed by venue name, so a venue pointed at
+//! another session's store, older and numbered further, passes both checks (the rest of the
+//! orphan logic, too, takes a venue and its session as one).
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -177,7 +182,8 @@ impl Gateway {
             let created = log.created_at().map(DateTime::<Utc>::from);
             let begin = match scan_from(checkpoints.get(&venue), created, log.next_outgoing()) {
                 Ok(begin) => {
-                    info!(%venue, begin, "scanning the venue's store from its checkpoint");
+                    let next_outgoing = log.next_outgoing();
+                    info!(%venue, begin, next_outgoing, "scanning the venue's store from its checkpoint");
                     begin
                 }
                 Err(why) => {
@@ -187,9 +193,8 @@ impl Gateway {
             };
             let requests = scan(log.as_mut(), &venue, begin, &mut found.scanned).await.map_err(in_store)?;
             self.check_prefix(&venue, &requests)?;
-            let mut ids: Vec<CompactString> = requests.iter().map(|request| request.cl_ord_id.clone()).collect();
-            let seqs: Vec<(CompactString, u64)> =
-                requests.iter().map(|request| (request.cl_ord_id.clone(), request.seq)).collect();
+            let (mut ids, seqs): (Vec<CompactString>, Vec<u64>) =
+                requests.iter().map(|request| (request.cl_ord_id.clone(), request.seq)).unzip();
             found.unsent += self.find_unsent(&venue, &ids, created, log.next_outgoing());
             let chains = chains(requests);
             ids.extend(chains.keys().cloned());
@@ -210,7 +215,8 @@ impl Gateway {
                     found.amendments += usize::from(self.orphaned_amendment(log.as_mut(), &venue, request).await?);
                 }
             }
-            self.seed_in_flight(&venue, seqs);
+            // The zip stops before the chains' roots, appended to `ids`.
+            self.seed_in_flight(&venue, ids.iter().zip(seqs));
         }
         info!(
             scanned = found.scanned,
@@ -228,7 +234,7 @@ impl Gateway {
     /// the book counts unanswered, so no checkpoint passes it: those restored from the database,
     /// and orphaned amendments now pending, or waiting to be (no checkpoint is taken while one
     /// waits, and it's pending after). Requests sent again at the logon get theirs as sent.
-    fn seed_in_flight(&self, venue: &VenueId, stored: Vec<(CompactString, u64)>) {
+    fn seed_in_flight<'a>(&self, venue: &VenueId, stored: impl Iterator<Item = (&'a CompactString, u64)>) {
         if self.writer.is_none() {
             return;
         }
@@ -237,8 +243,8 @@ impl Gateway {
         let book = &state.book;
         let unanswered = |downstream: &CompactString| book.is_unanswered(downstream) || book.orphan_waiting(downstream);
         let bounds = state.in_flight.entry(venue.clone()).or_default();
-        for (downstream, seq) in stored.into_iter().filter(|(downstream, _)| unanswered(downstream)) {
-            bounds.entry(downstream).and_modify(|bound| *bound = (*bound).min(seq)).or_insert(seq);
+        for (downstream, seq) in stored.filter(|(downstream, _)| unanswered(downstream)) {
+            bounds.entry(downstream.clone()).and_modify(|bound| *bound = (*bound).min(seq)).or_insert(seq);
         }
     }
 
