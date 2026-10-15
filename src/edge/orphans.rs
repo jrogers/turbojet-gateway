@@ -581,13 +581,17 @@ impl Gateway {
             // resets the store with no logout: requests sent between the reset and this run were
             // bounded by the old store's number, too high, so every bound of the venue goes to 1;
             // and no checkpoint this run, as one stamped after the reset, which a start accepts,
-            // could pass them. Both tests: the count can lag the reset's numbers for a read, and
-            // the numbers alone miss a reset after which the session sent more than before it.
+            // could pass them. The count alone is safe: one this read misses lags a reset too
+            // recent for a checkpoint of this run to be accepted, as a start ignores one taken
+            // before, or within a millisecond after, the store's reset (`scan_from`). The numbers
+            // going down only catch such a reset a run sooner.
             if activity.resets != before.resets || next_outgoing < before.next_outgoing {
                 warn!(
                     %venue,
                     before = before.next_outgoing,
                     next_outgoing,
+                    resets_before = before.resets,
+                    resets = activity.resets,
                     "the venue's session store was reset mid-session: its requests are bounded at 1, and no \
                      checkpoint of it is taken this run"
                 );
