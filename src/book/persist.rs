@@ -103,8 +103,9 @@ impl Changes {
 
 /// Where a start's scan of a venue's session store for orphans may begin (see
 /// [`edge::orphans`](crate::edge::orphans)): every request of ours the store holds below `next_seq`
-/// has its change committed, and its answer too. Taken at `taken_at`, stamped before `next_seq`
-/// was read, so it is ignored if the venue's store was reset since.
+/// has its change committed, and is no longer unanswered: answered, its order done, or an original
+/// order past PendingNew. Taken at `taken_at`, stamped before `next_seq` was read, so it is
+/// ignored if the venue's store was reset since.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Checkpoint {
     pub next_seq: u64,

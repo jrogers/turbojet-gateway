@@ -218,7 +218,7 @@ struct State {
     in_flight: HashMap<VenueId, HashMap<CompactString, u64>>,
     /// Venue sessions logged on, from the venue app's `on_logon` to its `on_logout`: by then a
     /// reset at logon has happened, so the numbers a session publishes are its own. By session,
-    /// not venue: a reload that drops or renames a venue while it's up still sees it logged out.
+    /// not venue: a reload that renames a venue while it's up keeps it logged on, as its session is.
     /// With each, its next outgoing number as last read, at the logon and at each
     /// [`Gateway::checkpoint_once`]: numbers only rise within a connection, so a request sent
     /// since is stored at or above it.

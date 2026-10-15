@@ -33,10 +33,11 @@
 //! the venue may refuse it as a duplicate.
 //!
 //! The scan reads each venue's store from its checkpoint (see [`Gateway::checkpoint_once`]): every
-//! request of ours stored below it has its change committed, and its answer too, so it can be
-//! neither an orphan nor unsent. A checkpoint is ignored, and the whole store read, if the store
-//! was created or reset after it was taken, doesn't say when it was created, or is numbered short
-//! of it. Unanswered requests the scan finds are bounded again (`State::in_flight`), so a later
+//! request of ours stored below it has its change committed, and is no longer unanswered
+//! (answered, its order done, or an original order past PendingNew), so it can be neither an
+//! orphan nor unsent. A checkpoint is ignored, and the whole store read, if the store was created
+//! or reset after it was taken, or within a millisecond before, doesn't say when it was created,
+//! or is numbered short of it. Unanswered requests the scan finds are bounded again (`State::in_flight`), so a later
 //! checkpoint doesn't pass them. A request's bound is its session's next number as last read, at
 //! its logon or the last checkpoint's run, not at each send, which would cost Turbojet's registry
 //! locks per request: so under steady load a checkpoint lags a run behind, and a crash leaves
@@ -632,7 +633,7 @@ fn scan_from(
     let checkpoint = checkpoint.ok_or("no checkpoint")?;
     let created = created.ok_or("the store doesn't say when it was created, so a reset can't be ruled out")?;
     if created + Duration::from_millis(1) > checkpoint.taken_at {
-        return Err("the store was created or reset after the checkpoint was taken");
+        return Err("the store was created or reset after the checkpoint was taken, or within a millisecond before");
     }
     if checkpoint.next_seq > next_outgoing {
         return Err("the checkpoint is past the store's next number: the store was reset since");
