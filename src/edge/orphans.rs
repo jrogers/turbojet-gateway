@@ -41,7 +41,11 @@
 //! so a later checkpoint doesn't pass them. A request's bound is its session's next number as last
 //! read, at its logon or the last checkpoint's run, not at each send, which would cost Turbojet's
 //! registry locks per request: so under steady load a checkpoint lags a run behind, and a crash
-//! leaves about two intervals' messages to scan, not one.
+//! leaves about two intervals' messages to scan, not one. A counterparty's ResetSeqNumFlag
+//! mid-session resets the store with no logout, leaving bounds read before it too high: the next
+//! checkpoint's run catches it exactly, from the session's reset count (Turbojet 0.4's
+//! `Activity::resets`) together with its number going down, bounds the venue's requests at 1 and
+//! takes no checkpoint of it.
 //!
 //! ponytail: a whole scan, in windows of [`SCAN_WINDOW`], costs about 3.9 s per million stored
 //! NewOrderSingles, all ours (2.2 s reading and decoding, 1.7 s looking up), a release build on an
@@ -50,14 +54,9 @@
 //! whole one; orphan work pending for any venue (one that never logs on again, say) holds back
 //! every venue's checkpoint, not just its own, so until it clears each start reads more of every
 //! store, back towards the whole, as before checkpoints; `Gateway::check_prefix`, the backstop for
-//! a clock that went back, sees only the scanned tail; a counterparty's ResetSeqNumFlag mid-session
-//! resets the store with no logout, leaving bounds read before it too high: the next checkpoint's
-//! run catches it (the session's number fell), bounds the venue's requests at 1 and takes no
-//! checkpoint of it, unless the session sent more after the reset than before it within that
-//! interval, when a checkpoint can pass a request (exact would be a reset count, or the store's
-//! created time, in Turbojet's `Activity`: an engine change); a clock stepped back across a reset,
-//! with no checkpoint taken after the reset before a stop, can make the stale checkpoint look newer
-//! than the store; and checkpoints are keyed by venue name, so a venue pointed at another session's
+//! a clock that went back, sees only the scanned tail; a clock stepped back across a reset, with
+//! no checkpoint taken after the reset before a stop, can make the stale checkpoint look newer than
+//! the store; and checkpoints are keyed by venue name, so a venue pointed at another session's
 //! store, older and numbered further, passes both checks (the rest of the orphan logic, too, takes
 //! a venue and its session as one).
 
@@ -75,7 +74,7 @@ use turbojet::message::tags;
 use turbojet::store::{Fetched, Opened, SentMessages, SessionLog};
 use turbojet::{Message, MsgType, Receipt, SessionHandle, SessionId, SessionStorage};
 
-use super::{Gateway, State};
+use super::{Gateway, LastRead, State};
 use crate::book::{AlarmKind, Changes, Checkpoint, ClientId, Input, OrdType, OrphanedReplace, VenueId};
 use crate::fix::Version;
 use crate::store::Store;
@@ -576,16 +575,18 @@ impl Gateway {
             let Some(last_read) = state.logged_on.get_mut(to.session.id()) else { continue };
             let Some(activity) = to.session.status().and_then(|status| status.activity) else { continue };
             // What later requests to it are bounded by.
-            let before = std::mem::replace(last_read, activity.next_outgoing);
             let next_outgoing = activity.next_outgoing;
+            let before = std::mem::replace(last_read, LastRead { next_outgoing, resets: activity.resets });
             // Numbers only rise, but for a counterparty's ResetSeqNumFlag mid-session, which
-            // resets the store with no logout: requests sent since were bounded by the old
-            // store's number, too high, so they're bounded at 1; and no checkpoint this run, as
-            // one stamped after the reset, which a start accepts, could pass them.
-            if next_outgoing < before {
+            // resets the store with no logout: requests sent between the reset and this run were
+            // bounded by the old store's number, too high, so every bound of the venue goes to 1;
+            // and no checkpoint this run, as one stamped after the reset, which a start accepts,
+            // could pass them. Both tests: the count can lag the reset's numbers for a read, and
+            // the numbers alone miss a reset after which the session sent more than before it.
+            if activity.resets != before.resets || next_outgoing < before.next_outgoing {
                 warn!(
                     %venue,
-                    before,
+                    before = before.next_outgoing,
                     next_outgoing,
                     "the venue's session store was reset mid-session: its requests are bounded at 1, and no \
                      checkpoint of it is taken this run"

@@ -219,13 +219,34 @@ struct State {
     /// Venue sessions logged on, from the venue app's `on_logon` to its `on_logout`: by then a
     /// reset at logon has happened, so the numbers a session publishes are its own. By session,
     /// not venue: a reload that renames a venue while it's up keeps it logged on, as its session is.
-    /// With each, its next outgoing number as last read, at the logon and at each
-    /// [`Gateway::checkpoint_once`]: numbers only rise within a connection, but for a
-    /// counterparty's reset mid-session, which `checkpoint_once` catches, so a request sent since
-    /// is stored at or above it.
-    logged_on: HashMap<SessionId, u64>,
+    /// With each, its numbers as last read, at the logon and at each [`Gateway::checkpoint_once`]:
+    /// numbers only rise within a connection, but for a counterparty's reset mid-session, which
+    /// `checkpoint_once` catches, so a request sent since is stored at or above the next outgoing.
+    logged_on: HashMap<SessionId, LastRead>,
     /// What this start's [`Gateway::cancel_orphans`] found: `Orphans::default()` if it didn't run.
     orphans_found: orphans::Orphans,
+}
+
+/// A logged-on venue session's numbers, from one read of its [`Activity`](turbojet::Activity):
+/// see `State::logged_on`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LastRead {
+    /// The number its next message goes under.
+    next_outgoing: u64,
+    /// How many times its store was reset since it bound.
+    resets: u64,
+}
+
+impl LastRead {
+    /// From the session's activity; with none, a guess that bounds requests at 1 until the next
+    /// read.
+    fn of(session: &SessionHandle) -> Self {
+        let activity = session.status().and_then(|status| status.activity);
+        activity.map_or(Self { next_outgoing: 1, resets: 0 }, |activity| Self {
+            next_outgoing: activity.next_outgoing,
+            resets: activity.resets,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -922,12 +943,11 @@ impl Gateway {
                 // on yet takes sends, queued, and may still reset its store or publish the old
                 // one's numbers: then 1, and the venue's whole store is scanned until the request
                 // is answered.
-                // ponytail: a counterparty's ResetSeqNumFlag mid-session resets the store with no
-                // logout, so bounds read before it are too high; the next checkpoint's run catches
-                // it (the number fell) and bounds the venue's requests at 1, unless the session
-                // sent more after the reset than before it within that interval. Exact would be a
-                // reset count, or the store's created time, in Turbojet's `Activity`.
-                let bound = state.logged_on.get(to.session.id()).copied().unwrap_or(1);
+                // A counterparty's ResetSeqNumFlag mid-session resets the store with no logout, so
+                // a bound read before it is too high; the next checkpoint's run catches the reset
+                // exactly, from the session's reset count (Turbojet 0.4's `Activity::resets`) with
+                // its number going down, and bounds the venue's requests at 1.
+                let bound = state.logged_on.get(to.session.id()).map_or(1, |last_read| last_read.next_outgoing);
                 match to.session.send(msg) {
                     Ok(receipt) => {
                         if self.writer.is_some() {
@@ -1147,11 +1167,11 @@ impl Application for VenueApp {
         let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
         let Some(venue) = venue else { return };
         // After the logon, so after any reset of its store.
-        let next_outgoing = session.status().and_then(|status| status.activity).map_or(1, |a| a.next_outgoing);
+        let last_read = LastRead::of(session);
         let unsent = {
             let mut state = self.0.lock();
             // Before the unsent requests go, so they get their bounds.
-            state.logged_on.insert(session.id().clone(), next_outgoing);
+            state.logged_on.insert(session.id().clone(), last_read);
             state.unsent.remove(&venue)
         };
         let unsent = unsent.map(|unsent| self.0.unsent_inputs(&venue, unsent, session)).unwrap_or_default();
@@ -3031,7 +3051,7 @@ pub(crate) mod tests {
         assert_eq!(taken.len(), 1, "{taken:?}");
         assert!((before..=after).contains(&taken[0].1.next_seq), "{taken:?}, between {before} and {after}");
         // What later requests are bounded by.
-        assert_eq!(gateway.lock().logged_on[&id()], taken[0].1.next_seq);
+        assert_eq!(gateway.lock().logged_on[&id()].next_outgoing, taken[0].1.next_seq);
         gateway.committed().await;
         assert_eq!(store.checkpoints().await.unwrap()[&VenueId::from(VENUE)], taken[0].1);
     }
@@ -3092,36 +3112,43 @@ pub(crate) mod tests {
     }
 
     /// A store reset mid-session, as a counterparty's ResetSeqNumFlag does with no logout, shows
-    /// as the session's next number below the one last read (faked here by raising that): no
-    /// checkpoint of the venue that run, its requests bounded at 1, and the next run's checkpoint
-    /// at most 1. Caught while orphan work is pending as well.
+    /// as the session's reset count changed since last read, or its next number below the one last
+    /// read (each faked here through what was last read): no checkpoint of the venue that run, its
+    /// requests bounded at 1, what was last read refreshed, and the next run's checkpoint at most
+    /// 1. The count catches a reset after which the session sent more than it had before, which
+    /// the numbers alone miss. Caught while orphan work is pending as well.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_store_reset_mid_session_bounds_its_requests_at_1() {
         let (gateway, _store) = gateway_with_store(writer::MAX_COMMIT_WAIT).await;
         let mut sessions = connected(&gateway, false).await;
         venue_logged_on(&gateway, true).await;
-        sessions.client.handle().send(order("C1")).unwrap();
-        next_message(&mut sessions.venue_events).await;
-        gateway.lock().logged_on.insert(id(), u64::MAX);
-        assert!(gateway.checkpoint_once().is_empty());
-        let bound = gateway.lock().in_flight[VENUE]["1"];
-        let last_read = gateway.lock().logged_on[&id()];
-        assert_eq!(bound, 1);
-        assert!(last_read < u64::MAX);
-        let taken = gateway.checkpoint_once();
-        assert_eq!(taken.len(), 1, "{taken:?}");
-        assert!(taken[0].1.next_seq <= 1, "{taken:?}");
+        let resets = sessions.venue.handle().status().unwrap().activity.unwrap().resets;
+        let faked = [
+            ("the number fell", LastRead { next_outgoing: u64::MAX, resets }),
+            ("only the count changed", LastRead { next_outgoing: 1, resets: resets + 1 }),
+        ];
+        for (n, (case, last_read)) in faked.into_iter().enumerate() {
+            sessions.client.handle().send(order(&format!("C{n}"))).unwrap();
+            next_message(&mut sessions.venue_events).await;
+            let downstream = (n + 1).to_string();
+            gateway.lock().logged_on.insert(id(), last_read);
+            assert!(gateway.checkpoint_once().is_empty(), "{case}");
+            assert_eq!(gateway.lock().in_flight[VENUE][downstream.as_str()], 1, "{case}");
+            assert_ne!(gateway.lock().logged_on[&id()], last_read, "{case}");
+            let taken = gateway.checkpoint_once();
+            assert_eq!(taken.len(), 1, "{case}: {taken:?}");
+            assert!(taken[0].1.next_seq <= 1, "{case}: {taken:?}");
+        }
 
         // Caught while orphan work is pending, too, though no checkpoint is taken then.
         let unsent = orphans::Unsent { downstreams: vec!["X".into()], next_outgoing: 1 };
         gateway.lock().unsent.insert(VENUE.into(), unsent);
         gateway.lock().in_flight.entry(VENUE.into()).or_default().insert("1".into(), 5);
-        gateway.lock().logged_on.insert(id(), u64::MAX);
+        let last_read = LastRead { next_outgoing: 1, resets: resets + 1 };
+        gateway.lock().logged_on.insert(id(), last_read);
         assert!(gateway.checkpoint_once().is_empty());
-        let bound = gateway.lock().in_flight[VENUE]["1"];
-        let last_read = gateway.lock().logged_on[&id()];
-        assert_eq!(bound, 1);
-        assert!(last_read < u64::MAX);
+        assert_eq!(gateway.lock().in_flight[VENUE]["1"], 1);
+        assert_ne!(gateway.lock().logged_on[&id()], last_read);
     }
 
     /// A venue's answer drops its request's bound as it's handled, not at the next checkpoint's
