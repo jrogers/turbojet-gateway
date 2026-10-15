@@ -772,9 +772,10 @@ cargo build --release --features console
 Without the feature, the gateway serves the API only. The console's files are served with a
 Content-Security-Policy allowing only the gateway's own scripts, styles and connections.
 
-Its screens are kept live by `GET /api/live`, with a banner while that socket is down. Every user
-sees Orders, Sessions, Risk, Messages and Routes in the nav; an admin without `--clients` also sees
-Audit, and a Reload button in the header. A user with `--clients` sees and acts on only its clients,
+Its screens are kept live by `GET /api/live`, the header saying whether that socket is live. Every
+user sees Orders, Sessions, Risk, Messages and Routes in the sidebar, with the working orders and
+the venues down counted beside theirs; an admin without `--clients` also sees Audit, and a Reload
+button under the user. A user with `--clients` sees and acts on only its clients,
 as the API narrows it. A reload that changes a user's clients shows at its live socket's next
 snapshot, when the console also reads the user's role again. Viewers read; operators and admins act,
 each action with a reason. One the database hasn't committed within 5 seconds says it's not yet
@@ -809,7 +810,7 @@ saved to the database:
 - **Routes**: the routing rules in the order they're tried, and a dry run: a client's CompID,
   ExDestination and symbol, and the rule such an order would match, highlighted, with the venue it
   would go to or the reject it would get. Routing only: blocks and risk aren't checked.
-- **Reload**, from the header: rereads the files, as SIGHUP does. What it took, or why it kept a
+- **Reload**, from the sidebar: rereads the files, as SIGHUP does. What it took, or why it kept a
   file, shows under the header on every screen until dismissed.
 - **Audit**: the [audit log](#audit-log), newest first, from a since (UTC; the start if empty), the
   last 100 entries or up to 1,000 with a limit. It can't page back past those: a full read says

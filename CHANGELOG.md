@@ -131,6 +131,9 @@ Notable changes to Jetbridge.
   setting and resetting sequence numbers, for admins; the routes with a dry run; and, for admins
   without `--clients`, reload and the audit log. The nav shows each user what its role and
   clients allow. A reason dialog returns the focus where it was when it closes.
+- The console has a new look: dark first (light when the system asks), a sidebar with live
+  counts, status pills, fill bars, credit used against each limit, and rows that flash as the
+  feed changes them.
 - Marking an order unknown at its venue, and clearing that mark, now sends an `order` event on the
   live socket: a console saw the change only at its next snapshot.
 - The first start of this version on a database indexes its requests sent by time, once, for
