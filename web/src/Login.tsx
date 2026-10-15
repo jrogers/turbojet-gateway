@@ -27,7 +27,7 @@ export default function Login({ onLogin, notice }: { onLogin: (me: Me) => void; 
   return (
     <main className="login">
       <div className="panel">
-        <h1 className="brand">Jetbridge</h1>
+        <h1 className="brand">Turbojet Hub</h1>
         <form onSubmit={submit}>
           <label>
             User

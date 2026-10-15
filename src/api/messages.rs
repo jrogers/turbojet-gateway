@@ -132,7 +132,7 @@ pub(super) async fn messages(
 }
 
 /// The sessions a scoped caller's search finds: those of its clients, named as the acceptor logs
-/// them (`BEGIN:JETBRIDGE->CLIENT`). A venue's session is named the same way, Jetbridge's CompID
+/// them (`BEGIN:JETBRIDGE->CLIENT`). A venue's session is named the same way, Turbojet Hub's CompID
 /// then the venue's, so a venue whose CompID is a client's would pass as that client: the venues'
 /// sessions are refused by name first. A venue a reload has stopped isn't known, and one with a
 /// client's CompID would then pass.
@@ -526,7 +526,7 @@ fn open(dir: &Path, file: &LogFile, start: u64, from_cursor: bool) -> Result<Opt
 /// `record` as a hit, if it's a FIX message in the range matching one of the search's filters.
 fn hit(record: LogRecord, search: &Search) -> Option<Hit> {
     let LogRecord::Message { time, direction, session, frame } = record else { return None };
-    // FIXP frames: Jetbridge's sessions are all FIX.
+    // FIXP frames: Turbojet Hub's sessions are all FIX.
     if !search.range.in_range(time) || !frame.starts_with(b"8=") {
         return None;
     }

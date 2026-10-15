@@ -7,7 +7,7 @@
 //! clients = ["FUNDA"]               # optional: acts on these CompIDs only; all, if left out
 //!                                   # (an empty list is refused)
 //!
-//! [[user.alice.tokens]]             # `jetbridge token add` writes these
+//! [[user.alice.tokens]]             # `turbojet-hub token add` writes these
 //! id = "q3Xr9a_T"                   # the token's first characters after `jb_`, to revoke it by
 //! sha256 = "5f2c..."                # the token's SHA-256, hex: the token itself isn't kept
 //! ```

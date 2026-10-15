@@ -1434,7 +1434,7 @@ pub(crate) mod tests {
         Initiator::new(addr, config, storage, app).unwrap()
     }
 
-    /// Jetbridge serving clients with `gateway`, and a client logged on to it.
+    /// Turbojet Hub serving clients with `gateway`, and a client logged on to it.
     async fn client(gateway: &Arc<Gateway>) -> (Initiator, UnboundedReceiver<Event>) {
         let addr = serve("JETBRIDGE", Arc::new(ClientApp(gateway.clone()))).await;
         let (app, mut events) = peer();

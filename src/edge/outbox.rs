@@ -473,7 +473,7 @@ mod tests {
         }
     }
 
-    /// Jetbridge's side: tells the outbox of each logon.
+    /// Turbojet Hub's side: tells the outbox of each logon.
     struct Gateway {
         outbox: Arc<Outbox>,
         hold: Hold,
@@ -529,7 +529,7 @@ mod tests {
         Message::new(MsgType::ExecutionReport).with(tags::TEXT, text.to_string())
     }
 
-    /// Jetbridge's acceptor, serving on loopback, with an outbox holding `limit` per client.
+    /// Turbojet Hub's acceptor, serving on loopback, with an outbox holding `limit` per client.
     async fn gateway(limit: usize) -> (Arc<Outbox>, Arc<Gateway>, Acceptor, String) {
         let outbox = Arc::new(Outbox::with_limit(limit));
         let app = Arc::new(Gateway { outbox: outbox.clone(), hold: Hold::default() });
@@ -589,7 +589,7 @@ mod tests {
         numbered(n).into_iter().map(Event::Report).collect()
     }
 
-    /// Holds up Jetbridge's session with the client, by having the client send a message that
+    /// Holds up Turbojet Hub's session with the client, by having the client send a message that
     /// waits in `on_message` until the returned sender is dropped or sent to.
     async fn hold(app: &Gateway, initiator: &Initiator) -> std::sync::mpsc::Sender<()> {
         let release = app.hold.arm();
@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(next(&mut events).await, Event::LoggedOn);
         until(|| lock(&outbox.clients).get(&client()).is_some_and(|c| lock(&c.shared.session).is_some())).await;
 
-        // The client, held up, doesn't answer Jetbridge's Logout, so the session stays logging
+        // The client, held up, doesn't answer Turbojet Hub's Logout, so the session stays logging
         // out: it takes the report sent straight away, and its receipt says LoggingOut.
         let release = recorder.hold.arm();
         acceptor.session(CLIENT).send(report("before")).unwrap();
@@ -726,8 +726,8 @@ mod tests {
         until(|| outbox.held(&client()) == 0).await;
     }
 
-    /// Cuts the client's held-up connection, releases Jetbridge's session, and reconnects once
-    /// Jetbridge has noticed (it refuses a Logon until then). The client sees nothing in between.
+    /// Cuts the client's held-up connection, releases Turbojet Hub's session, and reconnects once
+    /// Turbojet Hub has noticed (it refuses a Logon until then). The client sees nothing in between.
     async fn cut_and_reconnect(
         connection: tokio::task::JoinHandle<std::io::Result<()>>,
         release: std::sync::mpsc::Sender<()>,

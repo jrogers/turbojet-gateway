@@ -1,26 +1,26 @@
-//! The Jetbridge binary; the gateway itself is the `jetbridge` library.
+//! The Turbojet Hub binary; the gateway itself is the `turbojet_hub` library.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use jetbridge::auth::{Role, Users};
-use jetbridge::service::Service;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use turbojet_hub::auth::{Role, Users};
+use turbojet_hub::service::Service;
 
 const USAGE: &str = "\
-usage: jetbridge --config FILE
-       jetbridge user add NAME --role viewer|operator|admin [--clients A,B] --users FILE
-       jetbridge user passwd NAME --users FILE
-       jetbridge user remove NAME --users FILE
-       jetbridge token add NAME --users FILE
-       jetbridge token revoke NAME PREFIX --users FILE
+usage: turbojet-hub --config FILE
+       turbojet-hub user add NAME --role viewer|operator|admin [--clients A,B] --users FILE
+       turbojet-hub user passwd NAME --users FILE
+       turbojet-hub user remove NAME --users FILE
+       turbojet-hub token add NAME --users FILE
+       turbojet-hub token revoke NAME PREFIX --users FILE
 
 A FIX gateway: clients log on to its acceptor, and it routes their orders to venues.
 
-  --config FILE   jetbridge.toml: the sessions file, the routes and the risk limits
+  --config FILE   turbojet-hub.toml: the sessions file, the routes and the risk limits
   --help          print this
 
 On Unix, SIGHUP reloads the files; a file that doesn't load keeps the one in use. Ctrl-C or
@@ -187,7 +187,7 @@ fn edit_users(path: &Path, change: Change) -> Result<(), String> {
             println!("{token}");
             eprintln!(
                 "added a token for {name}, id {}: keep it, it isn't shown again",
-                jetbridge::auth::token_id(&token)
+                turbojet_hub::auth::token_id(&token)
             );
         }
         Change::RevokeToken { name, prefix } => {
@@ -208,7 +208,7 @@ fn new_password(name: &str) -> Result<String, String> {
     if read_password("again: ")? != password {
         return Err("the passwords differ".to_string());
     }
-    jetbridge::auth::check_new_password(&password)?;
+    turbojet_hub::auth::check_new_password(&password)?;
     Ok(password)
 }
 

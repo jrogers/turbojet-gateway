@@ -1,10 +1,10 @@
 # Changelog
 
-Notable changes to Jetbridge.
+Notable changes to Turbojet Hub.
 
 ## Unreleased
 
-- A FIX gateway, `jetbridge --config jetbridge.toml`: clients log on to a Turbojet acceptor,
+- A FIX gateway, `turbojet-hub --config turbojet-hub.toml`: clients log on to a Turbojet acceptor,
   the gateway logs on to each venue with a Turbojet initiator, both set up by a
   `turbojet-config` sessions file, and orders are routed between them. FIX 4.2 and 4.4 on either
   side, across versions.
@@ -19,17 +19,17 @@ Notable changes to Jetbridge.
   answered with the order's state), one replace pending at a time, stale and resent venue reports
   dropped rather than rolling an order back, overfills refused, and the venue's reject reasons
   passed through in the client's version.
-- Routing rules in `jetbridge.toml`, `[[route]]`s matching on client, ExDestination and Symbol,
+- Routing rules in `turbojet-hub.toml`, `[[route]]`s matching on client, ExDestination and Symbol,
   first match wins, to a venue or rejected with a text.
 - A client is a session: sessions of one CompID with different SubIDs or LocationIDs each keep
   their own ClOrdIDs, reports and risk counts, up to 16 per CompID. Routes and limits match the
   CompID.
-- Risk limits in `jetbridge.toml`, `[risk.defaults]` and `[risk.client.COMPID]`: maximum order
+- Risk limits in `turbojet-hub.toml`, `[risk.defaults]` and `[risk.client.COMPID]`: maximum order
   quantity and notional, allowed symbols, a price band around the symbol's last fill, credit (open
   plus filled today) and self-trade prevention, checked per session on each order and
   replace after routing. A replace that adds no risk passes. Refused orders get OrdRejReason 3
   for quantity, notional and credit, and a Text naming the limit.
-- A trading day per client session, ending at `day_end` in `jetbridge.toml` (a time and time
+- A trading day per client session, ending at `day_end` in `turbojet-hub.toml` (a time and time
   zone; midnight UTC by default) or when its schedule's period ends, whichever comes first. When
   it ends, the session's done orders and their ClOrdIDs are dropped, its ClOrdID count and filled
   notional start again, and its live orders carry over. A possible resend of an order first sent
@@ -41,7 +41,7 @@ Notable changes to Jetbridge.
 - A client's order, cancel or replace stays in flight on its session (Turbojet's
   `Context::hold`) until the venue's session has stored what it was forwarded as, so a client
   connection lost before then resends it rather than losing it.
-- An optional database, `[database] url = "sqlite://...?mode=rwc"` in `jetbridge.toml` (SQLite;
+- An optional database, `[database] url = "sqlite://...?mode=rwc"` in `turbojet-hub.toml` (SQLite;
   a missing file is an error unless the URL asks for it to be created; read at start only). The
   book's orders, ClOrdIDs and requests sent, operators' blocks, risk counts and the reports not
   yet delivered are committed in the background, without delaying orders or reports, and
@@ -80,13 +80,13 @@ Notable changes to Jetbridge.
 - SIGHUP reloads the sessions file, the routes, the risk limits and `day_end`, keeping either file if it
   doesn't load; Ctrl-C or SIGTERM logs every session out and says what the stop leaves open.
   Optional TLS (feature `tls`).
-- An operator API, with `[api]` in `jetbridge.toml`: HTTP and JSON on its own port, on loopback
+- An operator API, with `[api]` in `turbojet-hub.toml`: HTTP and JSON on its own port, on loopback
   unless it has TLS (feature `tls`) or `behind_proxy = true`. Viewers read the sessions, the
   book's orders (working ones and each client's current day), risk usage and the routes;
   operators pause, resume and resend sessions, cancel an order and use the kill switch; admins
   reload and read the audit log. `GET /api/live` is a websocket sending a snapshot, then the
   orders, blocks, alarms and session events as they happen.
-- Users in a `users` file, edited with `jetbridge user add|passwd|remove` and `jetbridge token
+- Users in a `users` file, edited with `turbojet-hub user add|passwd|remove` and `turbojet-hub token
   add|revoke`: argon2 passwords for a browser session with a CSRF token, or bearer tokens kept
   hashed, in three roles, optionally limited to some CompIDs. Failed logins are limited per name
   and per address.
@@ -96,11 +96,11 @@ Notable changes to Jetbridge.
   sequence numbers; asking a venue where an order stands (`POST /api/orders/{order_id}/status`),
   with an `unknown_at_venue` alarm when it doesn't know a live order; the risk limits as
   configured (`GET /api/risk/limits`, amounts as decimal strings), and editing them, which
-  rewrites `jetbridge.toml`'s table in place and reloads. The order detail has the venue's
+  rewrites `turbojet-hub.toml`'s table in place and reloads. The order detail has the venue's
   OrderID.
 - A venue's ExecutionReport saying it doesn't know an order (Status, Rejected, OrdRejReason 5) no
   longer rejects the order: it raises the `unknown_at_venue` alarm, and the order stays live.
-- A message log, with `[message_log]` in `jetbridge.toml`: every message both sides' sessions
+- A message log, with `[message_log]` in `turbojet-hub.toml`: every message both sides' sessions
   receive and send, in files by UTC day, passwords masked, with size, retention and gzip
   compression (feature `gzip`). `GET /api/messages` searches it by session, direction, MsgType,
   tags and time, and `GET /api/orders/{order_id}/messages` finds an order's messages on both

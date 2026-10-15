@@ -1,6 +1,6 @@
-# Working on Jetbridge
+# Working on Turbojet Hub
 
-Jetbridge is a FIX connectivity gateway built on the Turbojet engine, from crates.io.
+Turbojet Hub is a FIX connectivity gateway built on the Turbojet engine, from crates.io.
 
 - House style is Turbojet's [STYLE.md](https://github.com/jrogers/turbojet/blob/main/docs/STYLE.md)
   (`../turbojet/docs/STYLE.md` in a checkout); read it before writing code.
@@ -11,7 +11,7 @@ Jetbridge is a FIX connectivity gateway built on the Turbojet engine, from crate
   build)` first.
 - Before committing: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`, and
   in `web/`, `npm run lint && npm test -- --run`.
-- With a PostgreSQL to hand, also `JETBRIDGE_POSTGRES_URL=… cargo test --features postgres
+- With a PostgreSQL to hand, also `TURBOJET_HUB_POSTGRES_URL=… cargo test --features postgres
   store::`: see `src/store/tests.rs`'s `postgres()`.
 - Engine work builds against a Turbojet checkout at `../turbojet` through a local, untracked
   `.cargo/config.toml` (gitignored):
@@ -25,5 +25,5 @@ Jetbridge is a FIX connectivity gateway built on the Turbojet engine, from crate
   It rewrites `Cargo.lock`'s Turbojet entries to the path; don't commit those. In the main
   checkout it applies to the worktrees under `.worktrees/` too. The checkout's version must match
   `0.3`, or cargo ignores the patch with only a warning.
-- Engine bugs found here are fixed in the Turbojet repo, in their own commits; Jetbridge takes the
+- Engine bugs found here are fixed in the Turbojet repo, in their own commits; Turbojet Hub takes the
   fix from the next release, or meanwhile through the local patch.

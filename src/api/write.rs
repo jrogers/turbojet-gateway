@@ -480,7 +480,7 @@ const WRITTEN: &str = "the edit is written, but the reload";
 const REFUSED: &str = "the edit is refused:";
 
 /// `PATCH /api/risk/limits/defaults {reason, set: {key: value | null}}` [unscoped admin]: sets
-/// the defaults' keys, removing those set to `null`, in `jetbridge.toml`, and reloads; see
+/// the defaults' keys, removing those set to `null`, in `turbojet-hub.toml`, and reloads; see
 /// [`Service::edit_limits`]. The keys and their values are the file's: an amount is a JSON number
 /// or a decimal as a string (which keeps every digit), `symbols` an array of strings,
 /// `self_trade` a boolean; 400 for another key or type. 422 with why if the file wouldn't load
@@ -521,7 +521,7 @@ pub(super) async fn set_client_limits(
 }
 
 /// `DELETE /api/risk/limits/client/{comp_id} {reason}` [admin of the CompID]: removes the
-/// CompID's table from `jetbridge.toml`, so its sessions get the defaults, and reloads, as
+/// CompID's table from `turbojet-hub.toml`, so its sessions get the defaults, and reloads, as
 /// [`set_default_limits`] does; 404 if it has none. A PATCH removing every key leaves the table, empty: the client gets
 /// the defaults but still has a table, until this removes it.
 pub(super) async fn delete_client_limits(
@@ -855,7 +855,7 @@ mod tests {
 
         /// The configuration file's text.
         fn config(&self) -> String {
-            std::fs::read_to_string(self.dirs.0.path().join("jetbridge.toml")).unwrap()
+            std::fs::read_to_string(self.dirs.0.path().join("turbojet-hub.toml")).unwrap()
         }
 
         /// `POST path` with `body` as the operator, which must answer `status`: its body.
@@ -1308,7 +1308,7 @@ mod tests {
 
         std::fs::write(dir.join("sessions.toml"), &sessions).unwrap();
         let config = fixture.config().replace("venue = \"NASDAQ\"", "venue = \"FUNDC\"");
-        std::fs::write(dir.join("jetbridge.toml"), config).unwrap();
+        std::fs::write(dir.join("turbojet-hub.toml"), config).unwrap();
         let answer = fixture.send("PATCH", &fixture.scoped_admin, fundb, credit).await;
         assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", answer.body);
         assert!(!answer.body.to_string().contains("FUNDC"), "{}", answer.body);
@@ -1334,7 +1334,7 @@ mod tests {
 
         std::fs::write(dir.join("sessions.toml"), format!("{sessions}[counterparty.FUNDC]\n")).unwrap();
         let config = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NOWHERE\"\n";
-        std::fs::write(dir.join("jetbridge.toml"), config).unwrap();
+        std::fs::write(dir.join("turbojet-hub.toml"), config).unwrap();
         let answer = fixture.post(&fixture.admin, "/api/reload", REASON).await;
         assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", answer.body);
         let error = answer.body["error"].as_str().unwrap();
@@ -1353,8 +1353,8 @@ mod tests {
     #[tokio::test]
     async fn limits_are_set_changed_removed_and_deleted() {
         let fixture = fixture().await;
-        let top = "# Jetbridge\nsessions = \"sessions.toml\"  # beside this file\n\n[[route]]\nvenue = \"NASDAQ\"\n";
-        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), top).unwrap();
+        let top = "# Turbojet Hub\nsessions = \"sessions.toml\"  # beside this file\n\n[[route]]\nvenue = \"NASDAQ\"\n";
+        std::fs::write(fixture.dirs.0.path().join("turbojet-hub.toml"), top).unwrap();
         let set = |set: &str| format!(r#"{{"reason":"testing","set":{set}}}"#);
         let funda = || fixture.service.gateway().limits().limits("FUNDA").clone();
 
@@ -1425,13 +1425,13 @@ mod tests {
     #[tokio::test]
     async fn a_file_broken_by_hand_refuses_every_edit() {
         let fixture = fixture().await;
-        let path = fixture.dirs.0.path().join("jetbridge.toml");
+        let path = fixture.dirs.0.path().join("turbojet-hub.toml");
         let good = format!("{}[risk.client.FUNDA]\ncredit = 1\n", fixture.config());
         let credit = r#"{"reason":"r","set":{"credit":5}}"#;
         for broken in [format!("{good}[[route]\n"), format!("{good}[[route]]\nvenue = \"NOWHERE\"\n")] {
             std::fs::write(&path, &broken).unwrap();
             let body = fixture.admin("PATCH", DEFAULTS, credit, StatusCode::UNPROCESSABLE_ENTITY).await;
-            assert!(body["error"].as_str().unwrap().contains("jetbridge.toml: "), "{body}");
+            assert!(body["error"].as_str().unwrap().contains("turbojet-hub.toml: "), "{body}");
             fixture.admin("DELETE", CLIENT_FUNDA, REASON, StatusCode::UNPROCESSABLE_ENTITY).await;
             assert_eq!(fixture.config(), broken);
         }

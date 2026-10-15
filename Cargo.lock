@@ -959,40 +959,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jetbridge"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "axum",
- "base64ct",
- "chrono",
- "compact_str",
- "futures-util",
- "getrandom 0.3.4",
- "rcgen",
- "rpassword",
- "rust_decimal",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "toml",
- "toml_edit",
- "tower",
- "tracing",
- "tracing-subscriber",
- "turbojet",
- "turbojet-config",
- "turbojet-fix42",
- "turbojet-fix44",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2524,6 +2490,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a00bb3a02b0dd8fc4b590f28cc59b9e37cf9d7384734693dce5041df0cd0ac8"
 dependencies = [
  "turbojet",
+]
+
+[[package]]
+name = "turbojet-hub"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "base64ct",
+ "chrono",
+ "compact_str",
+ "futures-util",
+ "getrandom 0.3.4",
+ "rcgen",
+ "rpassword",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "toml",
+ "toml_edit",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "turbojet",
+ "turbojet-config",
+ "turbojet-fix42",
+ "turbojet-fix44",
 ]
 
 [[package]]

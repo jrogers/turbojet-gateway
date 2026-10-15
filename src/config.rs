@@ -1,4 +1,4 @@
-//! The gateway's configuration file, `jetbridge.toml`: where its sessions file is, and its routes.
+//! The gateway's configuration file, `turbojet-hub.toml`: where its sessions file is, and its routes.
 //!
 //! ```toml
 //! sessions = "sessions.toml"      # relative to this file
@@ -25,7 +25,7 @@
 //! max_notional = "250000.50"
 //!
 //! [database]                      # optional: without it, the book is kept in memory only
-//! url = "sqlite://jetbridge.db?mode=rwc"  # `mode=rwc` creates the file; or "postgres://..."
+//! url = "sqlite://turbojet-hub.db?mode=rwc"  # `mode=rwc` creates the file; or "postgres://..."
 //! retention = "400d"              # optional: delete done orders older; a number and s, m, h or d
 //!
 //! [api]                           # optional: the operator API, an HTTP JSON server
@@ -680,9 +680,9 @@ connect = ["127.0.0.1:1"]
         dir
     }
 
-    fn load_error(jetbridge: &str) -> String {
-        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
-        load(&dir.path().join("jetbridge.toml")).unwrap_err().to_string()
+    fn load_error(hub: &str) -> String {
+        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
+        load(&dir.path().join("turbojet-hub.toml")).unwrap_err().to_string()
     }
 
     fn venue_rule(client: Option<&str>, venue: &str) -> Rule {
@@ -691,7 +691,7 @@ connect = ["127.0.0.1:1"]
 
     #[test]
     fn loads_routes_in_order_and_the_clients_version() {
-        let jetbridge = r#"
+        let hub = r#"
 sessions = "sessions.toml"
 [[route]]
 client = "FUNDA"
@@ -701,8 +701,8 @@ venue = "NASDAQ"
 [[route]]
 reject = "no route"
 "#;
-        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.path().join("jetbridge.toml")).unwrap();
+        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("turbojet-hub.toml")).unwrap();
         let expected = Router::new(vec![
             Rule {
                 client: Some("FUNDA".into()),
@@ -725,9 +725,9 @@ reject = "no route"
     #[test]
     fn the_database_url_is_optional_and_its_table_takes_no_other_key() {
         let sessions = format!("{SESSIONS}store = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n");
-        let load_database = |jetbridge: &str| {
-            let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", &sessions)]);
-            load(&dir.path().join("jetbridge.toml")).unwrap().database
+        let load_database = |hub: &str| {
+            let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", &sessions)]);
+            load(&dir.path().join("turbojet-hub.toml")).unwrap().database
         };
         assert_eq!(load_database("sessions = \"sessions.toml\""), None);
         let with = "sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"";
@@ -740,11 +740,10 @@ reject = "no route"
     #[test]
     fn the_database_password_stays_out_of_debug() {
         let sessions = format!("{SESSIONS}store = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n");
-        let jetbridge =
-            "sessions = \"sessions.toml\"\n[database]\nurl = \"postgres://jet:s3cret@db/j?password=s3cret\"";
-        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", &sessions)]);
-        let loaded = format!("{:?}", load(&dir.path().join("jetbridge.toml")).unwrap());
-        let reread = format!("{:?}", reread(Path::new("jetbridge.toml"), jetbridge, &[], false).unwrap());
+        let hub = "sessions = \"sessions.toml\"\n[database]\nurl = \"postgres://jet:s3cret@db/j?password=s3cret\"";
+        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", &sessions)]);
+        let loaded = format!("{:?}", load(&dir.path().join("turbojet-hub.toml")).unwrap());
+        let reread = format!("{:?}", reread(Path::new("turbojet-hub.toml"), hub, &[], false).unwrap());
         for debug in [loaded, reread] {
             assert!(!debug.contains("s3cret"), "{debug}");
             assert!(debug.contains("db/j"), "{debug}");
@@ -755,11 +754,11 @@ reject = "no route"
     /// and reload.
     #[test]
     fn the_database_retention_is_optional_and_at_least_a_day() {
-        let jetbridge =
+        let hub =
             |more: &str| format!("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"\n{more}");
         let retention = |more: &str| {
-            let dir = dir(&[("jetbridge.toml", &jetbridge(more)), ("sessions.toml", SESSIONS)]);
-            load(&dir.path().join("jetbridge.toml")).map(|loaded| loaded.retention).map_err(|e| e.to_string())
+            let dir = dir(&[("turbojet-hub.toml", &hub(more)), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("turbojet-hub.toml")).map(|loaded| loaded.retention).map_err(|e| e.to_string())
         };
         assert_eq!(retention(""), Ok(None));
         assert_eq!(retention("retention = \"400d\""), Ok(Some(Duration::from_secs(400 * 86_400))));
@@ -773,8 +772,8 @@ reject = "no route"
             let error_text = retention(more).unwrap_err();
             assert!(error_text.contains(error), "{more}: {error_text}");
         }
-        let path = Path::new("jetbridge.toml");
-        let reread = |more: &str| reread(path, &jetbridge(more), &[], false).map(|reread| reread.retention);
+        let path = Path::new("turbojet-hub.toml");
+        let reread = |more: &str| reread(path, &hub(more), &[], false).map(|reread| reread.retention);
         assert_eq!(reread("retention = \"2d\"").unwrap(), Some(Duration::from_secs(2 * 86_400)));
         let error = reread("retention = \"1h\"").unwrap_err().to_string();
         assert!(error.contains("[database] retention \"1h\": at least 1d"), "{error}");
@@ -784,17 +783,17 @@ reject = "no route"
     /// and no other key is taken. Loading opens the log, creating its directory.
     #[test]
     fn the_message_log_section_resolves_its_dir_and_takes_no_other_key() {
-        let jetbridge = "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log/fix\"\n";
-        let files = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
-        let log = load(&files.path().join("jetbridge.toml")).unwrap().message_log.unwrap();
+        let hub = "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log/fix\"\n";
+        let files = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
+        let log = load(&files.path().join("turbojet-hub.toml")).unwrap().message_log.unwrap();
         let expected =
             MessageLog { dir: files.path().join("log/fix"), file_bytes_max: None, retention: None, compress: false };
         assert_eq!(log, expected);
         assert!(files.path().join("log/fix").is_dir());
 
         let with = |more: &str| {
-            let dir = dir(&[("jetbridge.toml", format!("{jetbridge}{more}").as_str()), ("sessions.toml", SESSIONS)]);
-            load(&dir.path().join("jetbridge.toml"))
+            let dir = dir(&[("turbojet-hub.toml", format!("{hub}{more}").as_str()), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("turbojet-hub.toml"))
                 .map(|loaded| loaded.message_log.unwrap())
                 .map_err(|e| e.to_string())
         };
@@ -815,8 +814,8 @@ reject = "no route"
             assert!(error_text.contains(error), "{more}: {error_text}");
         }
         assert!(load_error("sessions = \"sessions.toml\"\n[message_log]\n").contains("missing field `dir`"));
-        let blocked = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS), ("log", "a file")]);
-        let error = load(&blocked.path().join("jetbridge.toml")).unwrap_err().to_string();
+        let blocked = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS), ("log", "a file")]);
+        let error = load(&blocked.path().join("turbojet-hub.toml")).unwrap_err().to_string();
         assert!(error.contains("[message_log] cannot open "), "{error}");
         let compressed = with("compress = true");
         if cfg!(feature = "gzip") {
@@ -843,8 +842,8 @@ reject = "no route"
     #[test]
     fn the_acceptor_must_speak_a_version_the_gateway_converts() {
         let sessions = SESSIONS.replace("FIX.4.4", "FIX.4.3");
-        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);
-        let error = load(&dir.path().join("jetbridge.toml")).unwrap_err().to_string();
+        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);
+        let error = load(&dir.path().join("turbojet-hub.toml")).unwrap_err().to_string();
         assert!(error.contains("\"FIX.4.3\" is not supported"), "{error}");
     }
 
@@ -852,24 +851,24 @@ reject = "no route"
     fn the_sessions_file_needs_an_acceptor() {
         let sessions = "[initiator.NASDAQ]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
                         target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]";
-        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", sessions)]);
-        let error = load(&dir.path().join("jetbridge.toml")).unwrap_err().to_string();
+        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", sessions)]);
+        let error = load(&dir.path().join("turbojet-hub.toml")).unwrap_err().to_string();
         assert!(error.contains("no [acceptor]"), "{error}");
     }
 
     /// The sessions path is relative to the configuration file, not the working directory.
     #[test]
     fn the_sessions_path_is_relative_to_the_file() {
-        let jetbridge = "sessions = \"fix/sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"";
-        let dir = dir(&[("conf/jetbridge.toml", jetbridge), ("conf/fix/sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.path().join("conf/jetbridge.toml")).unwrap();
+        let hub = "sessions = \"fix/sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"";
+        let dir = dir(&[("conf/turbojet-hub.toml", hub), ("conf/fix/sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("conf/turbojet-hub.toml")).unwrap();
         assert_eq!(loaded.router, Router::new(vec![venue_rule(None, "NASDAQ")]));
     }
 
     #[test]
     fn reloading_replaces_the_routes() {
-        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
-        let path = dir.path().join("jetbridge.toml");
+        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let path = dir.path().join("turbojet-hub.toml");
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.router, Router::new(Vec::new()));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"")
@@ -882,9 +881,11 @@ reject = "no route"
     }
 
     fn limits(risk: &str) -> Result<risk::Config, String> {
-        let dir =
-            dir(&[("jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{risk}")), ("sessions.toml", SESSIONS)]);
-        load(&dir.path().join("jetbridge.toml")).map(|loaded| loaded.limits).map_err(|e| e.to_string())
+        let dir = dir(&[
+            ("turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n{risk}")),
+            ("sessions.toml", SESSIONS),
+        ]);
+        load(&dir.path().join("turbojet-hub.toml")).map(|loaded| loaded.limits).map_err(|e| e.to_string())
     }
 
     fn decimal(text: &str) -> Decimal {
@@ -954,8 +955,8 @@ self_trade = false
     /// A reload returns the new limits with the routes; one that fails returns neither.
     #[test]
     fn reloading_replaces_the_limits_with_the_routes() {
-        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
-        let path = dir.path().join("jetbridge.toml");
+        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let path = dir.path().join("turbojet-hub.toml");
         let venues = load(&path).unwrap().sessions.initiator_names();
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = 5").unwrap();
         let limits = reload(&path, &venues).unwrap().limits;
@@ -993,8 +994,8 @@ self_trade = false
 
     #[test]
     fn day_end_is_midnight_utc_unless_set_and_a_bad_one_is_an_error() {
-        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.path().join("jetbridge.toml")).unwrap();
+        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("turbojet-hub.toml")).unwrap();
         assert_eq!(day_ends(&loaded.day_end, "2026-10-10T12:00:00Z"), "2026-10-11T00:00:00+00:00");
         for (day_end, error) in [
             ("", "empty"),
@@ -1009,8 +1010,8 @@ self_trade = false
 
     #[test]
     fn reloading_reads_day_end() {
-        let dir = dir(&[("jetbridge.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
-        let reloaded = reload(&dir.path().join("jetbridge.toml"), &[]).unwrap().day_end;
+        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
+        let reloaded = reload(&dir.path().join("turbojet-hub.toml"), &[]).unwrap().day_end;
         assert_eq!(reloaded, day_end("17:00").unwrap());
     }
 
@@ -1018,23 +1019,23 @@ self_trade = false
     /// unknown keys are errors.
     #[test]
     fn the_api_section_resolves_its_paths_and_takes_no_other_key() {
-        let jetbridge = "sessions = \"sessions.toml\"\n[api]\nlisten = \"127.0.0.1:8080\"\n\
+        let hub = "sessions = \"sessions.toml\"\n[api]\nlisten = \"127.0.0.1:8080\"\n\
                          users = \"users.toml\"\naudit_dir = \"log/audit\"\n";
-        let dir = dir(&[("jetbridge.toml", jetbridge), ("sessions.toml", SESSIONS)]);
-        let api = load(&dir.path().join("jetbridge.toml")).unwrap().api.unwrap();
+        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
+        let api = load(&dir.path().join("turbojet-hub.toml")).unwrap().api.unwrap();
         assert_eq!(api.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(api.users, dir.path().join("users.toml"));
         assert_eq!(api.audit_dir, dir.path().join("log/audit"));
         assert_eq!((api.tls, api.behind_proxy, api.audit_retention), (None, false, None));
-        let kept = format!("{jetbridge}audit_retention = \"400d\"\n");
-        let files = self::dir(&[("jetbridge.toml", kept.as_str()), ("sessions.toml", SESSIONS)]);
-        let api = load(&files.path().join("jetbridge.toml")).unwrap().api.unwrap();
+        let kept = format!("{hub}audit_retention = \"400d\"\n");
+        let files = self::dir(&[("turbojet-hub.toml", kept.as_str()), ("sessions.toml", SESSIONS)]);
+        let api = load(&files.path().join("turbojet-hub.toml")).unwrap().api.unwrap();
         assert_eq!(api.audit_retention, Some(Duration::from_secs(400 * 86_400)));
-        assert!(load_error(&format!("{jetbridge}audit_retention = \"0d\"")).contains("retention must be positive"));
-        assert!(load_error(&format!("{jetbridge}port = 1")).contains("unknown field `port`"));
+        assert!(load_error(&format!("{hub}audit_retention = \"0d\"")).contains("retention must be positive"));
+        assert!(load_error(&format!("{hub}port = 1")).contains("unknown field `port`"));
         // The single file the audit log was before its daily files: refused, not ignored.
-        assert!(load_error(&format!("{jetbridge}audit = \"audit.jsonl\"")).contains("unknown field `audit`"));
-        let without_listen = jetbridge.replace("listen = \"127.0.0.1:8080\"\n", "");
+        assert!(load_error(&format!("{hub}audit = \"audit.jsonl\"")).contains("unknown field `audit`"));
+        let without_listen = hub.replace("listen = \"127.0.0.1:8080\"\n", "");
         assert!(load_error(&without_listen).contains("missing field `listen`"));
     }
 
@@ -1042,11 +1043,13 @@ self_trade = false
     #[test]
     fn the_api_listens_off_loopback_only_with_tls_or_behind_a_proxy() {
         let api = |listen: &str, more: &str| {
-            let jetbridge = format!(
+            let hub = format!(
                 "sessions = \"sessions.toml\"\n[api]\nlisten = \"{listen}\"\nusers = \"u\"\naudit_dir = \"a\"\n{more}"
             );
-            let dir = dir(&[("jetbridge.toml", &jetbridge), ("sessions.toml", SESSIONS)]);
-            load(&dir.path().join("jetbridge.toml")).map(|loaded| loaded.api.unwrap().listen).map_err(|e| e.to_string())
+            let dir = dir(&[("turbojet-hub.toml", &hub), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("turbojet-hub.toml"))
+                .map(|loaded| loaded.api.unwrap().listen)
+                .map_err(|e| e.to_string())
         };
         assert!(api("127.0.0.1:8080", "").is_ok());
         assert!(api("[::1]:8080", "").is_ok());
@@ -1066,7 +1069,7 @@ self_trade = false
     /// The example files the readme shows load.
     #[test]
     fn the_examples_load() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/jetbridge.toml");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/turbojet-hub.toml");
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.version, Version::Fix44);
         assert_eq!(loaded.sessions.initiator_names(), ["NASDAQ"]);

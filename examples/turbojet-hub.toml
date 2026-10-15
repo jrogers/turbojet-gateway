@@ -1,4 +1,4 @@
-# Jetbridge: the sessions file, how orders are routed and the clients' risk limits. First match
+# Turbojet Hub: the sessions file, how orders are routed and the clients' risk limits. First match
 # wins; an order no route matches is rejected.
 sessions = "sessions.toml"
 day_end = "17:00 America/New_York"  # when client sessions' trading days end

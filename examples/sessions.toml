@@ -8,7 +8,7 @@ listen = "127.0.0.1:9876"
 
 [counterparty.FUNDA]
 
-# Jetbridge logs on to NASDAQ as JETBRIDGE.
+# Turbojet Hub logs on to NASDAQ as JETBRIDGE.
 [initiator.NASDAQ]
 target_comp_id = "NASDAQ"
 connect = ["127.0.0.1:9877"]

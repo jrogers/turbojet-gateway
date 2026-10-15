@@ -545,7 +545,7 @@ pub(super) mod tests {
         fixture_with("").await
     }
 
-    /// [`fixture`] with `extra` at the end of its `jetbridge.toml`.
+    /// [`fixture`] with `extra` at the end of its `turbojet-hub.toml`.
     pub(in crate::api) async fn fixture_with(extra: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         // Durable, as `[database]` needs.
@@ -555,8 +555,8 @@ pub(super) mod tests {
                         target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]\nstore = \"disk\"\n";
         std::fs::write(dir.path().join("sessions.toml"), sessions).unwrap();
         let config = format!("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n{extra}");
-        std::fs::write(dir.path().join("jetbridge.toml"), config).unwrap();
-        let (service, _serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        std::fs::write(dir.path().join("turbojet-hub.toml"), config).unwrap();
+        let (service, _serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
 
         let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", "FUNDA"), "JETBRIDGE");
         config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
@@ -905,7 +905,7 @@ pub(super) mod tests {
         let config = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n\
                       [risk.defaults]\nmax_order_qty = 1000\nprice_band = 5.5\nsymbols = [\"AAPL\"]\n\
                       [risk.client.FUNDA]\nmax_notional = \"250000.50\"\nself_trade = true\n";
-        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), config).unwrap();
+        std::fs::write(fixture.dirs.0.path().join("turbojet-hub.toml"), config).unwrap();
         let service = fixture.service.clone();
         let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
         assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);
@@ -925,7 +925,7 @@ pub(super) mod tests {
         let config = "sessions = \"sessions.toml\"\n[[route]]\nsymbol = \"MSFT\"\nreject = \"not MSFT\"\n\
                       [[route]]\nex_destination = \"XNAS\"\nvenue = \"NASDAQ\"\n\
                       [[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"\n";
-        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), config).unwrap();
+        std::fs::write(fixture.dirs.0.path().join("turbojet-hub.toml"), config).unwrap();
         let service = fixture.service.clone();
         let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
         assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);
@@ -1065,7 +1065,7 @@ pub(super) mod tests {
         let config = "sessions = \"sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"\n\
                       [risk.defaults]\nmax_order_qty = 1000\n\
                       [risk.client.FUNDA]\nmax_notional = 1\n[risk.client.FUNDB]\nmax_notional = 2\n";
-        std::fs::write(fixture.dirs.0.path().join("jetbridge.toml"), config).unwrap();
+        std::fs::write(fixture.dirs.0.path().join("turbojet-hub.toml"), config).unwrap();
         let service = fixture.service.clone();
         let reloaded = tokio::task::spawn_blocking(move || service.reload()).await.unwrap().unwrap();
         assert!(reloaded.config.is_ok(), "{:?}", reloaded.config);

@@ -1,4 +1,4 @@
-//! The operator API: an HTTP JSON server in the gateway's process, started when `jetbridge.toml`
+//! The operator API: an HTTP JSON server in the gateway's process, started when `turbojet-hub.toml`
 //! has `[api]` (see [`Api`]).
 //!
 //! Every answer is JSON, errors included: [`ApiError`] is `{"error": "..."}` with its status.
@@ -169,7 +169,7 @@ struct Health {
     version: &'static str,
 }
 
-/// `GET /api/health`, without authentication: the server is up, and which Jetbridge it is.
+/// `GET /api/health`, without authentication: the server is up, and which Turbojet Hub it is.
 async fn health() -> Json<Health> {
     Json(Health { version: env!("CARGO_PKG_VERSION") })
 }

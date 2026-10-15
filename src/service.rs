@@ -111,7 +111,7 @@ pub struct Service {
     /// The limits in force, as the file writes them: set with the gateway's.
     risk: Mutex<RiskTables>,
     /// Held for the whole of a reload: SIGHUP and the API can each start one, and only the
-    /// sessions file's half locks itself, so an older jetbridge.toml could land over a newer one.
+    /// sessions file's half locks itself, so an older turbojet-hub.toml could land over a newer one.
     reloading: Mutex<()>,
     /// Set as shutdown starts: a reload that hasn't begun doesn't, as it would start initiators
     /// being stopped.
@@ -725,13 +725,13 @@ mod tests {
             .replace("127.0.0.1:9876", "127.0.0.1:0")
             .replace("127.0.0.1:9877", "127.0.0.1:1");
         write(&dir, "sessions.toml", &sessions);
-        let jetbridge = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/jetbridge.toml"))
+        let hub = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/turbojet-hub.toml"))
             .unwrap()
             .replace("127.0.0.1:8080", "127.0.0.1:0");
-        write(&dir, "jetbridge.toml", &jetbridge);
+        write(&dir, "turbojet-hub.toml", &hub);
         let users = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/users.toml")).unwrap();
         write(&dir, "users.toml", &users);
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         assert_ne!(service.local_addr().port(), 0);
         assert!(tokio::net::TcpStream::connect(service.local_addr()).await.is_ok());
         assert!(service.api_addr().is_some());
@@ -748,8 +748,8 @@ mod tests {
     async fn the_users_file_loads_at_start_and_reload() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
-        let path = dir.path().join("jetbridge.toml");
+        write(&dir, "turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
+        let path = dir.path().join("turbojet-hub.toml");
         let e = Service::start(&path).await.unwrap_err();
         assert!(e.to_string().contains("cannot read"), "{e}");
         write(&dir, "users.toml", "[user.a]\nrole = \"viewer\"\n");
@@ -759,7 +759,7 @@ mod tests {
         let (service, serving) = Service::start(&path).await.unwrap();
         assert!(service.reload().unwrap().warnings.is_empty());
         write(&dir, "users.toml", "[user.a]\nrole = \"viewer\"\n");
-        write(&dir, "jetbridge.toml", "not toml");
+        write(&dir, "turbojet-hub.toml", "not toml");
         let reloaded = service.reload().unwrap();
         assert!(reloaded.config.is_err());
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
@@ -778,7 +778,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         write(&dir, "real.toml", "sessions = \"sessions.toml\"\n");
-        let (real, link) = (dir.path().join("real.toml"), dir.path().join("jetbridge.toml"));
+        let (real, link) = (dir.path().join("real.toml"), dir.path().join("turbojet-hub.toml"));
         std::os::unix::fs::symlink("real.toml", &link).unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
         let (service, serving) = Service::start(&link).await.unwrap();
@@ -814,8 +814,8 @@ mod tests {
     async fn reloads_run_one_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
-        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"\n");
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        write(&dir, "turbojet-hub.toml", "sessions = \"sessions.toml\"\n");
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         let held = service.reloading.lock().unwrap();
         let reloading = service.clone();
         let reload = tokio::task::spawn_blocking(move || reloading.reload());
@@ -850,11 +850,11 @@ mod tests {
         write(&dir, "users.toml", "");
         let config = API.replace("\"audit\"", "\"blocked/audit\"");
         write(&dir, "blocked", "");
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{config}listen = \"127.0.0.1:0\"\n"));
-        let e = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
+        write(&dir, "turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n{config}listen = \"127.0.0.1:0\"\n"));
+        let e = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap_err();
         assert!(e.to_string().contains("cannot open the audit log"), "{e}");
         std::fs::remove_file(dir.path().join("blocked")).unwrap();
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         assert!(dir.path().join("blocked/audit").is_dir());
         service.shutdown().await;
         serving.abort();
@@ -865,9 +865,9 @@ mod tests {
     async fn the_api_answers_health_until_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
+        write(&dir, "turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n"));
         write(&dir, "users.toml", "");
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         let addr = service.api_addr().unwrap();
         let response = api::tests::request(addr, "GET", "/api/health").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -888,15 +888,15 @@ mod tests {
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         let config =
             |listen: &str| format!("sessions = \"sessions.toml\"\n{API}listen = \"{listen}\"\nbehind_proxy = true\n");
-        write(&dir, "jetbridge.toml", &config("0.0.0.0:8080"));
+        write(&dir, "turbojet-hub.toml", &config("0.0.0.0:8080"));
         write(&dir, "users.toml", "");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let options = StartOptions { api_listener: Some(listener), ..StartOptions::default() };
-        let (service, serving) = Service::start_with(&dir.path().join("jetbridge.toml"), options).await.unwrap();
+        let (service, serving) = Service::start_with(&dir.path().join("turbojet-hub.toml"), options).await.unwrap();
         assert!(api::tests::request(addr, "GET", "/api/health").await.starts_with("HTTP/1.1 200"));
         assert!(service.reload().unwrap().warnings.is_empty());
-        write(&dir, "jetbridge.toml", &config("0.0.0.0:8081"));
+        write(&dir, "turbojet-hub.toml", &config("0.0.0.0:8081"));
         let reloaded = service.reload().unwrap();
         assert!(reloaded.config.is_ok(), "{reloaded:?}");
         let [warning] = reloaded.warnings.as_slice() else { panic!("{reloaded:?}") };
@@ -916,9 +916,13 @@ mod tests {
         write(&dir, "api.key", &key);
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         let tls = "tls = { cert = \"api.pem\", key = \"api.key\" }\n";
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n{tls}"));
+        write(
+            &dir,
+            "turbojet-hub.toml",
+            &format!("sessions = \"sessions.toml\"\n{API}listen = \"127.0.0.1:0\"\n{tls}"),
+        );
         write(&dir, "users.toml", "");
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         let addr = service.api_addr().unwrap();
         let health = async |cert: &str| api::tests::request_tls(addr, cert, "/api/health").await;
         let response = health(&cert).await.unwrap();
@@ -949,8 +953,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let listen = "listen = \"127.0.0.1:0\"\n";
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}{listen}"));
-        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
-        let path = dir.path().join("jetbridge.toml");
+        write(&dir, "turbojet-hub.toml", "sessions = \"sessions.toml\"");
+        let path = dir.path().join("turbojet-hub.toml");
         let (service, serving) = Service::start(&path).await.unwrap();
 
         write(
@@ -958,7 +962,7 @@ mod tests {
             "sessions.toml",
             &format!("{ACCEPTOR}{listen}{}{}", venue_section("B", "FIX.4.4"), venue_section("C", "FIX.4.3")),
         );
-        write(&dir, "jetbridge.toml", &routes_to("B"));
+        write(&dir, "turbojet-hub.toml", &routes_to("B"));
         let reloaded = service.reload().unwrap();
         assert_eq!(reloaded.sessions.map(|changes| changes.started), Ok(vec!["B".into(), "C".into()]));
         assert_eq!(reloaded.config.map(|config| config.routes), Ok(1));
@@ -971,7 +975,7 @@ mod tests {
         assert_eq!(service.gateway.router(), to_b);
         assert_eq!(service.set_venues(), ["B"]);
 
-        write(&dir, "jetbridge.toml", &routes_to("C"));
+        write(&dir, "turbojet-hub.toml", &routes_to("C"));
         let reloaded = service.reload().unwrap();
         assert_eq!(reloaded.sessions, Ok(Changes::default()));
         assert!(reloaded.config.unwrap_err().contains("\"C\""));
@@ -987,17 +991,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         let limit = |qty: u32| format!("[risk.defaults]\nmax_order_qty = {qty}\n");
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(5)));
-        let path = dir.path().join("jetbridge.toml");
+        write(&dir, "turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(5)));
+        let path = dir.path().join("turbojet-hub.toml");
         let (service, serving) = Service::start(&path).await.unwrap();
         let max_order_qty = || service.gateway.limits().defaults.max_order_qty;
         assert_eq!(max_order_qty(), Some(5.into()));
 
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(7)));
+        write(&dir, "turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n{}", limit(7)));
         let config = service.reload().unwrap().config.unwrap();
         assert_eq!((config.routes, config.clients), (0, 0));
         assert_eq!(max_order_qty(), Some(7.into()));
-        write(&dir, "jetbridge.toml", &format!("{}{}", routes_to("NOWHERE"), limit(9)));
+        write(&dir, "turbojet-hub.toml", &format!("{}{}", routes_to("NOWHERE"), limit(9)));
         service.reload().unwrap();
         assert_eq!(max_order_qty(), Some(7.into()));
         assert_eq!(service.gateway.router(), Router::new(Vec::new()));
@@ -1012,8 +1016,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let venues = format!("{}{}", venue_section("B", "FIX.4.4"), venue_section("C", "FIX.4.3"));
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n{venues}"));
-        write(&dir, "jetbridge.toml", &routes_to("B"));
-        let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
+        write(&dir, "turbojet-hub.toml", &routes_to("B"));
+        let error = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap_err();
         assert!(error.to_string().contains("venue \"C\": BeginString \"FIX.4.3\" is not supported"), "{error}");
     }
 
@@ -1025,10 +1029,10 @@ mod tests {
         let disk = "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n";
         let db = dir.path().join("book.db");
         let config = format!("{}[database]\nurl = \"sqlite://{}?mode=rwc\"\n", routes_to("B"), db.display());
-        write(&dir, "jetbridge.toml", &config);
+        write(&dir, "turbojet-hub.toml", &config);
         let start = async |sessions: String| {
             write(&dir, "sessions.toml", &sessions);
-            Service::start(&dir.path().join("jetbridge.toml")).await.map(|_| ()).unwrap_err().to_string()
+            Service::start(&dir.path().join("turbojet-hub.toml")).await.map(|_| ()).unwrap_err().to_string()
         };
         let venue = venue_section("B", "FIX.4.4");
         let error =
@@ -1050,14 +1054,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("book.db");
         let config = format!("{}[database]\nurl = \"sqlite://{}?mode=rwc\"\n", routes_to("B"), db.display());
-        write(&dir, "jetbridge.toml", &config);
+        write(&dir, "turbojet-hub.toml", &config);
         let durable = format!(
             "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n{ACCEPTOR}listen = \"127.0.0.1:0\"\n\
              [defaults]\nstore = \"disk\"\n{}store = \"disk\"\n",
             venue_section("B", "FIX.4.4")
         );
         write(&dir, "sessions.toml", &durable);
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         assert!(service.reload().unwrap().warnings.is_empty());
         write(&dir, "sessions.toml", &format!("{durable}{}store = \"memory\"\n", venue_section("C", "FIX.4.4")));
         let reloaded = service.reload().unwrap();
@@ -1088,8 +1092,8 @@ mod tests {
         write(&dir, "server.key", &key.serialize_pem());
         let tls = "tls = { cert = \"server.pem\", key = \"server.key\" }\n";
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\nunknown = \"admit\"\n{tls}"));
-        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        write(&dir, "turbojet-hub.toml", "sessions = \"sessions.toml\"");
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
 
         let client = format!(
             "[initiator.JETBRIDGE]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"FUNDA\"\n\
@@ -1112,8 +1116,8 @@ mod tests {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"{}\"\n", taken.local_addr().unwrap()));
-        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"");
-        let error = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap_err();
+        write(&dir, "turbojet-hub.toml", "sessions = \"sessions.toml\"");
+        let error = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap_err();
         assert!(error.to_string().starts_with("cannot bind"), "{error}");
     }
 
@@ -1159,7 +1163,7 @@ mod tests {
             &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n{stores}{initiator}store = \"disk\"\n"),
         );
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
+        write(&dir, "turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
 
         // What a gateway that stopped had sent: order PREVIO1, never committed.
         let [(_, id, storage)] =
@@ -1186,7 +1190,7 @@ mod tests {
         let venue_side = SessionId::new("FIX.4.4", id.target_comp_id.as_str(), id.sender_comp_id.as_str());
         venue_store.open(&venue_side).unwrap().set_next_incoming(2).unwrap();
 
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         let cancel = tokio::time::timeout(Duration::from_secs(5), cancelled.recv()).await.expect("no cancel").unwrap();
         assert_eq!(cancel.get(tags::ORIG_CL_ORD_ID), Some("PREVIO1"));
         service.shutdown().await;
@@ -1231,9 +1235,9 @@ mod tests {
         tokio::spawn(venue.serve(listener));
         let initiator = venue_section("VENUE", "FIX.4.4").replace("127.0.0.1:1", &venue_addr.to_string());
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\nunknown = \"admit\"\n{initiator}"));
-        let jetbridge = "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log\"\n";
-        write(&dir, "jetbridge.toml", jetbridge);
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        let hub = "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log\"\n";
+        write(&dir, "turbojet-hub.toml", hub);
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
 
         let mut config = turbojet::InitiatorConfig::new(turbojet::SessionConfig::new("FIX.4.4", "FUNDA"), "JETBRIDGE");
         config.password = Some("hunter2".to_string().into());
@@ -1261,7 +1265,7 @@ mod tests {
         assert!(frames.iter().any(|frame| frame.contains("\x01554=*")), "{frames:?}");
         assert!(!frames.iter().any(|frame| frame.contains("hunter2")), "{frames:?}");
 
-        write(&dir, "jetbridge.toml", &format!("{jetbridge}retention = \"30d\"\n"));
+        write(&dir, "turbojet-hub.toml", &format!("{hub}retention = \"30d\"\n"));
         let reloaded = tokio::task::spawn_blocking({
             let service = service.clone();
             move || service.reload().unwrap()
@@ -1282,12 +1286,12 @@ mod tests {
     async fn no_message_log_table_no_log() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
-        write(&dir, "jetbridge.toml", "sessions = \"sessions.toml\"\n");
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        write(&dir, "turbojet-hub.toml", "sessions = \"sessions.toml\"\n");
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         assert!(service.message_log.is_none());
         let changed =
             "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log\"\n[database]\nurl = \"sqlite://j.db\"\n";
-        write(&dir, "jetbridge.toml", changed);
+        write(&dir, "turbojet-hub.toml", changed);
         let reloaded = service.reload().unwrap();
         assert!(reloaded.warnings.iter().any(|w| w.contains("[message_log] changed")), "{reloaded:?}");
         assert!(reloaded.warnings.iter().any(|w| w.contains("[database] url changed")), "{reloaded:?}");
@@ -1311,19 +1315,19 @@ mod tests {
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
         let config = |more: &str| format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n{more}");
-        write(&dir, "jetbridge.toml", &config("retention = \"400d\"\n"));
-        let (service, serving) = Service::start(&dir.path().join("jetbridge.toml")).await.unwrap();
+        write(&dir, "turbojet-hub.toml", &config("retention = \"400d\"\n"));
+        let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
         let retention = || *service.retention.lock().unwrap();
         assert!(service.pruning.is_some());
         assert!(service.checkpointing.is_some());
         assert_eq!(retention(), Some(Duration::from_secs(400 * 86_400)));
-        write(&dir, "jetbridge.toml", &config("retention = \"2d\"\n"));
+        write(&dir, "turbojet-hub.toml", &config("retention = \"2d\"\n"));
         assert!(service.reload().unwrap().warnings.is_empty());
         assert_eq!(retention(), Some(Duration::from_secs(2 * 86_400)));
-        write(&dir, "jetbridge.toml", &config("retention = \"1h\"\n"));
+        write(&dir, "turbojet-hub.toml", &config("retention = \"1h\"\n"));
         assert!(service.reload().unwrap().config.is_err());
         assert_eq!(retention(), Some(Duration::from_secs(2 * 86_400)));
-        write(&dir, "jetbridge.toml", &config(""));
+        write(&dir, "turbojet-hub.toml", &config(""));
         assert!(service.reload().unwrap().config.is_ok());
         assert_eq!(retention(), None);
         service.shutdown().await;
@@ -1394,8 +1398,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, "sessions.toml", &format!("{ACCEPTOR}listen = \"127.0.0.1:0\"\n"));
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
-        write(&dir, "jetbridge.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
-        let path = dir.path().join("jetbridge.toml");
+        write(&dir, "turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n[database]\nurl = \"{url}\"\n"));
+        let path = dir.path().join("turbojet-hub.toml");
         let (service, serving) = Service::start(&path).await.unwrap();
         service.gateway().block(book::Scope::All);
         service.shutdown().await;

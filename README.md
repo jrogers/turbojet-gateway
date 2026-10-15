@@ -1,4 +1,4 @@
-# Jetbridge
+# Turbojet Hub
 
 A FIX connectivity gateway built on [Turbojet](https://github.com/jrogers/turbojet): clients log
 on to it, it logs on to venues, and it routes the clients' orders to the venues and the venues'
@@ -61,7 +61,7 @@ reports back, keeping each order's state as it goes.
 ## Building and running
 
 ```sh
-cargo run --release -- --config examples/jetbridge.toml
+cargo run --release -- --config examples/turbojet-hub.toml
 ```
 
 This listens for clients on 127.0.0.1:9876 and connects to a venue at 127.0.0.1:9877, retrying
@@ -69,7 +69,7 @@ until one is there. Build with `--features tls` for TLS on either side, set up i
 file; without it, a sessions file that asks for TLS doesn't load.
 
 ```sh
-cargo run --release --features tls -- --config examples/jetbridge.toml
+cargo run --release --features tls -- --config examples/turbojet-hub.toml
 ```
 
 Build with `--features gzip` to compress the [message log](#message-log)'s files.
@@ -83,12 +83,12 @@ It needs Rust 1.89 or later.
 
 ## Configuration
 
-Two files: `jetbridge.toml`, given with `--config`, and the sessions file it names.
+Two files: `turbojet-hub.toml`, given with `--config`, and the sessions file it names.
 
-### jetbridge.toml
+### turbojet-hub.toml
 
 ```toml
-# Jetbridge: the sessions file, how orders are routed and the clients' risk limits. First match
+# Turbojet Hub: the sessions file, how orders are routed and the clients' risk limits. First match
 # wins; an order no route matches is rejected.
 sessions = "sessions.toml"
 day_end = "17:00 America/New_York"  # when client sessions' trading days end
@@ -170,7 +170,7 @@ listen = "127.0.0.1:9876"
 
 [counterparty.FUNDA]
 
-# Jetbridge logs on to NASDAQ as JETBRIDGE.
+# Turbojet Hub logs on to NASDAQ as JETBRIDGE.
 [initiator.NASDAQ]
 target_comp_id = "NASDAQ"
 connect = ["127.0.0.1:9877"]
@@ -179,7 +179,7 @@ connect = ["127.0.0.1:9877"]
 This is Turbojet's sessions file, read by `turbojet-config`; its keys (stores, schedules,
 throttling, TLS, failover and the rest) are documented in
 [turbojet-config](https://github.com/jrogers/turbojet/tree/main/crates/turbojet-config). For
-Jetbridge:
+Turbojet Hub:
 
 - `[acceptor]` is where clients log on. It's required, and its `begin_string`, `FIX.4.2` or
   `FIX.4.4`, is every client's version. Which CompIDs may log on is turbojet-config's: those listed
@@ -196,14 +196,14 @@ Jetbridge:
 
 ## Database
 
-With a `[database]` in `jetbridge.toml`, the book survives a restart: its orders, the ClOrdIDs each
+With a `[database]` in `turbojet-hub.toml`, the book survives a restart: its orders, the ClOrdIDs each
 client has used and the requests sent to venues, operators' blocks, what the risk limits count
 (each session's filled notional, each symbol's last fill price), and the reports not yet delivered
 to clients.
 
 ```toml
 [database]
-url = "sqlite:///var/lib/jetbridge/jetbridge.db?mode=rwc"
+url = "sqlite:///var/lib/turbojet-hub/turbojet-hub.db?mode=rwc"
 retention = "400d"
 ```
 
@@ -222,7 +222,7 @@ retention = "400d"
 
 ```toml
 [database]
-url = "postgres://jetbridge@db.internal/jetbridge?sslmode=verify-full"
+url = "postgres://turbojet-hub@db.internal/turbojet-hub?sslmode=verify-full"
 ```
 
 - The database must already exist (`?mode=rwc` is SQLite's), and the user needs CREATE on its
@@ -294,13 +294,13 @@ What recovery doesn't cover is in [CAVEATS.md](CAVEATS.md#database-and-recovery)
 
 ## Message log
 
-With a `[message_log]` in `jetbridge.toml`, every message the clients' and venues' sessions receive
+With a `[message_log]` in `turbojet-hub.toml`, every message the clients' and venues' sessions receive
 and send is written to files in one directory, both sides in the same files, for a record of what
 was said and to search over the [API](#searching-the-message-log).
 
 ```toml
 [message_log]
-dir = "/var/log/jetbridge/fix"
+dir = "/var/log/turbojet-hub/fix"
 file_bytes_max = 268435456
 retention = "90d"
 compress = true
@@ -379,7 +379,7 @@ Each client session has a trading day. When it ends, the session starts the next
 Symbols' last fill prices are every client's, and carry over. With a database, the done orders
 forgotten can still be read over the [API](#endpoints), until pruned.
 
-A session's day ends at `day_end` in `jetbridge.toml`, or sooner, when its schedule's period
+A session's day ends at `day_end` in `turbojet-hub.toml`, or sooner, when its schedule's period
 (from the sessions file) ends: whichever comes first. `day_end` is a time, `HH:MM` or
 `HH:MM:SS`, and a time zone, `UTC`, an offset such as `+05:30` or an IANA name such as
 `America/New_York` (daylight saving followed). The zone is UTC if left out, and `day_end` is
@@ -448,7 +448,7 @@ as one warning with the count per session. Other clients' orders stay working at
 
 ## API
 
-With `[api]` in `jetbridge.toml` (see [Configuration](#jetbridgetoml)), the gateway serves an HTTP
+With `[api]` in `turbojet-hub.toml` (see [Configuration](#turbojet-hubtoml)), the gateway serves an HTTP
 JSON API for operators: the sessions, the book's orders, risk, routes and the message log to read,
 and the kill switch, session controls, risk limits and reload to act with. Every answer is JSON,
 an error as `{"error": "..."}` with its status.
@@ -460,11 +460,11 @@ a reload (SIGHUP or `POST /api/reload`) applies the change. Run these as the gat
 rewritten file belongs to whoever runs them.
 
 ```sh
-jetbridge user add alice --role operator --clients FUNDA --users users.toml   # asks for a password
-jetbridge user passwd alice --users users.toml       # ends alice's sessions once the gateway reloads
-jetbridge token add alice --users users.toml         # prints the token, once
-jetbridge token revoke alice q3Xr --users users.toml # by the token, its id, or the id's start
-jetbridge user remove alice --users users.toml
+turbojet-hub user add alice --role operator --clients FUNDA --users users.toml   # asks for a password
+turbojet-hub user passwd alice --users users.toml       # ends alice's sessions once the gateway reloads
+turbojet-hub token add alice --users users.toml         # prints the token, once
+turbojet-hub token revoke alice q3Xr --users users.toml # by the token, its id, or the id's start
+turbojet-hub user remove alice --users users.toml
 ```
 
 - **Roles**: `viewer` reads; `operator` also pauses, resumes and resends sessions, cancels orders
@@ -515,7 +515,7 @@ jetbridge user remove alice --users users.toml
 | `GET /api/orders/{order_id}/messages` | viewer | `?limit=&after=`: the order's messages, both sides'; see [Searching the message log](#searching-the-message-log) |
 | `GET /api/messages` | viewer | `?session=&direction=&msg_type=&tag=&since=&until=&limit=&after=`: the message log, searched |
 | `GET /api/risk` | viewer | the limits in force, each session's open and filled notional, reference prices, blocks |
-| `GET /api/risk/limits` | viewer | the limits as `jetbridge.toml` writes them; see [Editing the risk limits](#editing-the-risk-limits) |
+| `GET /api/risk/limits` | viewer | the limits as `turbojet-hub.toml` writes them; see [Editing the risk limits](#editing-the-risk-limits) |
 | `GET /api/routes` | viewer | the routes, in the order they're tried |
 | `GET /api/routes/test` | viewer | `?client=&ex_destination=&symbol=`: the route such an order would take |
 | `GET /api/live` | viewer | a websocket; see [Live events](#live-events) |
@@ -529,8 +529,8 @@ jetbridge user remove alice --users users.toml
 | `POST /api/risk/cancel-all` | operator | `{scope}`: blocks the scope and cancels its orders; answers 204 |
 | `POST /api/sessions/{id}/sequence` | admin | `{next_incoming, next_outgoing}`, either or both: sets the session's sequence numbers |
 | `POST /api/sessions/{id}/reset` | admin | sets both sequence numbers to 1 and clears the session's resend store |
-| `PATCH /api/risk/limits/defaults`, `/client/{comp_id}` | admin | `{set}`: edits the limits in `jetbridge.toml`, then reloads |
-| `DELETE /api/risk/limits/client/{comp_id}` | admin | removes a CompID's limits from `jetbridge.toml`, then reloads |
+| `PATCH /api/risk/limits/defaults`, `/client/{comp_id}` | admin | `{set}`: edits the limits in `turbojet-hub.toml`, then reloads |
+| `DELETE /api/risk/limits/client/{comp_id}` | admin | removes a CompID's limits from `turbojet-hub.toml`, then reloads |
 | `POST /api/reload` | admin | rereads the files, as SIGHUP does, and says what changed |
 | `GET /api/audit` | admin, without `--clients` | `?since=&limit=`: the audit log's last entries |
 
@@ -603,7 +603,7 @@ jetbridge user remove alice --users users.toml
 
 ### Editing the risk limits
 
-`GET /api/risk/limits` answers the limits as `jetbridge.toml` writes them, `{"defaults": {...},
+`GET /api/risk/limits` answers the limits as `turbojet-hub.toml` writes them, `{"defaults": {...},
 "clients": {"FUNDA": {...}}}`, each table with only the keys it sets, amounts as decimal strings
 (`"1000"`, `"5.5"`) however the file writes them; `GET /api/risk` has them as in force, merged.
 An admin changes them with a `PATCH` to `/api/risk/limits/defaults` or
@@ -622,7 +622,7 @@ An admin changes them with a `PATCH` to `/api/risk/limits/defaults` or
   the defaults; 404 if it has none.
 - **`--clients`** applies: an admin with it edits only those CompIDs' tables (403 for another's).
   The defaults, like `POST /api/reload`, reach every client, so they need an admin without it.
-- **The file is rewritten.** The gateway reads `jetbridge.toml` afresh, changes only that table,
+- **The file is rewritten.** The gateway reads `turbojet-hub.toml` afresh, changes only that table,
   keeping the comments and layout elsewhere, checks the result loads, and replaces the file
   whole (the file a symlink points to, keeping its permissions). Then it reloads, as SIGHUP does,
   so the reload takes whatever else changed in the files since the last, the sessions file
@@ -726,8 +726,8 @@ cross the network in the clear. It serves HTTP/1.1, websockets included. Behind 
 - the client's address, for the login limit and the audit log, is the last `X-Forwarded-For` hop,
   and a page's `Origin` is checked against `X-Forwarded-Host` if sent, else `Host`. The proxy must
   set both, overwriting what the client sent;
-- the session cookie is `__Host-jetbridge_session`, `Secure` with `Path=/`, as under TLS (on
-  plain loopback it's `jetbridge_session` with `Path=/api`). The browser sends it to every path on
+- the session cookie is `__Host-turbojet_hub_session`, `Secure` with `Path=/`, as under TLS (on
+  plain loopback it's `turbojet_hub_session` with `Path=/api`). The browser sends it to every path on
   that host name, so give the API a host name of its own.
 
 ### Audit log
@@ -797,7 +797,7 @@ saved to the database:
   blocks, read again every 5 seconds while the screen is open and the page shown. An operator or
   admin can block a scope, lift a block, or pull the [kill switch](#kill-switch) for a scope, which
   blocks it and cancels its working orders, confirmed by typing the scope. Below, the limits as
-  `jetbridge.toml` writes them, each client's table with only the keys it sets. An admin edits a
+  `turbojet-hub.toml` writes them, each client's table with only the keys it sets. An admin edits a
   key, removes it, or adds or deletes a client's table, the defaults only without `--clients`; each
   edit [rewrites the file and reloads](#editing-the-risk-limits), and shows the table as written and
   what the reload took.
@@ -823,7 +823,7 @@ text, until dismissed; the header counts those not dismissed. While the gateway 
 What to expect of it is in [CAVEATS.md](CAVEATS.md#console).
 
 To work on it, run the gateway with an `[api]`, then `npm run dev` in `web/`: Vite serves the
-console, reloading on changes, and passes `/api`, websockets included, to `JETBRIDGE_API`
+console, reloading on changes, and passes `/api`, websockets included, to `TURBOJET_HUB_API`
 (`http://127.0.0.1:8080` by default). `npm test -- --run` runs its tests and `npm run lint` checks
 its types. `cargo test --all-features` includes the console, so needs `web/dist` built first.
 
@@ -833,7 +833,7 @@ its types. `cargo test --all-features` includes the console, so needs `web/dist`
   settings apply from each session's next logon, added venues start and removed ones are logged out
   and stopped. Then the routes, risk limits and `day_end`, the routes checked against the venues
   running after that. A file that doesn't load is logged as a warning and the one in use is kept: a
-  bad sessions file keeps the sessions as they were, and a bad `jetbridge.toml` keeps the routes,
+  bad sessions file keeps the sessions as they were, and a bad `turbojet-hub.toml` keeps the routes,
   limits and `day_end` (an `[api]` that doesn't load, or breaks the bind rule, makes the whole file
   bad). Then the API's certificate, with `[api] tls`. New routes and limits apply to new orders;
   orders already working stay with their venue. A new `day_end` or schedule applies from each
@@ -857,7 +857,7 @@ Logs go to standard output through `tracing`, at `info` by default. `RUST_LOG` s
 `tracing-subscriber`'s `EnvFilter` reads it:
 
 ```sh
-RUST_LOG=info,jetbridge=debug cargo run --release -- --config examples/jetbridge.toml
+RUST_LOG=info,turbojet_hub=debug cargo run --release -- --config examples/turbojet-hub.toml
 ```
 
 Reports the gateway can't use (a trade bust, a report taking an order past its quantity, a

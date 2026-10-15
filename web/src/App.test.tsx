@@ -499,11 +499,11 @@ test('an admin reloads from the header, and sees what it took or why a file was 
   )
   expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1, name: 'Audit' }))
 
-  answer = () => json({ error: 'jetbridge.toml is kept: bad route; the sessions file: nothing changed' }, 422)
+  answer = () => json({ error: 'turbojet-hub.toml is kept: bad route; the sessions file: nothing changed' }, 422)
   await reload('again')
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(outcome().textContent).toBe(
-    'The reload kept a file: jetbridge.toml is kept: bad route; the sessions file: nothing changed',
+    'The reload kept a file: turbojet-hub.toml is kept: bad route; the sessions file: nothing changed',
   )
 
   // Any other failure stays in the dialog, to try again.
