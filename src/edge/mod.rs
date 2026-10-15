@@ -945,7 +945,7 @@ impl Gateway {
                 // is answered.
                 // A counterparty's ResetSeqNumFlag mid-session resets the store with no logout, so
                 // a bound read before it is too high; the next checkpoint's run catches the reset
-                // exactly, from the session's reset count (Turbojet 0.4's `Activity::resets`) with
+                // exactly, from the session's reset count (Turbojet 0.3.1's `Activity::resets`) with
                 // its number going down, and bounds the venue's requests at 1.
                 let bound = state.logged_on.get(to.session.id()).map_or(1, |last_read| last_read.next_outgoing);
                 match to.session.send(msg) {

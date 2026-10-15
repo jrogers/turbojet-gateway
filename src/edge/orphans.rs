@@ -43,7 +43,7 @@
 //! registry locks per request: so under steady load a checkpoint lags a run behind, and a crash
 //! leaves about two intervals' messages to scan, not one. A counterparty's ResetSeqNumFlag
 //! mid-session resets the store with no logout, leaving bounds read before it too high: the next
-//! checkpoint's run catches it exactly, from the session's reset count (Turbojet 0.4's
+//! checkpoint's run catches it exactly, from the session's reset count (Turbojet 0.3.1's
 //! `Activity::resets`) together with its number going down, bounds the venue's requests at 1 and
 //! takes no checkpoint of it.
 //!
