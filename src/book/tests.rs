@@ -3490,6 +3490,9 @@ fn a_replace_sent_again_adopts_the_pending_orphaned_one() {
             (sent.origin, sent.cl_ord_id.as_str(), sent.orig_cl_ord_id.as_deref()),
             (Origin::Client, "C2", Some("C1"))
         );
+        // Taken once: the same terms again are a replace of their own, refused while C2 is pending.
+        let out = run(&mut book, client_replace("C3", "C2", 200, false));
+        assert!(matches!(out.as_slice(), [Output::CancelReject { .. }]), "{out:?}");
         let out = run(&mut book, venue_report_as("1-1", ExecType::Replaced, Status::New, 0, 0));
         let report = report_of(&out);
         assert_eq!(

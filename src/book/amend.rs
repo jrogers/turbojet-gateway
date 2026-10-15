@@ -30,7 +30,8 @@ impl Book {
     /// A replace goes to the venue like a cancel, one at a time; the order keeps its terms until
     /// the venue accepts it (see `venue_report`). Refused, like a cancel, while the gateway's own
     /// cancel is in flight; for a blocked client, if it raises the quantity; and if its new terms
-    /// break a risk limit (see [`risk::check`]).
+    /// break a risk limit (see [`risk::check`]). One taken as an orphaned replace comes first, and
+    /// none of that applies: the venue has the request already (see `adopt_orphaned_replace`).
     pub(super) fn replace(&mut self, amend: Amend, named: (Side, CompactString), terms: Terms, out: &mut Vec<Output>) {
         if self.adopt_orphaned_replace(&amend, &named, &terms, out) {
             return;
