@@ -98,7 +98,7 @@ test('sums the sessions, orders and blocks up in cards, the venues down in warn'
     sessions: [
       session('client', FUNDA),
       { ...session('client', 'FIX.4.4:JETBRIDGE->FUNDB'), status: 'connected' },
-      session('venue', VENUE),
+      { ...session('venue', VENUE, true), status: 'disconnected' },
       down,
     ],
     orders,
@@ -114,17 +114,20 @@ test('sums the sessions, orders and blocks up in cards, the venues down in warn'
   )
   expect(cards()).toEqual([
     ['Clients logged on', '1 / 2'],
-    ['Venues logged on', '1 / 2, 1 down'],
+    // NASDAQ's paused: disconnected on purpose, not down.
+    ['Venues logged on', '0 / 2, 1 down'],
     ['Working orders', '2+'],
     ['Blocks', '2'],
   ])
   expect(venues().className).toBe('warn')
   // Each state a pill, toned by it.
   const pill = (name: string) => row(name).querySelector('.pill')!
-  expect([pill(FUNDA), pill('FIX.4.4:JETBRIDGE->FUNDB'), pill('NYSE')].map((p) => [p.className, p.textContent])).toEqual([
+  const pills = [pill(FUNDA), pill('FIX.4.4:JETBRIDGE->FUNDB'), pill('NYSE'), pill('NASDAQ')]
+  expect(pills.map((p) => [p.className, p.textContent])).toEqual([
     ['pill ok', 'logged on'],
     ['pill info', 'connected'],
     ['pill warn', 'disconnected'],
+    ['pill muted', 'disconnected'],
   ])
 })
 

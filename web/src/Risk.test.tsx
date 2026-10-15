@@ -306,6 +306,18 @@ test('Enter in the scope opens Block, not the kill switch', async () => {
   expect(within(screen.getByRole('dialog')).getByRole('heading').textContent).toBe('Block all')
 })
 
+test('Enter in the kill switch\'s scope opens nothing: only its button does', async () => {
+  serve({ 'GET /api/risk': () => json(fixture) })
+  render(page(who('operator'), snapshot()))
+  await screen.findByText(FUNDA)
+  const field = screen.getByLabelText('Scope to cancel') as HTMLInputElement
+  fireEvent.change(field, { target: { value: 'all' } })
+  // No form, so nothing for Enter to submit.
+  expect(field.form).toBeNull()
+  fireEvent.keyDown(field, { key: 'Enter' })
+  expect(screen.queryByRole('dialog')).toBeNull()
+})
+
 test('block and unblock post the reason and scope with the CSRF token, and say how it went', async () => {
   serve({ 'GET /api/me': () => json({ user: 'u', role: 'operator', clients: null, csrf: 'tok' }) })
   await api.me()

@@ -189,8 +189,7 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
         <section className="panel">
           <h2>Kill switch</h2>
           <p>{cancelsAll('a scope')}</p>
-          {/* Enter in the field opens nothing: the kill switch is pulled by its button only. */}
-          <form className="filters" onSubmit={(e) => e.preventDefault()}>
+          <div className="filters">
             <label>
               Scope to cancel
               <input
@@ -208,7 +207,7 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
             >
               Cancel all orders…
             </button>
-          </form>
+          </div>
         </section>
       )}
 
