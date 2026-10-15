@@ -12,7 +12,10 @@ const TONES: Record<Status, string> = {
   rejected: 'error',
 }
 
+/** A status as the screens write it. */
+export const statusText = (status: Status) => status.replaceAll('_', ' ')
+
 /** An order's status as a pill: its text, and its tone beside it. */
 export function StatusPill({ status }: { status: Status }) {
-  return <span className={`pill ${TONES[status]}`}>{status.replaceAll('_', ' ')}</span>
+  return <span className={`pill ${TONES[status]}`}>{statusText(status)}</span>
 }

@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from 'reac
 import * as api from './api.ts'
 import { orderHref } from './router.ts'
 import { namesTarget } from './sessions.ts'
-import { StatusPill } from './Status.tsx'
+import { StatusPill, statusText } from './Status.tsx'
 import { done, useLive } from './store.ts'
 import { utc } from './time.ts'
 import type { OrderView, Status } from './types.ts'
@@ -198,7 +198,7 @@ export default function Orders() {
             <option value="">any</option>
             {STATUSES.map((status) => (
               <option key={status} value={status}>
-                {status.replaceAll('_', ' ')}
+                {statusText(status)}
               </option>
             ))}
           </select>
@@ -283,13 +283,19 @@ const Row = memo(function Row({ order }: { order: OrderView }) {
   const last = useRef(order)
   useEffect(() => {
     if (last.current === order) return
+    // Sound as every source, the snapshot, the events and the pages, is `OrderView`'s serde order.
     const changed = JSON.stringify(last.current) !== JSON.stringify(order)
     last.current = order
     const row = tr.current
-    if (!changed || !row) return
-    // Removed and added again, reflowing between, to restart a flash still running.
-    row.classList.remove('flash')
-    void row.offsetWidth
+    // Without motion, no `animationend` would ever take the class off.
+    if (!changed || !row || window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches) return
+    if (row.classList.contains('flash')) {
+      // Removed and added again, reflowing between, to restart it; its listener is still there.
+      row.classList.remove('flash')
+      void row.offsetWidth
+      row.classList.add('flash')
+      return
+    }
     row.classList.add('flash')
     // Not React's onAnimationEnd: without AnimationEvent, as in jsdom, it listens for a prefixed one.
     row.addEventListener('animationend', () => row.classList.remove('flash'), { once: true })
