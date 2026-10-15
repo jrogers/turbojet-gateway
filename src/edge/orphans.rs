@@ -33,15 +33,15 @@
 //! the venue may refuse it as a duplicate.
 //!
 //! The scan reads each venue's store from its checkpoint (see [`Gateway::checkpoint_once`]): every
-//! request of ours stored below it has its change committed, and is no longer unanswered
-//! (answered, its order done, or an original order past PendingNew), so it can be neither an
-//! orphan nor unsent. A checkpoint is ignored, and the whole store read, if the store was created
-//! or reset after it was taken, or within a millisecond before, doesn't say when it was created,
-//! or is numbered short of it. Unanswered requests the scan finds are bounded again (`State::in_flight`), so a later
-//! checkpoint doesn't pass them. A request's bound is its session's next number as last read, at
-//! its logon or the last checkpoint's run, not at each send, which would cost Turbojet's registry
-//! locks per request: so under steady load a checkpoint lags a run behind, and a crash leaves
-//! about two intervals' messages to scan, not one.
+//! request of ours stored below it has its change committed, and is no longer unanswered (answered,
+//! its order done, or an original order past PendingNew), so it can be neither an orphan nor
+//! unsent. A checkpoint is ignored, and the whole store read, if the store was created or reset
+//! after it was taken, or within a millisecond before, doesn't say when it was created, or is
+//! numbered short of it. Unanswered requests the scan finds are bounded again (`State::in_flight`),
+//! so a later checkpoint doesn't pass them. A request's bound is its session's next number as last
+//! read, at its logon or the last checkpoint's run, not at each send, which would cost Turbojet's
+//! registry locks per request: so under steady load a checkpoint lags a run behind, and a crash
+//! leaves about two intervals' messages to scan, not one.
 //!
 //! ponytail: a whole scan, in windows of [`SCAN_WINDOW`], costs about 3.9 s per million stored
 //! NewOrderSingles, all ours (2.2 s reading and decoding, 1.7 s looking up), a release build on an
@@ -548,8 +548,9 @@ impl Gateway {
     /// answer, its order done, an original order past PendingNew. Takes none without a
     /// database, or while orphan work is pending: until handled, an orphan isn't recorded, and a
     /// checkpoint past it would lose it, nor for a venue whose logon isn't done or whose store was
-    /// reset mid-session since the last run. Drops answered requests' bounds whether it takes one
-    /// or not. Returns what it queued.
+    /// reset mid-session since the last run. Drops the bounds of requests that no longer hold a
+    /// checkpoint back ([`Book::holds_checkpoint`](crate::book::Book::holds_checkpoint)) whether
+    /// it takes one or not. Returns what it queued.
     pub fn checkpoint_once(&self) -> Vec<(VenueId, Checkpoint)> {
         let Some(writer) = &self.writer else { return Vec::new() };
         let mut state = self.lock();
