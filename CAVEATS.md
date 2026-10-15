@@ -118,7 +118,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   whole if it was reset or created after its checkpoint, doesn't say when it was created, or is
   numbered short of it.
 - No checkpoint is taken while work a start found for the venues is pending, or of a venue not
-  logged on. A request a venue never answers holds its checkpoint back for good, so each start
+  logged on. Work pending for one venue holds back every venue's checkpoint: a venue that never logs
+  on again has each start read more of every venue's store, back towards the whole of it, as before
+  checkpoints. A request a venue never answers holds its checkpoint back for good, so each start
   reads more of that venue's store, up to the whole of it.
 - A reload that keeps a client's or venue's session in memory is applied all the same, with an
   error logged; the next start refuses the file.

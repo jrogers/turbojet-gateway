@@ -43,16 +43,18 @@
 //! about two intervals' messages to scan, not one.
 //!
 //! ponytail: a whole scan, in windows of [`SCAN_WINDOW`], costs about 3.9 s per million stored
-//! NewOrderSingles, all ours (2.2 s reading and decoding, 1.7 s looking up), a release build on
-//! an M3 from a `MemoryStorage` and an in-memory SQLite, the machine not idle. Accepted
-//! ceilings: a request its venue never answers holds the checkpoint back, so the scan grows
-//! back towards a whole one; `Gateway::check_prefix`, the backstop for a clock that went back,
-//! sees only the scanned tail; a counterparty's ResetSeqNumFlag mid-session can leave a bound
-//! read before the reset, too high, so a checkpoint past a request; a clock stepped back across a
-//! reset, with no checkpoint taken after the reset before a stop, can make the stale checkpoint
-//! look newer than the store; and checkpoints are keyed by venue name, so a venue pointed at
-//! another session's store, older and numbered further, passes both checks (the rest of the
-//! orphan logic, too, takes a venue and its session as one).
+//! NewOrderSingles, all ours (2.2 s reading and decoding, 1.7 s looking up), a release build on an
+//! M3 from a `MemoryStorage` and an in-memory SQLite, the machine not idle. Accepted ceilings: a
+//! request its venue never answers holds the checkpoint back, so the scan grows back towards a
+//! whole one; orphan work pending for any venue (one that never logs on again, say) holds back
+//! every venue's checkpoint, not just its own, so until it clears each start reads more of every
+//! store, back towards the whole, as before checkpoints; `Gateway::check_prefix`, the backstop for
+//! a clock that went back, sees only the scanned tail; a counterparty's ResetSeqNumFlag mid-session
+//! can leave a bound read before the reset, too high, so a checkpoint past a request; a clock
+//! stepped back across a reset, with no checkpoint taken after the reset before a stop, can make
+//! the stale checkpoint look newer than the store; and checkpoints are keyed by venue name, so a
+//! venue pointed at another session's store, older and numbered further, passes both checks (the
+//! rest of the orphan logic, too, takes a venue and its session as one).
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
