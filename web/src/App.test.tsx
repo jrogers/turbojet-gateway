@@ -361,7 +361,7 @@ test('the nav counts the working orders, and the venues down', async () => {
   render(<App />)
   await screen.findByText('operator')
   const socket = await opened()
-  const venue = (id: string, status: string) => ({
+  const session = (id: string, status: string, over = {}) => ({
     side: 'venue',
     id,
     venue: id,
@@ -370,18 +370,31 @@ test('the nav counts the working orders, and the venues down', async () => {
     next_outgoing: null,
     activity: null,
     paused: false,
+    ...over,
   })
-  const snapshot = (sessions: unknown[], orders: unknown[]) => ({ type: 'snapshot', sessions, orders, orders_next: null, blocked: [], unavailable: false, clients: null })
+  const snapshot = (sessions: unknown[], orders: unknown[], orders_next: number | null = null) => ({ type: 'snapshot', sessions, orders, orders_next, blocked: [], unavailable: false, clients: null })
+  // Only XNYS is down: ARCA is paused on purpose, BATS on its way, and FUNDA a client.
+  const sessions = [
+    session('NASDAQ', 'logged_on'),
+    session('XNYS', 'disconnected'),
+    session('ARCA', 'disconnected', { paused: true }),
+    session('BATS', 'logging_on'),
+    session('FUNDA', 'disconnected', { side: 'client', venue: null, paused: true }),
+  ]
   act(() => {
     socket.open()
-    socket.send(snapshot([venue('NASDAQ', 'logged_on'), venue('XNYS', 'disconnected')], [{ id: 1, status: 'new' }, { id: 2, status: 'new' }]))
+    socket.send(snapshot(sessions, [{ id: 1, status: 'new' }, { id: 2, status: 'new' }]))
   })
   const nav = within(screen.getByRole('navigation'))
   expect(within(nav.getByRole('link', { name: 'Orders, 2 working' })).getByText('2')).toBeTruthy()
-  expect(within(nav.getByRole('link', { name: 'Sessions, 1 down' })).getByText('1 down').className).toBe('count pill warn')
+  expect(within(nav.getByRole('link', { name: 'Sessions, 1 down' })).getByText('1 down').classList.contains('warn')).toBe(true)
+
+  // A full page: there are more than those.
+  act(() => socket.send(snapshot(sessions, [{ id: 1, status: 'new' }, { id: 2, status: 'new' }], 2)))
+  expect(within(nav.getByRole('link', { name: 'Orders, more than 2 working' })).getByText('2+')).toBeTruthy()
 
   // None working and none down: no counts.
-  act(() => socket.send(snapshot([venue('NASDAQ', 'logged_on')], [])))
+  act(() => socket.send(snapshot([session('NASDAQ', 'logged_on')], [])))
   expect(nav.getByRole('link', { name: 'Orders' })).toBeTruthy()
   expect(nav.getByRole('link', { name: 'Sessions' })).toBeTruthy()
 })

@@ -119,9 +119,14 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
     }
   }
 
-  // The nav's counts: the working orders, and the venues not logged on.
+  // The nav's counts. The working orders: at least those, when the snapshot had only a page of
+  // them. The venues down: disconnected and not paused, as a paused one is so on purpose, and one
+  // logging on or out is on its way.
   const working = live.orders.size
-  const down = live.sessions.filter((session) => session.side === 'venue' && session.status !== 'logged_on').length
+  const more = live.ordersNext !== null
+  const down = live.sessions.filter(
+    (session) => session.side === 'venue' && !session.paused && session.status === 'disconnected',
+  ).length
 
   return (
     <div className="app">
@@ -130,7 +135,12 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
         <nav className="links" aria-label="Main">
           <a href="#/orders" aria-current={current(route, 'orders')}>
             Orders
-            {working > 0 && <Count shown={working} said={`${working} working`} />}
+            {working > 0 && (
+              <Count
+                shown={more ? `${working}+` : working}
+                said={more ? `more than ${working} working` : `${working} working`}
+              />
+            )}
           </a>
           <a href="#/sessions" aria-current={current(route, 'sessions')}>
             Sessions
