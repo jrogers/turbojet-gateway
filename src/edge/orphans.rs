@@ -37,7 +37,10 @@
 //! neither an orphan nor unsent. A checkpoint is ignored, and the whole store read, if the store
 //! was created or reset after it was taken, doesn't say when it was created, or is numbered short
 //! of it. Unanswered requests the scan finds are bounded again (`State::in_flight`), so a later
-//! checkpoint doesn't pass them.
+//! checkpoint doesn't pass them. A request's bound is its session's next number as last read, at
+//! its logon or the last checkpoint's run, not at each send, which would cost Turbojet's registry
+//! locks per request: so under steady load a checkpoint lags a run behind, and a crash leaves
+//! about two intervals' messages to scan, not one.
 //!
 //! ponytail: a whole scan, in windows of [`SCAN_WINDOW`], costs about 3.9 s per million stored
 //! NewOrderSingles, all ours (2.2 s reading and decoding, 1.7 s looking up), a release build on
@@ -559,10 +562,10 @@ impl Gateway {
         let mut checkpoints = Vec::new();
         for (venue, to) in &state.venues {
             // Until its logon is done, a session may publish the numbers of a store it's resetting.
-            if !state.logged_on.contains(to.session.id()) {
-                continue;
-            }
+            let Some(last_read) = state.logged_on.get_mut(to.session.id()) else { continue };
             let Some(activity) = to.session.status().and_then(|status| status.activity) else { continue };
+            // What later requests to it are bounded by.
+            *last_read = activity.next_outgoing;
             // ponytail: a request its venue never answers holds the checkpoint back for good, so
             // the scan grows back towards a whole one, as before checkpoints; a bound on the
             // wait if a venue shows it.

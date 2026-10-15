@@ -211,12 +211,18 @@ struct State {
     unsent: HashMap<VenueId, orphans::Unsent>,
     /// Each venue request's lower bound on the number its session stores it under, by venue and
     /// downstream ClOrdID, kept while it holds a checkpoint back ([`Book::holds_checkpoint`]):
-    /// what holds back [`Gateway::checkpoint_once`]. Kept with a database only.
+    /// what holds back [`Gateway::checkpoint_once`]. Kept with a database only. The bound is the
+    /// session's next number as last read (see `logged_on`), not read at each send: so under
+    /// steady load a checkpoint lags by one run, and a crash leaves up to about two intervals
+    /// between runs of each venue's store to scan, not one.
     in_flight: HashMap<VenueId, HashMap<CompactString, u64>>,
     /// Venue sessions logged on, from the venue app's `on_logon` to its `on_logout`: by then a
     /// reset at logon has happened, so the numbers a session publishes are its own. By session,
     /// not venue: a reload that drops or renames a venue while it's up still sees it logged out.
-    logged_on: HashSet<SessionId>,
+    /// With each, its next outgoing number as last read, at the logon and at each
+    /// [`Gateway::checkpoint_once`]: numbers only rise within a connection, so a request sent
+    /// since is stored at or above it.
+    logged_on: HashMap<SessionId, u64>,
     /// What this start's [`Gateway::cancel_orphans`] found: `Orphans::default()` if it didn't run.
     orphans_found: orphans::Orphans,
 }
@@ -242,7 +248,7 @@ impl Gateway {
             orphan_ids: HashSet::new(),
             unsent: HashMap::new(),
             in_flight: HashMap::new(),
-            logged_on: HashSet::new(),
+            logged_on: HashMap::new(),
             orphans_found: orphans::Orphans::default(),
         };
         Self {
@@ -900,22 +906,20 @@ impl Gateway {
                 if resent {
                     msg.set(tags::POSS_RESEND, true);
                 }
-                // Read before the send: the session publishes its next number once it has stored
-                // a message, and sends in order, so the request's own number can't be lower. A
-                // session not logged on yet takes sends, queued, and may still reset its store or
-                // publish the old one's numbers: then 1, and the venue's whole store is scanned
-                // until the request is answered.
+                // The session's next number as last read, not read now: that takes Turbojet's
+                // registry locks and clones the session's status, under the gateway's lock, per
+                // request. It was read before this send, and numbers only rise while the session
+                // is logged on, so the request's own number can't be lower. A session not logged
+                // on yet takes sends, queued, and may still reset its store or publish the old
+                // one's numbers: then 1, and the venue's whole store is scanned until the request
+                // is answered.
                 // ponytail: a counterparty's ResetSeqNumFlag mid-session can still leave a bound
                 // read before the reset, too high; the request's own MsgSeqNum, from its
                 // `Receipt`, if that shows.
-                let logged_on = state.logged_on.contains(to.session.id());
-                let bound = self.writer.is_some().then(|| {
-                    let status = logged_on.then(|| to.session.status()).flatten();
-                    status.and_then(|s| s.activity).map_or(1, |a| a.next_outgoing)
-                });
+                let bound = state.logged_on.get(to.session.id()).copied().unwrap_or(1);
                 match to.session.send(msg) {
                     Ok(receipt) => {
-                        if let Some(bound) = bound {
+                        if self.writer.is_some() {
                             let bounds = state.in_flight.entry(venue.clone()).or_default();
                             bounds.entry(downstream.clone()).and_modify(|b| *b = (*b).min(bound)).or_insert(bound);
                         }
@@ -1119,10 +1123,12 @@ impl Application for VenueApp {
     fn on_logon(&self, session: &SessionHandle) {
         let venue = self.0.lock().venue_names.get(session.id()).map(|(venue, _)| venue.clone());
         let Some(venue) = venue else { return };
+        // After the logon, so after any reset of its store.
+        let next_outgoing = session.status().and_then(|status| status.activity).map_or(1, |a| a.next_outgoing);
         let unsent = {
             let mut state = self.0.lock();
             // Before the unsent requests go, so they get their bounds.
-            state.logged_on.insert(session.id().clone());
+            state.logged_on.insert(session.id().clone(), next_outgoing);
             state.unsent.remove(&venue)
         };
         let unsent = unsent.map(|unsent| self.0.unsent_inputs(&venue, unsent, session)).unwrap_or_default();
@@ -3001,6 +3007,8 @@ pub(crate) mod tests {
         let after = next_outgoing();
         assert_eq!(taken.len(), 1, "{taken:?}");
         assert!((before..=after).contains(&taken[0].1.next_seq), "{taken:?}, between {before} and {after}");
+        // What later requests are bounded by.
+        assert_eq!(gateway.lock().logged_on[&id()], taken[0].1.next_seq);
         gateway.committed().await;
         assert_eq!(store.checkpoints().await.unwrap()[&VenueId::from(VENUE)], taken[0].1);
     }
@@ -3022,7 +3030,7 @@ pub(crate) mod tests {
     /// Waits until the venue app has seen the venue's session log on, or off.
     async fn venue_logged_on(gateway: &Gateway, logged_on: bool) {
         let reached = async {
-            while gateway.lock().logged_on.contains(&id()) != logged_on {
+            while gateway.lock().logged_on.contains_key(&id()) != logged_on {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };

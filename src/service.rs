@@ -45,8 +45,9 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(3_600);
 
 /// How often a checkpoint of the venues' stores is taken, with a database, the first time this
 /// long after the start (see [`Gateway::checkpoint_once`]). It bounds what a crash leaves the next
-/// start's orphan scan to read to about this long of each venue's messages, past any request still
-/// unanswered; a whole scan reads about 250k messages a second, so a minute's is quick.
+/// start's orphan scan to read to about twice this long of each venue's messages (a request's
+/// bound is read at the run before it was sent), past any request still unanswered; a whole scan
+/// reads about 250k messages a second, so two minutes' is quick.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What [`Service::reload`] did with each file: what changed, or why the file was kept as it
