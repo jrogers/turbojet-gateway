@@ -11,6 +11,7 @@ import Reason from './Reason.tsx'
 import Risk from './Risk.tsx'
 import Routes from './Routes.tsx'
 import Sessions from './Sessions.tsx'
+import { isDown } from './sessions.ts'
 import { LiveProvider, useLive } from './store.ts'
 import { useRoute, type Route } from './router.ts'
 import type { Me, ReloadView } from './types.ts'
@@ -120,13 +121,10 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
   }
 
   // The nav's counts. The working orders: at least those, when the snapshot had only a page of
-  // them. The venues down: disconnected and not paused, as a paused one is so on purpose, and one
-  // logging on or out is on its way.
+  // them. The venues down, as `isDown` says.
   const working = live.orders.size
   const more = live.ordersNext !== null
-  const down = live.sessions.filter(
-    (session) => session.side === 'venue' && !session.paused && session.status === 'disconnected',
-  ).length
+  const down = live.sessions.filter((session) => session.side === 'venue' && isDown(session)).length
 
   return (
     <div className="app">

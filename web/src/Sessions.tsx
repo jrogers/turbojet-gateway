@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from './api.ts'
 import Reason from './Reason.tsx'
+import { isDown } from './sessions.ts'
 import { useLive } from './store.ts'
-import type { Me, SessionView } from './types.ts'
+import type { Me, SessionState, SessionView } from './types.ts'
 
 /** How often the sequence numbers are read again, in ms: the live events don't carry them. */
 export const NUMBERS_EVERY = 5_000
@@ -20,6 +21,17 @@ function seqNumber(text: string): number | undefined {
   const n = Number(typed)
   return /^\d+$/.test(typed) && Number.isSafeInteger(n) && n >= 1 ? n : NaN
 }
+
+const TONES: Record<SessionState, string> = {
+  logged_on: 'ok',
+  logging_on: 'info',
+  logging_out: 'muted',
+  connected: 'info',
+  disconnected: 'warn',
+}
+
+/** A session's state's tone: a disconnected one muted when paused, as the Paused column says why. */
+const tone = (session: SessionView) => (session.paused && session.status === 'disconnected' ? 'muted' : TONES[session.status])
 
 const TITLES: Record<Action['kind'], (name: string) => string> = {
   pause: (name) => `Pause ${name}`,
@@ -134,7 +146,10 @@ export default function Sessions({ me }: { me: Me }) {
                   <tr key={session.id}>
                     <td title={session.id}>{session.venue ?? session.id}</td>
                     <td>
-                      {session.status.replaceAll('_', ' ')}
+                      <span className={`pill ${tone(session)}`}>
+                        <span className="dot" />
+                        {session.status.replaceAll('_', ' ')}
+                      </span>
                       {session.activity?.resending && ', resending'}
                     </td>
                     <td className="num">{session.next_incoming ?? ''}</td>
@@ -187,6 +202,7 @@ export default function Sessions({ me }: { me: Me }) {
       <p role="status">{done}</p>
       {live.ready ? (
         <>
+          <Summary />
           {table('client', 'Clients')}
           {table('venue', 'Venues')}
         </>
@@ -233,6 +249,44 @@ export default function Sessions({ me }: { me: Me }) {
         </Reason>
       )}
     </>
+  )
+}
+
+/**
+ * The page at a glance: the sessions logged on of each side, the venues down as the nav counts
+ * them, the working orders (at least, with `+`, as the nav's) and the blocks.
+ */
+function Summary() {
+  const live = useLive()
+  const side = (side: SessionView['side']) => live.sessions.filter((session) => session.side === side)
+  const on = (sessions: SessionView[]) => `${sessions.filter((s) => s.status === 'logged_on').length} / ${sessions.length}`
+  const [clients, venues] = [side('client'), side('venue')]
+  const down = venues.filter(isDown).length
+  return (
+    <div className="cards">
+      <dl className="card">
+        <dt>Clients logged on</dt>
+        <dd>{on(clients)}</dd>
+      </dl>
+      <dl className="card">
+        <dt>Venues logged on</dt>
+        <dd className={down > 0 ? 'warn' : undefined}>
+          {on(venues)}
+          {down > 0 && `, ${down} down`}
+        </dd>
+      </dl>
+      <dl className="card">
+        <dt>Working orders</dt>
+        <dd>
+          {live.orders.size}
+          {live.ordersNext !== null && '+'}
+        </dd>
+      </dl>
+      <dl className="card">
+        <dt>Blocks</dt>
+        <dd>{live.blocked.length}</dd>
+      </dl>
+    </div>
   )
 }
 

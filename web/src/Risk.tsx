@@ -4,12 +4,15 @@ import RiskLimits from './Limits.tsx'
 import Reason from './Reason.tsx'
 import { namesTarget, targetCompId } from './sessions.ts'
 import { useLive } from './store.ts'
-import type { Limits, Me, RiskView } from './types.ts'
+import type { Decimal, Limits, Me, RiskView } from './types.ts'
 
 /** How often the risk is read again, in ms: no live event carries notionals. */
 export const RISK_EVERY = 5_000
 
 type Action = { kind: 'block' | 'unblock' | 'cancel-all'; scope: string }
+
+/** What the kill switch does to `scope`: its panel's line, and its dialog's. */
+const cancelsAll = (scope: string) => `Blocks ${scope} and cancels its clients’ working orders at their venues.`
 
 /**
  * Risk: each session's open and filled notional beside its limits, the reference prices, and the
@@ -23,6 +26,7 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
   const [risk, setRisk] = useState<RiskView | null>()
   const [error, setError] = useState<string>()
   const [scope, setScope] = useState('')
+  const [killScope, setKillScope] = useState('')
   const [typed, setTyped] = useState('')
   const [action, setAction] = useState<Action>()
   const [done, setDone] = useState<string>()
@@ -131,7 +135,7 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
       {/* Always there, so a screen reader hears its text change. */}
       <p role="status">{done}</p>
 
-      <section>
+      <section className="panel">
         <h2>Blocks</h2>
         {!live.ready ? (
           <p className="muted">Loading…</p>
@@ -177,17 +181,36 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
             <button type="submit" disabled={scope.trim() === ''}>
               Block
             </button>
+          </form>
+        )}
+      </section>
+
+      {acts && (
+        <section className="panel">
+          <h2>Kill switch</h2>
+          <p>{cancelsAll('a scope')}</p>
+          {/* Enter in the field opens nothing: the kill switch is pulled by its button only. */}
+          <form className="filters" onSubmit={(e) => e.preventDefault()}>
+            <label>
+              Scope to cancel
+              <input
+                list="risk-scopes"
+                placeholder="all, comp:COMPID or session:SESSION"
+                value={killScope}
+                onChange={(e) => setKillScope(e.target.value)}
+              />
+            </label>
             <button
               type="button"
               className="danger"
-              disabled={scope.trim() === ''}
-              onClick={() => choose('cancel-all', scope.trim())}
+              disabled={killScope.trim() === ''}
+              onClick={() => choose('cancel-all', killScope.trim())}
             >
               Cancel all orders…
             </button>
           </form>
-        )}
-      </section>
+        </section>
+      )}
 
       {risk === undefined ? (
         !error && <p className="muted">Loading…</p>
@@ -233,7 +256,7 @@ export default function Risk({ me, reloads }: { me: Me; reloads: number }) {
         >
           {action.kind === 'cancel-all' && (
             <>
-              <p>Blocks {action.scope} and cancels its clients’ working orders at their venues.</p>
+              <p>{cancelsAll(action.scope)}</p>
               <label>
                 Type {action.scope} to confirm
                 <input
@@ -264,6 +287,7 @@ function Exposure({ risk, limitsOf }: { risk: RiskView; limitsOf: (session: stri
             <th className="num">Open</th>
             <th className="num">Filled</th>
             <th className="num">Credit</th>
+            <th className="num">Credit used</th>
             <th className="num">Max notional</th>
             <th className="num">Max order qty</th>
             <th className="num">Price band %</th>
@@ -280,6 +304,9 @@ function Exposure({ risk, limitsOf }: { risk: RiskView; limitsOf: (session: stri
                 <td className="num">{session.open}</td>
                 <td className="num">{session.filled}</td>
                 <td className="num">{limits.credit ?? ''}</td>
+                <td className="num usage">
+                  {limits.credit !== null && <Usage used={add(session.open, session.filled)} limit={limits.credit} />}
+                </td>
                 <td className="num">{limits.max_notional ?? ''}</td>
                 <td className="num">{limits.max_order_qty ?? ''}</td>
                 <td className="num">{limits.price_band ?? ''}</td>
@@ -292,6 +319,33 @@ function Exposure({ risk, limitsOf }: { risk: RiskView; limitsOf: (session: stri
       </table>
     </div>
   )
+}
+
+/**
+ * What a session has used of its credit, open and filled, as `risk::State::within_credit` counts
+ * it: a bar, warn from 75% and error from 90%, and the decimals exact beside it.
+ */
+function Usage({ used, limit }: { used: Decimal; limit: Decimal }) {
+  // For display only, the share is a float; the text beside it is the decimals.
+  const share = Number(used) / Number(limit)
+  return (
+    <>
+      <span className={share >= 0.9 ? 'bar error' : share >= 0.75 ? 'bar warn' : 'bar'} aria-hidden>
+        <span style={{ width: `${Math.min(1, share) * 100}%` }} />
+      </span>
+      {used} / {limit}
+    </>
+  )
+}
+
+const scale = (d: Decimal) => d.split('.')[1]?.length ?? 0
+
+/** `a + b` exactly, at the larger of their scales. Both not negative, as notionals are. */
+function add(a: Decimal, b: Decimal): Decimal {
+  const at = Math.max(scale(a), scale(b))
+  const whole = (d: Decimal) => BigInt(d.replace('.', '') + '0'.repeat(at - scale(d)))
+  const digits = (whole(a) + whole(b)).toString().padStart(at + 1, '0')
+  return at === 0 ? digits : `${digits.slice(0, -at)}.${digits.slice(-at)}`
 }
 
 function References({ references }: { references: RiskView['references'] }) {

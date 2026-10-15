@@ -4,7 +4,7 @@ import * as api from './api.ts'
 import Reason from './Reason.tsx'
 import Sessions, { NUMBERS_EVERY } from './Sessions.tsx'
 import { initial, LiveContext, reduce } from './store.ts'
-import type { Me, SessionView } from './types.ts'
+import type { Me, OrderView, SessionView } from './types.ts'
 
 const FUNDA = 'FIX.4.4:JETBRIDGE->FUNDA'
 const VENUE = 'FIX.4.4:JETBRIDGE->NASDAQ'
@@ -73,6 +73,59 @@ test('shows clients and venues from the store', () => {
   expect(within(venues).getByText('NASDAQ')).toBeTruthy()
   expect(row(FUNDA).textContent).toBe(`${FUNDA}logged on1234`)
   expect(within(row('NASDAQ')).getByText('paused')).toBeTruthy()
+})
+
+test('sums the sessions, orders and blocks up in cards, the venues down in warn', () => {
+  const cards = () =>
+    [...document.querySelectorAll('.card')].map((card) => [card.querySelector('dt')!.textContent, card.querySelector('dd')!.textContent])
+  const venues = () => document.querySelectorAll('.card dd')[1]
+  show(who('viewer'))
+  // NASDAQ's paused: not down.
+  expect(cards()).toEqual([
+    ['Clients logged on', '1 / 1'],
+    ['Venues logged on', '1 / 1'],
+    ['Working orders', '0'],
+    ['Blocks', '0'],
+  ])
+  expect(venues().className).toBe('')
+  cleanup()
+
+  const down = { ...session('venue', 'FIX.4.4:JETBRIDGE->NYSE'), venue: 'NYSE', status: 'disconnected' as const }
+  // The store counts what the snapshot has; their fields are the blotter's.
+  const orders = [1, 2].map((id) => ({ id }) as OrderView)
+  const state = reduce(initial, {
+    type: 'snapshot',
+    sessions: [
+      session('client', FUNDA),
+      { ...session('client', 'FIX.4.4:JETBRIDGE->FUNDB'), status: 'connected' },
+      session('venue', VENUE),
+      down,
+    ],
+    orders,
+    orders_next: 3,
+    blocked: ['all', 'comp:FUNDA'],
+    unavailable: false,
+    clients: null,
+  })
+  render(
+    <LiveContext.Provider value={{ ...state, link: 'open' }}>
+      <Sessions me={who('viewer')} />
+    </LiveContext.Provider>,
+  )
+  expect(cards()).toEqual([
+    ['Clients logged on', '1 / 2'],
+    ['Venues logged on', '1 / 2, 1 down'],
+    ['Working orders', '2+'],
+    ['Blocks', '2'],
+  ])
+  expect(venues().className).toBe('warn')
+  // Each state a pill, toned by it.
+  const pill = (name: string) => row(name).querySelector('.pill')!
+  expect([pill(FUNDA), pill('FIX.4.4:JETBRIDGE->FUNDB'), pill('NYSE')].map((p) => [p.className, p.textContent])).toEqual([
+    ['pill ok', 'logged on'],
+    ['pill info', 'connected'],
+    ['pill warn', 'disconnected'],
+  ])
 })
 
 test('shows the actions by role, and a venue only to an unscoped one', () => {

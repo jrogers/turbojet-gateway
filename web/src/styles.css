@@ -255,6 +255,7 @@ td.sell {
 }
 
 .card {
+  margin: 0;
   padding: 0.6rem 0.75rem;
 }
 
@@ -778,4 +779,34 @@ tr.matched {
 td.wrap {
   white-space: normal;
   max-width: 40ch;
+}
+
+/* Panels on a screen: apart, their heading at the top. */
+
+section.panel {
+  margin: 0 0 1rem;
+}
+
+.panel > h2:first-child {
+  margin-top: 0;
+}
+
+/* Summary cards: a label over its value. */
+
+.card dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.card dd {
+  margin: 0.2rem 0 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 1.25rem;
+}
+
+.card dd.warn {
+  color: var(--warn);
 }

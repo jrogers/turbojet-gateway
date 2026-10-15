@@ -1,3 +1,5 @@
+import type { SessionView } from './types.ts'
+
 /**
  * A session's target, the client's side: what follows `->` in `BEGIN:SENDER->TARGET` (maybe with
  * `/SUB` and `:QUAL`), or `''` if it isn't a session's name.
@@ -20,3 +22,9 @@ export function namesTarget(session: string, compId: string): boolean {
   const after = rest.slice(compId.length)
   return after === '' || after[0] === '/' || after[0] === ':'
 }
+
+/**
+ * Whether a session counts as down: disconnected and not paused, as a paused one is so on purpose,
+ * and one logging on or out is on its way.
+ */
+export const isDown = (session: SessionView) => !session.paused && session.status === 'disconnected'

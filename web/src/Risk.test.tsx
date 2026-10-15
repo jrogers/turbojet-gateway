@@ -65,7 +65,8 @@ afterEach(() => {
 })
 
 const row = (name: string) => screen.getByText(name).closest('tr')!
-const cells = (name: string) => [...row(name).querySelectorAll('td')].map((td) => td.textContent)
+// The usage column aside: its own test's.
+const cells = (name: string) => [...row(name).querySelectorAll('td:not(.usage)')].map((td) => td.textContent)
 
 test('shows each session against its limits as merged, and the reference prices, as written', async () => {
   serve({ 'GET /api/risk': () => json(fixture) })
@@ -75,6 +76,41 @@ test('shows each session against its limits as merged, and the reference prices,
   expect(cells(FUNDA)).toEqual([FUNDA, '1025.0000', '0', '', '', '1000', '5.5', '', ''])
   expect(cells(FUNDB)).toEqual([FUNDB, '0.000000000000000001', '12.5', '250000.50', '', '1000', '5.5', 'AAPL, MSFT', 'refused'])
   expect(cells('AAPL')).toEqual(['AAPL', '10.250000000000000001'])
+})
+
+test('a session with a credit limit shows its open and filled against it, exactly, toned by the share', async () => {
+  const FUNDC = 'FIX.4.4:JETBRIDGE->FUNDC'
+  const FUNDD = 'FIX.4.4:JETBRIDGE->FUNDD'
+  const credit = (credit: string) => ({ ...none, credit })
+  serve({
+    'GET /api/risk': () =>
+      json({
+        ...fixture,
+        by_comp_id: { FUNDA: credit('1281.25'), FUNDB: credit('1000'), FUNDC: credit('1000') },
+        sessions: [
+          ...fixture.sessions,
+          { client: FUNDC, open: '900', filled: '50.25' },
+          { client: FUNDD, open: '1', filled: '0' },
+        ],
+      }),
+  })
+  render(page(who('viewer'), snapshot()))
+  await screen.findByText(FUNDA)
+  const usage = (name: string) => row(name).querySelector('td.usage')!
+  const bar = (name: string) => usage(name).querySelector('.bar')
+  // 80%: warn.
+  expect(usage(FUNDA).textContent).toBe('1025.0000 / 1281.25')
+  expect(bar(FUNDA)!.className).toBe('bar warn')
+  expect((bar(FUNDA)!.firstChild as HTMLElement).style.width).toBe('80%')
+  // 95.025%: error.
+  expect(usage(FUNDC).textContent).toBe('950.25 / 1000')
+  expect(bar(FUNDC)!.className).toBe('bar error')
+  // Under 75%, the sum exact at the larger scale.
+  expect(usage(FUNDB).textContent).toBe('12.500000000000000001 / 1000')
+  expect(bar(FUNDB)!.className).toBe('bar')
+  // No limit, no bar.
+  expect(usage(FUNDD).textContent).toBe('')
+  expect(bar(FUNDD)).toBeNull()
 })
 
 test('a 404 clears what was shown, says why, and stops the reads until a snapshot', async () => {
@@ -306,7 +342,7 @@ test('the kill switch needs its scope typed exactly, then posts', async () => {
   })
   render(page(who('operator'), snapshot()))
   await screen.findByText(FUNDA)
-  fireEvent.change(screen.getByLabelText('Scope'), { target: { value: 'comp:FUNDA' } })
+  fireEvent.change(screen.getByLabelText('Scope to cancel'), { target: { value: 'comp:FUNDA' } })
   fireEvent.click(screen.getByRole('button', { name: 'Cancel all orders…' }))
   const dialog = screen.getByRole('dialog')
   expect(within(dialog).getByRole('heading').textContent).toBe('Cancel all orders of comp:FUNDA')
