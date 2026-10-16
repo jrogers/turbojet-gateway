@@ -51,7 +51,7 @@ function valueOf(key: Key, text: string, on: boolean, remove: boolean): LimitsSe
 }
 
 /**
- * The risk limits as `turbojet-hub.toml` writes them (`GET /api/risk/limits`), the defaults and each
+ * The risk limits as `turbojet-gateway.toml` writes them (`GET /api/risk/limits`), the defaults and each
  * client's table with only the keys it sets: the others say "default". An admin edits one key at
  * a time, or removes it, and deletes or adds a client's table; the defaults only an admin without
  * clients, a client's table an admin of it, as the API allows. Each edit is read again, with the

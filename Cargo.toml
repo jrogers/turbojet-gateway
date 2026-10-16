@@ -1,5 +1,5 @@
 [package]
-name = "turbojet-hub"
+name = "turbojet-gateway"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
@@ -55,7 +55,7 @@ tokio-rustls = { version = "0.26", default-features = false, optional = true }
 sqlx = { version = "0.8.6", default-features = false, features = ["any", "runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 toml = { version = "1", default-features = false, features = ["display", "parse", "serde", "std"] }
-# The API's limit edits: one table changed, the rest of turbojet-hub.toml kept as written.
+# The API's limit edits: one table changed, the rest of turbojet-gateway.toml kept as written.
 toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

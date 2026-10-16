@@ -31,13 +31,13 @@ async fn reopenable() -> (String, Option<tempfile::TempDir>) {
     (format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display()), Some(dir))
 }
 
-/// With the `postgres` feature and `TURBOJET_HUB_POSTGRES_URL` set, a new schema on that database,
-/// as a URL whose connections use it: the database is one the tests may fill. Schemas are
+/// With the `postgres` feature and `TURBOJET_GATEWAY_POSTGRES_URL` set, a new schema on that
+/// database, as a URL whose connections use it: the database is one the tests may fill. Schemas are
 /// left behind.
 #[cfg(feature = "postgres")]
 async fn postgres() -> Option<String> {
-    let url = std::env::var("TURBOJET_HUB_POSTGRES_URL").ok().filter(|url| !url.is_empty())?;
-    let schema = format!("turbojet_hub_test_{:016x}", getrandom::u64().unwrap());
+    let url = std::env::var("TURBOJET_GATEWAY_POSTGRES_URL").ok().filter(|url| !url.is_empty())?;
+    let schema = format!("turbojet_gateway_test_{:016x}", getrandom::u64().unwrap());
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
     pool.execute(format!("CREATE SCHEMA {schema}").as_str()).await.unwrap();
@@ -274,7 +274,7 @@ async fn every_row_reads_back_as_written() {
         ClOrdIdRow { client: funda.clone(), day: None, cl_ord_id: "C1".into(), order: OrderId(1) },
         ClOrdIdRow { client: funda.clone(), day: Some(Day(time(17, 1))), cl_ord_id: "C1".into(), order: OrderId(3) },
     ];
-    let session = ClientId::new(&turbojet::SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDC"));
+    let session = ClientId::new(&turbojet::SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDC"));
     let changes = Changes {
         orders: every_order(&funda),
         sent: every_sent(),
@@ -584,7 +584,7 @@ async fn a_database_reopens_and_another_schema_version_is_refused() {
     sqlx::query("UPDATE schema_version SET version = 2").execute(&store.pool).await.unwrap();
     store.close().await;
     let error = Store::open(&url).await.unwrap_err().to_string();
-    assert!(error.contains("schema is version 2; this Turbojet Hub reads version 1"), "{error}");
+    assert!(error.contains("schema is version 2; this Turbojet Gateway reads version 1"), "{error}");
     let pool = AnyPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
     let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version").fetch_one(&pool).await.unwrap();
     assert_eq!(version, 2, "left as it was");
@@ -1102,7 +1102,7 @@ fn on(day: i64, hour: u32) -> DateTime<Utc> {
 /// symbols, done and live, 3 and 4 created at one time. Returns the second FUNDA session.
 async fn history(store: &Store) -> ClientId {
     let (funda, fundb) = (ClientId::from("FUNDA"), ClientId::from("FUNDB"));
-    let funda_42 = ClientId::new(&turbojet::SessionId::new("FIX.4.2", "TURBOJETHUB", "FUNDA"));
+    let funda_42 = ClientId::new(&turbojet::SessionId::new("FIX.4.2", "TURBOJETGATEWAY", "FUNDA"));
     let orders = [
         (1, &funda, on(0, 9), false, "NASDAQ", "AAPL"),
         (2, &fundb, on(0, 10), true, "NYSE", "MSFT"),
@@ -1333,7 +1333,7 @@ async fn a_connection_silent_in_a_history_read_fails_it_and_a_read_after_answers
     }
     let Some(url) = postgres().await else { return };
     // The store's sessions named, to be found in `pg_stat_activity`.
-    let name = format!("turbojet_hub_test_{:016x}", getrandom::u64().unwrap());
+    let name = format!("turbojet_gateway_test_{:016x}", getrandom::u64().unwrap());
     let relay = Relay::new(&format!("{url}&application_name={name}")).await;
     let store = Store::open(&relay.url).await.unwrap();
     store.write(&[dated(1, &ClientId::from("FUNDA"), None, true, on(0, 9))]).await.unwrap();

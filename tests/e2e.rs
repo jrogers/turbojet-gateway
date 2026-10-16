@@ -1,5 +1,5 @@
 //! The gateway end to end: a client (a Turbojet initiator) and a venue (a Turbojet acceptor with a
-//! scripted application) in the test process, and Turbojet Hub between them, run from its
+//! scripted application) in the test process, and Turbojet Gateway between them, run from its
 //! configuration files, over TCP on loopback.
 //!
 //! The venue records what it receives, and the test answers for it (or, for the burst, it
@@ -30,15 +30,15 @@ use turbojet::{
 };
 use turbojet_fix42 as v42;
 use turbojet_fix44 as v44;
-use turbojet_hub::auth::{Role, Users};
-use turbojet_hub::book::{AlarmKind, ClientId, GatewayEvent, Scope, Status};
-use turbojet_hub::service::Service;
-use turbojet_hub::store::Store;
+use turbojet_gateway::auth::{Role, Users};
+use turbojet_gateway::book::{AlarmKind, ClientId, GatewayEvent, Scope, Status};
+use turbojet_gateway::service::Service;
+use turbojet_gateway::store::Store;
 
 const CLIENT: &str = "FUNDA";
 /// The venue's `[initiator.NAME]`, and its CompID.
 const VENUE: &str = "VENUE";
-const GATEWAY: &str = "TURBOJETHUB";
+const GATEWAY: &str = "TURBOJETGATEWAY";
 /// Orders for it are rejected by a route.
 const REFUSED_SYMBOL: &str = "MSFT";
 const REFUSED_TEXT: &str = "MSFT is not traded here";
@@ -249,12 +249,12 @@ reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
     };
     let log = if *message_log { "[message_log]\ndir = \"log\"\n" } else { "" };
     let config = routes(REFUSED_SYMBOL, REFUSED_TEXT) + &database + api + log;
-    std::fs::write(dir.path().join("turbojet-hub.toml"), config).unwrap();
+    std::fs::write(dir.path().join("turbojet-gateway.toml"), config).unwrap();
 }
 
 /// The gateway's database, with [`Options::database`].
 fn database_url(dir: &tempfile::TempDir) -> String {
-    format!("sqlite://{}?mode=rwc", dir.path().join("turbojet-hub.db").display())
+    format!("sqlite://{}?mode=rwc", dir.path().join("turbojet-gateway.db").display())
 }
 
 /// The audit log's lines, with [`Options::api`]: its day files, oldest first.
@@ -297,7 +297,7 @@ impl Default for Options {
     }
 }
 
-/// Turbojet Hub, its venue, and a client logged on through it.
+/// Turbojet Gateway, its venue, and a client logged on through it.
 struct Setup {
     service: Arc<Service>,
     venue: Venue,
@@ -327,7 +327,7 @@ impl Setup {
         let config = SessionConfig::new(options.venue_version, VENUE);
         let acceptor = Acceptor::new(config, Arc::new(MemoryStorage::new()), app).unwrap();
         let serving = tokio::spawn(acceptor.clone().serve(listener));
-        let (service, _serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
+        let (service, _serving) = Service::start(&dir.path().join("turbojet-gateway.toml")).await.unwrap();
         venue_events.logged_on_within(STARTUP_WAIT).await;
         let (client, mut events) = client(&service, options.client_version, None);
         let running = tokio::spawn(client.clone().run());
@@ -658,7 +658,7 @@ async fn an_order_a_route_rejects_is_rejected_with_its_text() {
 async fn reloaded_routes_apply_to_new_orders_and_working_ones_carry_on() {
     let mut setup = Setup::new().await;
     setup.working_order().await;
-    std::fs::write(setup.dir.path().join("turbojet-hub.toml"), routes("AAPL", "AAPL is halted")).unwrap();
+    std::fs::write(setup.dir.path().join("turbojet-gateway.toml"), routes("AAPL", "AAPL is halted")).unwrap();
     setup.reload().await;
 
     setup.send(order("C2", "AAPL"));
@@ -1039,7 +1039,8 @@ async fn until(done: impl Fn() -> bool) {
 async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
     let mut setup = Setup::new().await;
     let risk = "[risk.defaults]\nmax_order_qty = 99\n";
-    std::fs::write(setup.dir.path().join("turbojet-hub.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + risk).unwrap();
+    std::fs::write(setup.dir.path().join("turbojet-gateway.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT) + risk)
+        .unwrap();
     setup.reload().await;
 
     setup.send(order("C1", "AAPL"));
@@ -1047,7 +1048,7 @@ async fn an_order_over_max_order_qty_is_rejected_with_the_limits_text() {
     assert_unbooked_reject(&rejected, "C1", &setup.id("R1"));
     assert_eq!(rejected.text.as_deref(), Some("quantity over the limit (risk max_order_qty)"));
     assert_eq!(rejected.ord_rej_reason, Some(Code::Known(v44::OrdRejReason::OrderExceedsLimit)));
-    std::fs::write(setup.dir.path().join("turbojet-hub.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT)).unwrap();
+    std::fs::write(setup.dir.path().join("turbojet-gateway.toml"), routes(REFUSED_SYMBOL, REFUSED_TEXT)).unwrap();
     setup.reload().await;
     assert_eq!(setup.order("C2").await.cl_ord_id, &*setup.id("1"));
 }
@@ -1206,7 +1207,7 @@ async fn an_order_unknown_at_its_venue_is_resolved() {
     let lines = audit_lines(setup.dir.path());
     let seen: Vec<_> =
         lines.iter().map(|line| (line["action"].as_str(), line["target"].as_str(), line["result"].as_str())).collect();
-    let refused = format!("failed: {}", turbojet_hub::edge::ResolveError::NotUnknownAtVenue);
+    let refused = format!("failed: {}", turbojet_gateway::edge::ResolveError::NotUnknownAtVenue);
     assert_eq!(
         seen,
         [
@@ -1233,7 +1234,7 @@ async fn an_order_of_a_past_day_is_read_from_the_database() {
     for margin in [3, 6, 12] {
         let mut setup = Setup::with(Options { api: true, database: true, ..Options::default() }).await;
         let token = operator(&setup).await;
-        let config = setup.dir.path().join("turbojet-hub.toml");
+        let config = setup.dir.path().join("turbojet-gateway.toml");
         // To the second, as `day_end` is written.
         let day_end = Utc::now().trunc_subsecs(0) + TimeDelta::seconds(margin);
         let rest = std::fs::read_to_string(&config).unwrap();

@@ -1,6 +1,6 @@
-# Working on Turbojet Hub
+# Working on Turbojet Gateway
 
-Turbojet Hub is a FIX connectivity gateway built on the Turbojet engine, from crates.io.
+Turbojet Gateway is a FIX connectivity gateway built on the Turbojet engine, from crates.io.
 
 - House style is Turbojet's [STYLE.md](https://github.com/jrogers/turbojet/blob/main/docs/STYLE.md)
   (`../turbojet/docs/STYLE.md` in a checkout); read it before writing code.
@@ -12,7 +12,7 @@ Turbojet Hub is a FIX connectivity gateway built on the Turbojet engine, from cr
 - Before committing, `scripts/check.sh`: CI's per-push checks (`.github/workflows/ci.yml`), the
   web console's lint, tests and build, then clippy and tests for each feature. While iterating,
   `cargo test --all-features` and, in `web/`, `npm test -- --run` are enough.
-- With a PostgreSQL to hand, also `TURBOJET_HUB_POSTGRES_URL=… scripts/check.sh --postgres`: see
+- With a PostgreSQL to hand, also `TURBOJET_GATEWAY_POSTGRES_URL=… scripts/check.sh --postgres`: see
   `src/store/tests.rs`'s `postgres()`. `--msrv` adds the 1.89 tests, `--deny` cargo-deny.
 - Engine work builds against a Turbojet checkout at `../turbojet` through a local, untracked
   `.cargo/config.toml` (gitignored):
@@ -26,5 +26,5 @@ Turbojet Hub is a FIX connectivity gateway built on the Turbojet engine, from cr
   It rewrites `Cargo.lock`'s Turbojet entries to the path; don't commit those. In the main
   checkout it applies to the worktrees under `.worktrees/` too. The checkout's version must match
   `0.3`, or cargo ignores the patch with only a warning.
-- Engine bugs found here are fixed in the Turbojet repo, in their own commits; Turbojet Hub takes the
-  fix from the next release, or meanwhile through the local patch.
+- Engine bugs found here are fixed in the Turbojet repo, in their own commits; Turbojet Gateway
+  takes the fix from the next release, or meanwhile through the local patch.

@@ -12,8 +12,8 @@ yanked = "deny"
 ignore = []
 
 [licenses]
-# Turbojet Hub is Apache-2.0, and its binary carries every dependency, so they must be compatible
-# with it. An expression with OR passes if any choice is allowed.
+# Turbojet Gateway is Apache-2.0, and its binary carries every dependency, so they must be
+# compatible with it. An expression with OR passes if any choice is allowed.
 allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.9
 

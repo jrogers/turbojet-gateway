@@ -1,5 +1,5 @@
-//! The operator API: an HTTP JSON server in the gateway's process, started when `turbojet-hub.toml`
-//! has `[api]` (see [`Api`]).
+//! The operator API: an HTTP JSON server in the gateway's process, started when
+//! `turbojet-gateway.toml` has `[api]` (see [`Api`]).
 //!
 //! Every answer is JSON, errors included: [`ApiError`] is `{"error": "..."}` with its status.
 //! Handlers reach the gateway and the service through `State`, which holds the service weakly:
@@ -169,7 +169,7 @@ struct Health {
     version: &'static str,
 }
 
-/// `GET /api/health`, without authentication: the server is up, and which Turbojet Hub it is.
+/// `GET /api/health`, without authentication: the server is up, and which Turbojet Gateway it is.
 async fn health() -> Json<Health> {
     Json(Health { version: env!("CARGO_PKG_VERSION") })
 }

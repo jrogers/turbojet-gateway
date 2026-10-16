@@ -129,7 +129,7 @@ function Frame({ me: login, onMe, onLogout }: { me: Me; onMe: (me: Me) => void; 
   return (
     <div className="app">
       <header className="sidebar">
-        <span className="brand">Turbojet Hub</span>
+        <span className="brand">Turbojet Gateway</span>
         <nav className="links" aria-label="Main">
           <a href="#/orders" aria-current={current(route, 'orders')}>
             Orders

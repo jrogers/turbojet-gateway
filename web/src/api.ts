@@ -133,7 +133,7 @@ export const routeTest = (client: string, exDestination: string, symbol: string)
   request<RouteTest>('GET', `/api/routes/test${query({ client, ex_destination: exDestination, symbol })}`)
 /** [unscoped admin] The last `limit` entries from `since` (RFC 3339), oldest first. */
 export const audit = (since: string, limit: number) => request<AuditEntry[]>('GET', `/api/audit${query({ since, limit })}`)
-/** The limits as `turbojet-hub.toml` writes them: edit from these, not `RiskView`'s, which are merged. */
+/** The limits as `turbojet-gateway.toml` writes them: edit from these, not `RiskView`'s, which are merged. */
 export const riskLimits = () => request<RiskTables>('GET', '/api/risk/limits')
 
 /**
@@ -177,8 +177,8 @@ export const unblock = (scope: string, reason: string) => request<Changed>('POST
 /** The kill switch: blocks `scope` and cancels its orders. */
 export const cancelAll = (scope: string, reason: string) =>
   request<Committed | undefined>('POST', '/api/risk/cancel-all', { reason, scope }).then(committed)
-// The limit edits [admin]: each writes `turbojet-hub.toml` and reloads. An amount goes as a decimal
-// string, which keeps every digit.
+// The limit edits [admin]: each writes `turbojet-gateway.toml` and reloads. An amount goes as a
+// decimal string, which keeps every digit.
 export const setDefaultLimits = (reason: string, set: LimitsSet) =>
   request<EditedView>('PATCH', '/api/risk/limits/defaults', { reason, set })
 /** Creates the CompID's table if it has none. */

@@ -1,4 +1,4 @@
-//! Turbojet Hub: a FIX connectivity gateway built on Turbojet.
+//! Turbojet Gateway: a FIX connectivity gateway built on Turbojet.
 
 pub mod api;
 pub mod audit;

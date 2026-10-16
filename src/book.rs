@@ -85,11 +85,12 @@ impl Serialize for ClientId {
     }
 }
 
-/// The FIX 4.4 session from TURBOJETHUB to CompID `comp_id`, with no SubIDs: tests' usual client.
+/// The FIX 4.4 session from TURBOJETGATEWAY to CompID `comp_id`, with no SubIDs: tests' usual
+/// client.
 #[cfg(test)]
 impl From<&str> for ClientId {
     fn from(comp_id: &str) -> Self {
-        Self::new(&SessionId::new("FIX.4.4", "TURBOJETHUB", comp_id))
+        Self::new(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", comp_id))
     }
 }
 

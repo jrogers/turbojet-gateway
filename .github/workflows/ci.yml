@@ -89,18 +89,18 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: turbojet_hub
-          POSTGRES_PASSWORD: turbojet_hub
-          POSTGRES_DB: turbojet_hub_test
+          POSTGRES_USER: turbojet_gateway
+          POSTGRES_PASSWORD: turbojet_gateway
+          POSTGRES_DB: turbojet_gateway_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U turbojet_hub"
+          --health-cmd "pg_isready -U turbojet_gateway"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 15
     env:
-      TURBOJET_HUB_POSTGRES_URL: postgres://turbojet_hub:turbojet_hub@localhost:5432/turbojet_hub_test
+      TURBOJET_GATEWAY_POSTGRES_URL: postgres://turbojet_gateway:turbojet_gateway@localhost:5432/turbojet_gateway_test
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -132,5 +132,5 @@ jobs:
       - run: cargo build --release --all-features --locked
       - uses: actions/upload-artifact@v7
         with:
-          name: turbojet-hub-linux-x86_64
-          path: target/release/turbojet-hub
+          name: turbojet-gateway-linux-x86_64
+          path: target/release/turbojet-gateway

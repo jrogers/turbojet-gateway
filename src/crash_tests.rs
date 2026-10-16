@@ -1,4 +1,4 @@
-//! The crash suite: Turbojet Hub with disk session stores and a SQLite file, stopped dead at each step
+//! The crash suite: Turbojet Gateway with disk session stores and a SQLite file, stopped dead at each step
 //! of an order's flow and started again on the same files, with a client and a venue that stay up
 //! and reconnect, as in production. Each test checks what the client and the venue saw end to
 //! end, and that the database, once quiet, agrees.
@@ -49,7 +49,7 @@ use crate::store::Store;
 
 const CLIENT: &str = "FUNDA";
 const VENUE: &str = "VENUE";
-const GATEWAY: &str = "TURBOJETHUB";
+const GATEWAY: &str = "TURBOJETGATEWAY";
 /// How long any one event may take: a restart waits up to a second for its ID prefix.
 const WAIT: Duration = Duration::from_secs(5);
 /// How long a test waits to see that nothing more arrives: loopback delivers in well under it.
@@ -165,7 +165,7 @@ impl Events {
     }
 }
 
-/// Turbojet Hub on a runtime and thread of its own, so it can be stopped dead: see the module
+/// Turbojet Gateway on a runtime and thread of its own, so it can be stopped dead: see the module
 /// documentation.
 struct Gateway {
     service: Arc<Service>,
@@ -175,7 +175,7 @@ struct Gateway {
 }
 
 impl Gateway {
-    /// Starts Turbojet Hub from `dir`'s files, serving clients on `listener`, its venue's and
+    /// Starts Turbojet Gateway from `dir`'s files, serving clients on `listener`, its venue's and
     /// client's sessions in gated disk stores, open while `venue` and `client` are.
     fn start(
         dir: &Path,
@@ -183,7 +183,7 @@ impl Gateway {
         venue: watch::Receiver<bool>,
         client: watch::Receiver<bool>,
     ) -> Self {
-        let path = dir.join("turbojet-hub.toml");
+        let path = dir.join("turbojet-gateway.toml");
         let stores = vec![
             ("venue".to_string(), gated_disk(&dir.join("venue-store"), venue)),
             ("client".to_string(), gated_disk(&dir.join("client-store"), client)),
@@ -474,7 +474,7 @@ fn gated_disk(dir: &Path, open: watch::Receiver<bool>) -> Arc<dyn SessionStorage
 }
 
 fn database_url(dir: &Path) -> String {
-    format!("sqlite://{}?mode=rwc", dir.join("turbojet-hub.db").display())
+    format!("sqlite://{}?mode=rwc", dir.join("turbojet-gateway.db").display())
 }
 
 /// How a [`Setup`] differs from the usual.
@@ -495,8 +495,8 @@ impl Default for Options {
     }
 }
 
-/// Turbojet Hub's files: clients on `port`, the venue at `venue_port`, both sessions on disk, as
-/// `options` say.
+/// Turbojet Gateway's files: clients on `port`, the venue at `venue_port`, both sessions on disk,
+/// as `options` say.
 fn write_config(dir: &Path, port: u16, venue_port: u16, options: &Options) {
     let Options { cancel_on_disconnect, database, reset_on_logon, .. } = options;
     let cancel = cancel_on_disconnect
@@ -531,7 +531,7 @@ reset_on_logon = {reset_on_logon}
     std::fs::write(dir.join("sessions.toml"), sessions).unwrap();
     let database = if *database { format!("[database]\nurl = \"{}\"\n", database_url(dir)) } else { String::new() };
     let config = format!("sessions = \"sessions.toml\"\n[[route]]\nvenue = \"{VENUE}\"\n{database}");
-    std::fs::write(dir.join("turbojet-hub.toml"), config).unwrap();
+    std::fs::write(dir.join("turbojet-gateway.toml"), config).unwrap();
 }
 
 fn order(cl_ord_id: &str) -> Message {

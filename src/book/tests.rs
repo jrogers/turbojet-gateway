@@ -164,7 +164,7 @@ fn the_same_cl_ord_id_from_another_client_is_a_new_order() {
 
 /// FUNDA's session with SubID `sub_id`.
 fn desk(sub_id: &str) -> ClientId {
-    ClientId::new(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA").with_target_sub_id(sub_id))
+    ClientId::new(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA").with_target_sub_id(sub_id))
 }
 
 fn order_from(client: &ClientId, cl_ord_id: &str) -> Input {
@@ -3674,7 +3674,7 @@ fn an_unsent_request_answered_since_is_not_sent_again() {
 
 #[test]
 fn scope_names_print_as_they_parse() {
-    for text in ["all", "comp:FUNDA", "session:FIX.4.4:TURBOJETHUB->FUNDA/DESK1"] {
+    for text in ["all", "comp:FUNDA", "session:FIX.4.4:TURBOJETGATEWAY->FUNDA/DESK1"] {
         let name: ScopeName = text.parse().unwrap();
         assert_eq!(name.to_string(), text);
     }
@@ -3866,7 +3866,7 @@ fn views_serialize_as_the_api_sends_them() {
     new_order(&mut book, "C1");
     let json = serde_json::to_value(book.order_detail(OrderId(1)).unwrap()).unwrap();
     assert_eq!(json["order_id"], "1");
-    assert_eq!(json["client"], "FIX.4.4:TURBOJETHUB->FUNDA");
+    assert_eq!(json["client"], "FIX.4.4:TURBOJETGATEWAY->FUNDA");
     assert_eq!(
         (&json["side"], &json["ord_type"], &json["status"]),
         (&"buy".into(), &"limit".into(), &"pending_new".into())

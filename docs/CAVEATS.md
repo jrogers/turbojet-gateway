@@ -1,7 +1,7 @@
 # Known caveats
 
-Behaviour that is deliberate or documented, but worth knowing about before you rely on Turbojet Hub.
-Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/main/docs/CAVEATS.md).
+Behaviour that is deliberate or documented, but worth knowing about before you rely on Turbojet
+Gateway. Turbojet's own are in its [CAVEATS.md](https://github.com/jrogers/turbojet/blob/main/docs/CAVEATS.md).
 What's still open is in [ROADMAP.md](ROADMAP.md).
 
 ## The book
@@ -16,7 +16,7 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   stored: 256 messages past the oldest one waiting, a client's session stops reading from it until
   the venue's session catches up, its requests for other venues and its cancels included.
   Turbojet logs a warning when that happens. Its `turbojet_held_back` gauge needs Turbojet's
-  `metrics` feature, which Turbojet Hub isn't built with. A database that's slow or down holds
+  `metrics` feature, which Turbojet Gateway isn't built with. A database that's slow or down holds
   sessions back the same way (see below).
 - A gateway cancel (the kill switch's) that a venue's session can't queue is tried again once a
   second while the session is connected, without limit.
@@ -261,8 +261,8 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 
 ## Editing the limits over the API
 
-- An edit rewrites `turbojet-hub.toml`, so the gateway's user must be able to write it and to create
-  and rename a file in its directory (the directory of the file a symlink points to). The new
+- An edit rewrites `turbojet-gateway.toml`, so the gateway's user must be able to write it and to
+  create and rename a file in its directory (the directory of the file a symlink points to). The new
   file belongs to the gateway's user; an owner that changed, or a directory that couldn't be
   synced once the file was in place, comes back as a warning in the answer.
 - An edit reformats only the table it touches. A comment after a value it replaces stays; a
@@ -274,8 +274,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   `[risk.defaults]` and `[risk.client.COMPID]` tables answer 422: edit those by hand.
 - An edit checks the routes against the venues running now, so a venue added by hand to both
   files but not yet reloaded makes every edit 422 until a reload starts it.
-- Each edit runs a full reload, which takes whatever else was changed by hand in `turbojet-hub.toml`
-  and the sessions file. A hand edit saved while an API edit is under way is overwritten.
+- Each edit runs a full reload, which takes whatever else was changed by hand in
+  `turbojet-gateway.toml` and the sessions file. A hand edit saved while an API edit is under way is
+  overwritten.
 - Removing a client's last key leaves its table, empty: the client has the defaults, but still a
   table until it's deleted.
 - CompIDs the API refuses in a path (with dots, spaces, quotes, backslashes or non-ASCII) show in
@@ -296,9 +297,9 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   an error and the order or request stays pending, with nothing sent to the client.
 - A venue a reload removes leaves its open orders in the book: cancels and replaces for them are
   refused as venue unavailable, and its reports, should its session still be up, are rejected.
-- Turbojet Hub is built without Turbojet's `validation` feature, so a `dictionary` in the sessions
-  file doesn't load. On a venue initiator, one would refuse reports with a venue's own codes
-  before the gateway saw them.
+- Turbojet Gateway is built without Turbojet's `validation` feature, so a `dictionary` in the
+  sessions file doesn't load. On a venue initiator, one would refuse reports with a venue's own
+  codes before the gateway saw them.
 
 ## Clients
 
@@ -380,7 +381,7 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   loop writes one synced line each, and can delay real mutations.
 - A reload answered 422 may have applied half: the file that loaded is in use. The answer says
   which.
-- `turbojet-hub user` replaces a dangling symlink at the users file's path with a regular file.
+- `turbojet-gateway user` replaces a dangling symlink at the users file's path with a regular file.
 - Setting a session's sequence numbers while it's logged on has effects on the counterparty;
   pausing it first is safer:
   - lowering next_incoming can have messages accepted again, or, with messages in flight, draw a
@@ -427,7 +428,7 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   through lets it choose its address for the login limit and the audit log. The proxy must set
   and overwrite them. A proxy that sends no `X-Forwarded-For` is every client's address, with a
   warning logged once: every login then shares one limit.
-- Under TLS, or behind a proxy, the session cookie is `__Host-turbojet_hub_session` with `Path=/`, so
+- Under TLS, or behind a proxy, the session cookie is `__Host-turbojet_gateway_session` with `Path=/`, so
   the browser sends it to every path on the API's host name: give the API a host name of its own,
   not a path on a site that serves other pages.
 - A live socket's snapshot holds up to 1,000 working orders; the rest are read from
@@ -446,7 +447,7 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
   shown: the live events don't carry them, so between reads they lag.
 - The risk screen reads the risk every 5 seconds while it's open and the page shown, and at each
   snapshot and action: no live event carries notionals, so between reads they lag.
-- A limit edit from the risk screen rewrites `turbojet-hub.toml` and reloads: see
+- A limit edit from the risk screen rewrites `turbojet-gateway.toml` and reloads: see
   [Editing the limits over the API](#editing-the-limits-over-the-api).
 - The risk screen reads the limits table on opening, at each snapshot, edit and reload from the
   console, and when the page is shown again. A SIGHUP, or another admin's reload or edit, changes

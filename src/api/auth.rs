@@ -5,9 +5,9 @@
 //!
 //! - **a token**, `Authorization: Bearer jb_...`, for scripts. A header that's there but wrong is
 //!   refused, never passed over for the cookie.
-//! - **a session**, from `POST /api/login`: the session cookie (`__Host-turbojet_hub_session` under
-//!   TLS, here or at a proxy; `turbojet_hub_session` on plain loopback), which a browser sends by
-//!   itself, so every request but a GET or HEAD must also carry `X-CSRF-Token`, the session's own
+//! - **a session**, from `POST /api/login`: the session cookie
+//!   (`__Host-turbojet_gateway_session` under TLS, here or at a proxy; `turbojet_gateway_session`
+//!   on plain loopback), which a browser sends by itself, so every request but a GET or HEAD must also carry `X-CSRF-Token`, the session's own
 //!   token, which a page on another site can't read. A websocket upgrade can't carry a header a
 //!   page sets, so it must come from a page on the API's own host instead: its `Origin` must name
 //!   the `Host` (behind a proxy, `X-Forwarded-Host` if sent). A session ends after
@@ -51,12 +51,12 @@ use crate::book::{ClientId, Scope};
 use crate::config::Api;
 
 /// The session cookie's name over plain HTTP (on loopback), for `Path=/api`.
-pub(crate) const SESSION_COOKIE: &str = "turbojet_hub_session";
+pub(crate) const SESSION_COOKIE: &str = "turbojet_gateway_session";
 
 /// The session cookie's name under TLS, here or at a proxy. The `__Host-` prefix makes browsers
 /// refuse it unless it's `Secure`, `Path=/` and has no `Domain`, so a sibling subdomain can't
 /// plant or shadow it.
-pub(crate) const SESSION_COOKIE_SECURE: &str = "__Host-turbojet_hub_session";
+pub(crate) const SESSION_COOKIE_SECURE: &str = "__Host-turbojet_gateway_session";
 
 /// The header a session's every request but a GET or HEAD carries its CSRF token in.
 const CSRF_HEADER: &str = "x-csrf-token";
@@ -854,11 +854,11 @@ mod tests {
         ("GET", "/api/routes"),
         ("GET", "/api/routes/test?client=FUNDA&symbol=AAPL"),
         ("GET", "/api/live"),
-        ("POST", "/api/sessions/FIX.4.4:TURBOJETHUB-%3EFUNDA/pause"),
-        ("POST", "/api/sessions/FIX.4.4:TURBOJETHUB-%3EFUNDA/resume"),
-        ("POST", "/api/sessions/FIX.4.4:TURBOJETHUB-%3EFUNDA/resend"),
-        ("POST", "/api/sessions/FIX.4.4:TURBOJETHUB-%3EFUNDA/sequence"),
-        ("POST", "/api/sessions/FIX.4.4:TURBOJETHUB-%3EFUNDA/reset"),
+        ("POST", "/api/sessions/FIX.4.4:TURBOJETGATEWAY-%3EFUNDA/pause"),
+        ("POST", "/api/sessions/FIX.4.4:TURBOJETGATEWAY-%3EFUNDA/resume"),
+        ("POST", "/api/sessions/FIX.4.4:TURBOJETGATEWAY-%3EFUNDA/resend"),
+        ("POST", "/api/sessions/FIX.4.4:TURBOJETGATEWAY-%3EFUNDA/sequence"),
+        ("POST", "/api/sessions/FIX.4.4:TURBOJETGATEWAY-%3EFUNDA/reset"),
         ("POST", "/api/orders/JB1/cancel"),
         ("POST", "/api/orders/JB1/status"),
         ("POST", "/api/orders/JB1/resolve"),
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(answer.body["role"], "operator");
         assert_eq!(answer.body["clients"], serde_json::json!(["FUNDA"]));
         let set = answer.headers[SET_COOKIE].to_str().unwrap();
-        assert!(set.starts_with("turbojet_hub_session="), "{set}");
+        assert!(set.starts_with("turbojet_gateway_session="), "{set}");
         assert!(set.ends_with("; HttpOnly; SameSite=Strict; Path=/api"), "{set}");
         // The scheme of Authorization is case-insensitive: a session's cookie is no fallback.
         let lower = [("authorization", "bearer jb_wrong")];
@@ -921,7 +921,7 @@ mod tests {
             assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{user}");
             assert!(!answer.headers.contains_key(SET_COOKIE));
         }
-        let answer = send(&app, "GET", "/api/me", &[("cookie", "turbojet_hub_session=made-up")], "").await;
+        let answer = send(&app, "GET", "/api/me", &[("cookie", "turbojet_gateway_session=made-up")], "").await;
         assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
         assert_eq!(send(&app, "POST", "/api/login", &[], "{\"user\":\"alice\"}").await.status, StatusCode::BAD_REQUEST);
     }
@@ -934,11 +934,11 @@ mod tests {
         let mut auth = Arc::into_inner(auth).unwrap();
         auth.secure = true;
         let auth = Arc::new(auth);
-        assert_eq!(auth.cookie("x"), "__Host-turbojet_hub_session=x; HttpOnly; SameSite=Strict; Path=/; Secure");
+        assert_eq!(auth.cookie("x"), "__Host-turbojet_gateway_session=x; HttpOnly; SameSite=Strict; Path=/; Secure");
         assert!(auth.cookie("").ends_with("; Secure; Max-Age=0"));
         let app = app(&auth);
         let (cookie, _) = session(&app, "bob", "hunter2hunter2").await;
-        assert!(cookie.starts_with("__Host-turbojet_hub_session="));
+        assert!(cookie.starts_with("__Host-turbojet_gateway_session="));
         assert_eq!(send(&app, "GET", "/api/me", &[("cookie", &cookie)], "").await.status, StatusCode::OK);
         let plain = cookie.replace("__Host-", "");
         assert_eq!(send(&app, "GET", "/api/me", &[("cookie", &plain)], "").await.status, StatusCode::UNAUTHORIZED);
@@ -1197,7 +1197,7 @@ mod tests {
         assert_eq!(login(&app, &"x".repeat(MAX_NAME_LEN + 1), "guess").await.status, StatusCode::UNAUTHORIZED);
         assert_eq!(login(&app, "carol", "guess").await.status, StatusCode::UNAUTHORIZED);
         assert_eq!(send(&app, "GET", "/api/me", &[], "").await.status, StatusCode::UNAUTHORIZED);
-        let ended = [("cookie", "turbojet_hub_session=made-up")];
+        let ended = [("cookie", "turbojet_gateway_session=made-up")];
         assert_eq!(send(&app, "GET", "/api/me", &ended, "").await.status, StatusCode::UNAUTHORIZED);
         let wrong = [("authorization", "Bearer jb_wrong")];
         assert_eq!(send(&app, "GET", "/api/me", &wrong, "").await.status, StatusCode::UNAUTHORIZED);

@@ -1,4 +1,4 @@
-//! The gateway's configuration file, `turbojet-hub.toml`: where its sessions file is, and its routes.
+//! The gateway's configuration file, `turbojet-gateway.toml`: where its sessions file is, and its routes.
 //!
 //! ```toml
 //! sessions = "sessions.toml"      # relative to this file
@@ -25,7 +25,7 @@
 //! max_notional = "250000.50"
 //!
 //! [database]                      # optional: without it, the book is kept in memory only
-//! url = "sqlite://turbojet-hub.db?mode=rwc"  # `mode=rwc` creates the file; or "postgres://..."
+//! url = "sqlite://turbojet-gateway.db?mode=rwc"  # `mode=rwc` creates the file; or "postgres://..."
 //! retention = "400d"              # optional: delete done orders older; a number and s, m, h or d
 //!
 //! [api]                           # optional: the operator API, an HTTP JSON server
@@ -660,7 +660,7 @@ mod tests {
     const SESSIONS: &str = r#"
 [acceptor]
 begin_string = "FIX.4.4"
-sender_comp_id = "TURBOJETHUB"
+sender_comp_id = "TURBOJETGATEWAY"
 listen = "127.0.0.1:0"
 unknown = "admit"
 
@@ -681,8 +681,8 @@ connect = ["127.0.0.1:1"]
     }
 
     fn load_error(hub: &str) -> String {
-        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
-        load(&dir.path().join("turbojet-hub.toml")).unwrap_err().to_string()
+        let dir = dir(&[("turbojet-gateway.toml", hub), ("sessions.toml", SESSIONS)]);
+        load(&dir.path().join("turbojet-gateway.toml")).unwrap_err().to_string()
     }
 
     fn venue_rule(client: Option<&str>, venue: &str) -> Rule {
@@ -701,8 +701,8 @@ venue = "NASDAQ"
 [[route]]
 reject = "no route"
 "#;
-        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.path().join("turbojet-hub.toml")).unwrap();
+        let dir = dir(&[("turbojet-gateway.toml", hub), ("sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("turbojet-gateway.toml")).unwrap();
         let expected = Router::new(vec![
             Rule {
                 client: Some("FUNDA".into()),
@@ -726,8 +726,8 @@ reject = "no route"
     fn the_database_url_is_optional_and_its_table_takes_no_other_key() {
         let sessions = format!("{SESSIONS}store = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n");
         let load_database = |hub: &str| {
-            let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", &sessions)]);
-            load(&dir.path().join("turbojet-hub.toml")).unwrap().database
+            let dir = dir(&[("turbojet-gateway.toml", hub), ("sessions.toml", &sessions)]);
+            load(&dir.path().join("turbojet-gateway.toml")).unwrap().database
         };
         assert_eq!(load_database("sessions = \"sessions.toml\""), None);
         let with = "sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"";
@@ -741,9 +741,9 @@ reject = "no route"
     fn the_database_password_stays_out_of_debug() {
         let sessions = format!("{SESSIONS}store = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n");
         let hub = "sessions = \"sessions.toml\"\n[database]\nurl = \"postgres://jet:s3cret@db/j?password=s3cret\"";
-        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", &sessions)]);
-        let loaded = format!("{:?}", load(&dir.path().join("turbojet-hub.toml")).unwrap());
-        let reread = format!("{:?}", reread(Path::new("turbojet-hub.toml"), hub, &[], false).unwrap());
+        let dir = dir(&[("turbojet-gateway.toml", hub), ("sessions.toml", &sessions)]);
+        let loaded = format!("{:?}", load(&dir.path().join("turbojet-gateway.toml")).unwrap());
+        let reread = format!("{:?}", reread(Path::new("turbojet-gateway.toml"), hub, &[], false).unwrap());
         for debug in [loaded, reread] {
             assert!(!debug.contains("s3cret"), "{debug}");
             assert!(debug.contains("db/j"), "{debug}");
@@ -757,8 +757,8 @@ reject = "no route"
         let hub =
             |more: &str| format!("sessions = \"sessions.toml\"\n[database]\nurl = \"sqlite://j.db?mode=rwc\"\n{more}");
         let retention = |more: &str| {
-            let dir = dir(&[("turbojet-hub.toml", &hub(more)), ("sessions.toml", SESSIONS)]);
-            load(&dir.path().join("turbojet-hub.toml")).map(|loaded| loaded.retention).map_err(|e| e.to_string())
+            let dir = dir(&[("turbojet-gateway.toml", &hub(more)), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("turbojet-gateway.toml")).map(|loaded| loaded.retention).map_err(|e| e.to_string())
         };
         assert_eq!(retention(""), Ok(None));
         assert_eq!(retention("retention = \"400d\""), Ok(Some(Duration::from_secs(400 * 86_400))));
@@ -772,7 +772,7 @@ reject = "no route"
             let error_text = retention(more).unwrap_err();
             assert!(error_text.contains(error), "{more}: {error_text}");
         }
-        let path = Path::new("turbojet-hub.toml");
+        let path = Path::new("turbojet-gateway.toml");
         let reread = |more: &str| reread(path, &hub(more), &[], false).map(|reread| reread.retention);
         assert_eq!(reread("retention = \"2d\"").unwrap(), Some(Duration::from_secs(2 * 86_400)));
         let error = reread("retention = \"1h\"").unwrap_err().to_string();
@@ -784,16 +784,16 @@ reject = "no route"
     #[test]
     fn the_message_log_section_resolves_its_dir_and_takes_no_other_key() {
         let hub = "sessions = \"sessions.toml\"\n[message_log]\ndir = \"log/fix\"\n";
-        let files = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
-        let log = load(&files.path().join("turbojet-hub.toml")).unwrap().message_log.unwrap();
+        let files = dir(&[("turbojet-gateway.toml", hub), ("sessions.toml", SESSIONS)]);
+        let log = load(&files.path().join("turbojet-gateway.toml")).unwrap().message_log.unwrap();
         let expected =
             MessageLog { dir: files.path().join("log/fix"), file_bytes_max: None, retention: None, compress: false };
         assert_eq!(log, expected);
         assert!(files.path().join("log/fix").is_dir());
 
         let with = |more: &str| {
-            let dir = dir(&[("turbojet-hub.toml", format!("{hub}{more}").as_str()), ("sessions.toml", SESSIONS)]);
-            load(&dir.path().join("turbojet-hub.toml"))
+            let dir = dir(&[("turbojet-gateway.toml", format!("{hub}{more}").as_str()), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("turbojet-gateway.toml"))
                 .map(|loaded| loaded.message_log.unwrap())
                 .map_err(|e| e.to_string())
         };
@@ -814,8 +814,8 @@ reject = "no route"
             assert!(error_text.contains(error), "{more}: {error_text}");
         }
         assert!(load_error("sessions = \"sessions.toml\"\n[message_log]\n").contains("missing field `dir`"));
-        let blocked = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS), ("log", "a file")]);
-        let error = load(&blocked.path().join("turbojet-hub.toml")).unwrap_err().to_string();
+        let blocked = dir(&[("turbojet-gateway.toml", hub), ("sessions.toml", SESSIONS), ("log", "a file")]);
+        let error = load(&blocked.path().join("turbojet-gateway.toml")).unwrap_err().to_string();
         assert!(error.contains("[message_log] cannot open "), "{error}");
         let compressed = with("compress = true");
         if cfg!(feature = "gzip") {
@@ -842,17 +842,17 @@ reject = "no route"
     #[test]
     fn the_acceptor_must_speak_a_version_the_gateway_converts() {
         let sessions = SESSIONS.replace("FIX.4.4", "FIX.4.3");
-        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);
-        let error = load(&dir.path().join("turbojet-hub.toml")).unwrap_err().to_string();
+        let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);
+        let error = load(&dir.path().join("turbojet-gateway.toml")).unwrap_err().to_string();
         assert!(error.contains("\"FIX.4.3\" is not supported"), "{error}");
     }
 
     #[test]
     fn the_sessions_file_needs_an_acceptor() {
-        let sessions = "[initiator.NASDAQ]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"TURBOJETHUB\"\n\
+        let sessions = "[initiator.NASDAQ]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"TURBOJETGATEWAY\"\n\
                         target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]";
-        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", sessions)]);
-        let error = load(&dir.path().join("turbojet-hub.toml")).unwrap_err().to_string();
+        let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\""), ("sessions.toml", sessions)]);
+        let error = load(&dir.path().join("turbojet-gateway.toml")).unwrap_err().to_string();
         assert!(error.contains("no [acceptor]"), "{error}");
     }
 
@@ -860,15 +860,15 @@ reject = "no route"
     #[test]
     fn the_sessions_path_is_relative_to_the_file() {
         let hub = "sessions = \"fix/sessions.toml\"\n[[route]]\nvenue = \"NASDAQ\"";
-        let dir = dir(&[("conf/turbojet-hub.toml", hub), ("conf/fix/sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.path().join("conf/turbojet-hub.toml")).unwrap();
+        let dir = dir(&[("conf/turbojet-gateway.toml", hub), ("conf/fix/sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("conf/turbojet-gateway.toml")).unwrap();
         assert_eq!(loaded.router, Router::new(vec![venue_rule(None, "NASDAQ")]));
     }
 
     #[test]
     fn reloading_replaces_the_routes() {
-        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
-        let path = dir.path().join("turbojet-hub.toml");
+        let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let path = dir.path().join("turbojet-gateway.toml");
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.router, Router::new(Vec::new()));
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[[route]]\nclient = \"FUNDA\"\nvenue = \"NASDAQ\"")
@@ -882,10 +882,10 @@ reject = "no route"
 
     fn limits(risk: &str) -> Result<risk::Config, String> {
         let dir = dir(&[
-            ("turbojet-hub.toml", &format!("sessions = \"sessions.toml\"\n{risk}")),
+            ("turbojet-gateway.toml", &format!("sessions = \"sessions.toml\"\n{risk}")),
             ("sessions.toml", SESSIONS),
         ]);
-        load(&dir.path().join("turbojet-hub.toml")).map(|loaded| loaded.limits).map_err(|e| e.to_string())
+        load(&dir.path().join("turbojet-gateway.toml")).map(|loaded| loaded.limits).map_err(|e| e.to_string())
     }
 
     fn decimal(text: &str) -> Decimal {
@@ -955,8 +955,8 @@ self_trade = false
     /// A reload returns the new limits with the routes; one that fails returns neither.
     #[test]
     fn reloading_replaces_the_limits_with_the_routes() {
-        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
-        let path = dir.path().join("turbojet-hub.toml");
+        let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let path = dir.path().join("turbojet-gateway.toml");
         let venues = load(&path).unwrap().sessions.initiator_names();
         std::fs::write(&path, "sessions = \"sessions.toml\"\n[risk.defaults]\nmax_order_qty = 5").unwrap();
         let limits = reload(&path, &venues).unwrap().limits;
@@ -994,8 +994,8 @@ self_trade = false
 
     #[test]
     fn day_end_is_midnight_utc_unless_set_and_a_bad_one_is_an_error() {
-        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
-        let loaded = load(&dir.path().join("turbojet-hub.toml")).unwrap();
+        let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\""), ("sessions.toml", SESSIONS)]);
+        let loaded = load(&dir.path().join("turbojet-gateway.toml")).unwrap();
         assert_eq!(day_ends(&loaded.day_end, "2026-10-10T12:00:00Z"), "2026-10-11T00:00:00+00:00");
         for (day_end, error) in [
             ("", "empty"),
@@ -1010,8 +1010,8 @@ self_trade = false
 
     #[test]
     fn reloading_reads_day_end() {
-        let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
-        let reloaded = reload(&dir.path().join("turbojet-hub.toml"), &[]).unwrap().day_end;
+        let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\"\nday_end = \"17:00\"")]);
+        let reloaded = reload(&dir.path().join("turbojet-gateway.toml"), &[]).unwrap().day_end;
         assert_eq!(reloaded, day_end("17:00").unwrap());
     }
 
@@ -1021,15 +1021,15 @@ self_trade = false
     fn the_api_section_resolves_its_paths_and_takes_no_other_key() {
         let hub = "sessions = \"sessions.toml\"\n[api]\nlisten = \"127.0.0.1:8080\"\n\
                          users = \"users.toml\"\naudit_dir = \"log/audit\"\n";
-        let dir = dir(&[("turbojet-hub.toml", hub), ("sessions.toml", SESSIONS)]);
-        let api = load(&dir.path().join("turbojet-hub.toml")).unwrap().api.unwrap();
+        let dir = dir(&[("turbojet-gateway.toml", hub), ("sessions.toml", SESSIONS)]);
+        let api = load(&dir.path().join("turbojet-gateway.toml")).unwrap().api.unwrap();
         assert_eq!(api.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(api.users, dir.path().join("users.toml"));
         assert_eq!(api.audit_dir, dir.path().join("log/audit"));
         assert_eq!((api.tls, api.behind_proxy, api.audit_retention), (None, false, None));
         let kept = format!("{hub}audit_retention = \"400d\"\n");
-        let files = self::dir(&[("turbojet-hub.toml", kept.as_str()), ("sessions.toml", SESSIONS)]);
-        let api = load(&files.path().join("turbojet-hub.toml")).unwrap().api.unwrap();
+        let files = self::dir(&[("turbojet-gateway.toml", kept.as_str()), ("sessions.toml", SESSIONS)]);
+        let api = load(&files.path().join("turbojet-gateway.toml")).unwrap().api.unwrap();
         assert_eq!(api.audit_retention, Some(Duration::from_secs(400 * 86_400)));
         assert!(load_error(&format!("{hub}audit_retention = \"0d\"")).contains("retention must be positive"));
         assert!(load_error(&format!("{hub}port = 1")).contains("unknown field `port`"));
@@ -1046,8 +1046,8 @@ self_trade = false
             let hub = format!(
                 "sessions = \"sessions.toml\"\n[api]\nlisten = \"{listen}\"\nusers = \"u\"\naudit_dir = \"a\"\n{more}"
             );
-            let dir = dir(&[("turbojet-hub.toml", &hub), ("sessions.toml", SESSIONS)]);
-            load(&dir.path().join("turbojet-hub.toml"))
+            let dir = dir(&[("turbojet-gateway.toml", &hub), ("sessions.toml", SESSIONS)]);
+            load(&dir.path().join("turbojet-gateway.toml"))
                 .map(|loaded| loaded.api.unwrap().listen)
                 .map_err(|e| e.to_string())
         };
@@ -1069,7 +1069,7 @@ self_trade = false
     /// The example files the readme shows load.
     #[test]
     fn the_examples_load() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/turbojet-hub.toml");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/turbojet-gateway.toml");
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.version, Version::Fix44);
         assert_eq!(loaded.sessions.initiator_names(), ["NASDAQ"]);

@@ -2,11 +2,11 @@
 # comments aren't kept), then reload the gateway (SIGHUP) for them to take effect. Run it as the
 # gateway's user: whoever runs it owns the rewritten file.
 #
-#   turbojet-hub user add alice --role operator --clients FUNDA --users users.toml
-#   turbojet-hub user passwd alice --users users.toml
-#   turbojet-hub token add alice --users users.toml       # prints the token, once
-#   turbojet-hub token revoke alice q3Xr --users users.toml
-#   turbojet-hub user remove alice --users users.toml
+#   turbojet-gateway user add alice --role operator --clients FUNDA --users users.toml
+#   turbojet-gateway user passwd alice --users users.toml
+#   turbojet-gateway token add alice --users users.toml       # prints the token, once
+#   turbojet-gateway token revoke alice q3Xr --users users.toml
+#   turbojet-gateway user remove alice --users users.toml
 #
 # Each user looks like this (the hashes are written for you):
 #

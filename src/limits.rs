@@ -1,7 +1,8 @@
-//! Editing the risk limits in `turbojet-hub.toml`, as the API does: one table, `[risk.defaults]` or
-//! `[risk.client.COMPID]`, changed with `toml_edit`, so the comments and layout elsewhere in the
-//! file stay as they were. [`Service::edit_limits`](crate::service::Service::edit_limits) checks,
-//! writes and reloads the result.
+//! Editing the risk limits in `turbojet-gateway.toml`, as the API does: one table,
+//! `[risk.defaults]` or `[risk.client.COMPID]`, changed with `toml_edit`, so the comments and
+//! layout elsewhere in the file stay as they were.
+//! [`Service::edit_limits`](crate::service::Service::edit_limits) checks, writes and reloads the
+//! result.
 
 use std::fmt;
 

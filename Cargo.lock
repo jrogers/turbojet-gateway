@@ -2493,7 +2493,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "turbojet-hub"
+name = "turbojet-gateway"
 version = "0.1.0"
 dependencies = [
  "argon2",

@@ -4,8 +4,8 @@ import Orders from './Orders.tsx'
 import { initial, LiveContext, reduce, type LiveState } from './store.ts'
 import type { LiveMessage, OrderView, OrdersPage } from './types.ts'
 
-const FUNDA = 'FIX.4.4:TURBOJETHUB->FUNDA'
-const FUNDB = 'FIX.4.4:TURBOJETHUB->FUNDB/DESK'
+const FUNDA = 'FIX.4.4:TURBOJETGATEWAY->FUNDA'
+const FUNDB = 'FIX.4.4:TURBOJETGATEWAY->FUNDB/DESK'
 
 const order = (id: number, over: Partial<OrderView> = {}): OrderView => ({
   id,

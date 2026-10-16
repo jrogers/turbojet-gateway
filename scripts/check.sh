@@ -4,7 +4,7 @@
 # combination CI uses. Flags add the slower jobs:
 #   scripts/check.sh            # what most changes need
 #   scripts/check.sh --msrv     # also the tests on the minimum supported Rust (rustup toolchain 1.89)
-#   scripts/check.sh --postgres # also the store on PostgreSQL, at TURBOJET_HUB_POSTGRES_URL (a
+#   scripts/check.sh --postgres # also the store on PostgreSQL, at TURBOJET_GATEWAY_POSTGRES_URL (a
 #                               # database the tests may fill)
 #   scripts/check.sh --deny     # also cargo-deny (`cargo install cargo-deny`)
 #   scripts/check.sh --all      # all three
@@ -48,8 +48,8 @@ done
 
 if $postgres; then
     step postgres
-    if [ -z "${TURBOJET_HUB_POSTGRES_URL:-}" ]; then
-        echo "--postgres needs TURBOJET_HUB_POSTGRES_URL, e.g. postgres://user@localhost/turbojet_hub_test" >&2
+    if [ -z "${TURBOJET_GATEWAY_POSTGRES_URL:-}" ]; then
+        echo "--postgres needs TURBOJET_GATEWAY_POSTGRES_URL, e.g. postgres://user@localhost/turbojet_gateway_test" >&2
         exit 2
     fi
     cargo test --features postgres $locked --quiet store::

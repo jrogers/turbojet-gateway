@@ -473,7 +473,7 @@ mod tests {
         }
     }
 
-    /// Turbojet Hub's side: tells the outbox of each logon.
+    /// Turbojet Gateway's side: tells the outbox of each logon.
     struct Gateway {
         outbox: Arc<Outbox>,
         hold: Hold,
@@ -529,11 +529,11 @@ mod tests {
         Message::new(MsgType::ExecutionReport).with(tags::TEXT, text.to_string())
     }
 
-    /// Turbojet Hub's acceptor, serving on loopback, with an outbox holding `limit` per client.
+    /// Turbojet Gateway's acceptor, serving on loopback, with an outbox holding `limit` per client.
     async fn gateway(limit: usize) -> (Arc<Outbox>, Arc<Gateway>, Acceptor, String) {
         let outbox = Arc::new(Outbox::with_limit(limit));
         let app = Arc::new(Gateway { outbox: outbox.clone(), hold: Hold::default() });
-        let mut config = SessionConfig::new("FIX.4.4", "TURBOJETHUB");
+        let mut config = SessionConfig::new("FIX.4.4", "TURBOJETGATEWAY");
         // Small, so a held-up session fills it quickly.
         config.send_queue = 4;
         let acceptor = Acceptor::new(config, Arc::new(MemoryStorage::new()), app.clone()).unwrap();
@@ -547,7 +547,7 @@ mod tests {
     fn client_session(addr: &str) -> (Initiator, Arc<Recorder>, UnboundedReceiver<Event>) {
         let (events, rx) = unbounded_channel();
         let recorder = Arc::new(Recorder { events, hold: Hold::default() });
-        let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", CLIENT), "TURBOJETHUB");
+        let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", CLIENT), "TURBOJETGATEWAY");
         config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
         let initiator = Initiator::new(addr, config, Arc::new(MemoryStorage::new()), recorder.clone()).unwrap();
         (initiator, recorder, rx)
@@ -589,8 +589,8 @@ mod tests {
         numbered(n).into_iter().map(Event::Report).collect()
     }
 
-    /// Holds up Turbojet Hub's session with the client, by having the client send a message that
-    /// waits in `on_message` until the returned sender is dropped or sent to.
+    /// Holds up Turbojet Gateway's session with the client, by having the client send a message
+    /// that waits in `on_message` until the returned sender is dropped or sent to.
     async fn hold(app: &Gateway, initiator: &Initiator) -> std::sync::mpsc::Sender<()> {
         let release = app.hold.arm();
         initiator.handle().send(Message::new(MsgType::NewOrderSingle).with(tags::CL_ORD_ID, "hold")).unwrap();
@@ -705,8 +705,8 @@ mod tests {
         assert_eq!(next(&mut events).await, Event::LoggedOn);
         until(|| lock(&outbox.clients).get(&client()).is_some_and(|c| lock(&c.shared.session).is_some())).await;
 
-        // The client, held up, doesn't answer Turbojet Hub's Logout, so the session stays logging
-        // out: it takes the report sent straight away, and its receipt says LoggingOut.
+        // The client, held up, doesn't answer Turbojet Gateway's Logout, so the session stays
+        // logging out: it takes the report sent straight away, and its receipt says LoggingOut.
         let release = recorder.hold.arm();
         acceptor.session(CLIENT).send(report("before")).unwrap();
         recorder.hold.held().await;
@@ -726,8 +726,9 @@ mod tests {
         until(|| outbox.held(&client()) == 0).await;
     }
 
-    /// Cuts the client's held-up connection, releases Turbojet Hub's session, and reconnects once
-    /// Turbojet Hub has noticed (it refuses a Logon until then). The client sees nothing in between.
+    /// Cuts the client's held-up connection, releases Turbojet Gateway's session, and reconnects
+    /// once Turbojet Gateway has noticed (it refuses a Logon until then). The client sees nothing
+    /// in between.
     async fn cut_and_reconnect(
         connection: tokio::task::JoinHandle<std::io::Result<()>>,
         release: std::sync::mpsc::Sender<()>,

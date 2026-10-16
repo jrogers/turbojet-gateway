@@ -1,4 +1,4 @@
-//! The Turbojet Hub binary; the gateway itself is the `turbojet_hub` library.
+//! The Turbojet Gateway binary; the gateway itself is the `turbojet_gateway` library.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -7,20 +7,20 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use turbojet_hub::auth::{Role, Users};
-use turbojet_hub::service::Service;
+use turbojet_gateway::auth::{Role, Users};
+use turbojet_gateway::service::Service;
 
 const USAGE: &str = "\
-usage: turbojet-hub --config FILE
-       turbojet-hub user add NAME --role viewer|operator|admin [--clients A,B] --users FILE
-       turbojet-hub user passwd NAME --users FILE
-       turbojet-hub user remove NAME --users FILE
-       turbojet-hub token add NAME --users FILE
-       turbojet-hub token revoke NAME PREFIX --users FILE
+usage: turbojet-gateway --config FILE
+       turbojet-gateway user add NAME --role viewer|operator|admin [--clients A,B] --users FILE
+       turbojet-gateway user passwd NAME --users FILE
+       turbojet-gateway user remove NAME --users FILE
+       turbojet-gateway token add NAME --users FILE
+       turbojet-gateway token revoke NAME PREFIX --users FILE
 
 A FIX gateway: clients log on to its acceptor, and it routes their orders to venues.
 
-  --config FILE   turbojet-hub.toml: the sessions file, the routes and the risk limits
+  --config FILE   turbojet-gateway.toml: the sessions file, the routes and the risk limits
   --help          print this
 
 On Unix, SIGHUP reloads the files; a file that doesn't load keeps the one in use. Ctrl-C or
@@ -187,7 +187,7 @@ fn edit_users(path: &Path, change: Change) -> Result<(), String> {
             println!("{token}");
             eprintln!(
                 "added a token for {name}, id {}: keep it, it isn't shown again",
-                turbojet_hub::auth::token_id(&token)
+                turbojet_gateway::auth::token_id(&token)
             );
         }
         Change::RevokeToken { name, prefix } => {
@@ -208,7 +208,7 @@ fn new_password(name: &str) -> Result<String, String> {
     if read_password("again: ")? != password {
         return Err("the passwords differ".to_string());
     }
-    turbojet_hub::auth::check_new_password(&password)?;
+    turbojet_gateway::auth::check_new_password(&password)?;
     Ok(password)
 }
 

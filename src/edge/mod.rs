@@ -1232,7 +1232,7 @@ pub(crate) mod tests {
     }
 
     fn session(begin_string: &str, target: &str) -> SessionHandle {
-        SessionHandle::disconnected(SessionId::new(begin_string, "TURBOJETHUB", target))
+        SessionHandle::disconnected(SessionId::new(begin_string, "TURBOJETGATEWAY", target))
     }
 
     fn logon(app: &impl Application, session: &SessionHandle) -> Result<(), String> {
@@ -1252,7 +1252,7 @@ pub(crate) mod tests {
 
     /// FUNDA's session with TargetSubID `sub_id`.
     fn desk(sub_id: &str) -> SessionHandle {
-        SessionHandle::disconnected(SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA").with_target_sub_id(sub_id))
+        SessionHandle::disconnected(SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA").with_target_sub_id(sub_id))
     }
 
     #[test]
@@ -1273,7 +1273,7 @@ pub(crate) mod tests {
     #[test]
     fn a_name_that_prints_as_another_session_is_refused() {
         let app = ClientApp(gateway());
-        let id = |comp_id: &str| SessionId::new("FIX.4.4", "TURBOJETHUB", comp_id);
+        let id = |comp_id: &str| SessionId::new("FIX.4.4", "TURBOJETGATEWAY", comp_id);
         let refused = [
             id("FUNDA").with_target_sub_id("DESK/1"),
             id("FUNDA").with_target_location_id("LDN/2"),
@@ -1434,11 +1434,11 @@ pub(crate) mod tests {
         Initiator::new(addr, config, storage, app).unwrap()
     }
 
-    /// Turbojet Hub serving clients with `gateway`, and a client logged on to it.
+    /// Turbojet Gateway serving clients with `gateway`, and a client logged on to it.
     async fn client(gateway: &Arc<Gateway>) -> (Initiator, UnboundedReceiver<Event>) {
-        let addr = serve("TURBOJETHUB", Arc::new(ClientApp(gateway.clone()))).await;
+        let addr = serve("TURBOJETGATEWAY", Arc::new(ClientApp(gateway.clone()))).await;
         let (app, mut events) = peer();
-        let client = initiator(&addr, "FUNDA", "TURBOJETHUB", app);
+        let client = initiator(&addr, "FUNDA", "TURBOJETGATEWAY", app);
         tokio::spawn(client.clone().run());
         assert!(matches!(next(&mut events).await, Event::LoggedOn));
         (client, events)
@@ -1462,7 +1462,7 @@ pub(crate) mod tests {
         let gateway = gateway();
         let (venue_app, mut venue_events) = peer();
         let venue_addr = serve("VENUE", venue_app).await;
-        let venue = initiator(&venue_addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        let venue = initiator(&venue_addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())));
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
@@ -1485,7 +1485,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_order_for_a_venue_not_connected_is_rejected() {
         let gateway = gateway();
-        let venue = initiator("127.0.0.1:1", "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        let venue = initiator("127.0.0.1:1", "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())));
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         let (client, mut events) = client(&gateway).await;
 
@@ -1505,7 +1505,7 @@ pub(crate) mod tests {
         let gateway = gateway();
         let (venue_app, mut venue_events) = peer();
         let venue_addr = serve("VENUE", venue_app).await;
-        let venue = initiator(&venue_addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        let venue = initiator(&venue_addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())));
         tokio::spawn(venue.clone().run());
         // The venue's side completes the logon, and then ours refuses it.
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
@@ -1544,7 +1544,7 @@ pub(crate) mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
         let venue_addr = serve("VENUE", refuser).await;
-        let venue = initiator(&venue_addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        let venue = initiator(&venue_addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())));
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         timeout(Duration::from_secs(5), held.recv()).await.expect("logon not held");
@@ -1654,7 +1654,7 @@ pub(crate) mod tests {
         let gateway = gateway();
         let (venue_app, mut venue_events) = peer();
         let venue_addr = serve("VENUE", venue_app).await;
-        let venue = initiator(&venue_addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        let venue = initiator(&venue_addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())));
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         book_order(&gateway);
         gateway.cancel_all(Scope::All);
@@ -1767,7 +1767,7 @@ pub(crate) mod tests {
         let scope = gateway.scope(&format!("session:{shown}").parse().unwrap());
         assert_eq!(scope, Some(Scope::Session(ClientId::new(desk1.id()))));
         assert_eq!(scope.unwrap().to_string(), format!("session:{shown}"));
-        assert_eq!(gateway.scope(&"session:FIX.4.4:TURBOJETHUB->FUNDB".parse().unwrap()), None);
+        assert_eq!(gateway.scope(&"session:FIX.4.4:TURBOJETGATEWAY->FUNDB".parse().unwrap()), None);
         assert_eq!(gateway.scope(&"comp:FUNDB".parse().unwrap()), Some(Scope::CompId("FUNDB".into())));
     }
 
@@ -1938,7 +1938,7 @@ pub(crate) mod tests {
         let venue_addr = serve("VENUE", venue_app).await;
         let (signal, mut logged_on) = unbounded_channel();
         let app = Arc::new(SentOnLogon(VenueApp(gateway.clone()), signal));
-        let venue = initiator(&venue_addr, "TURBOJETHUB", "VENUE", app);
+        let venue = initiator(&venue_addr, "TURBOJETGATEWAY", "VENUE", app);
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         let sent_at = timeout(Duration::from_secs(5), logged_on.recv()).await.expect("no logon").unwrap();
@@ -1955,7 +1955,7 @@ pub(crate) mod tests {
         let venue_addr = serve("VENUE", venue_app).await;
         let (signal, mut logged_on) = unbounded_channel();
         let app = Arc::new(LogonSignal(VenueApp(gateway.clone()), signal));
-        let venue = initiator(&venue_addr, "TURBOJETHUB", "VENUE", app);
+        let venue = initiator(&venue_addr, "TURBOJETGATEWAY", "VENUE", app);
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         // Past the logon's own VenueUp, so only the tick can send the cancel.
@@ -2063,12 +2063,13 @@ pub(crate) mod tests {
         let venue_addr = serve("VENUE", venue_app).await;
         let (gate, open) = tokio::sync::watch::channel(true);
         let storage = Arc::new(Gated { inner: Arc::new(MemoryStorage::new()), open });
-        let venue = initiator_with(&venue_addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())), storage);
+        let venue =
+            initiator_with(&venue_addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())), storage);
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
         gate.send_replace(false);
-        let addr = serve_with("TURBOJETHUB", Arc::new(ClientApp(gateway.clone())), clients).await;
+        let addr = serve_with("TURBOJETGATEWAY", Arc::new(ClientApp(gateway.clone())), clients).await;
         (gate, venue_events, addr)
     }
 
@@ -2091,10 +2092,10 @@ pub(crate) mod tests {
         let clients = Arc::new(MemoryStorage::new());
         let (gate, mut venue_events, addr) = gated_venue(&gateway, clients.clone()).await;
         let (app, mut client_events) = peer();
-        let client = initiator(&addr, "FUNDA", "TURBOJETHUB", app);
+        let client = initiator(&addr, "FUNDA", "TURBOJETGATEWAY", app);
         tokio::spawn(client.clone().run());
         assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
-        let log = clients.open(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA")).unwrap();
+        let log = clients.open(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA")).unwrap();
 
         client.handle().send(order("C1")).unwrap();
         wait_for(log.as_ref(), (3, Some(2))).await;
@@ -2119,16 +2120,16 @@ pub(crate) mod tests {
         let (gate, mut venue_events, addr) = gated_venue(&gateway, clients.clone()).await;
         let funda = Arc::new(MemoryStorage::new());
         let (app, mut client_events) = peer();
-        let client = initiator_with(&addr, "FUNDA", "TURBOJETHUB", app.clone(), funda.clone());
+        let client = initiator_with(&addr, "FUNDA", "TURBOJETGATEWAY", app.clone(), funda.clone());
         tokio::spawn(client.clone().run());
         assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
-        let log = clients.open(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA")).unwrap();
+        let log = clients.open(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA")).unwrap();
         client.handle().send(order("C1")).unwrap();
         wait_for(log.as_ref(), (3, Some(2))).await;
 
         client.shutdown(None).await;
         assert!(matches!(next(&mut client_events).await, Event::LoggedOut));
-        let client = initiator_with(&addr, "FUNDA", "TURBOJETHUB", app, funda);
+        let client = initiator_with(&addr, "FUNDA", "TURBOJETGATEWAY", app, funda);
         tokio::spawn(client.clone().run());
         assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
         let resent = report(&mut client_events).await;
@@ -2172,19 +2173,19 @@ pub(crate) mod tests {
         let venue_addr = serve("VENUE", venue_app).await;
         let venues = Arc::new(MemoryStorage::new());
         let app = Arc::new(VenueApp(gateway.clone()));
-        let venue = initiator_with(&venue_addr, "TURBOJETHUB", "VENUE", app, venues.clone());
+        let venue = initiator_with(&venue_addr, "TURBOJETGATEWAY", "VENUE", app, venues.clone());
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         assert!(matches!(next(&mut venue_events).await, Event::LoggedOn));
         let clients = Arc::new(MemoryStorage::new());
-        let addr = serve_with("TURBOJETHUB", Arc::new(ClientApp(gateway.clone())), clients.clone()).await;
+        let addr = serve_with("TURBOJETGATEWAY", Arc::new(ClientApp(gateway.clone())), clients.clone()).await;
         let (app, mut client_events) = peer();
-        let client = initiator(&addr, "FUNDA", "TURBOJETHUB", app);
+        let client = initiator(&addr, "FUNDA", "TURBOJETGATEWAY", app);
         tokio::spawn(client.clone().run());
         assert!(matches!(next(&mut client_events).await, Event::LoggedOn));
         Connected {
-            venue_log: venues.open(&SessionId::new("FIX.4.4", "TURBOJETHUB", "VENUE")).unwrap(),
-            client_log: clients.open(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA")).unwrap(),
+            venue_log: venues.open(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "VENUE")).unwrap(),
+            client_log: clients.open(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA")).unwrap(),
             venue,
             venue_events,
             client,
@@ -2370,7 +2371,7 @@ pub(crate) mod tests {
         let rows = store.load().await.unwrap().undelivered;
         assert_eq!(
             rows.values().map(|row| &row.client).collect::<Vec<_>>(),
-            [&ClientId::new(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA"))]
+            [&ClientId::new(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA"))]
         );
         let [msg] = undelivered(&store).await.try_into().unwrap();
         assert_eq!(msg.get(tags::BEGIN_STRING), Some("FIX.4.4"));
@@ -2422,17 +2423,17 @@ pub(crate) mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
         let venue_addr = serve("VENUE", refuser).await;
-        let venue = initiator(&venue_addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())));
+        let venue = initiator(&venue_addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())));
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         timeout(Duration::from_secs(5), held.recv()).await.expect("logon not held");
         let clients = Arc::new(MemoryStorage::new());
-        let addr = serve_with("TURBOJETHUB", Arc::new(ClientApp(gateway.clone())), clients.clone()).await;
+        let addr = serve_with("TURBOJETGATEWAY", Arc::new(ClientApp(gateway.clone())), clients.clone()).await;
         let (app, mut events) = peer();
-        let client = initiator(&addr, "FUNDA", "TURBOJETHUB", app);
+        let client = initiator(&addr, "FUNDA", "TURBOJETGATEWAY", app);
         tokio::spawn(client.clone().run());
         assert!(matches!(next(&mut events).await, Event::LoggedOn));
-        let log = clients.open(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA")).unwrap();
+        let log = clients.open(&SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA")).unwrap();
 
         client.handle().send(order("C1")).unwrap();
         wait_for(log.as_ref(), (3, Some(2))).await;
@@ -2628,7 +2629,7 @@ pub(crate) mod tests {
         store.write(&[changes]).await.unwrap();
         let gateway = restarted(&store, "NEWNEW").await;
         let app = ClientApp(gateway.clone());
-        let lookalike = SessionHandle::disconnected(SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA/DESK"));
+        let lookalike = SessionHandle::disconnected(SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "FUNDA/DESK"));
         assert_eq!(lookalike.id().to_string(), funda_desk.to_string());
         assert!(logon(&app, &lookalike).is_err());
         assert_eq!(logon(&app, &desk("DESK")), Ok(()));
@@ -2708,7 +2709,7 @@ pub(crate) mod tests {
     /// stored before is as if it had seen it.
     async fn venue_expecting(next_incoming: u64) -> (String, UnboundedReceiver<Event>) {
         let storage = Arc::new(MemoryStorage::new());
-        let mut log = storage.open(&SessionId::new("FIX.4.4", "VENUE", "TURBOJETHUB")).unwrap();
+        let mut log = storage.open(&SessionId::new("FIX.4.4", "VENUE", "TURBOJETGATEWAY")).unwrap();
         log.set_next_incoming(next_incoming).unwrap();
         let (app, events) = quiet_peer();
         (serve_with("VENUE", app, storage).await, events)
@@ -2716,7 +2717,7 @@ pub(crate) mod tests {
 
     /// Starts `gateway`'s venue on `storage`, logging on to `addr`.
     fn start_venue(gateway: &Arc<Gateway>, addr: &str, storage: Arc<MemoryStorage>) {
-        let venue = initiator_with(addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())), storage);
+        let venue = initiator_with(addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())), storage);
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.run());
     }
@@ -2854,7 +2855,8 @@ pub(crate) mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let refuser = Arc::new(Refuser { holding, release: Mutex::new(Some(gate)) });
         let venue_addr = serve("VENUE", refuser).await;
-        let venue = initiator_with(&venue_addr, "TURBOJETHUB", "VENUE", Arc::new(VenueApp(gateway.clone())), venues);
+        let venue =
+            initiator_with(&venue_addr, "TURBOJETGATEWAY", "VENUE", Arc::new(VenueApp(gateway.clone())), venues);
         assert!(gateway.set_venues([(VENUE.into(), venue.handle())]).is_empty());
         tokio::spawn(venue.clone().run());
         timeout(Duration::from_secs(5), held.recv()).await.expect("logon not held");
@@ -3190,7 +3192,7 @@ pub(crate) mod tests {
 
     /// Our session with the venue, as the gateway's initiator has it.
     fn id() -> SessionId {
-        SessionId::new("FIX.4.4", "TURBOJETHUB", "VENUE")
+        SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "VENUE")
     }
 
     /// A cancel the venue's session stored that the database never had, of an order it has: the
@@ -3211,7 +3213,7 @@ pub(crate) mod tests {
 
         let after = restarted(&store, "NEWNEW").await;
         let venues = Arc::new(MemoryStorage::new());
-        let id = SessionId::new("FIX.4.4", "TURBOJETHUB", "VENUE");
+        let id = SessionId::new("FIX.4.4", "TURBOJETGATEWAY", "VENUE");
         let mut orphan = v44::OrderCancelRequest::new("OLDOLD1", "OLDOLD1-1", v44::Side::Buy, UtcTimestamp::now());
         orphan.symbol = Some("AAPL".into());
         store_sent(&venues, &id, &[orphan.to_message()]);
@@ -3334,7 +3336,7 @@ pub(crate) mod tests {
         let time = at("2026-10-11T12:00:00Z");
         let alarm = Alarm { time, kind: AlarmKind::StuckCancel, client: Some("FUNDA".into()), text: "t".into() };
         let alarm = serde_json::to_value(GatewayEvent::Alarm(alarm)).unwrap();
-        let client = "FIX.4.4:TURBOJETHUB->FUNDA";
+        let client = "FIX.4.4:TURBOJETGATEWAY->FUNDA";
         let want = serde_json::json!(
             {"type": "alarm", "time": "2026-10-11T12:00:00Z", "kind": "stuck_cancel", "client": client, "text": "t"}
         );

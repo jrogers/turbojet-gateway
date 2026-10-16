@@ -3,12 +3,12 @@
 
 [acceptor]
 begin_string = "FIX.4.4"           # every client speaks this
-sender_comp_id = "TURBOJETHUB"
+sender_comp_id = "TURBOJETGATEWAY"
 listen = "127.0.0.1:9876"
 
 [counterparty.FUNDA]
 
-# Turbojet Hub logs on to NASDAQ as TURBOJETHUB.
+# Turbojet Gateway logs on to NASDAQ as TURBOJETGATEWAY.
 [initiator.NASDAQ]
 target_comp_id = "NASDAQ"
 connect = ["127.0.0.1:9877"]

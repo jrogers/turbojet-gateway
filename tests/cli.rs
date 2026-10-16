@@ -4,11 +4,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use turbojet_hub::auth::{Users, verify_password};
+use turbojet_gateway::auth::{Users, verify_password};
 
-/// Runs `turbojet-hub args`, `stdin` piped in.
+/// Runs `turbojet-gateway args`, `stdin` piped in.
 fn hub(args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_turbojet-hub"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_turbojet-gateway"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

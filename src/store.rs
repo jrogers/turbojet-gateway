@@ -1027,7 +1027,7 @@ async fn create(pool: &AnyPool) -> io::Result<bool> {
         .map_err(database("reading the schema version"))?;
     if version != SCHEMA_VERSION {
         return Err(io::Error::other(format!(
-            "the database's schema is version {version}; this Turbojet Hub reads version {SCHEMA_VERSION} only"
+            "the database's schema is version {version}; this Turbojet Gateway reads version {SCHEMA_VERSION} only"
         )));
     }
     for table in TABLES {
