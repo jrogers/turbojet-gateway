@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR supersedes the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # The web console (web/): types and tests. Its build is checked by the jobs that embed it.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test -- --run
+
+  # Clippy and tests for each feature, since feature-gated code only builds when enabled. No
+  # feature is on by default. `console` embeds web/dist, so --all-features builds the console first.
+  test:
+    name: test (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", --features tls, --features gzip, --features postgres, --all-features]
+    steps:
+      - uses: actions/checkout@v7
+      - if: matrix.features == '--all-features'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - if: matrix.features == '--all-features'
+        run: npm ci && npm run build
+        working-directory: web
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - run: cargo clippy --all-targets ${{ matrix.features }} --locked -- -D warnings
+      - run: cargo test ${{ matrix.features }} --locked
+
+  # The minimum supported Rust version (rust-version in Cargo.toml). Without `console`, which adds
+  # no Rust the other features don't, so it needs no Node.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features tls,gzip,postgres --locked
+
+  # The store on PostgreSQL, whose tests use SQLite without a database (src/store/tests.rs).
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: turbojet_hub
+          POSTGRES_PASSWORD: turbojet_hub
+          POSTGRES_DB: turbojet_hub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U turbojet_hub"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      TURBOJET_HUB_POSTGRES_URL: postgres://turbojet_hub:turbojet_hub@localhost:5432/turbojet_hub_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features postgres --locked store::
+
+  # Dependency licences, security advisories and sources (deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The gateway as it ships: a release build with every feature and the console embedded, kept as
+  # the run's artifact for Linux x86-64.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: web
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --all-features --locked
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turbojet-hub-linux-x86_64
+          path: target/release/turbojet-hub

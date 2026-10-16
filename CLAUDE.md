@@ -9,10 +9,11 @@ Turbojet Hub is a FIX connectivity gateway built on the Turbojet engine, from cr
 - Commits are small and each says why.
 - `--all-features` includes `console`, which embeds `web/dist`: run `(cd web && npm ci && npm run
   build)` first.
-- Before committing: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`, and
-  in `web/`, `npm run lint && npm test -- --run`.
-- With a PostgreSQL to hand, also `TURBOJET_HUB_POSTGRES_URL=… cargo test --features postgres
-  store::`: see `src/store/tests.rs`'s `postgres()`.
+- Before committing, `scripts/check.sh`: CI's per-push checks (`.github/workflows/ci.yml`), the
+  web console's lint, tests and build, then clippy and tests for each feature. While iterating,
+  `cargo test --all-features` and, in `web/`, `npm test -- --run` are enough.
+- With a PostgreSQL to hand, also `TURBOJET_HUB_POSTGRES_URL=… scripts/check.sh --postgres`: see
+  `src/store/tests.rs`'s `postgres()`. `--msrv` adds the 1.89 tests, `--deny` cargo-deny.
 - Engine work builds against a Turbojet checkout at `../turbojet` through a local, untracked
   `.cargo/config.toml` (gitignored):
   ```toml

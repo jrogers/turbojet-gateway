@@ -1,0 +1,26 @@
+# cargo-deny: the licences, security advisories and sources of every dependency. CI runs
+# `cargo deny check`; run it locally after changing dependencies.
+
+[graph]
+all-features = true
+
+[advisories]
+# A vulnerability or a yanked version fails the check. Unmaintained crates are reported only for
+# direct dependencies, where there's something to do about it.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Turbojet Hub is Apache-2.0, and its binary carries every dependency, so they must be compatible
+# with it. An expression with OR passes if any choice is allowed.
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
