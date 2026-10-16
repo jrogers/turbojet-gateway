@@ -1,0 +1,41 @@
+# Version updates. Security updates are on in the repository's settings and cover every
+# ecosystem; these are routine upgrades, grouped into one pull request per ecosystem a month.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # Its refs name toolchains, not releases: @1.89 is the minimum supported Rust, raised on
+      # purpose, and @stable moves by itself.
+      - dependency-name: dtolnay/rust-toolchain
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    # Releases at least two weeks old, so a broken one is usually yanked or fixed first.
+    cooldown:
+      default-days: 14
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      # 0.9 needs Rust 1.94; the minimum supported is 1.89.
+      - dependency-name: sqlx
+        versions: [">=0.9"]
+
+  # The web console, embedded by the console feature.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 14
+    groups:
+      npm:
+        patterns: ["*"]
