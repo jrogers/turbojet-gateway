@@ -984,6 +984,9 @@ async fn a_burst_with_a_database_commits_every_order() {
 }
 
 const BURST: usize = 200;
+/// How long any one of the burst's reports may take: it checks their order, not their latency,
+/// and a starved CI runner can stall the gateway for seconds while it works through them.
+const BURST_WAIT: Duration = Duration::from_secs(20);
 
 /// [`BURST`] orders at once, each acked and filled twice by the venue as it arrives: every
 /// client sees each of its orders' reports in order, numbered by the book.
@@ -994,7 +997,10 @@ async fn burst(setup: &mut Setup) {
     }
     let mut by_order: HashMap<String, Vec<v44::ExecutionReport>> = HashMap::new();
     for _ in 0..3 * ORDERS {
-        let report: v44::ExecutionReport = setup.events.parse().await;
+        let report: v44::ExecutionReport = match setup.events.next_within(BURST_WAIT).await {
+            Event::Message(msg) => msg.parse().unwrap_or_else(|e| panic!("{e:?}: {msg:?}")),
+            other => panic!("expected a report, got {other:?}"),
+        };
         by_order.entry(report.cl_ord_id.clone().expect("a ClOrdID").to_string()).or_default().push(report);
     }
     assert_eq!(by_order.len(), ORDERS);
