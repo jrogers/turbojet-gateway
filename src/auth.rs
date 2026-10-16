@@ -19,12 +19,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::path::Path;
 use std::str::FromStr;
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -463,13 +465,15 @@ pub fn token_id(token: &str) -> &str {
 
 /// `password`'s argon2id hash, with argon2's default cost, as a PHC string.
 pub fn hash_password(password: &str) -> String {
-    let salt = SaltString::encode_b64(&random::<16>()).expect("16 bytes is a valid salt");
-    Argon2::default().hash_password(password.as_bytes(), &salt).expect("the default parameters are valid").to_string()
+    Argon2::default()
+        .hash_password_with_salt(password.as_bytes(), &random::<16>())
+        .expect("the default parameters and a 16-byte salt are valid")
+        .to_string()
 }
 
 /// Whether `password` hashes to `phc`. Slow on purpose: call it off the runtime's threads.
 pub fn verify_password(phc: &str, password: &str) -> bool {
-    PasswordHash::new(phc).is_ok_and(|hash| Argon2::default().verify_password(password.as_bytes(), &hash).is_ok())
+    Argon2::default().verify_password(password.as_bytes(), phc).is_ok()
 }
 
 /// `N` bytes from the operating system's random source.
@@ -480,7 +484,10 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
 }
 
 fn sha256_hex(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    Sha256::digest(text.as_bytes()).iter().fold(String::with_capacity(64), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
 }
 
 #[cfg(test)]
@@ -595,13 +602,12 @@ mod tests {
     #[test]
     fn weak_hashes_are_refused() {
         let user = |hash: &str| format!("[user.a]\nrole = \"viewer\"\npassword = \"{hash}\"\n");
-        let salt = SaltString::encode_b64(&[7; 16]).unwrap();
         let weak = argon2::Params::new(1024, 1, 1, None).unwrap();
         let weak = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, weak);
-        let weak = weak.hash_password(b"pw", &salt).unwrap().to_string();
+        let weak = weak.hash_password_with_salt(b"pw", &[7; 16]).unwrap().to_string();
         assert!(user(&weak).parse::<Users>().unwrap_err().contains("below the defaults"));
         let argon2i = Argon2::new(argon2::Algorithm::Argon2i, argon2::Version::V0x13, argon2::Params::default());
-        let argon2i = argon2i.hash_password(b"pw", &salt).unwrap().to_string();
+        let argon2i = argon2i.hash_password_with_salt(b"pw", &[7; 16]).unwrap().to_string();
         assert!(user(&argon2i).parse::<Users>().unwrap_err().contains("isn't argon2id"));
         // Too dear: edited by hand, as hashing one would take a gigabyte and more.
         let dear = |m: u32, t: u32| hash_password("pw").replacen("m=19456,t=2", &format!("m={m},t={t}"), 1);
@@ -609,6 +615,16 @@ mod tests {
         assert!(user(&dear(MAX_HASH_MEMORY_KIB + 1, 2)).parse::<Users>().unwrap_err().contains("over the most"));
         assert!(user(&dear(19_456, MAX_HASH_PASSES + 1)).parse::<Users>().unwrap_err().contains("over the most"));
         assert!(user(&hash_password("pw")).parse::<Users>().is_ok());
+    }
+
+    /// Users files already written still check: a password hashed by argon2 0.5, and a token's
+    /// SHA-256 in the hex sha2 0.10 printed (FIPS 180-2's "abc").
+    #[test]
+    fn hashes_written_by_earlier_versions_still_check() {
+        let phc = "$argon2id$v=19$m=19456,t=2,p=1$MkT6HIy19hua6QLvsMAJRg$pZXi35Z0hEV7HXBmqeByH2GkR7a4jhv2DFNyfudETDA";
+        assert!(verify_password(phc, "a long password"));
+        assert!(!verify_password(phc, "another password"));
+        assert_eq!(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
     /// Two tokens with one hash, under one user or two, are refused.
