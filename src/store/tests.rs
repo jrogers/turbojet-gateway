@@ -778,6 +778,21 @@ async fn a_file_store_syncs_each_commit() {
     assert_eq!((journal.as_str(), synchronous), ("wal", 2));
 }
 
+/// Opening waits out another connection's write, as `busy_timeout` allows, rather than failing at
+/// once: at a restart just after a crash, the old process's last statement may still be finishing.
+#[tokio::test]
+async fn opening_waits_for_another_connections_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("j.db").display());
+    Store::open(&url).await.unwrap().close().await;
+    let other = AnyPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+    let writing = other.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let opening = tokio::spawn(async move { Store::open(&url).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    writing.commit().await.unwrap();
+    opening.await.unwrap().expect("opened once the other write was done");
+}
+
 /// A missing file isn't created unless the URL asks: the error names the file and the fix.
 #[tokio::test]
 async fn a_missing_file_is_an_error_naming_it_and_mode_rwc() {
@@ -847,8 +862,8 @@ async fn a_snapshot_is_repeatable_read_on_postgres() {
 async fn creating_says_whether_the_database_was_new() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
-    assert!(create(&pool).await.unwrap());
-    assert!(!create(&pool).await.unwrap());
+    assert!(create(&pool, true).await.unwrap());
+    assert!(!create(&pool, true).await.unwrap());
 }
 
 /// Requests sent under downstreams the store has, of orders it no longer loads too, and orphans

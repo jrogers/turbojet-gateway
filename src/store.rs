@@ -182,7 +182,7 @@ impl Store {
             .connect(url)
             .await
             .map_err(|e| open_error(url, sqlite, postgres, e))?;
-        if create(&pool).await? {
+        if create(&pool, sqlite).await? {
             warn!("created a new, empty database at {}", without_password(url));
         }
         let reads = open_reads(url, sqlite, postgres).await?;
@@ -1005,9 +1005,14 @@ const TABLES: &[&str] = &[
 /// Creates the tables a new database lacks, after checking the version of one that has them: a
 /// database of another version is left as it is.
 /// Whether the database is new: it had no schema version.
-async fn create(pool: &AnyPool) -> io::Result<bool> {
+///
+/// SQLite's transaction takes the write lock as it begins. Begun as a read (the version table
+/// already there), its first write would fail at once if another connection were writing: SQLite
+/// waits out `busy_timeout` only for a connection with no transaction yet.
+async fn create(pool: &AnyPool, sqlite: bool) -> io::Result<bool> {
     // ponytail: run at start, untimed, as `Store::load` is.
-    let mut transaction = pool.begin().await.map_err(database("starting to create the tables"))?;
+    let begin = if sqlite { pool.begin_with("BEGIN IMMEDIATE").await } else { pool.begin().await };
+    let mut transaction = begin.map_err(database("starting to create the tables"))?;
     let connection = &mut *transaction;
     let version_table = "CREATE TABLE IF NOT EXISTS schema_version (
         id BIGINT PRIMARY KEY CHECK (id = 1),
