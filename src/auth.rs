@@ -8,7 +8,7 @@
 //!                                   # (an empty list is refused)
 //!
 //! [[user.alice.tokens]]             # `turbojet-gateway token add` writes these
-//! id = "q3Xr9a_T"                   # the token's first characters after `jb_`, to revoke it by
+//! id = "q3Xr9a_T"                   # the token's first characters after `tg_`, to revoke it by
 //! sha256 = "5f2c..."                # the token's SHA-256, hex: the token itself isn't kept
 //! ```
 //!
@@ -51,7 +51,7 @@ const MAX_HASH_MEMORY_KIB: u32 = 256 * 1024;
 const MAX_HASH_PASSES: u32 = 20;
 
 /// What a token starts with: tells it from a password in a script, or in a leak scan.
-const TOKEN_PREFIX: &str = "jb_";
+const TOKEN_PREFIX: &str = "tg_";
 
 /// A token's random bytes: as many as a SHA-256, so guessing one is hopeless.
 const TOKEN_BYTES: usize = 32;
@@ -232,7 +232,7 @@ impl Users {
     }
 
     /// Revokes user `name`'s token whose id starts with `prefix`: the token whole, its id, or
-    /// the id's first characters, with or without `jb_`. Returns the revoked token's id.
+    /// the id's first characters, with or without `tg_`. Returns the revoked token's id.
     ///
     /// # Errors
     ///
@@ -533,7 +533,7 @@ mod tests {
         assert!(users.add("alice", Role::Admin, Vec::new(), "x").is_err());
         assert!(users.add("bob", Role::Admin, Vec::new(), "").is_err());
         let token = users.add_token("alice").unwrap();
-        assert!(token.starts_with("jb_"));
+        assert!(token.starts_with("tg_"));
         assert_eq!(token.len(), 3 + 43);
         users.save(&path).unwrap();
 
@@ -542,7 +542,7 @@ mod tests {
         assert!(verify_password(&alice.password, "alice secret"));
         assert!(!verify_password(&alice.password, "Alice secret"));
         assert_eq!(users.by_token(&token).map(|(name, _)| name), Some("alice"));
-        assert_eq!(users.by_token("jb_nope"), None);
+        assert_eq!(users.by_token("tg_nope"), None);
 
         assert!(users.revoke_token("alice", "zzzzzzzz").is_err());
         let id = users.revoke_token("alice", &token[..7]).unwrap();
@@ -563,7 +563,7 @@ mod tests {
         ];
         users.user.get_mut("a").unwrap().tokens = tokens.to_vec();
         assert!(users.revoke_token("a", "abcd").unwrap_err().contains("more than one"));
-        assert_eq!(users.revoke_token("a", "jb_abcd2222rest-of-token"), Ok("abcd2222".to_string()));
+        assert_eq!(users.revoke_token("a", "tg_abcd2222rest-of-token"), Ok("abcd2222".to_string()));
         assert_eq!(users.revoke_token("a", "abc"), Ok("abcd1111".to_string()));
     }
 

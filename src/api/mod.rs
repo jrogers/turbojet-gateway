@@ -691,7 +691,7 @@ pub(crate) mod tests {
             while fixture.audit.spend_refusal(std::time::Instant::now()) {}
             let reason = r#"{"reason":"testing"}"#;
             assert_eq!(fixture.flip(&fixture.viewer, reason).await, StatusCode::FORBIDDEN);
-            assert_eq!(fixture.flip("Bearer jb_wrong", reason).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(fixture.flip("Bearer tg_wrong", reason).await, StatusCode::UNAUTHORIZED);
             let lines = fixture.lines();
             let [line] = lines.as_slice() else { panic!("{lines:?}") };
             assert_eq!(line["user"], "vic");

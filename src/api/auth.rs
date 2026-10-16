@@ -3,7 +3,7 @@
 //! Every route but health and login sits behind [`authenticate`], which puts a [`Caller`] in the
 //! request or refuses it, so a handler can't forget to check. A caller is either:
 //!
-//! - **a token**, `Authorization: Bearer jb_...`, for scripts. A header that's there but wrong is
+//! - **a token**, `Authorization: Bearer tg_...`, for scripts. A header that's there but wrong is
 //!   refused, never passed over for the cookie.
 //! - **a session**, from `POST /api/login`: the session cookie
 //!   (`__Host-turbojet_gateway_session` under TLS, here or at a proxy; `turbojet_gateway_session`
@@ -899,7 +899,7 @@ mod tests {
         assert!(set.starts_with("turbojet_gateway_session="), "{set}");
         assert!(set.ends_with("; HttpOnly; SameSite=Strict; Path=/api"), "{set}");
         // The scheme of Authorization is case-insensitive: a session's cookie is no fallback.
-        let lower = [("authorization", "bearer jb_wrong")];
+        let lower = [("authorization", "bearer tg_wrong")];
         assert_eq!(send(&app, "GET", "/api/me", &lower, "").await.body["error"], Refusal::BadToken.message());
 
         let (cookie, csrf) = session(&app, "alice", "alice secret").await;
@@ -976,7 +976,7 @@ mod tests {
         );
 
         let (cookie, _) = session(&app, "bob", "hunter2hunter2").await;
-        let wrong = [("authorization", "Bearer jb_wrong"), ("cookie", cookie.as_str())];
+        let wrong = [("authorization", "Bearer tg_wrong"), ("cookie", cookie.as_str())];
         assert_eq!(send(&app, "GET", "/api/me", &wrong, "").await.status, StatusCode::UNAUTHORIZED);
 
         // A file that doesn't load keeps the users in use.
@@ -1199,7 +1199,7 @@ mod tests {
         assert_eq!(send(&app, "GET", "/api/me", &[], "").await.status, StatusCode::UNAUTHORIZED);
         let ended = [("cookie", "turbojet_gateway_session=made-up")];
         assert_eq!(send(&app, "GET", "/api/me", &ended, "").await.status, StatusCode::UNAUTHORIZED);
-        let wrong = [("authorization", "Bearer jb_wrong")];
+        let wrong = [("authorization", "Bearer tg_wrong")];
         assert_eq!(send(&app, "GET", "/api/me", &wrong, "").await.status, StatusCode::UNAUTHORIZED);
         assert_eq!(send(&app, "POST", "/api/logout", &[("cookie", &cookie)], "").await.status, StatusCode::FORBIDDEN);
         let headers = [("cookie", cookie.as_str()), ("x-csrf-token", &csrf)];
@@ -1257,7 +1257,7 @@ mod tests {
             .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()));
         // "GET /api/x/" is 11 bytes, so byte 256 falls inside an "é".
         let path = format!("/api/x/{}", "é".repeat(200));
-        let wrong = [("authorization", "Bearer jb_wrong")];
+        let wrong = [("authorization", "Bearer tg_wrong")];
         assert_eq!(send(&app, "GET", &path, &wrong, "").await.status, StatusCode::UNAUTHORIZED);
         let text = crate::audit::tests::text(dir.path());
         let line: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();

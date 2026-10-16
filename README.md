@@ -494,7 +494,7 @@ turbojet-gateway user remove alice --users users.toml
   - `GET /api/audit` is refused (403): it needs an admin without `--clients`.
   - `GET /api/live` sends what those reads show, and the alarms about its clients' orders; see
     [Live events](#live-events).
-- **Passwords** are at least 12 bytes, kept as argon2 hashes. **Tokens** (`jb_...`) are kept as
+- **Passwords** are at least 12 bytes, kept as argon2 hashes. **Tokens** (`tg_...`) are kept as
   their SHA-256 only, so a lost token is revoked and replaced, not recovered.
 - **Logging in.** A script sends `Authorization: Bearer <token>` on each request. A browser
   `POST`s `/api/login {"user", "password"}`, which sets a session cookie and answers
