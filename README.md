@@ -762,6 +762,9 @@ it back, oldest first: the last `limit` entries (100 by default, at most 1,000) 
 
 ## Console
 
+![The console's Orders page, in dark mode: a sidebar with Orders, Sessions (one down), Risk,
+Messages, Routes and Audit, and the live orders table with its filters](docs/console.png)
+
 A web console for operators, served by the gateway at the API's address, at `/`: with the
 example's `[api]`, <http://127.0.0.1:8080/>. Log in as one of the API's [users](#users-and-tokens);
 it shows and does what that user's role and clients allow, as the API does. It's built into the
