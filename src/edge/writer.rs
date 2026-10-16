@@ -250,6 +250,9 @@ async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>, ages: 
         let merged = Changes::merge(changes.drain(..));
         write(&store, std::slice::from_ref(&merged), written).await;
         ages.set(None);
+        // Counted as committed before anyone is told they are, so one told reads no less.
+        let before = uncommitted.fetch_sub(written, Ordering::AcqRel);
+        debug_assert!(before >= written, "committed more batches than were queued");
         for (hold, done) in task.waiting.drain(..) {
             drop(hold);
             if let Some(done) = done {
@@ -257,8 +260,6 @@ async fn run(store: Store, mut task: Task, uncommitted: Arc<AtomicUsize>, ages: 
                 let _ = done.send(());
             }
         }
-        let before = uncommitted.fetch_sub(written, Ordering::AcqRel);
-        debug_assert!(before >= written, "committed more batches than were queued");
     }
     info!("the book's writer stopped: nothing left to write");
 }
