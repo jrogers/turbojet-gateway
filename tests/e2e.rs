@@ -5,10 +5,11 @@
 //! The venue records what it receives, and the test answers for it (or, for the burst, it
 //! answers every order itself). Each test waits on events with a timeout rather than sleeping.
 //!
-//! The venue's first logon must be one the gateway takes: [`Service::start`] tells the gateway its
-//! venues right after starting their initiators, with no await between, so on the single-threaded
-//! runtime most tests use, no logon can come first; on a multi-threaded one, a logon round trip
-//! beating a few map inserts isn't a race that's seen.
+//! The venue's first logon must be one the gateway takes. [`Service::start`] tells the gateway its
+//! venues only after starting their initiators, and refuses a logon that comes first, so the venue
+//! serves only once it has returned: the gateway's Logon waits in the listener's backlog until
+//! then. Serving sooner, a loaded multi-threaded runtime let a logon round trip beat the start,
+//! and the burst's orders were rejected while the refused gateway waited to log on again.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -326,8 +327,8 @@ impl Setup {
         let (app, mut venue_events) = recorder(options.answers);
         let config = SessionConfig::new(options.venue_version, VENUE);
         let acceptor = Acceptor::new(config, Arc::new(MemoryStorage::new()), app).unwrap();
-        let serving = tokio::spawn(acceptor.clone().serve(listener));
         let (service, _serving) = Service::start(&dir.path().join("turbojet-gateway.toml")).await.unwrap();
+        let serving = tokio::spawn(acceptor.clone().serve(listener));
         venue_events.logged_on_within(STARTUP_WAIT).await;
         let (client, mut events) = client(&service, options.client_version, None);
         let running = tokio::spawn(client.clone().run());
