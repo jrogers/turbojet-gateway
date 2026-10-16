@@ -835,6 +835,10 @@ console, reloading on changes, and passes `/api`, websockets included, to `TURBO
 (`http://127.0.0.1:8080` by default). `npm test -- --run` runs its tests and `npm run lint` checks
 its types. `cargo test --all-features` includes the console, so needs `web/dist` built first.
 
+To see it with orders in it, run the gateway on `examples/turbojet-gateway.toml`, then
+`scripts/fix-demo.py venue` and `scripts/fix-demo.py client` (Python 3): a venue and a client
+that log on and trade a few orders, some filled, some working, one canceled and two rejected.
+
 ## Signals
 
 - **SIGHUP** (Unix) reloads. The sessions file first, as turbojet-config reloads it: changed

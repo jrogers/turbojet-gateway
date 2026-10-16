@@ -14,6 +14,8 @@ Turbojet Gateway is a FIX connectivity gateway built on the Turbojet engine, fro
   `cargo test --all-features` and, in `web/`, `npm test -- --run` are enough.
 - With a PostgreSQL to hand, also `TURBOJET_GATEWAY_POSTGRES_URL=… scripts/check.sh --postgres`: see
   `src/store/tests.rs`'s `postgres()`. `--msrv` adds the 1.89 tests, `--deny` cargo-deny.
+- To see the running gateway with traffic, run it on `examples/turbojet-gateway.toml` (with a
+  user from `turbojet-gateway user add`), then `scripts/fix-demo.py venue` and `client`.
 - Engine work builds against a Turbojet checkout at `../turbojet` through a local, untracked
   `.cargo/config.toml` (gitignored):
   ```toml
