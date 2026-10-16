@@ -1,5 +1,8 @@
 # Turbojet Hub
 
+[![CI](https://github.com/jrogers/turbojet-hub/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jrogers/turbojet-hub/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
+
 A FIX connectivity gateway built on [Turbojet](https://github.com/jrogers/turbojet): clients log
 on to it, it logs on to venues, and it routes the clients' orders to the venues and the venues'
 reports back, keeping each order's state as it goes.
