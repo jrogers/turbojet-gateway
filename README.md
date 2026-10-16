@@ -7,7 +7,7 @@ reports back, keeping each order's state as it goes.
 > [!WARNING]
 > **Early work.** Without a [database](#database), everything is kept in memory only: a restart
 > forgets every order, every report not yet delivered, operators' blocks and what the risk limits
-> have counted. It hasn't been run against a real venue or client. Read [CAVEATS.md](CAVEATS.md)
+> have counted. It hasn't been run against a real venue or client. Read [CAVEATS.md](docs/CAVEATS.md)
 > before relying on it, and don't use it to trade real money without testing it thoroughly
 > yourself. It is provided as is, without warranty of any kind.
 
@@ -257,7 +257,7 @@ orders of a client's current day, for that venue.
 **What a restart does.** Before any session starts, the gateway restores the book as last
 committed, then reads the requests each venue's session stored and compares them with the
 database. It reads each store from a checkpoint, taken every minute, below which every request
-has committed and been answered; see [CAVEATS.md](CAVEATS.md#database-and-recovery) for when it
+has committed and been answered; see [CAVEATS.md](docs/CAVEATS.md#database-and-recovery) for when it
 reads one whole:
 
 - an order the venue's session stored but the database never recorded (the gateway stopped
@@ -290,7 +290,7 @@ for the venues is still pending (orphans to cancel, requests to send at a venue'
 skipped with a warning saying what it waits for. The startup log line counts the requests in
 venues' stores that belong to pruned orders as `pruned`.
 
-What recovery doesn't cover is in [CAVEATS.md](CAVEATS.md#database-and-recovery).
+What recovery doesn't cover is in [CAVEATS.md](docs/CAVEATS.md#database-and-recovery).
 
 ## Message log
 
@@ -588,7 +588,7 @@ turbojet-hub user remove alice --users users.toml
   `reset` works only while the session is disconnected: pause it first. For a reset agreed with
   the counterparty, it logs on with ResetSeqNumFlag(141) instead. Both answer `{next_incoming,
   next_outgoing}`, and 500 if the session's store fails. See
-  [CAVEATS.md](CAVEATS.md#operator-api) before moving a live session's numbers.
+  [CAVEATS.md](docs/CAVEATS.md#operator-api) before moving a live session's numbers.
 - **What a refusal says**: 401 without valid credentials, 403 for the role or the CSRF token or a
   target out of a scoped user's CompIDs, 404 for a target that doesn't exist (whatever the user's
   scope), 409 for an order already done, a resolve of an order its venue hasn't said it doesn't
@@ -792,7 +792,7 @@ saved to the database:
   admin can also set the next sequence numbers, either or both, warned that lowering next in while
   logged on can have messages accepted again, so pause the session first; or reset both to 1,
   which works only while the session is disconnected and clears the messages kept for resends.
-  See [CAVEATS.md](CAVEATS.md#operator-api).
+  See [CAVEATS.md](docs/CAVEATS.md#operator-api).
 - **Risk**: each session's open and filled notional beside its limits, the reference prices and the
   blocks, read again every 5 seconds while the screen is open and the page shown. An operator or
   admin can block a scope, lift a block, or pull the [kill switch](#kill-switch) for a scope, which
@@ -820,7 +820,7 @@ Alarms show above every screen, newest first, the latest 100, each with its time
 text, until dismissed; the header counts those not dismissed. While the gateway is
 [unavailable](#database), a banner says so.
 
-What to expect of it is in [CAVEATS.md](CAVEATS.md#console).
+What to expect of it is in [CAVEATS.md](docs/CAVEATS.md#console).
 
 To work on it, run the gateway with an `[api]`, then `npm run dev` in `web/`: Vite serves the
 console, reloading on changes, and passes `/api`, websockets included, to `TURBOJET_HUB_API`
