@@ -5,8 +5,8 @@ import Risk, { add, RISK_EVERY } from './Risk.tsx'
 import { initial, LiveContext, reduce, type LiveState } from './store.ts'
 import type { Limits, LiveMessage, Me, RiskView, SessionView } from './types.ts'
 
-const FUNDA = 'FIX.4.4:JETBRIDGE->FUNDA'
-const FUNDB = 'FIX.4.4:JETBRIDGE->FUNDB/desk'
+const FUNDA = 'FIX.4.4:TURBOJETHUB->FUNDA'
+const FUNDB = 'FIX.4.4:TURBOJETHUB->FUNDB/desk'
 
 const none: Limits = { max_order_qty: null, max_notional: null, symbols: null, price_band: null, credit: null, self_trade: false }
 
@@ -79,9 +79,9 @@ test('shows each session against its limits as merged, and the reference prices,
 })
 
 test('a session with a credit limit shows its open and filled against it, exactly, toned by the share', async () => {
-  const FUNDC = 'FIX.4.4:JETBRIDGE->FUNDC'
-  const FUNDD = 'FIX.4.4:JETBRIDGE->FUNDD'
-  const FUNDE = 'FIX.4.4:JETBRIDGE->FUNDE'
+  const FUNDC = 'FIX.4.4:TURBOJETHUB->FUNDC'
+  const FUNDD = 'FIX.4.4:TURBOJETHUB->FUNDD'
+  const FUNDE = 'FIX.4.4:TURBOJETHUB->FUNDE'
   const credit = (credit: string) => ({ ...none, credit })
   serve({
     'GET /api/risk': () =>
@@ -283,7 +283,7 @@ const client = (id: string): SessionView => ({
 test("the CompIDs offered are the live sessions' too, and the snapshot's clients over login's", async () => {
   serve({ 'GET /api/risk': () => json({ ...fixture, by_comp_id: {}, sessions: [] }) })
   const offered = () => [...document.querySelectorAll('#risk-scopes option')].map((o) => (o as HTMLOptionElement).value)
-  const sessions = [client('FIX.4.2:JETBRIDGE->DESK1:q'), client('FIX.4.4:JETBRIDGE->DESK1'), client('FIX.4.4:JETBRIDGE->DESK2/s/l')]
+  const sessions = [client('FIX.4.2:TURBOJETHUB->DESK1:q'), client('FIX.4.4:TURBOJETHUB->DESK1'), client('FIX.4.4:TURBOJETHUB->DESK2/s/l')]
   render(page(who('operator'), snapshot([], null, sessions)))
   await act(async () => {})
   expect(offered()).toEqual(['all', 'comp:DESK1', 'comp:DESK2', ...sessions.map((s) => `session:${s.id}`)])

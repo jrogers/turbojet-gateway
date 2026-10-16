@@ -697,7 +697,7 @@ mod tests {
     use super::*;
     use crate::router::{Router, Rule, Target};
 
-    const ACCEPTOR: &str = "[acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n";
+    const ACCEPTOR: &str = "[acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"TURBOJETHUB\"\n";
 
     /// An initiator section for venue `name`, speaking `begin_string`, retrying a closed port.
     fn venue_section(name: &str, begin_string: &str) -> String {
@@ -1096,8 +1096,8 @@ mod tests {
         let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
 
         let client = format!(
-            "[initiator.JETBRIDGE]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"FUNDA\"\n\
-             target_comp_id = \"JETBRIDGE\"\nconnect = [\"{}\"]\n\
+            "[initiator.TURBOJETHUB]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"FUNDA\"\n\
+             target_comp_id = \"TURBOJETHUB\"\nconnect = [\"{}\"]\n\
              tls = {{ ca = \"server.pem\", server_name = \"localhost\" }}\n",
             service.local_addr()
         );
@@ -1239,7 +1239,8 @@ mod tests {
         write(&dir, "turbojet-hub.toml", hub);
         let (service, serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
 
-        let mut config = turbojet::InitiatorConfig::new(turbojet::SessionConfig::new("FIX.4.4", "FUNDA"), "JETBRIDGE");
+        let mut config =
+            turbojet::InitiatorConfig::new(turbojet::SessionConfig::new("FIX.4.4", "FUNDA"), "TURBOJETHUB");
         config.password = Some("hunter2".to_string().into());
         let app = Arc::new(LoggedOn(tokio::sync::Notify::new()));
         let addr = service.local_addr().to_string();

@@ -49,7 +49,7 @@ use crate::store::Store;
 
 const CLIENT: &str = "FUNDA";
 const VENUE: &str = "VENUE";
-const GATEWAY: &str = "JETBRIDGE";
+const GATEWAY: &str = "TURBOJETHUB";
 /// How long any one event may take: a restart waits up to a second for its ID prefix.
 const WAIT: Duration = Duration::from_secs(5);
 /// How long a test waits to see that nothing more arrives: loopback delivers in well under it.

@@ -550,7 +550,7 @@ pub(super) mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Durable, as `[database]` needs.
         let sessions = "[store.disk]\nkind = \"disk\"\ndir = \"store\"\n\
-                        [acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
+                        [acceptor]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"TURBOJETHUB\"\n\
                         listen = \"127.0.0.1:0\"\n[counterparty.FUNDA]\nstore = \"disk\"\n[initiator.NASDAQ]\n\
                         target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]\nstore = \"disk\"\n";
         std::fs::write(dir.path().join("sessions.toml"), sessions).unwrap();
@@ -558,7 +558,7 @@ pub(super) mod tests {
         std::fs::write(dir.path().join("turbojet-hub.toml"), config).unwrap();
         let (service, _serving) = Service::start(&dir.path().join("turbojet-hub.toml")).await.unwrap();
 
-        let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", "FUNDA"), "JETBRIDGE");
+        let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", "FUNDA"), "TURBOJETHUB");
         config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
         let client =
             Initiator::new(service.local_addr().to_string(), config, Arc::new(MemoryStorage::new()), Arc::new(Nothing))
@@ -635,7 +635,7 @@ pub(super) mod tests {
         let sessions = fixture.ok("/api/sessions").await;
         let [client, venue] = sessions.as_array().unwrap().as_slice() else { panic!("{sessions}") };
         assert_eq!(client["side"], "client");
-        assert_eq!(client["id"], "FIX.4.4:JETBRIDGE->FUNDA");
+        assert_eq!(client["id"], "FIX.4.4:TURBOJETHUB->FUNDA");
         assert_eq!(client["venue"], serde_json::Value::Null);
         assert_eq!(client["status"], "logged_on");
         assert_eq!(client["next_incoming"], 2);
@@ -655,7 +655,7 @@ pub(super) mod tests {
         let page = fixture.ok("/api/orders").await;
         let [order] = page["orders"].as_array().unwrap().as_slice() else { panic!("{page}") };
         let id = order["id"].as_u64().unwrap();
-        assert_eq!(order["client"], "FIX.4.4:JETBRIDGE->FUNDA");
+        assert_eq!(order["client"], "FIX.4.4:TURBOJETHUB->FUNDA");
         assert_eq!(page["next"], serde_json::Value::Null);
 
         let found = "?client=comp:FUNDA&venue=NASDAQ&symbol=AAPL&status=pending_new&working=true";
@@ -742,9 +742,10 @@ pub(super) mod tests {
             let fixture = &fixture;
             async move { names(&fixture.ok(&format!("/api/orders?{range}&{query}")).await).0.len() }
         };
-        assert_eq!(found("client=session:FIX.4.4:JETBRIDGE-%3EFUNDA&status=filled&venue=NASDAQ").await, 3);
+        assert_eq!(found("client=session:FIX.4.4:TURBOJETHUB-%3EFUNDA&status=filled&venue=NASDAQ").await, 3);
         assert_eq!(found("client=comp:FUNDA&symbol=AAPL").await, 3);
-        for missed in ["client=comp:FUNDB", "client=session:FIX.4.2:JETBRIDGE-%3EFUNDA", "working=true", "symbol=MSFT"]
+        for missed in
+            ["client=comp:FUNDB", "client=session:FIX.4.2:TURBOJETHUB-%3EFUNDA", "working=true", "symbol=MSFT"]
         {
             assert_eq!(found(missed).await, 0, "{missed}");
         }
@@ -854,8 +855,8 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_session_scope_matches_the_whole_name() {
         let fixture = with_history("").await;
-        let desk = ClientId::new(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDA").with_target_sub_id("DESK"));
-        assert_eq!(desk.session(), "FIX.4.4:JETBRIDGE->FUNDA/DESK");
+        let desk = ClientId::new(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDA").with_target_sub_id("DESK"));
+        assert_eq!(desk.session(), "FIX.4.4:TURBOJETHUB->FUNDA/DESK");
         let written = crate::store::tests::dated(103, &desk, None, true, past(3) + TimeDelta::hours(1));
         fixture.service.store().unwrap().write(&[written]).await.unwrap();
         let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z";
@@ -863,9 +864,9 @@ pub(super) mod tests {
             let page = fixture.ok(&format!("/api/orders?{range}&client={client}")).await;
             names(&page).0.into_iter().map(str::to_owned).collect::<Vec<_>>()
         };
-        assert_eq!(found("session:FIX.4.4:JETBRIDGE-%3EFUNDA%2FDESK").await, ["A103"]);
-        assert_eq!(found("session:FIX.4.4:JETBRIDGE-%3EFUNDA").await, ["A100", "A101", "A102"]);
-        assert_eq!(found("session:FIX.4.4:JETBRIDGE-%3EFUNDA%2FDES").await, Vec::<String>::new());
+        assert_eq!(found("session:FIX.4.4:TURBOJETHUB-%3EFUNDA%2FDESK").await, ["A103"]);
+        assert_eq!(found("session:FIX.4.4:TURBOJETHUB-%3EFUNDA").await, ["A100", "A101", "A102"]);
+        assert_eq!(found("session:FIX.4.4:TURBOJETHUB-%3EFUNDA%2FDES").await, Vec::<String>::new());
         assert_eq!(found("comp:FUNDA").await, ["A100", "A101", "A102", "A103"]);
     }
 
@@ -887,7 +888,7 @@ pub(super) mod tests {
     async fn risk_and_routes() {
         let fixture = fixture().await;
         let risk = fixture.ok("/api/risk").await;
-        assert_eq!(risk["sessions"][0]["client"], "FIX.4.4:JETBRIDGE->FUNDA");
+        assert_eq!(risk["sessions"][0]["client"], "FIX.4.4:TURBOJETHUB->FUNDA");
         assert_eq!(risk["blocked"], serde_json::json!([]));
         let routes = fixture.ok("/api/routes").await;
         let route = serde_json::json!({
@@ -968,7 +969,7 @@ pub(super) mod tests {
             assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
             answer.body["orders"].as_array().unwrap().len()
         };
-        let session = |target: &str| format!("?client=session:FIX.4.4:JETBRIDGE-%3E{target}");
+        let session = |target: &str| format!("?client=session:FIX.4.4:TURBOJETHUB-%3E{target}");
         assert_eq!(count(funda, "").await, 1);
         assert_eq!(count(funda, "?client=comp:FUNDA").await, 1);
         assert_eq!(count(funda, &session("FUNDA")).await, 1);
@@ -1005,7 +1006,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_scoped_caller_reads_its_clients_past_orders() {
         let fixture = with_history("").await;
-        let desk = ClientId::new(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB").with_target_sub_id("DESK"));
+        let desk = ClientId::new(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDB").with_target_sub_id("DESK"));
         let written = crate::store::tests::dated(103, &desk, None, true, past(3) + TimeDelta::hours(1));
         fixture.service.store().unwrap().write(&[written]).await.unwrap();
         let (funda, fundb) = (fixture.scoped_viewer.as_str(), fixture.scoped.as_str());
@@ -1015,10 +1016,10 @@ pub(super) mod tests {
             assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
             names(&answer.body).0.into_iter().map(str::to_owned).collect::<Vec<_>>()
         };
-        let session = |target: &str| format!("&client=session:FIX.4.4:JETBRIDGE-%3E{target}");
+        let session = |target: &str| format!("&client=session:FIX.4.4:TURBOJETHUB-%3E{target}");
         assert_eq!(found(funda, "").await, ["A100", "A101", "A102"]);
         assert_eq!(found(funda, &session("FUNDA")).await, ["A100", "A101", "A102"]);
-        assert_eq!(found(funda, "&client=session:FIX.4.2:JETBRIDGE-%3EFUNDA").await, Vec::<String>::new());
+        assert_eq!(found(funda, "&client=session:FIX.4.2:TURBOJETHUB-%3EFUNDA").await, Vec::<String>::new());
         assert_eq!(found(fundb, "").await, ["A103"]);
         assert_eq!(found(fundb, "&client=comp:FUNDB").await, ["A103"]);
         assert_eq!(found(fundb, &session("FUNDB%2FDESK")).await, ["A103"]);
@@ -1028,7 +1029,7 @@ pub(super) mod tests {
             (funda, "&client=all".to_string()),
             (funda, session("FUNDB%2FDESK")),
             (fundb, session("FUNDA")),
-            (fundb, "&client=session:FIX.4.2:JETBRIDGE-%3EFUNDA".to_string()),
+            (fundb, "&client=session:FIX.4.2:TURBOJETHUB-%3EFUNDA".to_string()),
         ];
         for (bearer, query) in refused {
             let answer = fixture.get_as(bearer, &format!("/api/orders?{range}{query}")).await;
@@ -1047,11 +1048,11 @@ pub(super) mod tests {
     /// qualifier.
     #[test]
     fn a_sessions_name_names_its_target() {
-        assert!(names_target("FIX.4.4:JETBRIDGE->FUNDA", "FUNDA"));
-        assert!(names_target("FIX.4.4:JETBRIDGE/S->FUNDA/DESK/NY", "FUNDA"));
-        assert!(names_target("FIX.4.4:JETBRIDGE->FUNDA:Q", "FUNDA"));
-        assert!(!names_target("FIX.4.4:JETBRIDGE->FUNDAX", "FUNDA"));
-        assert!(!names_target("FIX.4.4:FUNDA->JETBRIDGE", "FUNDA"));
+        assert!(names_target("FIX.4.4:TURBOJETHUB->FUNDA", "FUNDA"));
+        assert!(names_target("FIX.4.4:TURBOJETHUB/S->FUNDA/DESK/NY", "FUNDA"));
+        assert!(names_target("FIX.4.4:TURBOJETHUB->FUNDA:Q", "FUNDA"));
+        assert!(!names_target("FIX.4.4:TURBOJETHUB->FUNDAX", "FUNDA"));
+        assert!(!names_target("FIX.4.4:FUNDA->TURBOJETHUB", "FUNDA"));
         assert!(!names_target("FUNDA", "FUNDA"));
     }
 
@@ -1081,14 +1082,14 @@ pub(super) mod tests {
         for scope in blocks {
             assert!(gateway.block(scope));
         }
-        fixture.service.client_session(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB")).pause(None);
+        fixture.service.client_session(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDB")).pause(None);
         let read = async |bearer: &str, path: &str| {
             let answer = fixture.get_as(bearer, path).await;
             assert_eq!(answer.status, StatusCode::OK, "{path}: {}", answer.body);
             answer.body
         };
         let keys = |value: &serde_json::Value| value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-        let funda_session = "FIX.4.4:JETBRIDGE->FUNDA";
+        let funda_session = "FIX.4.4:TURBOJETHUB->FUNDA";
         let cases = [
             (fixture.scoped_viewer.as_str(), vec![funda_session], vec!["FUNDA"]),
             (fixture.scoped.as_str(), vec![], vec!["FUNDB"]),
@@ -1097,8 +1098,8 @@ pub(super) mod tests {
         for (bearer, risk_sessions, comp_ids) in cases {
             let sessions = read(bearer, "/api/sessions").await;
             let shown: Vec<_> = sessions.as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
-            let expected: Vec<_> = comp_ids.iter().map(|c| format!("FIX.4.4:JETBRIDGE->{c}")).collect();
-            assert_eq!(shown, [expected, vec!["FIX.4.4:JETBRIDGE->NASDAQ".to_string()]].concat());
+            let expected: Vec<_> = comp_ids.iter().map(|c| format!("FIX.4.4:TURBOJETHUB->{c}")).collect();
+            assert_eq!(shown, [expected, vec!["FIX.4.4:TURBOJETHUB->NASDAQ".to_string()]].concat());
             let risk = read(bearer, "/api/risk").await;
             let shown: Vec<_> =
                 risk["sessions"].as_array().unwrap().iter().map(|s| s["client"].as_str().unwrap()).collect();
@@ -1108,8 +1109,8 @@ pub(super) mod tests {
                 "comp:FUNDA",
                 "comp:FUNDB",
                 "all",
-                "session:FIX.4.4:JETBRIDGE->FUNDA",
-                "session:FIX.4.4:JETBRIDGE->FUNDB",
+                "session:FIX.4.4:TURBOJETHUB->FUNDA",
+                "session:FIX.4.4:TURBOJETHUB->FUNDB",
             ];
             let blocked: Vec<_> = blocked
                 .into_iter()

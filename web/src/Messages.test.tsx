@@ -4,8 +4,8 @@ import Messages, { CONDITIONS_MAX, searchParams, type Search } from './Messages.
 import { initial, LiveContext, reduce } from './store.ts'
 import type { Hit, Me, Page, SessionView } from './types.ts'
 
-const FUNDA = 'FIX.4.4:JETBRIDGE->FUNDA'
-const VENUE = 'FIX.4.4:JETBRIDGE->NASDAQ'
+const FUNDA = 'FIX.4.4:TURBOJETHUB->FUNDA'
+const VENUE = 'FIX.4.4:TURBOJETHUB->NASDAQ'
 
 const session = (side: SessionView['side'], id: string): SessionView => ({
   side,
@@ -182,7 +182,7 @@ test('tag rows are numbered; focus follows adding and removing them', () => {
 })
 
 test('the form asks with repeated tags, and pages on through the list', async () => {
-  const first = `/api/messages?session=FIX.4.4%3AJETBRIDGE-%3EFUNDA&msg_type=D%2CF&tag=11%3DC7&tag=55%3DMSFT&${SINCE}&${UNTIL}`
+  const first = `/api/messages?session=FIX.4.4%3ATURBOJETHUB-%3EFUNDA&msg_type=D%2CF&tag=11%3DC7&tag=55%3DMSFT&${SINCE}&${UNTIL}`
   const pages: Page[] = [
     { messages: [hit('8=FIX.4.4|35=D|')], next: 'n1', follow: null },
     { messages: [hit('8=FIX.4.4|35=F|')], next: null, follow: null },
@@ -220,14 +220,14 @@ test('the known sessions are suggested; a scoped user only its clients’', () =
 })
 
 test('a 403 is shown, and clears what was shown', async () => {
-  const query = `/api/messages?session=FIX.4.4%3AJETBRIDGE-%3EFUNDB&${SINCE}&${UNTIL}`
-  let answer = () => json({ error: 'u may see only clients FUNDA, not FIX.4.4:JETBRIDGE->FUNDB' }, 403)
+  const query = `/api/messages?session=FIX.4.4%3ATURBOJETHUB-%3EFUNDB&${SINCE}&${UNTIL}`
+  let answer = () => json({ error: 'u may see only clients FUNDA, not FIX.4.4:TURBOJETHUB->FUNDB' }, 403)
   serve({ [query]: () => answer(), [`${query}&after=n1`]: () => answer() })
   show(who(['FUNDA']))
-  type('Session', 'FIX.4.4:JETBRIDGE->FUNDB')
+  type('Session', 'FIX.4.4:TURBOJETHUB->FUNDB')
   type('Since (UTC)', '2026-10-08T09:00')
   await searchNow()
-  expect(screen.getByRole('alert').textContent).toBe('u may see only clients FUNDA, not FIX.4.4:JETBRIDGE->FUNDB')
+  expect(screen.getByRole('alert').textContent).toBe('u may see only clients FUNDA, not FIX.4.4:TURBOJETHUB->FUNDB')
 
   // Rescoped between pages: what the first showed goes.
   answer = () => json({ messages: [hit('8=FIX.4.4|35=D|')], next: 'n1', follow: null })

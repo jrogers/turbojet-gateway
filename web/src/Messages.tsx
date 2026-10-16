@@ -166,7 +166,7 @@ export default function Messages({ me }: { me: Me }) {
       <form className="filters" onSubmit={submit}>
         <label>
           Session
-          <input name="session" list="known-sessions" placeholder="FIX.4.4:JETBRIDGE->…" />
+          <input name="session" list="known-sessions" placeholder="FIX.4.4:TURBOJETHUB->…" />
         </label>
         <datalist id="known-sessions">
           {sessions.map((session) => (

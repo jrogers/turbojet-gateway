@@ -831,7 +831,7 @@ mod tests {
     use crate::book::{ExecType, Input, OrderId, Status, VenueReport};
 
     /// FUNDA's session, as a path segment.
-    const FUNDA: &str = "FIX.4.4:JETBRIDGE-%3EFUNDA";
+    const FUNDA: &str = "FIX.4.4:TURBOJETHUB-%3EFUNDA";
     const REASON: &str = r#"{"reason":"testing"}"#;
 
     impl Fixture {
@@ -1030,7 +1030,7 @@ mod tests {
 
         // A `/` in the name stays in its segment.
         let body = fixture.expect(&format!("/api/sessions/{FUNDA}%2FDESK/pause"), REASON, StatusCode::NOT_FOUND).await;
-        assert_eq!(body["error"], "no session FIX.4.4:JETBRIDGE->FUNDA/DESK");
+        assert_eq!(body["error"], "no session FIX.4.4:TURBOJETHUB->FUNDA/DESK");
     }
 
     /// An admin sets FUNDA's outgoing number while it's logged on, but not below the next, and
@@ -1174,7 +1174,7 @@ mod tests {
         assert_eq!(fixture.expect("/api/risk/unblock", funda, StatusCode::OK).await["changed"], false);
         assert_eq!(fixture.last_result(), "unchanged: not blocked");
 
-        let session = r#"{"reason":"testing","scope":"session:FIX.4.4:JETBRIDGE->FUNDA"}"#;
+        let session = r#"{"reason":"testing","scope":"session:FIX.4.4:TURBOJETHUB->FUNDA"}"#;
         fixture.expect("/api/risk/cancel-all", session, StatusCode::NO_CONTENT).await;
         let blocked = gateway.blocked();
         let [Scope::Session(client)] = blocked.as_slice() else { panic!("{blocked:?}") };

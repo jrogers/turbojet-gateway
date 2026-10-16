@@ -19,7 +19,7 @@ const entry = (time: string, action: string, more: Partial<AuditEntry> = {}): Au
 const ENTRIES = [
   entry('2026-10-11T09:30:00.123456Z', 'block'),
   entry('2026-10-11T09:31:00Z', 'sequence', {
-    target: 'FIX.4.4:JETBRIDGE->FUNDA',
+    target: 'FIX.4.4:TURBOJETHUB->FUNDA',
     params: { next_incoming: null, next_outgoing: 100 },
   }),
   entry('2026-10-11T09:32:00Z', 'login', { user: null, role: null, target: null, reason: null, result: 'refused: wrong password' }),
@@ -70,7 +70,7 @@ test('shows the last entries newest first, params as compact JSON, missing field
       'operator',
       '192.0.2.1',
       'sequence',
-      'FIX.4.4:JETBRIDGE->FUNDA',
+      'FIX.4.4:TURBOJETHUB->FUNDA',
       '{"next_incoming":null,"next_outgoing":100}',
       'runaway algo',
       'allowed',

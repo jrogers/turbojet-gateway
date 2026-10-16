@@ -336,7 +336,7 @@ test('a snapshot under other clients shows them in the header, and scopes the ac
   const socket = await opened()
   const venue = {
     side: 'venue',
-    id: 'FIX.4.4:JETBRIDGE->NASDAQ',
+    id: 'FIX.4.4:TURBOJETHUB->NASDAQ',
     venue: 'NASDAQ',
     status: 'logged_on',
     next_incoming: null,

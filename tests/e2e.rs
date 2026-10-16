@@ -38,7 +38,7 @@ use turbojet_hub::store::Store;
 const CLIENT: &str = "FUNDA";
 /// The venue's `[initiator.NAME]`, and its CompID.
 const VENUE: &str = "VENUE";
-const GATEWAY: &str = "JETBRIDGE";
+const GATEWAY: &str = "TURBOJETHUB";
 /// Orders for it are rejected by a route.
 const REFUSED_SYMBOL: &str = "MSFT";
 const REFUSED_TEXT: &str = "MSFT is not traded here";

@@ -589,7 +589,7 @@ mod tests {
                 snapshot["clients"].clone(),
             )
         };
-        let client = |comp_id: &str| format!("FIX.4.4:JETBRIDGE->{comp_id}");
+        let client = |comp_id: &str| format!("FIX.4.4:TURBOJETHUB->{comp_id}");
         let venue = fixture.service.venue_session("NASDAQ").unwrap().id().to_string();
         let all = (vec![client("FUNDA"), client("FUNDB")], serde_json::json!(["comp:FUNDA", "comp:FUNDB"]));
         let unscoped = (all.0, all.1, vec![client("FUNDA"), venue.clone()], serde_json::Value::Null);
@@ -700,7 +700,7 @@ mod tests {
         let snapshot = next_json(&mut client).await;
         assert_eq!((&snapshot["type"], &snapshot["clients"]), (&"snapshot".into(), &serde_json::json!(["FUNDB"])));
         let [order] = snapshot["orders"].as_array().unwrap().as_slice() else { panic!("{snapshot}") };
-        assert_eq!(order["client"], "FIX.4.4:JETBRIDGE->FUNDB");
+        assert_eq!(order["client"], "FIX.4.4:TURBOJETHUB->FUNDB");
         let (orders, _, _) = fixture.service.gateway().working_view(None);
         let [funda, fundb] = <[OrderView; 2]>::try_from(orders).unwrap();
         gateway.send(GatewayEvent::Order(funda)).unwrap();

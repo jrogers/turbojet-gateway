@@ -5,7 +5,7 @@ import type { Alarm, LiveMessage, OrderView, SessionChange, SessionView, Snapsho
 const order = (id: number, status: OrderView['status'] = 'new'): OrderView => ({
   id,
   order_id: `O${id}`,
-  client: 'FIX.4.4:JETBRIDGE->FUNDA',
+  client: 'FIX.4.4:TURBOJETHUB->FUNDA',
   cl_ord_id: `C${id}`,
   venue: 'NASDAQ',
   symbol: 'MSFT',
@@ -34,8 +34,8 @@ const session = (side: SessionView['side'], id: string): SessionView => ({
   paused: false,
 })
 
-const FUNDA = 'FIX.4.4:JETBRIDGE->FUNDA'
-const VENUE = 'FIX.4.4:JETBRIDGE->NASDAQ'
+const FUNDA = 'FIX.4.4:TURBOJETHUB->FUNDA'
+const VENUE = 'FIX.4.4:TURBOJETHUB->NASDAQ'
 
 const snapshot = (over: Partial<Snapshot> = {}): Snapshot => ({
   type: 'snapshot',

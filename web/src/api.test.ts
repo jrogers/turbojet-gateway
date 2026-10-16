@@ -47,11 +47,11 @@ test('sends the CSRF token on writes only, once known, until logged out', async 
 
   await api.me()
   await api.sessions()
-  await api.pause('FIX.4.4:JETBRIDGE->FUNDA/desk', 'maintenance')
+  await api.pause('FIX.4.4:TURBOJETHUB->FUNDA/desk', 'maintenance')
   expect(header(calls[1], 'X-CSRF-Token')).toBeUndefined()
   expect(header(calls[2], 'X-CSRF-Token')).toBeUndefined()
   expect(header(calls[3], 'X-CSRF-Token')).toBe('tok')
-  expect(calls[3].url).toBe('/api/sessions/FIX.4.4%3AJETBRIDGE-%3EFUNDA%2Fdesk/pause')
+  expect(calls[3].url).toBe('/api/sessions/FIX.4.4%3ATURBOJETHUB-%3EFUNDA%2Fdesk/pause')
   expect(calls[3].init).toMatchObject({ method: 'POST', credentials: 'same-origin', body: '{"reason":"maintenance"}' })
 
   await api.logout()

@@ -165,12 +165,12 @@ now.
 
 [acceptor]
 begin_string = "FIX.4.4"           # every client speaks this
-sender_comp_id = "JETBRIDGE"
+sender_comp_id = "TURBOJETHUB"
 listen = "127.0.0.1:9876"
 
 [counterparty.FUNDA]
 
-# Turbojet Hub logs on to NASDAQ as JETBRIDGE.
+# Turbojet Hub logs on to NASDAQ as TURBOJETHUB.
 [initiator.NASDAQ]
 target_comp_id = "NASDAQ"
 connect = ["127.0.0.1:9877"]
@@ -542,9 +542,9 @@ turbojet-hub user remove alice --users users.toml
   unblock's `{"changed", "committed"}` too), the change in effect and committed when the database
   answers; a crash before then can lose it.
 - **Scopes** are `all`, `comp:COMPID` or `session:SESSION`, a session as `GET /api/sessions` shows
-  it (`session:FIX.4.4:JETBRIDGE->FUNDA`). A session scope names one the gateway has seen.
+  it (`session:FIX.4.4:TURBOJETHUB->FUNDA`). A session scope names one the gateway has seen.
 - **A session in a path** is its `id` percent-encoded as `encodeURIComponent` does, `>` as `%3E` and
-  a `/` (before a SubID or LocationID) as `%2F`: `/api/sessions/FIX.4.4:JETBRIDGE-%3EFUNDA/pause`.
+  a `/` (before a SubID or LocationID) as `%2F`: `/api/sessions/FIX.4.4:TURBOJETHUB-%3EFUNDA/pause`.
   A client session can be acted on while connected or paused; otherwise it's 404.
 - **Orders** come by OrderID in a path, and are paged by their numeric `id`: `GET /api/orders`
   answers `{orders, next}`, 100 by default and up to 1,000 with `limit`, and `next` is the `after`

@@ -274,7 +274,7 @@ async fn every_row_reads_back_as_written() {
         ClOrdIdRow { client: funda.clone(), day: None, cl_ord_id: "C1".into(), order: OrderId(1) },
         ClOrdIdRow { client: funda.clone(), day: Some(Day(time(17, 1))), cl_ord_id: "C1".into(), order: OrderId(3) },
     ];
-    let session = ClientId::new(&turbojet::SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDC"));
+    let session = ClientId::new(&turbojet::SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDC"));
     let changes = Changes {
         orders: every_order(&funda),
         sent: every_sent(),
@@ -1102,7 +1102,7 @@ fn on(day: i64, hour: u32) -> DateTime<Utc> {
 /// symbols, done and live, 3 and 4 created at one time. Returns the second FUNDA session.
 async fn history(store: &Store) -> ClientId {
     let (funda, fundb) = (ClientId::from("FUNDA"), ClientId::from("FUNDB"));
-    let funda_42 = ClientId::new(&turbojet::SessionId::new("FIX.4.2", "JETBRIDGE", "FUNDA"));
+    let funda_42 = ClientId::new(&turbojet::SessionId::new("FIX.4.2", "TURBOJETHUB", "FUNDA"));
     let orders = [
         (1, &funda, on(0, 9), false, "NASDAQ", "AAPL"),
         (2, &fundb, on(0, 10), true, "NYSE", "MSFT"),

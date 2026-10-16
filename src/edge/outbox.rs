@@ -533,7 +533,7 @@ mod tests {
     async fn gateway(limit: usize) -> (Arc<Outbox>, Arc<Gateway>, Acceptor, String) {
         let outbox = Arc::new(Outbox::with_limit(limit));
         let app = Arc::new(Gateway { outbox: outbox.clone(), hold: Hold::default() });
-        let mut config = SessionConfig::new("FIX.4.4", "JETBRIDGE");
+        let mut config = SessionConfig::new("FIX.4.4", "TURBOJETHUB");
         // Small, so a held-up session fills it quickly.
         config.send_queue = 4;
         let acceptor = Acceptor::new(config, Arc::new(MemoryStorage::new()), app.clone()).unwrap();
@@ -547,7 +547,7 @@ mod tests {
     fn client_session(addr: &str) -> (Initiator, Arc<Recorder>, UnboundedReceiver<Event>) {
         let (events, rx) = unbounded_channel();
         let recorder = Arc::new(Recorder { events, hold: Hold::default() });
-        let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", CLIENT), "JETBRIDGE");
+        let mut config = InitiatorConfig::new(SessionConfig::new("FIX.4.4", CLIENT), "TURBOJETHUB");
         config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
         let initiator = Initiator::new(addr, config, Arc::new(MemoryStorage::new()), recorder.clone()).unwrap();
         (initiator, recorder, rx)

@@ -6,8 +6,8 @@ import Sessions, { NUMBERS_EVERY } from './Sessions.tsx'
 import { initial, LiveContext, reduce } from './store.ts'
 import type { Me, OrderView, SessionView } from './types.ts'
 
-const FUNDA = 'FIX.4.4:JETBRIDGE->FUNDA'
-const VENUE = 'FIX.4.4:JETBRIDGE->NASDAQ'
+const FUNDA = 'FIX.4.4:TURBOJETHUB->FUNDA'
+const VENUE = 'FIX.4.4:TURBOJETHUB->NASDAQ'
 
 const session = (side: SessionView['side'], id: string, paused = false): SessionView => ({
   side,
@@ -90,14 +90,14 @@ test('sums the sessions, orders and blocks up in cards, the venues down in warn'
   expect(venues().className).toBe('')
   cleanup()
 
-  const down = { ...session('venue', 'FIX.4.4:JETBRIDGE->NYSE'), venue: 'NYSE', status: 'disconnected' as const }
+  const down = { ...session('venue', 'FIX.4.4:TURBOJETHUB->NYSE'), venue: 'NYSE', status: 'disconnected' as const }
   // The store counts what the snapshot has; their fields are the blotter's.
   const orders = [1, 2].map((id) => ({ id }) as OrderView)
   const state = reduce(initial, {
     type: 'snapshot',
     sessions: [
       session('client', FUNDA),
-      { ...session('client', 'FIX.4.4:JETBRIDGE->FUNDB'), status: 'connected' },
+      { ...session('client', 'FIX.4.4:TURBOJETHUB->FUNDB'), status: 'connected' },
       { ...session('venue', VENUE, true), status: 'disconnected' },
       down,
     ],
@@ -122,7 +122,7 @@ test('sums the sessions, orders and blocks up in cards, the venues down in warn'
   expect(venues().className).toBe('warn')
   // Each state a pill, toned by it.
   const pill = (name: string) => row(name).querySelector('.pill')!
-  const pills = [pill(FUNDA), pill('FIX.4.4:JETBRIDGE->FUNDB'), pill('NYSE'), pill('NASDAQ')]
+  const pills = [pill(FUNDA), pill('FIX.4.4:TURBOJETHUB->FUNDB'), pill('NYSE'), pill('NASDAQ')]
   expect(pills.map((p) => [p.className, p.textContent])).toEqual([
     ['pill ok', 'logged on'],
     ['pill info', 'connected'],
@@ -230,10 +230,10 @@ test('a resend posts the reason and from, with the CSRF token, and says how it w
   calls = serve(() => json({ next_incoming: 12, next_outgoing: 34 }))
   fireEvent.click(confirm)
   const status = await screen.findByRole('status')
-  expect(status.textContent).toBe('Asked FIX.4.4:JETBRIDGE->FUNDA to resend from 7; next incoming 12.')
+  expect(status.textContent).toBe('Asked FIX.4.4:TURBOJETHUB->FUNDA to resend from 7; next incoming 12.')
   expect(screen.queryByRole('dialog')).toBeNull()
   expect(calls).toHaveLength(1)
-  expect(calls[0].url).toBe('/api/sessions/FIX.4.4%3AJETBRIDGE-%3EFUNDA/resend')
+  expect(calls[0].url).toBe('/api/sessions/FIX.4.4%3ATURBOJETHUB-%3EFUNDA/resend')
   expect(calls[0].init.body).toBe('{"reason":"gap at 7","from":7}')
   expect((calls[0].init.headers as Record<string, string>)['X-CSRF-Token']).toBe('tok')
 })

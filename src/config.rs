@@ -660,7 +660,7 @@ mod tests {
     const SESSIONS: &str = r#"
 [acceptor]
 begin_string = "FIX.4.4"
-sender_comp_id = "JETBRIDGE"
+sender_comp_id = "TURBOJETHUB"
 listen = "127.0.0.1:0"
 unknown = "admit"
 
@@ -849,7 +849,7 @@ reject = "no route"
 
     #[test]
     fn the_sessions_file_needs_an_acceptor() {
-        let sessions = "[initiator.NASDAQ]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"JETBRIDGE\"\n\
+        let sessions = "[initiator.NASDAQ]\nbegin_string = \"FIX.4.4\"\nsender_comp_id = \"TURBOJETHUB\"\n\
                         target_comp_id = \"NASDAQ\"\nconnect = [\"127.0.0.1:1\"]";
         let dir = dir(&[("turbojet-hub.toml", "sessions = \"sessions.toml\""), ("sessions.toml", sessions)]);
         let error = load(&dir.path().join("turbojet-hub.toml")).unwrap_err().to_string();

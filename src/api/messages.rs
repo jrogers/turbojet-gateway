@@ -132,7 +132,7 @@ pub(super) async fn messages(
 }
 
 /// The sessions a scoped caller's search finds: those of its clients, named as the acceptor logs
-/// them (`BEGIN:JETBRIDGE->CLIENT`). A venue's session is named the same way, Turbojet Hub's CompID
+/// them (`BEGIN:TURBOJETHUB->CLIENT`). A venue's session is named the same way, Turbojet Hub's CompID
 /// then the venue's, so a venue whose CompID is a client's would pass as that client: the venues'
 /// sessions are refused by name first. A venue a reload has stopped isn't known, and one with a
 /// client's CompID would then pass.
@@ -592,7 +592,7 @@ mod tests {
         let log = FileMessageLog::open(dir, options).unwrap();
         for (time, direction, comp_id, frame) in records {
             *now.lock().unwrap() = *time;
-            let session = comp_id.map(|comp_id| SessionId::new("FIX.4.4", "JETBRIDGE", comp_id));
+            let session = comp_id.map(|comp_id| SessionId::new("FIX.4.4", "TURBOJETHUB", comp_id));
             match direction {
                 Direction::Inbound => log.inbound(session.as_ref(), frame),
                 Direction::Outbound => log.outbound(session.as_ref(), frame),
@@ -650,9 +650,9 @@ mod tests {
         );
         let ids = async |query: &str| search(&fixture, &format!("/api/messages?{DAY}{query}")).await.0;
         assert_eq!(ids("").await, ["A", "A", "B", "C"]);
-        assert_eq!(ids("&session=FIX.4.4:JETBRIDGE-%3EFUNDA").await, ["A", "A"]);
+        assert_eq!(ids("&session=FIX.4.4:TURBOJETHUB-%3EFUNDA").await, ["A", "A"]);
         assert_eq!(
-            ids("&session=FIX.4.4:JETBRIDGE-%3EFUNDA&session=FIX.4.4:JETBRIDGE-%3ENASDAQ").await,
+            ids("&session=FIX.4.4:TURBOJETHUB-%3EFUNDA&session=FIX.4.4:TURBOJETHUB-%3ENASDAQ").await,
             ["A", "A", "B"]
         );
         assert_eq!(ids("&direction=out").await, ["A", "B"]);
@@ -668,11 +668,11 @@ mod tests {
         assert_eq!(ids("since=2026-10-08T09:01:00Z&until=2026-10-08T09:03:00Z").await, ["A", "B"]);
         assert_eq!(ids("since=2026-10-08T10:00:00%2B01:00").await, ["A", "A", "B", "C"]);
 
-        let page = fixture.ok(&format!("/api/messages?{DAY}&direction=in&session=FIX.4.4:JETBRIDGE-%3EFUNDA")).await;
+        let page = fixture.ok(&format!("/api/messages?{DAY}&direction=in&session=FIX.4.4:TURBOJETHUB-%3EFUNDA")).await;
         let hit = &page["messages"][0];
         assert_eq!(hit["time"], "2026-10-08T09:00:00Z");
         assert_eq!(hit["direction"], "in");
-        assert_eq!(hit["session"], "FIX.4.4:JETBRIDGE->FUNDA");
+        assert_eq!(hit["session"], "FIX.4.4:TURBOJETHUB->FUNDA");
         assert_eq!(hit["msg_type"], "D");
         assert_eq!(hit["fields"][2], serde_json::json!([35, "D"]));
         let raw = hit["raw"].as_str().unwrap();
@@ -961,7 +961,7 @@ mod tests {
             .iter()
             .map(|hit| (hit["session"].as_str().unwrap().to_string(), hit["msg_type"].as_str().unwrap().to_string()))
             .collect();
-        let session = |comp_id| format!("FIX.4.4:JETBRIDGE->{comp_id}");
+        let session = |comp_id| format!("FIX.4.4:TURBOJETHUB->{comp_id}");
         let expected = [
             (session("FUNDA"), "D"),
             (session("NASDAQ"), "D"),
@@ -1013,7 +1013,7 @@ mod tests {
             ],
         );
         let (funda, fundb) = (fixture.scoped_viewer.as_str(), fixture.scoped.as_str());
-        let session = |comp_id: &str| format!("&session=FIX.4.4:JETBRIDGE-%3E{comp_id}");
+        let session = |comp_id: &str| format!("&session=FIX.4.4:TURBOJETHUB-%3E{comp_id}");
         let ids = async |bearer: &str, query: &str| {
             let answer = fixture.get_as(bearer, &format!("/api/messages?{DAY}{query}")).await;
             assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
@@ -1039,7 +1039,7 @@ mod tests {
             assert_eq!(answer.status, StatusCode::FORBIDDEN, "{query}: {}", answer.body);
         }
         let answer = fixture.get_as(funda, &format!("/api/messages?{DAY}{}", session("FUNDB"))).await;
-        assert_eq!(answer.body["error"], "val may see only clients FUNDA, not FIX.4.4:JETBRIDGE->FUNDB");
+        assert_eq!(answer.body["error"], "val may see only clients FUNDA, not FIX.4.4:TURBOJETHUB->FUNDB");
     }
 
     /// Every read as an unscoped caller and one scoped to FUNDA, with FUNDB's paused session,
@@ -1056,7 +1056,7 @@ mod tests {
         fixture.service.store().unwrap().write(&[past]).await.unwrap();
         crate::edge::tests::book_order_as(fixture.service.gateway(), "FUNDB", "B1");
         assert!(fixture.service.gateway().block(crate::book::Scope::CompId("FUNDB".into())));
-        fixture.service.client_session(&SessionId::new("FIX.4.4", "JETBRIDGE", "FUNDB")).pause(None);
+        fixture.service.client_session(&SessionId::new("FIX.4.4", "TURBOJETHUB", "FUNDB")).pause(None);
         let order =
             |minute, comp_id, id| (at(8, 9, minute), Direction::Inbound, Some(comp_id), fix(&[(35, "D"), (11, id)]));
         log(&fixture.dirs.0.path().join("log"), &[order(0, "FUNDA", "A"), order(1, "FUNDB", "B")]);
@@ -1075,7 +1075,7 @@ mod tests {
         let viewers = (fixture.viewer.as_str(), fixture.scoped_viewer.as_str());
         let admins = (fixture.admin.as_str(), fixture.scoped_admin.as_str());
         let range = "from=2026-10-01T00:00:00Z&to=2026-10-04T00:00:00Z";
-        let fundb_session = "session=FIX.4.4:JETBRIDGE-%3EFUNDB";
+        let fundb_session = "session=FIX.4.4:TURBOJETHUB-%3EFUNDB";
         let rows = [
             ("/api/sessions".to_string(), viewers, Shows, Hides),
             ("/api/orders".to_string(), viewers, Shows, Hides),
@@ -1119,7 +1119,7 @@ mod tests {
         let page = fixture.get_as(&fixture.venue_viewer, &format!("/api/messages?{DAY}")).await;
         assert_eq!((page.status, &page.body["messages"]), (StatusCode::OK, &serde_json::json!([])));
         let named = fixture
-            .get_as(&fixture.venue_viewer, &format!("/api/messages?{DAY}&session=FIX.4.4:JETBRIDGE-%3ENASDAQ"))
+            .get_as(&fixture.venue_viewer, &format!("/api/messages?{DAY}&session=FIX.4.4:TURBOJETHUB-%3ENASDAQ"))
             .await;
         assert_eq!(named.status, StatusCode::FORBIDDEN);
         assert_eq!(search(&fixture, &format!("/api/messages?{DAY}")).await.0, ["A", "V"]);
@@ -1131,13 +1131,13 @@ mod tests {
     fn a_venues_session_is_never_a_clients() {
         let clients = Clients {
             comp_ids: vec!["FUNDA".into(), "NASDAQ".into()],
-            venues: vec!["FIX.4.4:JETBRIDGE->NASDAQ".into()],
+            venues: vec!["FIX.4.4:TURBOJETHUB->NASDAQ".into()],
         };
-        assert!(clients.cover("FIX.4.4:JETBRIDGE->FUNDA"));
-        assert!(clients.cover("FIX.4.4:JETBRIDGE->FUNDA/DESK"));
-        assert!(clients.cover("FIX.4.2:JETBRIDGE->NASDAQ"));
-        assert!(!clients.cover("FIX.4.4:JETBRIDGE->NASDAQ"));
-        assert!(!clients.cover("FIX.4.4:JETBRIDGE->FUNDB"));
+        assert!(clients.cover("FIX.4.4:TURBOJETHUB->FUNDA"));
+        assert!(clients.cover("FIX.4.4:TURBOJETHUB->FUNDA/DESK"));
+        assert!(clients.cover("FIX.4.2:TURBOJETHUB->NASDAQ"));
+        assert!(!clients.cover("FIX.4.4:TURBOJETHUB->NASDAQ"));
+        assert!(!clients.cover("FIX.4.4:TURBOJETHUB->FUNDB"));
     }
 
     /// A past order the book has dropped, from the database: its messages are searched from its
