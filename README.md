@@ -194,8 +194,8 @@ Turbojet Gateway:
   the acceptor's `sender_comp_id` unless it sets its own. A venue with another version stops the
   gateway at start; a reload that adds one skips it, with an error logged.
 - A `FIXT.1.1` session carries FIX 5.0 SP2, the only application version the gateway converts:
-  give it `appl_versions = ["9"]` (in `[defaults]` for the acceptor, so a FIX 4.x venue clears it
-  with `appl_versions = []`). A Logon whose DefaultApplVerID(1137) isn't 9 is refused.
+  give it `appl_versions = ["9"]` (in `[defaults]` for the acceptor, so a FIX 4.x venue sets its
+  own `begin_string` and clears it with `appl_versions = []`). A Logon whose DefaultApplVerID(1137) isn't 9 is refused.
 - Sessions are kept in the `memory` store unless the file says otherwise, so sequence numbers
   start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them. With a
   [database](#database), the acceptor and every venue must be kept in one.
@@ -841,7 +841,9 @@ its types. `cargo test --all-features` includes the console, so needs `web/dist`
 
 To see it with orders in it, run the gateway on `examples/turbojet-gateway.toml`, then
 `scripts/fix-demo.py venue` and `scripts/fix-demo.py client` (Python 3): a venue and a client
-that log on and trade a few orders, some filled, some working, one canceled and two rejected.
+that log on and trade a few orders, some filled, some working, one replaced, one canceled and two
+rejected, then ask after one. `scripts/fix-demo.py client --fixt` is the same client in FIX 5.0
+SP2, for a FIXT acceptor: the script's docstring says what to change in `examples/sessions.toml`.
 
 ## Signals
 

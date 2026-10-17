@@ -29,9 +29,3 @@ worth knowing about is in [CAVEATS.md](CAVEATS.md).
   session's journal to the standby (on Turbojet's roadmap).
 - **Split the book** (L). One lock guards the book, router and risk: the known ceiling. Splitting
   by client would lift it if it ever binds.
-
-## 4. Tooling
-
-- **Demo replace and status** (S). `scripts/fix-demo.py`'s client sends orders and a cancel, but
-  no OrderCancelReplaceRequest or OrderStatusRequest, so a demo never shows a replace or a
-  status request.
