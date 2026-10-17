@@ -29,3 +29,18 @@ worth knowing about is in [CAVEATS.md](CAVEATS.md).
   session's journal to the standby (on Turbojet's roadmap).
 - **Split the book** (L). One lock guards the book, router and risk: the known ceiling. Splitting
   by client would lift it if it ever binds.
+
+## 4. Operations
+
+- **Structured logging** (S). Logs come only in `tracing`'s text format (`src/main.rs`), and the
+  gateway's own events (an order routed or refused, a risk limit hit, a reload) put what they're
+  about in the text. A `[log]` setting for JSON output, with those events carrying the client,
+  venue, ClOrdID and symbol as fields and a stable name each, would let a log pipeline filter and
+  alert on them without parsing.
+- **OpenTelemetry** (M). The gateway exports no metrics or traces. Behind a feature, configured
+  in a `[telemetry]` table (the OTLP endpoint and sampling):
+  - a trace per order, from the client's NewOrderSingle through risk and routing to the venue and
+    back to each execution report, with its ClOrdIDs as attributes, so a slow or lost order can
+    be followed across both sessions;
+  - metrics over OTLP: Turbojet's per-session ones (its `metrics` feature) and the gateway's own,
+    such as orders and rejects by reason, risk limits hit and open orders by venue.
