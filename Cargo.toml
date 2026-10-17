@@ -37,7 +37,7 @@ tempfile = "3"
 turbojet = "0.4.0"
 # `tz`: named time zones in session schedules and `day_end`.
 turbojet-config = { version = "0.4.0", features = ["tz"] }
-turbojet-fix = { version = "0.4.0", features = ["fix42", "fix44"] }
+turbojet-fix = { version = "0.4.0", features = ["fix42", "fix44", "fix50sp2"] }
 # The operator API's HTTP server. HTTP/1.1 only: the Origin check on a cookie's websocket upgrade
 # (`api::auth`) keys on the Upgrade header, which HTTP/2's extended CONNECT doesn't send.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }

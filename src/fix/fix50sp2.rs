@@ -1,0 +1,1413 @@
+//! FIX 5.0 SP2, over FIXT.1.1, to and from the book. Requests and venue reports parse into
+//! [`Input`]s, outputs build typed messages.
+//!
+//! As FIX 4.4, but 5.0 SP2 makes some fields optional that the book needs: OrigClOrdID(41) on a
+//! cancel or replace and ClOrdID(11) on a status request (it allows OrderID(37) instead), and
+//! AvgPx(6) on a venue's report. Their absence is refused like a missing required field.
+//!
+//! What the book doesn't model is refused at the edge with a [`MessageReject`] naming the field:
+//! an OrdType other than Market or Limit, a TimeInForce other than Day, GTC, IOC or FOK, a Side
+//! other than Buy, Sell or SellShort, a quantity that isn't positive, a Limit order without a
+//! price and a Market order with one.
+
+use turbojet::fields::{Code, CodeRef, CompactString, Decimal, UtcTimestamp};
+use turbojet::message::tags;
+use turbojet::{FixMessage, Message, MessageReject};
+use turbojet_fix::fix50sp2 as fix;
+
+use super::{check_price, order_id_out, quantity, reason_code, replaced_status, required, unsupported, venue_code};
+use crate::book::{
+    CancelKind, CancelRejectReason, ClientId, ClientReport, ExecType, Input, OrdType, OrderRequest, Output,
+    RejectReason, Side, Status, TimeInForce, VenueId, VenueReport,
+};
+use crate::risk::RiskReject;
+
+/// A client's NewOrderSingle(D), OrderCancelRequest(F), OrderCancelReplaceRequest(G) or
+/// OrderStatusRequest(H) as the book's input. `redelivered` is the caller's: Turbojet's
+/// `maybe_redelivered()` or [`possibly_resent`](super::possibly_resent).
+///
+/// # Errors
+///
+/// The reject to answer with: any other MsgType, a malformed message, or a value the book
+/// doesn't model.
+pub fn client_input(client: &ClientId, msg: &Message, redelivered: bool) -> Result<Input, MessageReject> {
+    let client = client.clone();
+    match msg.get(tags::MSG_TYPE) {
+        Some("D") => new_order(client, msg.parse()?, redelivered),
+        Some("F") => cancel(client, msg.parse()?, redelivered),
+        Some("G") => replace(client, msg.parse()?, redelivered),
+        Some("H") => status_request(client, msg.parse()?),
+        _ => Err(MessageReject::unsupported_message_type()),
+    }
+}
+
+/// The client's message for `output`: an ExecutionReport or an OrderCancelReject. `None` for
+/// venue-bound outputs. `now` is TransactTime(60).
+pub fn client_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
+    match output {
+        Output::Report { report, .. } => Some(execution_report(report, now).to_message()),
+        Output::CancelReject { order_id, cl_ord_id, orig_cl_ord_id, response_to, status, reason, text, .. } => {
+            let response_to = match response_to {
+                CancelKind::Cancel => fix::CxlRejResponseTo::OrderCancelRequest,
+                // Code 2, OrderCancelReplaceRequest; the repository names it OrderCancel.
+                CancelKind::Replace => fix::CxlRejResponseTo::OrderCancel,
+            };
+            let mut reject = fix::OrderCancelReject::new(
+                order_id_out(order_id.as_ref()),
+                cl_ord_id.as_str(),
+                ord_status_to_fix(*status),
+                response_to,
+            );
+            reject.orig_cl_ord_id = Some(orig_cl_ord_id.clone());
+            reject.cxl_rej_reason = Some(cxl_rej_reason_to_fix(*reason));
+            reject.text = Some(text.clone());
+            reject.transact_time = Some(now);
+            Some(reject.to_message())
+        }
+        Output::NewOrder { .. } | Output::Cancel { .. } | Output::Replace { .. } | Output::StatusRequest { .. } => None,
+    }
+}
+
+/// The venue's message for `output`: a NewOrderSingle, OrderCancelRequest,
+/// OrderCancelReplaceRequest or OrderStatusRequest under the downstream ClOrdIDs.
+/// `request.cl_ord_id` is the client's and never goes to a venue. `None` for client-bound
+/// outputs. `now` is TransactTime(60), for those that carry one.
+pub fn venue_message(output: &Output, now: UtcTimestamp) -> Option<Message> {
+    match output {
+        Output::NewOrder { downstream, request, .. } => Some(new_order_single(downstream, request, now).to_message()),
+        Output::Cancel { downstream, orig_downstream, request, venue_order_id, .. } => {
+            let side = side_to_fix(request.side);
+            let mut cancel = fix::OrderCancelRequest::new(downstream.as_str(), side, now);
+            cancel.orig_cl_ord_id = Some(orig_downstream.clone());
+            // Optional in FIX 5.0 SP2, so left out until the venue has named the order, not "NONE".
+            cancel.order_id.clone_from(venue_order_id);
+            cancel.account.clone_from(&request.account);
+            cancel.symbol = Some(request.symbol.clone());
+            cancel.order_qty = Some(request.qty);
+            Some(cancel.to_message())
+        }
+        Output::Replace { downstream, orig_downstream, request, venue_order_id, .. } => {
+            Some(replace_request(downstream, orig_downstream, request, venue_order_id.as_ref(), now).to_message())
+        }
+        Output::StatusRequest { downstream, request, venue_order_id, .. } => {
+            let mut status = fix::OrderStatusRequest::new(side_to_fix(request.side));
+            status.cl_ord_id = Some(downstream.clone());
+            status.order_id.clone_from(venue_order_id);
+            status.account.clone_from(&request.account);
+            status.symbol = Some(request.symbol.clone());
+            Some(status.to_message())
+        }
+        Output::Report { .. } | Output::CancelReject { .. } => None,
+    }
+}
+
+/// A venue's ExecutionReport(8) or OrderCancelReject(9) as the book's input.
+///
+/// `Ok(None)` for a trade bust or correction (ExecType TradeCancel or TradeCorrect): it lowers
+/// CumQty, which the book would drop silently as stale, so it's logged here as an error for an
+/// operator and the caller drops it. The session still takes the message: a reject wouldn't
+/// make the venue send anything the book could use. ExecTypes and OrdStatuses the book doesn't
+/// model, and codes outside the FIX 5.0 SP2 dictionary, are logged as warnings and passed on as
+/// Restated, and as no status.
+///
+/// Only the fields the book needs are read, from the raw message: a strict typed parse would
+/// refuse the whole report, fill and all, over a venue's own code in a field the book ignores.
+///
+/// # Errors
+///
+/// The reject to answer with: any other MsgType, a field the book needs missing or malformed
+/// (ClOrdID(11), which the book finds the order by, among them), or a fill without LastPx(31).
+pub fn venue_input(venue: &VenueId, msg: &Message) -> Result<Option<Input>, MessageReject> {
+    match msg.get(tags::MSG_TYPE) {
+        Some("8") => {
+            let report = venue_report(venue, msg)?;
+            Ok(report.map(|report| Input::VenueReport { venue: venue.clone(), report }))
+        }
+        Some("9") => venue_cancel_reject(venue, msg).map(Some),
+        _ => Err(MessageReject::unsupported_message_type()),
+    }
+}
+
+fn new_order(client: ClientId, order: fix::NewOrderSingleRef<'_>, redelivered: bool) -> Result<Input, MessageReject> {
+    let ord_type = ord_type_in(order.ord_type)?;
+    let qty = quantity(order.order_qty)?;
+    check_price(ord_type, order.price)?;
+    let request = OrderRequest {
+        cl_ord_id: order.cl_ord_id.into(),
+        account: order.account.map(CompactString::from),
+        symbol: symbol(order.symbol)?,
+        side: side_in(order.side)?,
+        ord_type,
+        qty,
+        price: order.price,
+        ex_destination: order.ex_destination.map(CompactString::from),
+        time_in_force: order.time_in_force.map(time_in_force_in).transpose()?,
+    };
+    Ok(Input::NewOrder { client, request, redelivered, sent: None })
+}
+
+fn cancel(client: ClientId, cancel: fix::OrderCancelRequestRef<'_>, redelivered: bool) -> Result<Input, MessageReject> {
+    Ok(Input::Cancel {
+        client,
+        cl_ord_id: cancel.cl_ord_id.into(),
+        orig_cl_ord_id: conditionally_required(cancel.orig_cl_ord_id, tags::ORIG_CL_ORD_ID)?,
+        side: side_in(cancel.side)?,
+        symbol: symbol(cancel.symbol)?,
+        redelivered,
+    })
+}
+
+/// A FIX replace carries the order's full terms, so OrdType is always set and an absent
+/// TimeInForce is Day (FIX's default), never the book's "unchanged".
+fn replace(
+    client: ClientId,
+    replace: fix::OrderCancelReplaceRequestRef<'_>,
+    redelivered: bool,
+) -> Result<Input, MessageReject> {
+    let ord_type = ord_type_in(replace.ord_type)?;
+    let qty = quantity(replace.order_qty)?;
+    check_price(ord_type, replace.price)?;
+    let time_in_force = replace.time_in_force.map_or(Ok(TimeInForce::Day), time_in_force_in)?;
+    Ok(Input::Replace {
+        client,
+        cl_ord_id: replace.cl_ord_id.into(),
+        orig_cl_ord_id: conditionally_required(replace.orig_cl_ord_id, tags::ORIG_CL_ORD_ID)?,
+        side: side_in(replace.side)?,
+        symbol: symbol(replace.symbol)?,
+        qty,
+        price: replace.price,
+        ord_type: Some(ord_type),
+        time_in_force: Some(time_in_force),
+        redelivered,
+    })
+}
+
+fn status_request(client: ClientId, request: fix::OrderStatusRequestRef<'_>) -> Result<Input, MessageReject> {
+    Ok(Input::StatusRequest {
+        client,
+        cl_ord_id: conditionally_required(request.cl_ord_id, tags::CL_ORD_ID)?,
+        side: side_in(request.side)?,
+        symbol: symbol(request.symbol)?,
+    })
+}
+
+/// A field FIX 5.0 SP2 makes optional, where another may stand in, but the book finds the
+/// order by.
+fn conditionally_required(value: Option<&str>, tag: u32) -> Result<CompactString, MessageReject> {
+    value.map(CompactString::from).ok_or(MessageReject::conditionally_required_field_missing(tag))
+}
+
+/// Symbol(55): optional in FIX 5.0 SP2's Instrument block, but the book routes and checks on it.
+fn symbol(symbol: Option<&str>) -> Result<CompactString, MessageReject> {
+    symbol.map(CompactString::from).ok_or(MessageReject::required_tag_missing(tags::SYMBOL))
+}
+
+fn side_in(side: CodeRef<'_, fix::Side>) -> Result<Side, MessageReject> {
+    side.known().and_then(side_from_fix).ok_or_else(|| unsupported(tags::SIDE, "Side", side.code()))
+}
+
+fn ord_type_in(ord_type: CodeRef<'_, fix::OrdType>) -> Result<OrdType, MessageReject> {
+    ord_type.known().and_then(ord_type_from_fix).ok_or_else(|| unsupported(tags::ORD_TYPE, "OrdType", ord_type.code()))
+}
+
+fn time_in_force_in(time_in_force: CodeRef<'_, fix::TimeInForce>) -> Result<TimeInForce, MessageReject> {
+    let unsupported = || unsupported(tags::TIME_IN_FORCE, "TimeInForce", time_in_force.code());
+    time_in_force.known().and_then(time_in_force_from_fix).ok_or_else(unsupported)
+}
+
+fn execution_report(report: &ClientReport, now: UtcTimestamp) -> fix::ExecutionReport {
+    let mut message = fix::ExecutionReport::new(
+        order_id_out(report.order_id.as_ref()),
+        report.exec_id.as_str(),
+        exec_type_to_fix(report.exec_type),
+        ord_status_to_fix(report.status),
+        side_to_fix(report.request.side),
+        report.leaves_qty,
+        report.cum_qty,
+    );
+    message.avg_px = Some(report.avg_px);
+    let request = &report.request;
+    message.cl_ord_id = Some(report.cl_ord_id.clone());
+    message.orig_cl_ord_id.clone_from(&report.orig_cl_ord_id);
+    message.account.clone_from(&request.account);
+    message.symbol = Some(request.symbol.clone());
+    message.order_qty = Some(request.qty);
+    message.ord_type = Some(ord_type_to_fix(request.ord_type).into());
+    message.price = request.price;
+    message.time_in_force = request.time_in_force.map(|time_in_force| time_in_force_to_fix(time_in_force).into());
+    if report.last_qty > Decimal::ZERO {
+        message.last_qty = Some(report.last_qty);
+        message.last_px = Some(report.last_px);
+    }
+    message.ord_rej_reason = report.reject.map(ord_rej_reason_to_fix);
+    // A status request about no order: FIX 5.0 SP2 answers Rejected, UnknownOrder.
+    if report.reject.is_none() && report.order_id.is_none() && report.status == Status::Rejected {
+        message.ord_rej_reason = Some(fix::OrdRejReason::UnknownOrder.into());
+    }
+    message.text.clone_from(&report.text);
+    message.transact_time = Some(now);
+    message
+}
+
+fn new_order_single(downstream: &CompactString, request: &OrderRequest, now: UtcTimestamp) -> fix::NewOrderSingle {
+    let side = side_to_fix(request.side);
+    let mut order = fix::NewOrderSingle::new(downstream.as_str(), side, now, ord_type_to_fix(request.ord_type));
+    order.account.clone_from(&request.account);
+    order.ex_destination.clone_from(&request.ex_destination);
+    order.symbol = Some(request.symbol.clone());
+    order.order_qty = Some(request.qty);
+    order.price = request.price;
+    order.time_in_force = request.time_in_force.map(|time_in_force| time_in_force_to_fix(time_in_force).into());
+    order
+}
+
+fn replace_request(
+    downstream: &CompactString,
+    orig_downstream: &CompactString,
+    request: &OrderRequest,
+    venue_order_id: Option<&CompactString>,
+    now: UtcTimestamp,
+) -> fix::OrderCancelReplaceRequest {
+    let (side, ord_type) = (side_to_fix(request.side), ord_type_to_fix(request.ord_type));
+    let mut replace = fix::OrderCancelReplaceRequest::new(downstream.as_str(), side, now, ord_type);
+    replace.orig_cl_ord_id = Some(orig_downstream.clone());
+    replace.order_id = venue_order_id.cloned();
+    replace.account.clone_from(&request.account);
+    replace.ex_destination.clone_from(&request.ex_destination);
+    replace.symbol = Some(request.symbol.clone());
+    replace.order_qty = Some(request.qty);
+    replace.price = request.price;
+    replace.time_in_force = request.time_in_force.map(|time_in_force| time_in_force_to_fix(time_in_force).into());
+    replace
+}
+
+fn venue_report(venue: &VenueId, msg: &Message) -> Result<Option<VenueReport>, MessageReject> {
+    let downstream =
+        msg.get(tags::CL_ORD_ID).ok_or(MessageReject::conditionally_required_field_missing(tags::CL_ORD_ID))?;
+    let exec_id = required(msg, tags::EXEC_ID)?;
+    let exec_type_code = required(msg, tags::EXEC_TYPE)?;
+    let ord_status_code = required(msg, tags::ORD_STATUS)?;
+    let cum_qty: Decimal = msg.field(fix::tags::CUM_QTY)?;
+    // ponytail: optional in FIX 5.0 SP2, but the book takes the order's AvgPx from each report;
+    // make VenueReport's avg_px an Option, kept from the order when absent, if a venue omits it.
+    let avg_px: Decimal = msg.field(fix::tags::AVG_PX)?;
+    let last_qty = msg.opt_field(fix::tags::LAST_QTY)?.unwrap_or(Decimal::ZERO);
+    let last_px = match msg.opt_field(fix::tags::LAST_PX)? {
+        Some(last_px) => last_px,
+        None if last_qty > Decimal::ZERO => {
+            tracing::error!(%venue, downstream, exec_id, %last_qty, "fill without LastPx needs an operator; rejected");
+            return Err(MessageReject::conditionally_required_field_missing(fix::tags::LAST_PX));
+        }
+        None => Decimal::ZERO,
+    };
+    let Some(exec_type) = venue_exec_type(venue, downstream, exec_type_code) else {
+        tracing::error!(%venue, downstream, exec_id, exec_type = exec_type_code,
+            "trade bust or correction needs an operator; dropped");
+        return Ok(None);
+    };
+    let status = match fix::OrdStatus::from_code(ord_status_code) {
+        // Deprecated since FIX 4.3, but some venues still accept a replace with it.
+        Some(fix::OrdStatus::Replaced) => Some(replaced_status(cum_qty, msg.opt_field(fix::tags::LEAVES_QTY)?)),
+        _ => venue_status(venue, downstream, ord_status_code),
+    };
+    Ok(Some(VenueReport {
+        downstream: downstream.into(),
+        exec_type,
+        status,
+        last_qty,
+        last_px,
+        cum_qty,
+        avg_px,
+        exec_id: exec_id.into(),
+        text: msg.get(tags::TEXT).map(CompactString::from),
+        // As the venue sent it: the book ignores "NONE".
+        venue_order_id: msg.get(tags::ORDER_ID).map(CompactString::from),
+        ord_rej_reason: reason_code(venue, downstream, msg, tags::ORD_REJ_REASON),
+    }))
+}
+
+fn venue_cancel_reject(venue: &VenueId, msg: &Message) -> Result<Input, MessageReject> {
+    let downstream = required(msg, tags::CL_ORD_ID)?;
+    Ok(Input::VenueCancelReject {
+        venue: venue.clone(),
+        downstream: downstream.into(),
+        status: venue_status(venue, downstream, required(msg, tags::ORD_STATUS)?),
+        text: msg.get(tags::TEXT).map(CompactString::from),
+        reason: reason_code(venue, downstream, msg, tags::CXL_REJ_REASON),
+        venue_order_id: msg.get(tags::ORDER_ID).map(CompactString::from),
+    })
+}
+
+/// The book's ExecType for a venue's code; `None` for a trade bust or correction. A code the
+/// book doesn't model, or FIX 5.0 SP2 doesn't list, is passed on as Restated.
+fn venue_exec_type(venue: &VenueId, downstream: &str, code: &str) -> Option<ExecType> {
+    let fix_exec_type = fix::ExecType::from_code(code);
+    let exec_type = fix_exec_type.map_or(Some(ExecType::Restated), exec_type_from_fix);
+    if exec_type == Some(ExecType::Restated) && fix_exec_type != Some(fix::ExecType::Restated) {
+        tracing::warn!(%venue, downstream, exec_type = code, "ExecType not modelled; passed on as Restated");
+    }
+    exec_type
+}
+
+/// The book's status for a venue's OrdStatus code; `None`, keeping the order's, for one it
+/// doesn't model or FIX 5.0 SP2 doesn't list. DoneForDay is expected; the others are logged.
+fn venue_status(venue: &VenueId, downstream: &str, code: &str) -> Option<Status> {
+    let fix_status = fix::OrdStatus::from_code(code);
+    let status = fix_status.and_then(ord_status_from_fix);
+    if status.is_none() && fix_status != Some(fix::OrdStatus::DoneForDay) {
+        tracing::warn!(%venue, downstream, ord_status = code, "OrdStatus not modelled; the order keeps its own");
+    }
+    status
+}
+
+// The mapping tables, one per enum pair.
+
+fn side_from_fix(side: fix::Side) -> Option<Side> {
+    match side {
+        fix::Side::Buy => Some(Side::Buy),
+        fix::Side::Sell => Some(Side::Sell),
+        fix::Side::SellShort => Some(Side::SellShort),
+        _ => None,
+    }
+}
+
+fn side_to_fix(side: Side) -> fix::Side {
+    match side {
+        Side::Buy => fix::Side::Buy,
+        Side::Sell => fix::Side::Sell,
+        Side::SellShort => fix::Side::SellShort,
+    }
+}
+
+fn ord_type_from_fix(ord_type: fix::OrdType) -> Option<OrdType> {
+    match ord_type {
+        fix::OrdType::Market => Some(OrdType::Market),
+        fix::OrdType::Limit => Some(OrdType::Limit),
+        _ => None,
+    }
+}
+
+fn ord_type_to_fix(ord_type: OrdType) -> fix::OrdType {
+    match ord_type {
+        OrdType::Market => fix::OrdType::Market,
+        OrdType::Limit => fix::OrdType::Limit,
+    }
+}
+
+fn time_in_force_from_fix(time_in_force: fix::TimeInForce) -> Option<TimeInForce> {
+    match time_in_force {
+        fix::TimeInForce::Day => Some(TimeInForce::Day),
+        fix::TimeInForce::GoodTillCancel => Some(TimeInForce::Gtc),
+        fix::TimeInForce::ImmediateOrCancel => Some(TimeInForce::Ioc),
+        fix::TimeInForce::FillOrKill => Some(TimeInForce::Fok),
+        _ => None,
+    }
+}
+
+fn time_in_force_to_fix(time_in_force: TimeInForce) -> fix::TimeInForce {
+    match time_in_force {
+        TimeInForce::Day => fix::TimeInForce::Day,
+        TimeInForce::Gtc => fix::TimeInForce::GoodTillCancel,
+        TimeInForce::Ioc => fix::TimeInForce::ImmediateOrCancel,
+        TimeInForce::Fok => fix::TimeInForce::FillOrKill,
+    }
+}
+
+fn ord_status_to_fix(status: Status) -> fix::OrdStatus {
+    match status {
+        Status::PendingNew => fix::OrdStatus::PendingNew,
+        Status::New => fix::OrdStatus::New,
+        Status::PartiallyFilled => fix::OrdStatus::PartiallyFilled,
+        Status::Filled => fix::OrdStatus::Filled,
+        Status::PendingCancel => fix::OrdStatus::PendingCancel,
+        Status::PendingReplace => fix::OrdStatus::PendingReplace,
+        Status::Canceled => fix::OrdStatus::Canceled,
+        Status::Expired => fix::OrdStatus::Expired,
+        Status::Rejected => fix::OrdStatus::Rejected,
+    }
+}
+
+fn exec_type_to_fix(exec_type: ExecType) -> fix::ExecType {
+    match exec_type {
+        ExecType::PendingNew => fix::ExecType::PendingNew,
+        ExecType::New => fix::ExecType::New,
+        ExecType::Trade => fix::ExecType::Trade,
+        ExecType::PendingCancel => fix::ExecType::PendingCancel,
+        ExecType::Canceled => fix::ExecType::Canceled,
+        ExecType::PendingReplace => fix::ExecType::PendingReplace,
+        ExecType::Replaced => fix::ExecType::Replaced,
+        ExecType::Rejected => fix::ExecType::Rejected,
+        ExecType::Expired => fix::ExecType::Expired,
+        ExecType::Restated => fix::ExecType::Restated,
+        ExecType::DoneForDay => fix::ExecType::DoneForDay,
+        ExecType::Status => fix::ExecType::OrderStatus,
+    }
+}
+
+/// The inverse of [`ord_status_to_fix`]; `None` for the statuses the book doesn't model.
+fn ord_status_from_fix(status: fix::OrdStatus) -> Option<Status> {
+    match status {
+        fix::OrdStatus::PendingNew => Some(Status::PendingNew),
+        fix::OrdStatus::New => Some(Status::New),
+        fix::OrdStatus::PartiallyFilled => Some(Status::PartiallyFilled),
+        fix::OrdStatus::Filled => Some(Status::Filled),
+        fix::OrdStatus::PendingCancel => Some(Status::PendingCancel),
+        fix::OrdStatus::PendingReplace => Some(Status::PendingReplace),
+        fix::OrdStatus::Canceled => Some(Status::Canceled),
+        fix::OrdStatus::Expired => Some(Status::Expired),
+        fix::OrdStatus::Rejected => Some(Status::Rejected),
+        fix::OrdStatus::DoneForDay
+        | fix::OrdStatus::Replaced
+        | fix::OrdStatus::Stopped
+        | fix::OrdStatus::Suspended
+        | fix::OrdStatus::Calculated
+        | fix::OrdStatus::AcceptedForBidding => None,
+    }
+}
+
+/// The inverse of [`exec_type_to_fix`]. Stopped, Suspended and Calculated are Restated, as are
+/// 5.0's clearing holds and releases and a triggered order: the book passes them on without
+/// acting on them. `None` for a trade bust or correction.
+fn exec_type_from_fix(exec_type: fix::ExecType) -> Option<ExecType> {
+    match exec_type {
+        fix::ExecType::PendingNew => Some(ExecType::PendingNew),
+        fix::ExecType::New => Some(ExecType::New),
+        fix::ExecType::Trade => Some(ExecType::Trade),
+        fix::ExecType::PendingCancel => Some(ExecType::PendingCancel),
+        fix::ExecType::Canceled => Some(ExecType::Canceled),
+        fix::ExecType::PendingReplace => Some(ExecType::PendingReplace),
+        fix::ExecType::Replaced => Some(ExecType::Replaced),
+        fix::ExecType::Rejected => Some(ExecType::Rejected),
+        fix::ExecType::Expired => Some(ExecType::Expired),
+        fix::ExecType::Restated
+        | fix::ExecType::Stopped
+        | fix::ExecType::Suspended
+        | fix::ExecType::Calculated
+        | fix::ExecType::TradeInAClearingHold
+        | fix::ExecType::TradeHasBeenReleasedToClearing
+        | fix::ExecType::TriggeredOrActivatedBySystem => Some(ExecType::Restated),
+        fix::ExecType::DoneForDay => Some(ExecType::DoneForDay),
+        fix::ExecType::OrderStatus => Some(ExecType::Status),
+        fix::ExecType::TradeCorrect | fix::ExecType::TradeCancel => None,
+    }
+}
+
+/// FIX 5.0 SP2 has codes for Duplicate (6), for the quantity, notional and credit limits, Order
+/// exceeds limit (3), and for the price band, Price exceeds current price band (16); the book's
+/// other reasons say Other (99) and the report's Text says why. A venue's code passes through,
+/// listed in FIX 5.0 SP2 or not.
+fn ord_rej_reason_to_fix(reason: RejectReason) -> Code<fix::OrdRejReason> {
+    let known = match reason {
+        RejectReason::Duplicate => fix::OrdRejReason::DuplicateOrder,
+        RejectReason::NoRoute
+        | RejectReason::RouteRejected
+        | RejectReason::TooManyOrders
+        | RejectReason::VenueUnavailable
+        | RejectReason::GatewayUnavailable
+        | RejectReason::Blocked => fix::OrdRejReason::Other,
+        RejectReason::Risk(RiskReject::OrderQty | RiskReject::Notional | RiskReject::Credit) => {
+            fix::OrdRejReason::OrderExceedsLimit
+        }
+        RejectReason::Risk(RiskReject::PriceBand) => fix::OrdRejReason::PriceExceedsCurrentPriceBand,
+        RejectReason::Risk(RiskReject::Symbol | RiskReject::NoReferencePrice | RiskReject::SelfTrade) => {
+            fix::OrdRejReason::Other
+        }
+        RejectReason::Venue(code) => return venue_code(code),
+    };
+    known.into()
+}
+
+fn cxl_rej_reason_to_fix(reason: CancelRejectReason) -> Code<fix::CxlRejReason> {
+    let known = match reason {
+        CancelRejectReason::TooLate => fix::CxlRejReason::TooLateToCancel,
+        CancelRejectReason::UnknownOrder => fix::CxlRejReason::UnknownOrder,
+        CancelRejectReason::AlreadyPending => fix::CxlRejReason::OrderAlreadyInPendingStatus,
+        CancelRejectReason::Duplicate => fix::CxlRejReason::DuplicateClOrdID,
+        CancelRejectReason::Other => fix::CxlRejReason::Other,
+        CancelRejectReason::Venue(code) => return venue_code(code),
+    };
+    known.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dec(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    fn time() -> UtcTimestamp {
+        UtcTimestamp::from_timestamp(1_760_000_000, 0).unwrap()
+    }
+
+    fn client() -> ClientId {
+        "FUNDA".into()
+    }
+
+    fn limit_order() -> fix::NewOrderSingle {
+        let mut order = fix::NewOrderSingle::new("C1", fix::Side::Buy, time(), fix::OrdType::Limit);
+        order.symbol = Some("AAPL".into());
+        order.account = Some("ACC".into());
+        order.ex_destination = Some("XNAS".into());
+        order.order_qty = Some(dec("100"));
+        order.price = Some(dec("10.5"));
+        order
+    }
+
+    fn limit_replace() -> fix::OrderCancelReplaceRequest {
+        let mut replace = fix::OrderCancelReplaceRequest::new("C2", fix::Side::Buy, time(), fix::OrdType::Limit);
+        replace.orig_cl_ord_id = Some("C1".into());
+        replace.symbol = Some("AAPL".into());
+        replace.order_qty = Some(dec("80"));
+        replace.price = Some(dec("11"));
+        replace
+    }
+
+    fn input(message: &impl FixMessage) -> Result<Input, MessageReject> {
+        client_input(&client(), &message.to_message(), false)
+    }
+
+    fn request() -> OrderRequest {
+        OrderRequest {
+            cl_ord_id: "C1".into(),
+            account: Some("ACC".into()),
+            symbol: "AAPL".into(),
+            side: Side::Sell,
+            ord_type: OrdType::Limit,
+            qty: dec("100"),
+            price: Some(dec("10.5")),
+            ex_destination: Some("XNAS".into()),
+            time_in_force: Some(TimeInForce::Gtc),
+        }
+    }
+
+    // Mapping tables.
+
+    #[test]
+    fn side_round_trips_and_refuses_the_rest() {
+        for side in [Side::Buy, Side::Sell, Side::SellShort] {
+            assert_eq!(side_from_fix(side_to_fix(side)), Some(side));
+        }
+        for side in [fix::Side::SellShortExempt, fix::Side::Cross, fix::Side::BuyMinus] {
+            assert_eq!(side_from_fix(side), None, "{side:?}");
+        }
+    }
+
+    #[test]
+    fn ord_type_round_trips_and_refuses_the_rest() {
+        for ord_type in [OrdType::Market, OrdType::Limit] {
+            assert_eq!(ord_type_from_fix(ord_type_to_fix(ord_type)), Some(ord_type));
+        }
+        for ord_type in [fix::OrdType::Stop, fix::OrdType::StopLimit, fix::OrdType::Pegged] {
+            assert_eq!(ord_type_from_fix(ord_type), None, "{ord_type:?}");
+        }
+    }
+
+    #[test]
+    fn time_in_force_round_trips_and_refuses_the_rest() {
+        for tif in [TimeInForce::Day, TimeInForce::Gtc, TimeInForce::Ioc, TimeInForce::Fok] {
+            assert_eq!(time_in_force_from_fix(time_in_force_to_fix(tif)), Some(tif));
+        }
+        for tif in [fix::TimeInForce::AtTheOpening, fix::TimeInForce::GoodTillDate, fix::TimeInForce::AtTheClose] {
+            assert_eq!(time_in_force_from_fix(tif), None, "{tif:?}");
+        }
+    }
+
+    #[test]
+    fn ord_status_and_exec_type_codes() {
+        let statuses = [
+            (Status::PendingNew, "A"),
+            (Status::New, "0"),
+            (Status::PartiallyFilled, "1"),
+            (Status::Filled, "2"),
+            (Status::PendingCancel, "6"),
+            (Status::PendingReplace, "E"),
+            (Status::Canceled, "4"),
+            (Status::Expired, "C"),
+            (Status::Rejected, "8"),
+        ];
+        for (status, code) in statuses {
+            assert_eq!(ord_status_to_fix(status).code(), code, "{status:?}");
+        }
+        let exec_types = [
+            (ExecType::PendingNew, "A"),
+            (ExecType::New, "0"),
+            (ExecType::Trade, "F"),
+            (ExecType::PendingCancel, "6"),
+            (ExecType::Canceled, "4"),
+            (ExecType::PendingReplace, "E"),
+            (ExecType::Replaced, "5"),
+            (ExecType::Rejected, "8"),
+            (ExecType::Expired, "C"),
+            (ExecType::Restated, "D"),
+            (ExecType::DoneForDay, "3"),
+            (ExecType::Status, "I"),
+        ];
+        for (exec_type, code) in exec_types {
+            assert_eq!(exec_type_to_fix(exec_type).code(), code, "{exec_type:?}");
+        }
+    }
+
+    #[test]
+    fn reject_reasons_map_to_fix_50_sp2_codes() {
+        let reasons = [
+            (RejectReason::Duplicate, "6"),
+            (RejectReason::NoRoute, "99"),
+            (RejectReason::RouteRejected, "99"),
+            (RejectReason::TooManyOrders, "99"),
+            (RejectReason::VenueUnavailable, "99"),
+            (RejectReason::Blocked, "99"),
+            (RejectReason::GatewayUnavailable, "99"),
+            (RejectReason::Risk(RiskReject::OrderQty), "3"),
+            (RejectReason::Risk(RiskReject::Notional), "3"),
+            (RejectReason::Risk(RiskReject::Credit), "3"),
+            (RejectReason::Risk(RiskReject::Symbol), "99"),
+            (RejectReason::Risk(RiskReject::NoReferencePrice), "99"),
+            (RejectReason::Risk(RiskReject::PriceBand), "16"),
+            (RejectReason::Risk(RiskReject::SelfTrade), "99"),
+            (RejectReason::Venue(3), "3"),
+            (RejectReason::Venue(15), "15"),
+            (RejectReason::Venue(18), "18"),
+            (RejectReason::Venue(100), "100"),
+        ];
+        for (reason, code) in reasons {
+            assert_eq!(ord_rej_reason_to_fix(reason).code(), code, "{reason:?}");
+        }
+        let reasons = [
+            (CancelRejectReason::TooLate, "0"),
+            (CancelRejectReason::UnknownOrder, "1"),
+            (CancelRejectReason::AlreadyPending, "3"),
+            (CancelRejectReason::Duplicate, "6"),
+            (CancelRejectReason::Other, "99"),
+            (CancelRejectReason::Venue(2), "2"),
+            (CancelRejectReason::Venue(7), "7"),
+        ];
+        for (reason, code) in reasons {
+            assert_eq!(cxl_rej_reason_to_fix(reason).code(), code, "{reason:?}");
+        }
+    }
+
+    // Client requests in.
+
+    #[test]
+    fn a_new_order_single_becomes_a_new_order() {
+        let mut order = limit_order();
+        order.time_in_force = Some(fix::TimeInForce::ImmediateOrCancel.into());
+        let msg = order.to_message();
+        let Input::NewOrder { client, request: parsed, redelivered, .. } = client_input(&client(), &msg, true).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((client, redelivered), (ClientId::from("FUNDA"), true));
+        let expected = OrderRequest { side: Side::Buy, time_in_force: Some(TimeInForce::Ioc), ..request() };
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn a_new_order_without_time_in_force_keeps_it_absent() {
+        let Input::NewOrder { request, .. } = input(&limit_order()).unwrap() else { panic!() };
+        assert_eq!(request.time_in_force, None);
+    }
+
+    #[test]
+    fn a_market_order_needs_no_price() {
+        let mut order = limit_order();
+        order.ord_type = fix::OrdType::Market.into();
+        order.price = None;
+        let Input::NewOrder { request, .. } = input(&order).unwrap() else { panic!() };
+        assert_eq!((request.ord_type, request.price), (OrdType::Market, None));
+    }
+
+    /// The reject's kind and the tag it names, or the text that does for a business reject.
+    fn rejected_tag(reject: &MessageReject) -> String {
+        match reject {
+            MessageReject::Session { ref_tag, .. } => format!("{ref_tag:?}"),
+            MessageReject::Business { text, .. } => text.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn new_orders_the_book_cant_take_are_rejected_on_their_field() {
+        let mut cases: Vec<(fix::NewOrderSingle, &str)> = Vec::new();
+        let mut order = limit_order();
+        order.order_qty = None;
+        cases.push((order, "Conditionally required tag 38 missing"));
+        for qty in ["0", "-5"] {
+            let mut order = limit_order();
+            order.order_qty = Some(dec(qty));
+            cases.push((order, "Some(38)"));
+        }
+        let mut order = limit_order();
+        order.price = None;
+        cases.push((order, "Conditionally required tag 44 missing"));
+        let mut order = limit_order();
+        order.ord_type = fix::OrdType::Market.into();
+        cases.push((order, "Some(44)"));
+        let mut order = limit_order();
+        order.ord_type = fix::OrdType::Stop.into();
+        cases.push((order, "Some(40)"));
+        let mut order = limit_order();
+        order.time_in_force = Some(fix::TimeInForce::GoodTillDate.into());
+        cases.push((order, "Some(59)"));
+        let mut order = limit_order();
+        order.side = fix::Side::Cross.into();
+        cases.push((order, "Some(54)"));
+        let mut order = limit_order();
+        order.symbol = None;
+        cases.push((order, "Some(55)"));
+        for (order, expected) in cases {
+            let reject = input(&order).unwrap_err();
+            assert_eq!(rejected_tag(&reject), expected, "{order:?}: {reject}");
+        }
+    }
+
+    #[test]
+    fn a_new_order_with_a_code_outside_the_dictionary_is_rejected_like_an_unsupported_one() {
+        let mut order = limit_order();
+        order.side = Code::Unknown("Z".into());
+        assert_eq!(input(&order), Err(MessageReject::value_incorrect(tags::SIDE, "Side Z is not supported")));
+    }
+
+    #[test]
+    fn a_cancel_request_becomes_a_cancel() {
+        let mut cancel = fix::OrderCancelRequest::new("C2", fix::Side::SellShort, time());
+        cancel.orig_cl_ord_id = Some("C1".into());
+        cancel.symbol = Some("AAPL".into());
+        let expected = Input::Cancel {
+            client: client(),
+            cl_ord_id: "C2".into(),
+            orig_cl_ord_id: "C1".into(),
+            side: Side::SellShort,
+            symbol: "AAPL".into(),
+            redelivered: false,
+        };
+        assert_eq!(input(&cancel).unwrap(), expected);
+        cancel.symbol = None;
+        assert_eq!(rejected_tag(&input(&cancel).unwrap_err()), "Some(55)");
+    }
+
+    #[test]
+    fn a_replace_carries_full_terms() {
+        let expected = Input::Replace {
+            client: client(),
+            cl_ord_id: "C2".into(),
+            orig_cl_ord_id: "C1".into(),
+            side: Side::Buy,
+            symbol: "AAPL".into(),
+            qty: dec("80"),
+            price: Some(dec("11")),
+            ord_type: Some(OrdType::Limit),
+            // Absent on the request: FIX's default, not the book's "unchanged".
+            time_in_force: Some(TimeInForce::Day),
+            redelivered: false,
+        };
+        assert_eq!(input(&limit_replace()).unwrap(), expected);
+        let mut replace = limit_replace();
+        replace.time_in_force = Some(fix::TimeInForce::GoodTillCancel.into());
+        let Input::Replace { time_in_force, .. } = input(&replace).unwrap() else { panic!() };
+        assert_eq!(time_in_force, Some(TimeInForce::Gtc));
+    }
+
+    #[test]
+    fn replaces_the_book_cant_take_are_rejected_on_their_field() {
+        let mut cases: Vec<(fix::OrderCancelReplaceRequest, &str)> = Vec::new();
+        let mut replace = limit_replace();
+        replace.order_qty = None;
+        cases.push((replace, "Conditionally required tag 38 missing"));
+        let mut replace = limit_replace();
+        replace.order_qty = Some(dec("0"));
+        cases.push((replace, "Some(38)"));
+        let mut replace = limit_replace();
+        replace.price = None;
+        cases.push((replace, "Conditionally required tag 44 missing"));
+        let mut replace = limit_replace();
+        replace.ord_type = fix::OrdType::Market.into();
+        cases.push((replace, "Some(44)"));
+        let mut replace = limit_replace();
+        replace.ord_type = fix::OrdType::StopLimit.into();
+        cases.push((replace, "Some(40)"));
+        let mut replace = limit_replace();
+        replace.time_in_force = Some(fix::TimeInForce::AtTheClose.into());
+        cases.push((replace, "Some(59)"));
+        let mut replace = limit_replace();
+        replace.side = fix::Side::Undisclosed.into();
+        cases.push((replace, "Some(54)"));
+        for (replace, expected) in cases {
+            let reject = input(&replace).unwrap_err();
+            assert_eq!(rejected_tag(&reject), expected, "{replace:?}: {reject}");
+        }
+    }
+
+    /// FIX 5.0 SP2 lets OrderID(37) stand in for these, but the book finds the order by ClOrdID.
+    #[test]
+    fn requests_without_the_cl_ord_ids_the_book_needs_are_rejected() {
+        let missing = |tag| Err(MessageReject::conditionally_required_field_missing(tag));
+        let mut cancel = fix::OrderCancelRequest::new("C2", fix::Side::Buy, time());
+        cancel.symbol = Some("AAPL".into());
+        assert_eq!(input(&cancel), missing(tags::ORIG_CL_ORD_ID));
+        let mut replace = limit_replace();
+        replace.orig_cl_ord_id = None;
+        assert_eq!(input(&replace), missing(tags::ORIG_CL_ORD_ID));
+        let mut request = fix::OrderStatusRequest::new(fix::Side::Buy);
+        (request.symbol, request.order_id) = (Some("AAPL".into()), Some("7".into()));
+        assert_eq!(input(&request), missing(tags::CL_ORD_ID));
+    }
+
+    #[test]
+    fn a_status_request_becomes_a_status_request() {
+        let mut request = fix::OrderStatusRequest::new(fix::Side::Sell);
+        request.cl_ord_id = Some("C1".into());
+        request.symbol = Some("AAPL".into());
+        let expected =
+            Input::StatusRequest { client: client(), cl_ord_id: "C1".into(), side: Side::Sell, symbol: "AAPL".into() };
+        assert_eq!(input(&request).unwrap(), expected);
+    }
+
+    #[test]
+    fn other_message_types_are_unsupported() {
+        let report = fix::ExecutionReport::new(
+            "1",
+            "E",
+            fix::ExecType::New,
+            fix::OrdStatus::New,
+            fix::Side::Buy,
+            0.into(),
+            0.into(),
+        );
+        assert_eq!(input(&report).unwrap_err(), MessageReject::unsupported_message_type());
+    }
+
+    #[test]
+    fn a_malformed_request_is_rejected() {
+        let msg = limit_order().to_message();
+        let mut bad = Message::default();
+        for (tag, value) in msg.fields().filter(|&(tag, _)| tag != tags::SIDE) {
+            bad.push(tag, value);
+        }
+        assert_eq!(client_input(&client(), &bad, false).unwrap_err(), MessageReject::required_tag_missing(tags::SIDE));
+    }
+
+    // Client messages out.
+
+    fn report() -> ClientReport {
+        ClientReport {
+            exec_type: ExecType::Trade,
+            order_id: Some("7".into()),
+            cl_ord_id: "C2".into(),
+            orig_cl_ord_id: Some("C1".into()),
+            request: request(),
+            status: Status::PartiallyFilled,
+            reject: None,
+            last_qty: dec("40"),
+            last_px: dec("10.25"),
+            cum_qty: dec("40"),
+            leaves_qty: dec("60"),
+            avg_px: dec("10.25"),
+            exec_id: "7.3".into(),
+            text: Some("fill".into()),
+        }
+    }
+
+    fn client_report(report: ClientReport) -> fix::ExecutionReport {
+        let output = Output::Report { client: client(), report };
+        client_message(&output, time()).unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn a_fill_becomes_an_execution_report() {
+        let er = client_report(report());
+        assert_eq!((er.order_id.as_str(), er.exec_id.as_str()), ("7", "7.3"));
+        assert_eq!(
+            (er.exec_type, er.ord_status, er.side),
+            (
+                Code::Known(fix::ExecType::Trade),
+                Code::Known(fix::OrdStatus::PartiallyFilled),
+                Code::Known(fix::Side::Sell)
+            )
+        );
+        assert_eq!((er.cl_ord_id.as_deref(), er.orig_cl_ord_id.as_deref()), (Some("C2"), Some("C1")));
+        assert_eq!((er.last_qty, er.last_px), (Some(dec("40")), Some(dec("10.25"))));
+        assert_eq!((er.leaves_qty, er.cum_qty, er.avg_px), (dec("60"), dec("40"), Some(dec("10.25"))));
+        assert_eq!((er.symbol.as_deref(), er.account.as_deref()), (Some("AAPL"), Some("ACC")));
+        assert_eq!((er.order_qty, er.price), (Some(dec("100")), Some(dec("10.5"))));
+        assert_eq!(
+            (er.ord_type, er.time_in_force),
+            (Some(Code::Known(fix::OrdType::Limit)), Some(Code::Known(fix::TimeInForce::GoodTillCancel)))
+        );
+        assert_eq!((er.ord_rej_reason, er.text.as_deref(), er.transact_time), (None, Some("fill"), Some(time())));
+    }
+
+    #[test]
+    fn a_report_without_a_fill_has_no_last_qty() {
+        let er = client_report(ClientReport { exec_type: ExecType::New, last_qty: Decimal::ZERO, ..report() });
+        assert_eq!((er.last_qty, er.last_px), (None, None));
+    }
+
+    #[test]
+    fn a_reject_before_booking_says_none_and_why() {
+        let reject = ClientReport {
+            exec_type: ExecType::Rejected,
+            order_id: None,
+            status: Status::Rejected,
+            reject: Some(RejectReason::Duplicate),
+            last_qty: Decimal::ZERO,
+            text: Some("duplicate ClOrdID".into()),
+            ..report()
+        };
+        let er = client_report(reject);
+        assert_eq!((er.order_id.as_str(), er.ord_status), ("NONE", Code::Known(fix::OrdStatus::Rejected)));
+        assert_eq!(
+            (er.ord_rej_reason, er.text.as_deref()),
+            (Some(Code::Known(fix::OrdRejReason::DuplicateOrder)), Some("duplicate ClOrdID"))
+        );
+    }
+
+    #[test]
+    fn a_status_request_for_no_order_says_unknown_order() {
+        let unknown = ClientReport {
+            exec_type: ExecType::Status,
+            order_id: None,
+            status: Status::Rejected,
+            last_qty: Decimal::ZERO,
+            ..report()
+        };
+        let er = client_report(unknown);
+        assert_eq!(
+            (er.exec_type, er.ord_rej_reason),
+            (Code::Known(fix::ExecType::OrderStatus), Some(Code::Known(fix::OrdRejReason::UnknownOrder)))
+        );
+    }
+
+    #[test]
+    fn a_cancel_reject_becomes_an_order_cancel_reject() {
+        let output = |order_id, response_to| Output::CancelReject {
+            client: client(),
+            order_id,
+            cl_ord_id: "C3".into(),
+            orig_cl_ord_id: "C2".into(),
+            response_to,
+            status: Status::PendingReplace,
+            reason: CancelRejectReason::AlreadyPending,
+            text: "replace pending".into(),
+        };
+        let reject: fix::OrderCancelReject =
+            client_message(&output(Some("7".into()), CancelKind::Replace), time()).unwrap().parse().unwrap();
+        assert_eq!(
+            (reject.order_id.as_str(), reject.cl_ord_id.as_str(), reject.orig_cl_ord_id.as_deref()),
+            ("7", "C3", Some("C2"))
+        );
+        assert_eq!(
+            (reject.ord_status, reject.cxl_rej_response_to),
+            (Code::Known(fix::OrdStatus::PendingReplace), Code::Known(fix::CxlRejResponseTo::OrderCancel))
+        );
+        assert_eq!(
+            (reject.cxl_rej_reason, reject.text.as_deref()),
+            (Some(Code::Known(fix::CxlRejReason::OrderAlreadyInPendingStatus)), Some("replace pending"))
+        );
+        assert_eq!(reject.transact_time, Some(time()));
+        let reject: fix::OrderCancelReject =
+            client_message(&output(None, CancelKind::Cancel), time()).unwrap().parse().unwrap();
+        assert_eq!(
+            (reject.order_id.as_str(), reject.cxl_rej_response_to),
+            ("NONE", Code::Known(fix::CxlRejResponseTo::OrderCancelRequest))
+        );
+    }
+
+    #[test]
+    fn venue_outputs_are_not_client_messages() {
+        let output = Output::NewOrder { venue: "NASDAQ".into(), downstream: "1".into(), request: request() };
+        assert!(client_message(&output, time()).is_none());
+    }
+
+    // Venue messages in.
+
+    #[test]
+    fn ord_status_round_trips_and_leaves_the_rest_to_the_order() {
+        let statuses = [
+            Status::PendingNew,
+            Status::New,
+            Status::PartiallyFilled,
+            Status::Filled,
+            Status::PendingCancel,
+            Status::PendingReplace,
+            Status::Canceled,
+            Status::Expired,
+            Status::Rejected,
+        ];
+        for status in statuses {
+            assert_eq!(ord_status_from_fix(ord_status_to_fix(status)), Some(status));
+        }
+        let unmodelled = [
+            fix::OrdStatus::DoneForDay,
+            fix::OrdStatus::Replaced,
+            fix::OrdStatus::Stopped,
+            fix::OrdStatus::Suspended,
+            fix::OrdStatus::Calculated,
+            fix::OrdStatus::AcceptedForBidding,
+        ];
+        for status in unmodelled {
+            assert_eq!(ord_status_from_fix(status), None, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn exec_type_round_trips_and_unmodelled_ones_are_restated() {
+        let exec_types = [
+            ExecType::PendingNew,
+            ExecType::New,
+            ExecType::Trade,
+            ExecType::PendingCancel,
+            ExecType::Canceled,
+            ExecType::PendingReplace,
+            ExecType::Replaced,
+            ExecType::Rejected,
+            ExecType::Expired,
+            ExecType::Restated,
+            ExecType::DoneForDay,
+            ExecType::Status,
+        ];
+        for exec_type in exec_types {
+            assert_eq!(exec_type_from_fix(exec_type_to_fix(exec_type)), Some(exec_type));
+        }
+        let restated = [
+            fix::ExecType::Stopped,
+            fix::ExecType::Suspended,
+            fix::ExecType::Calculated,
+            fix::ExecType::TradeInAClearingHold,
+            fix::ExecType::TradeHasBeenReleasedToClearing,
+            fix::ExecType::TriggeredOrActivatedBySystem,
+        ];
+        for exec_type in restated {
+            assert_eq!(exec_type_from_fix(exec_type), Some(ExecType::Restated), "{exec_type:?}");
+        }
+        for exec_type in [fix::ExecType::TradeCancel, fix::ExecType::TradeCorrect] {
+            assert_eq!(exec_type_from_fix(exec_type), None, "{exec_type:?}");
+        }
+    }
+
+    fn venue() -> VenueId {
+        "NASDAQ".into()
+    }
+
+    fn venue_fill() -> fix::ExecutionReport {
+        let mut report = fix::ExecutionReport::new(
+            "V-9",
+            "X1",
+            fix::ExecType::Trade,
+            fix::OrdStatus::PartiallyFilled,
+            fix::Side::Buy,
+            dec("60"),
+            dec("40"),
+        );
+        report.avg_px = Some(dec("10.25"));
+        report.cl_ord_id = Some("1".into());
+        report.last_qty = Some(dec("40"));
+        report.last_px = Some(dec("10.25"));
+        report.text = Some("fill".into());
+        report
+    }
+
+    fn venue_report_of(report: &fix::ExecutionReport) -> Option<VenueReport> {
+        match venue_input(&venue(), &report.to_message()).unwrap() {
+            Some(Input::VenueReport { venue, report }) => {
+                assert_eq!(venue, "NASDAQ");
+                Some(report)
+            }
+            None => None,
+            Some(other) => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_venue_fill_becomes_a_venue_report() {
+        let expected = VenueReport {
+            downstream: "1".into(),
+            exec_type: ExecType::Trade,
+            status: Some(Status::PartiallyFilled),
+            last_qty: dec("40"),
+            last_px: dec("10.25"),
+            cum_qty: dec("40"),
+            avg_px: dec("10.25"),
+            exec_id: "X1".into(),
+            text: Some("fill".into()),
+            venue_order_id: Some("V-9".into()),
+            ord_rej_reason: None,
+        };
+        assert_eq!(venue_report_of(&venue_fill()), Some(expected));
+    }
+
+    #[test]
+    fn a_venue_reject_keeps_its_reason_code_and_order_id_none() {
+        let mut report = venue_fill();
+        (report.order_id, report.exec_type, report.ord_status) =
+            ("NONE".into(), fix::ExecType::Rejected.into(), fix::OrdStatus::Rejected.into());
+        (report.last_qty, report.last_px, report.cum_qty) = (None, None, Decimal::ZERO);
+        report.ord_rej_reason = Some(fix::OrdRejReason::UnknownSymbol.into());
+        let report = venue_report_of(&report).unwrap();
+        assert_eq!((report.exec_type, report.status), (ExecType::Rejected, Some(Status::Rejected)));
+        assert_eq!((report.last_qty, report.last_px), (Decimal::ZERO, Decimal::ZERO));
+        assert_eq!((report.ord_rej_reason, report.venue_order_id.as_deref()), (Some(1), Some("NONE")));
+    }
+
+    #[test]
+    fn unmodelled_venue_reports_keep_the_orders_status() {
+        let cases = [
+            (fix::ExecType::DoneForDay, fix::OrdStatus::DoneForDay, ExecType::DoneForDay),
+            (fix::ExecType::Suspended, fix::OrdStatus::Suspended, ExecType::Restated),
+            (fix::ExecType::Calculated, fix::OrdStatus::Calculated, ExecType::Restated),
+            (fix::ExecType::Stopped, fix::OrdStatus::Stopped, ExecType::Restated),
+        ];
+        for (fix_exec_type, ord_status, exec_type) in cases {
+            let mut report = venue_fill();
+            (report.exec_type, report.ord_status) = (fix_exec_type.into(), ord_status.into());
+            let report = venue_report_of(&report).unwrap();
+            assert_eq!((report.exec_type, report.status), (exec_type, None), "{fix_exec_type:?}");
+        }
+    }
+
+    #[test]
+    fn a_replaced_ord_status_is_the_order_working() {
+        for (cum_qty, status) in [("0", Status::New), ("40", Status::PartiallyFilled)] {
+            let mut report = venue_fill();
+            (report.exec_type, report.ord_status, report.cum_qty) =
+                (fix::ExecType::Replaced.into(), fix::OrdStatus::Replaced.into(), dec(cum_qty));
+            let report = venue_report_of(&report).unwrap();
+            assert_eq!((report.exec_type, report.status), (ExecType::Replaced, Some(status)), "{cum_qty}");
+        }
+    }
+
+    #[test]
+    fn trade_busts_and_corrections_are_dropped() {
+        for exec_type in [fix::ExecType::TradeCancel, fix::ExecType::TradeCorrect] {
+            let mut report = venue_fill();
+            report.exec_type = exec_type.into();
+            assert_eq!(venue_report_of(&report), None, "{exec_type:?}");
+        }
+    }
+
+    #[test]
+    fn a_venue_report_without_a_cl_ord_id_is_rejected() {
+        let mut report = venue_fill();
+        report.cl_ord_id = None;
+        let reject = venue_input(&venue(), &report.to_message()).unwrap_err();
+        assert_eq!(reject, MessageReject::conditionally_required_field_missing(tags::CL_ORD_ID));
+    }
+
+    #[test]
+    fn a_venue_cancel_reject_becomes_a_venue_cancel_reject() {
+        let mut reject =
+            fix::OrderCancelReject::new("V-9", "1-1", fix::OrdStatus::New, fix::CxlRejResponseTo::OrderCancelRequest);
+        reject.cxl_rej_reason = Some(fix::CxlRejReason::TooLateToCancel.into());
+        reject.text = Some("too late".into());
+        let expected = Input::VenueCancelReject {
+            venue: venue(),
+            downstream: "1-1".into(),
+            status: Some(Status::New),
+            text: Some("too late".into()),
+            reason: Some(0),
+            venue_order_id: Some("V-9".into()),
+        };
+        assert_eq!(venue_input(&venue(), &reject.to_message()).unwrap(), Some(expected));
+        reject.ord_status = fix::OrdStatus::DoneForDay.into();
+        let Some(Input::VenueCancelReject { status, .. }) = venue_input(&venue(), &reject.to_message()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn other_venue_message_types_are_unsupported() {
+        let msg = limit_order().to_message();
+        assert_eq!(venue_input(&venue(), &msg).unwrap_err(), MessageReject::unsupported_message_type());
+    }
+
+    /// `msg` with `tag` set to `value`, in place of any it had.
+    fn with(msg: &Message, tag: u32, value: &str) -> Message {
+        let mut out = Message::default();
+        for (t, v) in msg.fields().filter(|&(t, _)| t != tag) {
+            out.push(t, v);
+        }
+        out.push(tag, value);
+        out
+    }
+
+    fn venue_report_from(msg: &Message) -> VenueReport {
+        let Some(Input::VenueReport { report, .. }) = venue_input(&venue(), msg).unwrap() else { panic!("{msg:?}") };
+        report
+    }
+
+    #[test]
+    fn codes_outside_the_fix_50_sp2_dictionary_dont_lose_a_report() {
+        let fill = venue_fill().to_message();
+        // LastLiquidityInd(851), ExecRestatementReason(378): not read, so any code passes.
+        for (tag, value) in [(851, "9"), (378, "123"), (847, "1001")] {
+            assert_eq!(venue_report_from(&with(&fill, tag, value)).last_qty, dec("40"), "{tag}={value}");
+        }
+        let report = venue_report_from(&with(&fill, fix::tags::ORD_REJ_REASON, "100"));
+        assert_eq!(report.ord_rej_reason, Some(100));
+        let report = venue_report_from(&with(&fill, fix::tags::ORD_REJ_REASON, "X"));
+        assert_eq!(report.ord_rej_reason, None);
+        let report = venue_report_from(&with(&fill, tags::EXEC_TYPE, "Z"));
+        assert_eq!((report.exec_type, report.last_qty), (ExecType::Restated, dec("40")));
+        let report = venue_report_from(&with(&fill, tags::ORD_STATUS, "Z"));
+        assert_eq!(report.status, None);
+
+        let mut reject =
+            fix::OrderCancelReject::new("V-9", "1-1", fix::OrdStatus::New, fix::CxlRejResponseTo::OrderCancelRequest);
+        reject.text = Some("no".into());
+        let msg = with(&reject.to_message(), fix::tags::CXL_REJ_REASON, "100");
+        let Some(Input::VenueCancelReject { reason, status, .. }) = venue_input(&venue(), &msg).unwrap() else {
+            panic!()
+        };
+        assert_eq!((reason, status), (Some(100), Some(Status::New)));
+        let msg = with(&reject.to_message(), tags::CXL_REJ_RESPONSE_TO, "7");
+        assert!(venue_input(&venue(), &msg).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_typed_venue_report_with_an_unknown_exec_type_is_restated() {
+        let mut fill = venue_fill();
+        fill.exec_type = Code::Unknown("Z".into());
+        let report = venue_report_of(&fill).unwrap();
+        assert_eq!((report.exec_type, report.last_qty), (ExecType::Restated, dec("40")));
+    }
+
+    #[test]
+    fn venue_reports_without_what_the_book_needs_are_rejected() {
+        let fill = venue_fill().to_message();
+        for tag in [tags::EXEC_ID, tags::ORD_STATUS, tags::EXEC_TYPE, fix::tags::CUM_QTY, fix::tags::AVG_PX] {
+            let mut msg = Message::default();
+            for (t, v) in fill.fields().filter(|&(t, _)| t != tag) {
+                msg.push(t, v);
+            }
+            assert_eq!(venue_input(&venue(), &msg).unwrap_err(), MessageReject::required_tag_missing(tag), "{tag}");
+        }
+        let bad_qty = with(&fill, fix::tags::CUM_QTY, "lots");
+        assert!(matches!(venue_input(&venue(), &bad_qty), Err(MessageReject::Session { ref_tag: Some(14), .. })));
+    }
+
+    #[test]
+    fn a_fill_without_a_price_is_refused() {
+        let mut fill = venue_fill();
+        fill.last_px = None;
+        let reject = venue_input(&venue(), &fill.to_message()).unwrap_err();
+        assert_eq!(reject, MessageReject::conditionally_required_field_missing(fix::tags::LAST_PX));
+    }
+
+    #[test]
+    fn a_replaced_ord_status_with_nothing_left_is_filled() {
+        let mut report = venue_fill();
+        (report.exec_type, report.ord_status, report.cum_qty, report.leaves_qty) =
+            (fix::ExecType::Replaced.into(), fix::OrdStatus::Replaced.into(), dec("80"), Decimal::ZERO);
+        assert_eq!(venue_report_of(&report).unwrap().status, Some(Status::Filled));
+    }
+
+    // Venue messages out.
+
+    /// The client's ClOrdID, to check it never reaches a venue.
+    const CLIENT_CL_ORD_ID: &str = "CLIENT-SECRET-ClOrdID";
+
+    fn venue_request() -> OrderRequest {
+        OrderRequest { cl_ord_id: CLIENT_CL_ORD_ID.into(), ..request() }
+    }
+
+    fn venue_outputs() -> [Output; 4] {
+        [
+            Output::NewOrder { venue: venue(), downstream: "7".into(), request: venue_request() },
+            Output::Cancel {
+                venue: venue(),
+                downstream: "7-2".into(),
+                orig_downstream: "7-1".into(),
+                request: venue_request(),
+                venue_order_id: Some("V-9".into()),
+            },
+            Output::Replace {
+                venue: venue(),
+                downstream: "7-1".into(),
+                orig_downstream: "7".into(),
+                request: venue_request(),
+                venue_order_id: Some("V-9".into()),
+            },
+            Output::StatusRequest {
+                venue: venue(),
+                downstream: "7-1".into(),
+                request: venue_request(),
+                venue_order_id: Some("V-9".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_clients_cl_ord_id_never_reaches_a_venue() {
+        for output in venue_outputs() {
+            let msg = venue_message(&output, time()).unwrap();
+            for (tag, value) in msg.fields() {
+                assert!(!value.contains(CLIENT_CL_ORD_ID), "{tag}={value} in {output:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_order_goes_to_the_venue_under_its_downstream_cl_ord_id() {
+        let [output, ..] = venue_outputs();
+        let order: fix::NewOrderSingle = venue_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!(
+            (order.cl_ord_id.as_str(), order.side, order.transact_time),
+            ("7", Code::Known(fix::Side::Sell), time())
+        );
+        assert_eq!((order.symbol.as_deref(), order.account.as_deref()), (Some("AAPL"), Some("ACC")));
+        assert_eq!(order.ex_destination.as_deref(), Some("XNAS"));
+        assert_eq!(
+            (order.ord_type, order.order_qty, order.price),
+            (Code::Known(fix::OrdType::Limit), Some(dec("100")), Some(dec("10.5")))
+        );
+        assert_eq!(order.time_in_force, Some(Code::Known(fix::TimeInForce::GoodTillCancel)));
+    }
+
+    #[test]
+    fn a_cancel_names_the_downstream_order_and_the_venues_order_id() {
+        let [_, mut output, ..] = venue_outputs();
+        let cancel: fix::OrderCancelRequest = venue_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!((cancel.cl_ord_id.as_str(), cancel.orig_cl_ord_id.as_deref()), ("7-2", Some("7-1")));
+        assert_eq!(
+            (cancel.order_id.as_deref(), cancel.side, cancel.transact_time),
+            (Some("V-9"), Code::Known(fix::Side::Sell), time())
+        );
+        assert_eq!((cancel.symbol.as_deref(), cancel.order_qty), (Some("AAPL"), Some(dec("100"))));
+        let Output::Cancel { venue_order_id, .. } = &mut output else { unreachable!() };
+        *venue_order_id = None;
+        let msg = venue_message(&output, time()).unwrap();
+        assert_eq!(msg.get(tags::ORDER_ID), None);
+    }
+
+    #[test]
+    fn a_status_request_names_the_downstream_order_and_the_venues_order_id() {
+        let [.., output] = venue_outputs();
+        let status: fix::OrderStatusRequest = venue_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!((status.cl_ord_id.as_deref(), status.order_id.as_deref()), (Some("7-1"), Some("V-9")));
+        assert_eq!((status.symbol.as_deref(), status.side), (Some("AAPL"), Code::Known(fix::Side::Sell)));
+        assert_eq!(status.account.as_deref(), Some("ACC"));
+    }
+
+    #[test]
+    fn a_replace_carries_the_new_terms() {
+        let [_, _, output, _] = venue_outputs();
+        let replace: fix::OrderCancelReplaceRequest = venue_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!((replace.cl_ord_id.as_str(), replace.orig_cl_ord_id.as_deref()), ("7-1", Some("7")));
+        assert_eq!((replace.order_id.as_deref(), replace.transact_time), (Some("V-9"), time()));
+        assert_eq!(
+            (replace.ord_type, replace.order_qty, replace.price),
+            (Code::Known(fix::OrdType::Limit), Some(dec("100")), Some(dec("10.5")))
+        );
+        assert_eq!((replace.symbol.as_deref(), replace.side), (Some("AAPL"), Code::Known(fix::Side::Sell)));
+        assert_eq!(replace.time_in_force, Some(Code::Known(fix::TimeInForce::GoodTillCancel)));
+    }
+
+    #[test]
+    fn client_outputs_are_not_venue_messages() {
+        let output = Output::Report { client: client(), report: report() };
+        assert!(venue_message(&output, time()).is_none());
+    }
+}
