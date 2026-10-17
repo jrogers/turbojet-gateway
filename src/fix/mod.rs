@@ -171,7 +171,7 @@ mod tests {
     use crate::book::Book;
     use crate::router::{Router, Rule, Target};
     use turbojet::FixMessage;
-    use {turbojet_fix42 as v42, turbojet_fix44 as v44};
+    use turbojet_fix::{fix42 as v42, fix44 as v44};
 
     #[test]
     fn possibly_resent_reads_poss_dup_and_poss_resend() {

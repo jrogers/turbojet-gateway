@@ -40,7 +40,7 @@ use turbojet::{
     Acceptor, Application, Context, Disconnect, DiskStorage, FixMessage, Initiator, InitiatorConfig, MemoryStorage,
     Message, MessageReject, MsgType, ReconnectPolicy, SessionConfig, SessionHandle, SessionStorage,
 };
-use turbojet_fix44 as v44;
+use turbojet_fix::fix44 as v44;
 
 use crate::book::{self, Snapshot, Status};
 use crate::edge::tests::Gated;

@@ -16,7 +16,7 @@
 use turbojet::fields::{Code, CodeRef, CompactString, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{FixMessage, Message, MessageReject};
-use turbojet_fix42 as fix;
+use turbojet_fix::fix42 as fix;
 
 use super::{check_price, order_id_out, quantity, reason_code, replaced_status, required, unsupported, venue_code};
 use crate::book::{

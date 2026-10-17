@@ -29,8 +29,7 @@ use turbojet::{
     Acceptor, Application, Context, Disconnect, FixMessage, Initiator, InitiatorConfig, MemoryStorage, Message,
     MessageReject, MsgType, ReconnectPolicy, SessionConfig, SessionHandle, SessionId,
 };
-use turbojet_fix42 as v42;
-use turbojet_fix44 as v44;
+use turbojet_fix::{fix42 as v42, fix44 as v44};
 use turbojet_gateway::auth::{Role, Users};
 use turbojet_gateway::book::{AlarmKind, ClientId, GatewayEvent, Scope, Status};
 use turbojet_gateway::service::Service;

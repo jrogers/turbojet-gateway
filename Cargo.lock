@@ -2619,9 +2619,9 @@ dependencies = [
 
 [[package]]
 name = "turbojet"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f7264eaedb79acf1c8a63df98001e238023f1b7d571b8c9ba14b906bded4827"
+checksum = "bde0e121778147ad7c7efe8509dc92c22dccebf6080763c250761f156c70c057"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2636,9 +2636,9 @@ dependencies = [
 
 [[package]]
 name = "turbojet-config"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e908e10f44fec6356426ab7f021fe5c1f178ecdb1d4d2fc748bcdf28d4548a61"
+checksum = "2e1bc8f37dd2abd88a6f4419fc66c2a675602e5d854ada5b7b4c779c349ba1f6"
 dependencies = [
  "serde",
  "tokio",
@@ -2648,19 +2648,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "turbojet-fix42"
-version = "0.3.1"
+name = "turbojet-fix"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d22b465767135f49352a09e8fe81de13e47dcfaf903d07de0a832af1ff70fa2"
-dependencies = [
- "turbojet",
-]
-
-[[package]]
-name = "turbojet-fix44"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a00bb3a02b0dd8fc4b590f28cc59b9e37cf9d7384734693dce5041df0cd0ac8"
+checksum = "7471b257760cb8cc80adcc728c40b4e9d908f3e2675fcb20fa51632d934a0220"
 dependencies = [
  "turbojet",
 ]
@@ -2695,8 +2686,7 @@ dependencies = [
  "tracing-subscriber",
  "turbojet",
  "turbojet-config",
- "turbojet-fix42",
- "turbojet-fix44",
+ "turbojet-fix",
 ]
 
 [[package]]

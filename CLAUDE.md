@@ -22,11 +22,10 @@ Turbojet Gateway is a FIX connectivity gateway built on the Turbojet engine, fro
   [patch.crates-io]
   turbojet = { path = "../turbojet/crates/turbojet" }
   turbojet-config = { path = "../turbojet/crates/turbojet-config" }
-  turbojet-fix42 = { path = "../turbojet/crates/turbojet-fix42" }
-  turbojet-fix44 = { path = "../turbojet/crates/turbojet-fix44" }
+  turbojet-fix = { path = "../turbojet/crates/turbojet-fix" }
   ```
   It rewrites `Cargo.lock`'s Turbojet entries to the path; don't commit those. In the main
   checkout it applies to the worktrees under `.worktrees/` too. The checkout's version must match
-  `0.3`, or cargo ignores the patch with only a warning.
+  `0.4`, or cargo ignores the patch with only a warning.
 - Engine bugs found here are fixed in the Turbojet repo, in their own commits; Turbojet Gateway
   takes the fix from the next release, or meanwhile through the local patch.

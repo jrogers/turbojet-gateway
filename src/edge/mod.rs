@@ -1216,7 +1216,7 @@ pub(crate) mod tests {
         Acceptor, FixMessage, Initiator, InitiatorConfig, MemoryStorage, MsgType, ReconnectPolicy, SessionConfig,
         SessionStorage,
     };
-    use turbojet_fix44 as v44;
+    use turbojet_fix::fix44 as v44;
 
     use super::*;
     use crate::book::Scope;
