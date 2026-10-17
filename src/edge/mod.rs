@@ -1117,7 +1117,8 @@ fn restored_clients<'a>(snapshot: &'a Snapshot, undelivered: impl Iterator<Item 
 pub struct ClientApp(pub Arc<Gateway>);
 
 impl Application for ClientApp {
-    fn verify_logon(&self, session: &SessionHandle, _logon: &Message, _: &ConnectionInfo) -> Result<(), String> {
+    fn verify_logon(&self, session: &SessionHandle, logon: &Message, _: &ConnectionInfo) -> Result<(), String> {
+        fix::check_logon(&session.id().begin_string, logon)?;
         self.0.admit(session.id())
     }
 
@@ -1153,7 +1154,8 @@ impl Application for ClientApp {
 pub struct VenueApp(pub Arc<Gateway>);
 
 impl Application for VenueApp {
-    fn verify_logon(&self, session: &SessionHandle, _logon: &Message, _: &ConnectionInfo) -> Result<(), String> {
+    fn verify_logon(&self, session: &SessionHandle, logon: &Message, _: &ConnectionInfo) -> Result<(), String> {
+        fix::check_logon(&session.id().begin_string, logon)?;
         if self.0.lock().venue_names.contains_key(session.id()) {
             Ok(())
         } else {

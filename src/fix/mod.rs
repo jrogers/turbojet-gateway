@@ -1,7 +1,7 @@
 //! Conversion between FIX messages and the book's types, one module per FIX version. Pure: no
 //! sessions and no clocks; the caller passes the time for TransactTime.
 
-use turbojet::fields::{Code, CompactString, Decimal, FixEnum, UtcTimestamp, format_compact};
+use turbojet::fields::{ApplVerId, Code, CompactString, Decimal, FixEnum, UtcTimestamp, format_compact};
 use turbojet::message::tags;
 use turbojet::{Message, MessageReject};
 
@@ -9,6 +9,7 @@ use crate::book::{ClientId, Input, OrdType, Output, Status, VenueId};
 
 pub mod fix42;
 pub mod fix44;
+pub mod fix50sp2;
 
 /// A session's FIX version, from its BeginString(8): which module converts its messages. Parse
 /// it once when the session is configured, so an unsupported version stops the start.
@@ -16,15 +17,18 @@ pub mod fix44;
 pub enum Version {
     Fix42,
     Fix44,
+    /// FIXT.1.1 sessions, whose only application version the gateway converts is 5.0 SP2: see
+    /// [`check_logon`].
+    Fix50Sp2,
 }
 
-/// A BeginString with no conversion: neither FIX.4.2 nor FIX.4.4.
+/// A BeginString with no conversion: not FIX.4.2, FIX.4.4 or FIXT.1.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedVersion(pub String);
 
 impl std::fmt::Display for UnsupportedVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BeginString {:?} is not supported: use FIX.4.2 or FIX.4.4", self.0)
+        write!(f, "BeginString {:?} is not supported: use FIX.4.2, FIX.4.4 or FIXT.1.1 (FIX 5.0 SP2)", self.0)
     }
 }
 
@@ -37,6 +41,7 @@ impl std::str::FromStr for Version {
         match begin_string {
             "FIX.4.2" => Ok(Self::Fix42),
             "FIX.4.4" => Ok(Self::Fix44),
+            "FIXT.1.1" => Ok(Self::Fix50Sp2),
             _ => Err(UnsupportedVersion(begin_string.into())),
         }
     }
@@ -48,6 +53,7 @@ impl Version {
         match self {
             Self::Fix42 => "FIX.4.2",
             Self::Fix44 => "FIX.4.4",
+            Self::Fix50Sp2 => "FIXT.1.1",
         }
     }
 
@@ -60,6 +66,7 @@ impl Version {
         match self {
             Self::Fix42 => fix42::client_input(client, msg, redelivered),
             Self::Fix44 => fix44::client_input(client, msg, redelivered),
+            Self::Fix50Sp2 => fix50sp2::client_input(client, msg, redelivered),
         }
     }
 
@@ -68,6 +75,7 @@ impl Version {
         match self {
             Self::Fix42 => fix42::client_message(output, now),
             Self::Fix44 => fix44::client_message(output, now),
+            Self::Fix50Sp2 => fix50sp2::client_message(output, now),
         }
     }
 
@@ -76,6 +84,7 @@ impl Version {
         match self {
             Self::Fix42 => fix42::venue_message(output, now),
             Self::Fix44 => fix44::venue_message(output, now),
+            Self::Fix50Sp2 => fix50sp2::venue_message(output, now),
         }
     }
 
@@ -88,7 +97,26 @@ impl Version {
         match self {
             Self::Fix42 => fix42::venue_input(venue, msg),
             Self::Fix44 => fix44::venue_input(venue, msg),
+            Self::Fix50Sp2 => fix50sp2::venue_input(venue, msg),
         }
+    }
+}
+
+/// On a FIXT.1.1 session, the Logon's DefaultApplVerID(1137) must be FIX 5.0 SP2, the only
+/// application version the gateway converts: a session configured with others could otherwise
+/// settle on one. FIX 4.x sessions have none.
+///
+/// # Errors
+///
+/// Why the Logon is refused.
+pub fn check_logon(begin_string: &str, logon: &Message) -> Result<(), String> {
+    if begin_string != Version::Fix50Sp2.begin_string() {
+        return Ok(());
+    }
+    let expected = ApplVerId::Fix50Sp2.code();
+    match logon.get(tags::DEFAULT_APPL_VER_ID) {
+        Some(code) if code == expected => Ok(()),
+        code => Err(format!("DefaultApplVerID(1137) must be '{expected}' (FIX 5.0 SP2), not {code:?}")),
     }
 }
 
@@ -171,7 +199,7 @@ mod tests {
     use crate::book::Book;
     use crate::router::{Router, Rule, Target};
     use turbojet::FixMessage;
-    use turbojet_fix::{fix42 as v42, fix44 as v44};
+    use turbojet_fix::{fix42 as v42, fix44 as v44, fix50sp2 as v50};
 
     #[test]
     fn possibly_resent_reads_poss_dup_and_poss_resend() {
@@ -193,9 +221,28 @@ mod tests {
     fn versions_parse_from_begin_string() {
         assert_eq!("FIX.4.2".parse(), Ok(Version::Fix42));
         assert_eq!("FIX.4.4".parse(), Ok(Version::Fix44));
-        for unsupported in ["FIX.4.3", "FIXT.1.1", "fix.4.4", ""] {
+        assert_eq!("FIXT.1.1".parse(), Ok(Version::Fix50Sp2));
+        for unsupported in ["FIX.4.3", "FIX.5.0", "fixt.1.1", ""] {
             assert_eq!(unsupported.parse::<Version>(), Err(UnsupportedVersion(unsupported.into())));
         }
+    }
+
+    #[test]
+    fn a_fixt_logon_must_choose_fix_50_sp2() {
+        let logon = |code: Option<&str>| {
+            let mut msg = Message::default();
+            msg.push(tags::MSG_TYPE, "A");
+            if let Some(code) = code {
+                msg.push(tags::DEFAULT_APPL_VER_ID, code);
+            }
+            msg
+        };
+        assert_eq!(check_logon("FIXT.1.1", &logon(Some("9"))), Ok(()));
+        for refused in [Some("8"), Some("7"), None] {
+            assert!(check_logon("FIXT.1.1", &logon(refused)).is_err(), "{refused:?}");
+        }
+        // FIX 4.x has no application version to check.
+        assert_eq!(check_logon("FIX.4.4", &logon(None)), Ok(()));
     }
 
     fn book() -> Book {
@@ -251,6 +298,33 @@ mod tests {
             assert_eq!((er.cl_ord_id.as_deref(), er.order_id.as_str()), (Some("C1"), "1"));
             assert_eq!((er.last_shares, er.cum_qty, er.leaves_qty), (Some(last_qty), cum_qty, leaves_qty));
         }
+    }
+
+    /// A 5.0 SP2 client's order reaches a 4.4 venue, and the venue's fill comes back with AvgPx,
+    /// optional in 5.0 SP2, set.
+    #[test]
+    fn a_fix_50_sp2_client_trades_on_a_fix_44_venue() {
+        let (client, venue): (Version, Version) = ("FIXT.1.1".parse().unwrap(), "FIX.4.4".parse().unwrap());
+        let mut book = book();
+        let mut order = v50::NewOrderSingle::new("C1", v50::Side::Buy, time(), v50::OrdType::Limit);
+        (order.symbol, order.order_qty, order.price) = (Some("AAPL".into()), Some(100.into()), Some(10.into()));
+        let input = client.client_input(&"FUNDA".into(), &order.to_message(), false).unwrap();
+        let [output] = run(&mut book, input).try_into().unwrap();
+        let sent: v44::NewOrderSingle = venue.venue_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!((sent.cl_ord_id.as_str(), sent.symbol.as_deref()), ("1", Some("AAPL")));
+
+        let [qty, px] = [100, 10].map(Decimal::from);
+        let (trade, filled, side) = (v44::ExecType::Trade, v44::OrdStatus::Filled, v44::Side::Buy);
+        let mut fill = v44::ExecutionReport::new("V-9", "X1", trade, filled, side, Decimal::ZERO, qty, px);
+        (fill.cl_ord_id, fill.last_qty, fill.last_px) = (Some(sent.cl_ord_id.clone()), Some(qty), Some(px));
+        let input = venue.venue_input(&"NASDAQ".into(), &fill.to_message()).unwrap().unwrap();
+        let [output] = run(&mut book, input).try_into().unwrap();
+        let er: v50::ExecutionReport = client.client_message(&output, time()).unwrap().parse().unwrap();
+        assert_eq!(
+            (er.exec_type, er.ord_status),
+            (Code::Known(v50::ExecType::Trade), Code::Known(v50::OrdStatus::Filled))
+        );
+        assert_eq!((er.cl_ord_id.as_deref(), er.last_qty, er.avg_px), (Some("C1"), Some(qty), Some(px)));
     }
 
     /// A 4.4 client's order reaches a 4.2 venue with HandlInst, and the venue's PartialFill and

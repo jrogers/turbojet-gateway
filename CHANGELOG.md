@@ -6,8 +6,8 @@ Notable changes to Turbojet Gateway.
 
 - A FIX gateway, `turbojet-gateway --config turbojet-gateway.toml`: clients log on to a Turbojet
   acceptor, the gateway logs on to each venue with a Turbojet initiator, both set up by a
-  `turbojet-config` sessions file, and orders are routed between them. FIX 4.2 and 4.4 on either
-  side, across versions.
+  `turbojet-config` sessions file, and orders are routed between them. FIX 4.2, 4.4 and 5.0 SP2
+  (over FIXT.1.1) on either side, across versions.
 - Clients send NewOrderSingle, OrderCancelRequest, OrderCancelReplaceRequest and
   OrderStatusRequest, for Market and Limit orders, and get ExecutionReports and
   OrderCancelRejects. Venues get orders, cancels and replaces under the gateway's own ClOrdIDs,

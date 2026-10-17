@@ -23,13 +23,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
-use turbojet::fields::{Code, Decimal, UtcTimestamp};
+use turbojet::fields::{ApplVerId, Code, Decimal, UtcTimestamp};
 use turbojet::message::tags;
 use turbojet::{
     Acceptor, Application, Context, Disconnect, FixMessage, Initiator, InitiatorConfig, MemoryStorage, Message,
     MessageReject, MsgType, ReconnectPolicy, SessionConfig, SessionHandle, SessionId,
 };
-use turbojet_fix::{fix42 as v42, fix44 as v44};
+use turbojet_fix::{fix42 as v42, fix44 as v44, fix50sp2 as v50};
 use turbojet_gateway::auth::{Role, Users};
 use turbojet_gateway::book::{AlarmKind, ClientId, GatewayEvent, Scope, Status};
 use turbojet_gateway::service::Service;
@@ -219,11 +219,18 @@ fn write_config(dir: &tempfile::TempDir, options: &Options, venue_port: u16) {
             format!("cancel_on_disconnect = \"{trigger}\"\ncancel_grace = \"{}ms\"\n", grace.as_millis())
         })
         .unwrap_or_default();
+    // A FIXT acceptor takes its application version from the defaults, which the venue's FIX
+    // 4.4 session clears.
+    let (fixt, venue_appl) = if *client_version == "FIXT.1.1" {
+        ("[defaults]\nappl_versions = [\"9\"]\n", "appl_versions = []\n")
+    } else {
+        ("", "")
+    };
     // With a database, a venue's session must be on disk.
     let store =
         if *database { "[defaults]\nstore = \"disk\"\n[store.disk]\nkind = \"disk\"\ndir = \"store\"\n" } else { "" };
     let sessions = format!(
-        r#"{store}
+        r#"{store}{fixt}
 [acceptor]
 begin_string = "{client_version}"
 sender_comp_id = "{GATEWAY}"
@@ -235,7 +242,7 @@ listen = "127.0.0.1:0"
 begin_string = "{venue_version}"
 target_comp_id = "{VENUE}"
 connect = ["127.0.0.1:{venue_port}"]
-reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
+{venue_appl}reconnect = {{ initial = "50ms", max = "50ms", jitter = false }}
 "#
     );
     std::fs::write(dir.path().join("sessions.toml"), sessions).unwrap();
@@ -385,7 +392,11 @@ impl Setup {
 /// A client of the gateway's, not yet running, with SenderSubID `sub_id` if given.
 fn client(service: &Service, version: &str, sub_id: Option<&str>) -> (Initiator, Events) {
     let (app, events) = recorder(false);
-    let mut config = InitiatorConfig::new(SessionConfig::new(version, CLIENT), GATEWAY);
+    let mut session = SessionConfig::new(version, CLIENT);
+    if version == "FIXT.1.1" {
+        session = session.with_appl_ver_id(ApplVerId::Fix50Sp2);
+    }
+    let mut config = InitiatorConfig::new(session, GATEWAY);
     config.sender_sub_id = sub_id.map(Into::into);
     config.reconnect = ReconnectPolicy::fixed(Duration::from_millis(50));
     let addr = service.local_addr().to_string();
@@ -589,6 +600,32 @@ async fn a_fix42_client_trades_on_a_fix44_venue() {
     );
     assert_eq!((filled.ord_status, filled.exec_id.as_str()), (Code::Known(v42::OrdStatus::Filled), &*setup.id("1.2")));
     assert_eq!((filled.last_shares, filled.cum_qty, filled.leaves_qty), (Some(100.into()), 100.into(), 0.into()));
+}
+
+/// A FIX 5.0 SP2 client over FIXT.1.1, a FIX 4.4 venue: the order and its fill are converted
+/// both ways.
+#[tokio::test]
+async fn a_fix50sp2_client_trades_on_a_fix44_venue() {
+    let mut setup = Setup::with(Options { client_version: "FIXT.1.1", ..Options::default() }).await;
+    let mut order = v50::NewOrderSingle::new("C1", v50::Side::Buy, UtcTimestamp::now(), v50::OrdType::Limit);
+    (order.symbol, order.order_qty, order.price) = (Some("AAPL".into()), Some(100.into()), Some(10.into()));
+    setup.send(order.to_message());
+    let sent: v44::NewOrderSingle = setup.venue.events.parse().await;
+    assert_eq!((sent.cl_ord_id.as_str(), sent.order_qty), (&*setup.id("1"), Some(100.into())));
+
+    setup.venue.send(acked(&setup.id("1")));
+    setup.venue.send(fill(&setup.id("1"), "E-1", 100, 100));
+    let new: v50::ExecutionReport = setup.events.parse().await;
+    assert_eq!(
+        (new.cl_ord_id.as_deref(), new.order_id.as_str(), new.exec_type),
+        (Some("C1"), &*setup.id("1"), Code::Known(v50::ExecType::New))
+    );
+    let filled: v50::ExecutionReport = setup.events.parse().await;
+    assert_eq!(
+        (filled.exec_type, filled.ord_status),
+        (Code::Known(v50::ExecType::Trade), Code::Known(v50::OrdStatus::Filled))
+    );
+    assert_eq!((filled.last_qty, filled.cum_qty, filled.avg_px), (Some(100.into()), 100.into(), Some(10.into())));
 }
 
 /// The fill is held in the outbox while the client is away, and sent afresh, not resent, once

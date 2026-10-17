@@ -840,6 +840,13 @@ reject = "no route"
     }
 
     #[test]
+    fn a_fixt_acceptor_speaks_fix_50_sp2() {
+        let sessions = SESSIONS.replace("FIX.4.4", "FIXT.1.1") + "\n[defaults]\nappl_versions = [\"9\"]\n";
+        let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);
+        assert_eq!(load(&dir.path().join("turbojet-gateway.toml")).unwrap().version, Version::Fix50Sp2);
+    }
+
+    #[test]
     fn the_acceptor_must_speak_a_version_the_gateway_converts() {
         let sessions = SESSIONS.replace("FIX.4.4", "FIX.4.3");
         let dir = dir(&[("turbojet-gateway.toml", "sessions = \"sessions.toml\""), ("sessions.toml", &sessions)]);

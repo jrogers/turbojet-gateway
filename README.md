@@ -16,9 +16,9 @@ reports back, keeping each order's state as it goes.
 
 ## What it does
 
-- **FIX 4.2 and 4.4 on either side**, and across versions: a FIX 4.2 client can trade on a FIX 4.4
-  venue and the other way round. Every client speaks the acceptor's version; each venue speaks
-  its own.
+- **FIX 4.2, 4.4 and 5.0 SP2 (over FIXT.1.1) on either side**, and across versions: a FIX 4.2
+  client can trade on a FIX 5.0 SP2 venue and any other way round. Every client speaks the
+  acceptor's version; each venue speaks its own.
 - **NewOrderSingle, OrderCancelRequest, OrderCancelReplaceRequest and OrderStatusRequest** from
   clients; ExecutionReports and OrderCancelRejects back. Market and Limit orders; Buy, Sell and
   SellShort; Day, GTC, IOC and FOK. Anything else is rejected.
@@ -184,15 +184,18 @@ throttling, TLS, failover and the rest) are documented in
 [turbojet-config](https://github.com/jrogers/turbojet/tree/main/crates/turbojet-config). For
 Turbojet Gateway:
 
-- `[acceptor]` is where clients log on. It's required, and its `begin_string`, `FIX.4.2` or
-  `FIX.4.4`, is every client's version. Which CompIDs may log on is turbojet-config's: those listed
+- `[acceptor]` is where clients log on. It's required, and its `begin_string`, `FIX.4.2`,
+  `FIX.4.4` or `FIXT.1.1`, is every client's version. Which CompIDs may log on is turbojet-config's: those listed
   as `[counterparty.COMPID]`, or any under `unknown = "admit"`. A client is a session: sessions of
   one CompID with different SubIDs or LocationIDs each have their own ClOrdIDs, reports and risk
   counts.
 - Each `[initiator.NAME]` is a venue, and `NAME` is what routes call it. A venue speaks its own
-  `begin_string` (the acceptor's by default), `FIX.4.2` or `FIX.4.4`, and logs on as the
-  acceptor's `sender_comp_id` unless it sets its own. A venue with another version stops the
+  `begin_string` (the acceptor's by default), `FIX.4.2`, `FIX.4.4` or `FIXT.1.1`, and logs on as
+  the acceptor's `sender_comp_id` unless it sets its own. A venue with another version stops the
   gateway at start; a reload that adds one skips it, with an error logged.
+- A `FIXT.1.1` session carries FIX 5.0 SP2, the only application version the gateway converts:
+  give it `appl_versions = ["9"]` (in `[defaults]` for the acceptor, so a FIX 4.x venue clears it
+  with `appl_versions = []`). A Logon whose DefaultApplVerID(1137) isn't 9 is refused.
 - Sessions are kept in the `memory` store unless the file says otherwise, so sequence numbers
   start again at each restart. A `[store.NAME]` with `kind = "disk"` keeps them. With a
   [database](#database), the acceptor and every venue must be kept in one.
@@ -280,7 +283,7 @@ for the next second before taking its prefix, so it takes up to a second longer.
 
 **Gateway unavailable.** While the oldest change not yet committed has waited over a second (the
 database is down, or far behind), new orders are rejected with Text(58) "gateway unavailable"
-(OrdRejReason 0 on FIX 4.2, 99 on FIX 4.4). Cancels, replaces and venue reports keep flowing,
+(OrdRejReason 0 on FIX 4.2, 99 on FIX 4.4 and 5.0 SP2). Cancels, replaces and venue reports keep flowing,
 each held until it commits, and a failing commit is retried with an error logged each time. A
 session stops reading 256 messages past its oldest one waiting.
 
@@ -360,8 +363,9 @@ written), and must be positive; `symbols` can't be empty. Unknown keys are error
   always passes, so a client can cut an order the limits would refuse now.
 - **What the client sees.** A refused order gets a Rejected ExecutionReport whose Text(58) names
   the limit, such as "notional over the limit (risk max_notional)". Its OrdRejReason(103) is 3
-  (exceeds limit) for `max_order_qty`, `max_notional` and `credit`, and 0 (broker option) on FIX
-  4.2 or 99 (other) on FIX 4.4 for the rest. A refused replace gets an OrderCancelReject with the
+  (exceeds limit) for `max_order_qty`, `max_notional` and `credit`, 16 (price band) for the price
+  band on FIX 5.0 SP2, and 0 (broker option) on FIX 4.2 or 99 (other) on FIX 4.4 and 5.0 SP2 for
+  the rest. A refused replace gets an OrderCancelReject with the
   same text. New orders are checked in this order: a duplicate ClOrdID, blocked by an operator,
   too many ClOrdIDs, the routes (a route's reject or no route), then the limits.
 - **Reloads.** A SIGHUP rereads the limits with the routes, both or neither. New limits apply from

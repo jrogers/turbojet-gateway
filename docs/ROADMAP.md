@@ -11,7 +11,7 @@ worth knowing about is in [CAVEATS.md](CAVEATS.md).
   and a client certified against one may expect the gateway to do the same.
 - **Allocations** (S). NoAllocs isn't handled: a client's allocations don't reach the venue, and
   nothing checks that their quantities add up to the OrderQty.
-- **Dialect mapping** (L). Orders translate between FIX 4.2 and 4.4, but not between
+- **Dialect mapping** (L). Orders translate between FIX 4.2, 4.4 and 5.0 SP2, but not between
   counterparties' dialects. Rules per venue or client to set, drop or map fields, as hubs like FIX
   Antenna's FIXEdge do, would let one client's orders meet each venue's rules of engagement.
 

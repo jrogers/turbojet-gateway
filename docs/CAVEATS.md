@@ -287,7 +287,11 @@ What's still open is in [ROADMAP.md](ROADMAP.md).
 ## Venues
 
 - FIX 4.2 venues get HandlInst(21) 1 (automated, private) on every order and replace, whatever
-  the client sent; FIX 4.4 venues get none.
+  the client sent; FIX 4.4 and 5.0 SP2 venues get none.
+- FIX 5.0 SP2 makes AvgPx(6) optional, but the book takes each order's AvgPx from the venue's
+  reports: a 5.0 SP2 venue's report without one is rejected. Likewise a 5.0 SP2 client's cancel
+  or replace needs OrigClOrdID(41), and its status request ClOrdID(11), though 5.0 SP2 lets
+  OrderID(37) stand in.
 - Only Account, ExDestination, Symbol, Side, OrderQty, Price, OrdType and TimeInForce reach the
   venue, Account and ExDestination as the client sent them: nothing is mapped per venue, and
   other fields the client sent are dropped.
